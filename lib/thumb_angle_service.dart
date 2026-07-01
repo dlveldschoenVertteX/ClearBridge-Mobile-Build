@@ -1,6 +1,6 @@
 import 'dart:math' as math;
 
-import 'package:hand_landmarker/hand_landmarker.dart';
+import 'hand_types.dart';
 
 /// Derives the thumb's rotation angle from MediaPipe hand landmarks so the
 /// capture sequence can be driven by how the user rotates their *thumb* in

@@ -6,7 +6,6 @@ import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:hand_landmarker/hand_landmarker.dart';
 import 'package:just_audio/just_audio.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
@@ -18,7 +17,9 @@ import 'adaptive_flash_controller.dart';
 import 'device_orientation_service.dart';
 import 'fingerprint_frame_upload_service.dart';
 import 'frame_capture_service.dart';
+import 'hand_types.dart';
 import 'thumb_angle_service.dart';
+import 'thumb_landmarker_service.dart';
 
 const _uuid = Uuid();
 
@@ -172,7 +173,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   CameraController? _camera;
   AdaptiveFlashController? _flash;
   FingerprintFrameUploadService? _upload;
-  HandLandmarkerPlugin? _plugin;
+  ThumbLandmarkerService? _plugin;
   String? _userId;
   int _sensorOrientation = 0;
 
@@ -374,25 +375,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
   void _ensurePlugin() {
     if (_plugin != null) return;
     if (defaultTargetPlatform != TargetPlatform.android) return;
-    // Try GPU delegate first (2-3× faster, reduces frame-callback stall).
-    // Falls back to CPU if the device doesn't support it (e.g. Helio G99 NNAPI).
-    try {
-      _plugin = HandLandmarkerPlugin.create(
-        numHands: 2,
-        minHandDetectionConfidence: 0.35,
-        delegate: HandLandmarkerDelegate.gpu,
-      );
-      return;
-    } catch (_) {}
-    try {
-      _plugin = HandLandmarkerPlugin.create(
-        numHands: 2,
-        minHandDetectionConfidence: 0.35,
-        delegate: HandLandmarkerDelegate.cpu,
-      );
-    } catch (_) {
-      _plugin = null;
-    }
+    // ThumbLandmarkerService tries its own GPU delegate first, falling back
+    // to CPU internally (see thumb_landmarker_service.dart _initAsync). It
+    // stays not-ready (detect() returns []) until initialization completes,
+    // which _detectAndDrive/_runCalibration already handle as "no hand yet".
+    _plugin = ThumbLandmarkerService()..initialize();
   }
 
   // ── Stream processing ──────────────────────────────────────────────────────

@@ -872,14 +872,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "2.2.0"
-  hand_landmarker:
-    dependency: "direct main"
-    description:
-      name: hand_landmarker
-      sha256: c4cc26a6cd805e8586479eb0fc6e015c3bdfe98da8d8cbb0d49e845fb32bf3d8
-      url: "https://pub.dev"
-    source: hosted
-    version: "2.2.0"
   hooks:
     dependency: transitive
     description:
@@ -960,14 +952,6 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.0.5"
-  jni:
-    dependency: transitive
-    description:
-      name: jni
-      sha256: "8706a77e94c76fe9ec9315e18949cc9479cc03af97085ca9c1077b61323ea12d"
-      url: "https://pub.dev"
-    source: hosted
-    version: "0.15.2"
   js:
     dependency: transitive
     description:
@@ -1272,6 +1256,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "1.5.0"
+  quiver:
+    dependency: transitive
+    description:
+      name: quiver
+      sha256: ea0b925899e64ecdfbf9c7becb60d5b50e706ade44a85b2363be2a22d88117d2
+      url: "https://pub.dev"
+    source: hosted
+    version: "3.2.2"
   record_use:
     dependency: transitive
     description:
@@ -1541,6 +1533,14 @@ packages:
       url: "https://pub.dev"
     source: hosted
     version: "0.7.11"
+  tflite_flutter:
+    dependency: "direct main"
+    description:
+      name: tflite_flutter
+      sha256: "0bba9040d8decda0960d7abf8eabf32243bf092bc7d0084e8e19681866b0bdbe"
+      url: "https://pub.dev"
+    source: hosted
+    version: "0.12.1"
   timezone:
     dependency: transitive
     description:
