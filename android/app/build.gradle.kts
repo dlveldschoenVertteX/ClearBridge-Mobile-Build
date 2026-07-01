@@ -6,7 +6,11 @@ plugins {
 
 android {
     namespace = "com.clearbridge.app"
-    compileSdk = flutter.compileSdkVersion
+    // flutter.compileSdkVersion resolved to 33 here, but several AndroidX
+    // deps (androidx.core 1.13.1, lifecycle 2.7.0, exifinterface 1.4.1...)
+    // pulled in by sensors_plus and friends require compileSdk >= 34.
+    // Pinned directly rather than trusting the Flutter-resolved default.
+    compileSdk = 36
     ndkVersion = flutter.ndkVersion
 
     compileOptions {
