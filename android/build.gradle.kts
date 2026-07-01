@@ -19,22 +19,22 @@ subprojects {
     project.evaluationDependsOn(":app")
 }
 
-// Several plugins (tflite_flutter, flutter_image_compress_common, and
-// potentially others not yet hit) ship a build.gradle whose Java
-// compileOptions still target JVM 11 while their Kotlin compilation
-// resolves to 17 on this toolchain -- Gradle rejects the mismatch as
-// "Inconsistent JVM Target Compatibility".
+// Several plugins ship a build.gradle with a Java/Kotlin JVM target
+// mismatch that Gradle rejects as "Inconsistent JVM Target Compatibility"
+// -- but they don't all disagree in the same direction. tflite_flutter,
+// flutter_image_compress_common and audio_session pin Java to 11 while
+// Kotlin resolves to 17; camera_android_camerax's Java already resolves
+// to 17 and broke when Kotlin was blanket-forced to 11. There's no single
+// target that's correct for every plugin.
 //
-// Forcing JavaCompile's sourceCompatibility/targetCompatibility up to 17
-// (an earlier attempt) broke audio_session's compile: its Java sources
-// could no longer find android.* packages at all, meaning that override
-// was interfering with AGP's own Android SDK classpath wiring for that
-// task. Leaving Java compileOptions alone and only pulling Kotlin *down*
-// to 11 (matching what these legacy plugins already declare for Java,
-// rather than pushing Java up to match a newer Kotlin target) fixes the
-// mismatch without touching anything AGP itself manages. The app module
-// keeps its own JVM 17 target (set directly in app/build.gradle.kts) --
-// only plugin subprojects need pulling down to 11 here.
+// Forcing JavaCompile's own source/targetCompatibility (an earlier
+// attempt) broke audio_session outright: its Java sources could no
+// longer find android.* packages at all, meaning that interfered with
+// AGP's own Android SDK classpath wiring. So Java compileOptions are
+// left completely alone here -- instead, each module's Kotlin target is
+// read from and matched to whatever ITS OWN Java compile task already
+// resolved to, per-module, rather than assuming one value fits every
+// plugin.
 //
 // gradle.projectsEvaluated {} runs once every project has finished
 // configuring itself, regardless of evaluation order (subprojects {
@@ -43,9 +43,16 @@ subprojects {
 gradle.projectsEvaluated {
     subprojects {
         if (project.name == "app") return@subprojects
+        val javaTask = tasks.withType<JavaCompile>().firstOrNull() ?: return@subprojects
+        val jvmTarget = when (javaTask.targetCompatibility) {
+            "1.8", "8" -> org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8
+            "11" -> org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11
+            "17" -> org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17
+            else -> null
+        } ?: return@subprojects
         tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
             compilerOptions {
-                jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_11)
+                this.jvmTarget.set(jvmTarget)
             }
         }
     }
