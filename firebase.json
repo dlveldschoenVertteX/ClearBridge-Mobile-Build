@@ -1,0 +1,51 @@
+{
+  "hosting": {
+    "public": "build/web",
+    "ignore": ["firebase.json", "**/node_modules/**"],
+    "rewrites": [
+      { "source": "/admin_panel/**", "destination": "/admin_panel/index.html" },
+      { "source": "/beta_web/**",    "destination": "/beta_web/index.html" },
+      { "source": "**",              "destination": "/index.html" }
+    ]
+  },
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "nodejs-functions",
+      "predeploy": [],
+      "runtime": "nodejs20",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "ml",
+        "ml/**",
+        "processEnhanceAndScore"
+      ]
+    },
+    {
+      "source": "functions/processEnhanceAndScore",
+      "codebase": "python-pipeline",
+      "runtime": "python311",
+      "buildConfig": { "timeout": "1800s" },
+      "ignore": [
+        "venv", "venv/**",
+        "Include", "Include/**",
+        "Lib", "Lib/**",
+        "Scripts", "Scripts/**",
+        "pyvenv.cfg",
+        "eval_pipeline.py",
+        "eval_output", "eval_output/**",
+        "__pycache__", "**/__pycache__/**",
+        "*.pyc", "*.pyo", "*.pyd",
+        "*.dll", "*.exe"
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.rules",
+    "indexes": "firestore.indexes.json"
+  },
+  "storage": {
+    "rules": "storage.rules"
+  }
+}
