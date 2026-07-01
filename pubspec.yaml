@@ -110,6 +110,7 @@ flutter:
     - assets/audio/brand_jingle.wav
     - assets/audio/capture_success.wav
     - assets/videos/
+    - assets/models/
   #   - images/a_dot_ham.jpeg
 
   # An image asset can refer to one or more resolution-specific "variants", see
