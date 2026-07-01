@@ -1,0 +1,22 @@
+# Secrets - never commit
+serviceAccountKey*.json
+*.pem
+*.p12
+*.keystore
+.env
+.env.*
+
+# Flutter/Dart
+.dart_tool/
+.packages
+build/
+.flutter-plugins
+.flutter-plugins-dependencies
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
