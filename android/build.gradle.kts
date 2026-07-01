@@ -25,13 +25,18 @@ subprojects {
 // resolves to 17 on this toolchain -- Gradle rejects the mismatch as
 // "Inconsistent JVM Target Compatibility". A plain subprojects{} block
 // configures tasks too early: each plugin's own build.gradle sets its
-// Java target *during* its own evaluation, after this block already ran,
-// so it wins the race and silently overwrites our override. afterEvaluate
-// runs once a subproject's own script has finished, guaranteeing our
-// value is applied last for every plugin module, not just the ones
-// that have already surfaced an error one CI run at a time.
-subprojects {
-    afterEvaluate {
+// Java target *during* its own evaluation, so it wins the race and
+// silently overwrites a same-phase override.
+//
+// subprojects { afterEvaluate {...} } (the previous attempt) fails
+// outright here: the evaluationDependsOn(":app") above means :app is
+// already fully evaluated by the time this block runs, and Gradle
+// refuses afterEvaluate on an already-evaluated project.
+// gradle.projectsEvaluated {} is the correct hook -- it runs once,
+// after every project (root and subprojects) has finished configuring
+// itself, regardless of evaluation order, so it's always safe to call.
+gradle.projectsEvaluated {
+    subprojects {
         tasks.withType<JavaCompile>().configureEach {
             sourceCompatibility = JavaVersion.VERSION_17.toString()
             targetCompatibility = JavaVersion.VERSION_17.toString()
