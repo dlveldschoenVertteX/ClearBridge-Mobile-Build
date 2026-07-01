@@ -328,6 +328,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _smoothedAngle = 0.0;
     _smoothAngleInitialized = false;
     _retryCount = 0;
+    _focusPeak = 1.0;
 
     unawaited(
       _successPlayer
@@ -1060,6 +1061,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
         _angleStart = DateTime.now();
         _axisController.reset();
         _smoothAngleInitialized = false; // re-seed EMA on the new axis
+        // A stale peak from the just-completed angle (different distance/
+        // lighting) otherwise carries into the next angle's focus scoring
+        // until it decays, making early frames of the new angle read as
+        // falsely soft. See startCaptureSequence for the matching reset.
+        _focusPeak = 1.0;
         final advancingToFinal = index == 2;
         _set(_state.copyWith(
           phase: CapturePhase.capturing,
