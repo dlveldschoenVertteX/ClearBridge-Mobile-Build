@@ -56,7 +56,12 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     try {
       await _cameraService.initializeCamera(
         lensDirection: CameraLensDirection.back,
-        resolution: ResolutionPreset.max,
+        // 1920x1080 per the camera-system spec. ResolutionPreset.max requests
+        // the sensor's full resolution (4K+ on many devices), which means
+        // every frame's Laplacian scoring and TFLite hand detection runs on
+        // 4x+ the pixel count for no quality benefit -- the backend NFIQ
+        // pipeline works from the same-sized JPEGs regardless.
+        resolution: ResolutionPreset.veryHigh,
       );
       if (!mounted) return;
       _sensorOrientation = _cameraService.selectedCamera?.sensorOrientation ?? 0;
