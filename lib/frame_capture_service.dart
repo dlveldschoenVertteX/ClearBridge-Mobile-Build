@@ -356,6 +356,45 @@ class HybridCaptureService {
   static double ema(double previous, double incoming, {double alpha = 0.3}) =>
       alpha * incoming + (1 - alpha) * previous;
 
+  /// Mean luminance of the Y plane, optionally restricted to [roi] (normalized
+  /// 0-1 Rect). Shared brightness helper for controllers without their own ROI
+  /// tracking (see MultiAngleCaptureController._meanLuma for the ROI variant).
+  static double meanLuma(CameraImage image, {Rect? roi}) {
+    if (image.planes.isEmpty) return 0.0;
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    final w = image.width;
+    final h = image.height;
+    if (w < 8 || h < 8) return 0.0;
+    final stride = h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+    var sum = 0;
+    var n = 0;
+    if (roi != null) {
+      final x0 = (roi.left * w).clamp(0, w - 1).toInt();
+      final y0 = (roi.top * h).clamp(0, h - 1).toInt();
+      final x1 = (roi.right * w).clamp(0, w - 1).toInt();
+      final y1 = (roi.bottom * h).clamp(0, h - 1).toInt();
+      if (x1 > x0 + 1 && y1 > y0 + 1) {
+        for (var y = y0; y < y1; y += 8) {
+          final row = y * stride;
+          for (var x = x0; x < x1; x += 8) {
+            sum += bytes[row + x];
+            n++;
+          }
+        }
+        return n > 0 ? sum / n : 0.0;
+      }
+    }
+    for (var y = 0; y < h; y += 8) {
+      final row = y * stride;
+      for (var x = 0; x < w; x += 8) {
+        sum += bytes[row + x];
+        n++;
+      }
+    }
+    return n > 0 ? sum / n : 0.0;
+  }
+
   Uint8List? _extractBytes(CameraImage image) {
     if (image.planes.isEmpty) return null;
     try {

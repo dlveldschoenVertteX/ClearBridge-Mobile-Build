@@ -132,7 +132,7 @@ class _SplashScreenState extends ConsumerState<SplashScreen> {
                         AppConstants.logoPath,
                         width: logoSize,
                         height: logoSize,
-                        errorBuilder: (_, _, _) => Text(
+                        errorBuilder: (_, __, ___) => Text(
                           'ClearBridge',
                           style: ClearBridgeTypography.heroText,
                         ),

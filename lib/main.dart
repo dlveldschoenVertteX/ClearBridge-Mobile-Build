@@ -9,13 +9,13 @@ import 'package:firebase_crashlytics/firebase_crashlytics.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'core/services/connectivity_service.dart';
-import 'core/services/deep_link_service.dart';
-import 'core/services/router_service.dart';
-import 'core/services/sync_service.dart';
-import 'core/theme/app_theme.dart';
-import 'core/constants/app_constants.dart';
-import 'core/services/notification_service.dart';
+import 'package:clearbridge/connectivity_service.dart';
+import 'package:clearbridge/deep_link_service.dart';
+import 'package:clearbridge/router_service.dart';
+import 'package:clearbridge/sync_service.dart';
+import 'package:clearbridge/app_theme.dart';
+import 'package:clearbridge/app_constants.dart';
+import 'package:clearbridge/notification_service.dart';
 import 'firebase_options.dart';
 
 void main() async {

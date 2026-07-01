@@ -258,7 +258,7 @@ GoRouter router(Ref ref) {
       ),
       GoRoute(
         path: AppConstants.popiaConsentRoute,
-        builder: (context, state) => const PopiaConsentScreen(),
+        builder: (context, state) => const BetaConsentScreen(),
       ),
       GoRoute(
         path: '/popia-consent',
