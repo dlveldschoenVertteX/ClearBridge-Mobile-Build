@@ -63,12 +63,22 @@ gradle.projectsEvaluated {
 // potentially others) declare their own compileSdk = 33 in their own
 // build.gradle, which several transitively-pulled AndroidX deps
 // (androidx.core 1.13.1, lifecycle 2.7.0, exifinterface 1.4.1...)
-// require at least 34 for. Same fix shape as the JVM-target override
-// above: read late via projectsEvaluated so it wins over each plugin's
-// own declaration, applied to every android-library subproject.
-gradle.projectsEvaluated {
-    subprojects {
-        if (project.name == "app") return@subprojects
+// require at least 34 for.
+//
+// Unlike Kotlin's jvmTarget (a lazy task property, safely overridable
+// from gradle.projectsEvaluated above), AGP reads compileSdk eagerly
+// while a module is still configuring itself -- projectsEvaluated runs
+// only after every module has already finished configuring, so it's
+// genuinely too late there ("It is too late to set compileSdk. It has
+// already been read..."). It has to be set from inside each plugin
+// module's own afterEvaluate, before AGP reads it. :app is excluded by
+// name -- it sets its own compileSdk directly and, unlike the library
+// modules, is forced to evaluate early by evaluationDependsOn(":app")
+// above, so by the time this subprojects{} block runs :app has already
+// finished evaluating and calling afterEvaluate on it here would crash.
+subprojects {
+    if (project.name == "app") return@subprojects
+    afterEvaluate {
         plugins.withId("com.android.library") {
             extensions.findByType(com.android.build.gradle.LibraryExtension::class.java)
                 ?.compileSdk = 36
