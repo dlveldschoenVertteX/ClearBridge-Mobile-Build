@@ -3,34 +3,10 @@ name: Flutter Build
 on: [push]
 
 jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: subosito/flutter-action@v2
-        with:
-          channel: 'stable'
-          cache: true
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-${{ runner.os }}-${{ hashFiles('android/**/*.gradle*', 'android/gradle/wrapper/gradle-wrapper.properties') }}
-          restore-keys: |
-            gradle-${{ runner.os }}-
-
-      - run: flutter pub get
-
-      - run: flutter build apk --release --target-platform android-arm64
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: flutter-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
-
+  # NOTE: the full-app APK build was intentionally removed -- only the capture
+  # harness is built going forward (all active work targets the harness, so
+  # building the full app on every push just wastes CI time). Restore a `build`
+  # job mirroring the harness one below if the full app needs shipping again.
   build-capture-harness:
     runs-on: ubuntu-latest
     # Standalone camera-only test build (capture_harness/) -- depends only on
