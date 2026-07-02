@@ -180,7 +180,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     await FirebaseStorage.instance
         .ref()
         .child(path)
-        .putData(data, SettableMetadata(contentType: 'image/jpeg'));
+        .putData(data, SettableMetadata(contentType: 'application/octet-stream'));
   }
 }
 

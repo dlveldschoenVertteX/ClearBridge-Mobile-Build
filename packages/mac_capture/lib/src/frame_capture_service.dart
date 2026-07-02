@@ -46,6 +46,14 @@ class TaggedFrame {
   /// thumb without re-running detection on compressed frames.
   final Rect? thumbRoi;
 
+  /// Raw Y-plane dimensions. The backend decodes [bytes] as:
+  ///   np.frombuffer(data, dtype=uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
+  /// [bytesPerRow] is the effective stride (capped to buffer capacity / height)
+  /// and may equal [imageWidth] on devices that don't pad the Y-plane.
+  final int imageWidth;
+  final int imageHeight;
+  final int bytesPerRow;
+
   const TaggedFrame({
     required this.bytes,
     required this.timestamp,
@@ -54,6 +62,9 @@ class TaggedFrame {
     required this.laplacianScore,
     required this.zoneId,
     required this.thumbAngleDegrees,
+    required this.imageWidth,
+    required this.imageHeight,
+    required this.bytesPerRow,
     this.targetAngleDegrees,
     this.angularError,
     this.thumbCoverageRatio = 0.0,
@@ -132,7 +143,17 @@ class HybridCaptureService {
       if (_window.length < _maxCandidates) {
         final bytes = _extractBytes(image);
         if (bytes != null) {
-          _window.add(_Candidate(bytes, weightedScore, DateTime.now(), thumbRoi: thumbRoi));
+          final h = image.height;
+          final effectiveStride = h > 0
+              ? math.min(image.planes[0].bytesPerRow, bytes.length ~/ h)
+              : image.planes[0].bytesPerRow;
+          _window.add(_Candidate(
+            bytes, weightedScore, DateTime.now(),
+            thumbRoi: thumbRoi,
+            width: image.width,
+            height: h,
+            bytesPerRow: effectiveStride,
+          ));
         }
       } else {
         var lowestIdx = 0;
@@ -142,7 +163,17 @@ class HybridCaptureService {
         if (weightedScore > _window[lowestIdx].score) {
           final bytes = _extractBytes(image);
           if (bytes != null) {
-            _window[lowestIdx] = _Candidate(bytes, weightedScore, DateTime.now(), thumbRoi: thumbRoi);
+            final h = image.height;
+            final effectiveStride = h > 0
+                ? math.min(image.planes[0].bytesPerRow, bytes.length ~/ h)
+                : image.planes[0].bytesPerRow;
+            _window[lowestIdx] = _Candidate(
+              bytes, weightedScore, DateTime.now(),
+              thumbRoi: thumbRoi,
+              width: image.width,
+              height: h,
+              bytesPerRow: effectiveStride,
+            );
           }
         }
       }
@@ -288,6 +319,9 @@ class HybridCaptureService {
         angularError: angularError,
         thumbCoverageRatio: thumbCoverageRatio,
         thumbRoi: c.thumbRoi,
+        imageWidth: c.width,
+        imageHeight: c.height,
+        bytesPerRow: c.bytesPerRow,
       );
     }).toList();
   }
@@ -420,5 +454,16 @@ class _Candidate {
   final double score;
   final DateTime timestamp;
   final Rect? thumbRoi;
-  const _Candidate(this.bytes, this.score, this.timestamp, {this.thumbRoi});
+  final int width;
+  final int height;
+  final int bytesPerRow;
+  const _Candidate(
+    this.bytes,
+    this.score,
+    this.timestamp, {
+    this.thumbRoi,
+    required this.width,
+    required this.height,
+    required this.bytesPerRow,
+  });
 }

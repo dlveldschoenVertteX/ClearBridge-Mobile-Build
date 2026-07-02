@@ -1210,6 +1210,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
             'bottom': f.thumbRoi!.bottom,
           },
           'timestamp': f.timestamp.toIso8601String(),
+          // Raw Y-plane geometry. Backend decodes as:
+          //   np.frombuffer(data, uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
+          'imageWidth':   f.imageWidth,
+          'imageHeight':  f.imageHeight,
+          'bytesPerRow':  f.bytesPerRow,
         },
     ];
 
