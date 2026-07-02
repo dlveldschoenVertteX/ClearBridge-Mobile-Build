@@ -23,14 +23,32 @@ class ThumbAngleService {
   ThumbAngleService._();
   static final ThumbAngleService instance = ThumbAngleService._();
 
+  /// Degrees off front (0°) for the three non-front capture positions --
+  /// the single tunable knob for the whole target scheme. All three
+  /// non-front positions share this magnitude for now (symmetric, one
+  /// number to reason about) rather than the old asymmetric 15°/20°/20°
+  /// split, which had no real justification and made right measurably
+  /// easier to mis-fire than left.
+  ///
+  /// PROVISIONAL VALUE. 45° was the first proposal (also widens SfM angular
+  /// coverage and the CV classifier's class separation -- see the capture
+  /// audit) but was rejected as too physically demanding to reach one-handed
+  /// while orbiting the phone around a stationary thumb. 32° is a
+  /// placeholder pending hands-on UX testing to find the real ceiling --
+  /// update this one constant once that number is known. Changing it
+  /// invalidates the current CV model's training data (captures only fire
+  /// near whatever this value is, so old sessions reflect the old value) --
+  /// a retrain needs a fresh batch of sessions captured at the new angle.
+  static const double _offAxisDeg = 32.0;
+
   /// Target device-orientation angle for each capture position, in degrees.
   /// Values are relative to the zeroed front pose and depend on the active axis
   /// (see [axis] below). Measured on Samsung A16 via the Step 1 HUD.
   static const Map<String, double> targets = {
-    'front': 0.0,    // magnitude ≈ 0 immediately after calibration zeros the ref
-    'left': -20.0,   // pitch ≈ -20° (orbit phone left around thumb)
-    'top': -20.0,    // roll ≈ -20° (tip top of phone forward → camera looks down)
-    'right': 15.0,   // pitch ≈ +15° (orbit phone right around thumb)
+    'front': 0.0,           // magnitude ≈ 0 immediately after calibration zeros the ref
+    'left': -_offAxisDeg,   // pitch (orbit phone left around thumb)
+    'top': -_offAxisDeg,    // roll (tip top of phone forward → camera looks down)
+    'right': _offAxisDeg,   // pitch (orbit phone right around thumb)
   };
 
   /// Which DeviceOrientationService component drives each capture position.
