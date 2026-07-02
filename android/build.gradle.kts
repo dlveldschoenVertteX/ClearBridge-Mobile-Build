@@ -58,6 +58,24 @@ gradle.projectsEvaluated {
     }
 }
 
+// compileSdk = 36 on :app (build.gradle.kts) only raises the *app's own*
+// compileSdk -- it has no effect on plugin modules. sensors_plus (and
+// potentially others) declare their own compileSdk = 33 in their own
+// build.gradle, which several transitively-pulled AndroidX deps
+// (androidx.core 1.13.1, lifecycle 2.7.0, exifinterface 1.4.1...)
+// require at least 34 for. Same fix shape as the JVM-target override
+// above: read late via projectsEvaluated so it wins over each plugin's
+// own declaration, applied to every android-library subproject.
+gradle.projectsEvaluated {
+    subprojects {
+        if (project.name == "app") return@subprojects
+        plugins.withId("com.android.library") {
+            extensions.findByType(com.android.build.gradle.LibraryExtension::class.java)
+                ?.compileSdk = 36
+        }
+    }
+}
+
 tasks.register<Delete>("clean") {
     delete(rootProject.layout.buildDirectory)
 }
