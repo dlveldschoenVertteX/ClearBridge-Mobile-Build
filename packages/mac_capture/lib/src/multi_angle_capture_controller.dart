@@ -975,6 +975,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     if (effectiveOrbitDistance > _lockFireDeg) {
       _state = _state.copyWith(
         guidanceMessage: _rotationMessage(name, effectiveOrbitDistance),
+        distanceToTarget: effectiveOrbitDistance,
         gyroMagnitude: _gyroMagnitude,
         cvConfidence: cvPrediction?.confidence,
         cvPredictedAngle: cvPrediction?.angleName,
@@ -1003,7 +1004,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
       guidanceMessage: _qualityOnlyStreak >= _qualityOnlyRequired
           ? 'Capturing...'
           : 'Perfect — hold still',
+      distanceToTarget: effectiveOrbitDistance,
       axisGreenFrames: _qualityOnlyStreak,
+      gyroMagnitude: _gyroMagnitude,
+      cvConfidence: cvPrediction?.confidence,
+      cvPredictedAngle: cvPrediction?.angleName,
     );
 
     if (_qualityOnlyStreak >= _qualityOnlyRequired) {

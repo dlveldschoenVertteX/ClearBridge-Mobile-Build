@@ -5,10 +5,11 @@ class CaptureAngles {
   static const List<String> keys = ['front', 'right', 'top', 'left'];
   static const List<String> keyList = keys;
   // Not currently wired into any screen. Degrees intentionally left out of
-  // this copy -- the real fire angle lives in ThumbAngleService._offAxisDeg
-  // and is still being tuned; a previous version of this text hardcoded 45°
-  // here while the actual target was 15-20°, which is exactly the kind of
-  // instructed-vs-required mismatch that causes "won't fire" confusion.
+  // this copy -- the real fire angles live in ThumbAngleService._offAxisDeg /
+  // _topOffAxisDeg and are still being tuned; a previous version of this text
+  // hardcoded 45° here while the actual target was 15-20°, which is exactly
+  // the kind of instructed-vs-required mismatch that causes "won't fire"
+  // confusion.
   static const List<String> instructions = [
     'Point camera straight down at your thumb',
     'Tilt phone to the RIGHT — capture right edge',
