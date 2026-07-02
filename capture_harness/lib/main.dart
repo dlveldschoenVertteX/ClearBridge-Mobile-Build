@@ -1,10 +1,18 @@
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:mac_capture/mac_capture.dart';
 
-import 'local_capture_uploader.dart';
+import 'backend_capture_uploader.dart';
+import 'firebase_options.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+  // Anonymous auth so Firestore/Storage security rules (which require
+  // request.auth.uid == userId) are satisfied without a full login flow.
+  await FirebaseAuth.instance.signInAnonymously();
   runApp(const ProviderScope(child: CaptureHarnessApp()));
 }
 
@@ -20,10 +28,6 @@ class CaptureHarnessApp extends StatelessWidget {
     );
   }
 }
-
-/// No login flow in the harness -- always "authenticated" as a fixed test
-/// user ID, since MacCaptureScreen requires a non-null getUserId() to start.
-const _testUserId = 'capture-harness-tester';
 
 class _HarnessHome extends StatelessWidget {
   const _HarnessHome();
@@ -51,10 +55,10 @@ class _HarnessCaptureRoute extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MacCaptureScreen(
-      uploader: const LocalCaptureUploader(),
-      getUserId: () => _testUserId,
+      uploader: const BackendCaptureUploader(),
+      getUserId: () => FirebaseAuth.instance.currentUser?.uid,
       onRequireLogin: () => Navigator.of(context).pop(),
-      onComplete: (captureId) => _showResult(context, 'Saved locally: $captureId'),
+      onComplete: (captureId) => _showResult(context, 'Uploaded: $captureId'),
       onQueued: (captureId) => _showResult(context, 'Queued offline: $captureId'),
       onClose: () => Navigator.of(context).pop(),
     );
