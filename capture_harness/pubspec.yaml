@@ -1,0 +1,30 @@
+name: capture_harness
+description: >
+  Standalone camera-only test harness for the mac_capture package. Launches
+  straight into MacCaptureScreen with a local (non-uploading) backend, so the
+  MAC3D capture flow can be built and tested in isolation from the full
+  ClearBridge app (no Firebase, no Paystack, no MLKit, no dashboard/auth).
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mac_capture:
+    path: ../packages/mac_capture
+  flutter_riverpod: ^2.6.1
+  path_provider: ^2.1.5
+  uuid: ^4.5.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/

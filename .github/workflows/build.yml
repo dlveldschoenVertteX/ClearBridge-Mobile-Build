@@ -25,8 +25,41 @@ jobs:
       - run: flutter pub get
 
       - run: flutter build apk --release --target-platform android-arm64
-      
+
       - uses: actions/upload-artifact@v4
         with:
           name: flutter-apk
           path: build/app/outputs/flutter-apk/app-release.apk
+
+  build-capture-harness:
+    runs-on: ubuntu-latest
+    # Standalone camera-only test build (capture_harness/) -- depends only on
+    # the mac_capture package, no Firebase/Paystack/MLKit/dashboard, so it's
+    # a small APK for testing just the MAC3D capture flow.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-harness-${{ runner.os }}-${{ hashFiles('capture_harness/android/**/*.gradle*', 'capture_harness/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-harness-${{ runner.os }}-
+
+      - run: flutter pub get
+        working-directory: capture_harness
+
+      - run: flutter build apk --release --target-platform android-arm64
+        working-directory: capture_harness
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: capture-harness-apk
+          path: capture_harness/build/app/outputs/flutter-apk/app-release.apk
