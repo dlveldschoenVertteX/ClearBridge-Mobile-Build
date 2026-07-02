@@ -10,6 +10,7 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 import 'offline_capture_queue.dart';
+import 'angle_audio_guidance_service.dart';
 import 'capture_axis_controller.dart';
 import 'capture_uploader.dart';
 import 'multi_angle_capture.dart';
@@ -163,6 +164,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   final _hybrid = HybridCaptureService();
   final _axisController = CaptureAxisController();
   final _successPlayer = AudioPlayer();
+  final _audioGuidance = AngleAudioGuidanceService();
   final _orientation = DeviceOrientationService();
 
   /// Live device orientation relative to the front-pose reference. Step 1
@@ -238,6 +240,14 @@ class MultiAngleCaptureController extends ChangeNotifier {
 
   // Smooth retry: counts consecutive burst exceptions; escalates to error after 3.
   int _retryCount = 0;
+
+  // CV orientation classifier is advisory-only (see _classifyThrottled) --
+  // running it every other detect cycle instead of every cycle roughly halves
+  // its inference cost without materially affecting responsiveness, since a
+  // confident/correct prediction only ever speeds up a lock that IMU alone
+  // would eventually allow anyway.
+  int _cvCallCounter = 0;
+  OrientationPrediction? _lastCvPrediction;
 
   DateTime? _lastHandDetectedAt;
 
@@ -335,6 +345,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _latestBrightness = 0.0;
     _latestFocusNorm = 0.0;
     _axisController.reset();
+    _audioGuidance.stop();
+    _cvCallCounter = 0;
+    _lastCvPrediction = null;
     _smoothedAngle = 0.0;
     _smoothAngleInitialized = false;
     _retryCount = 0;
@@ -345,6 +358,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
           .setAsset('assets/audio/capture_success.wav')
           .catchError((_) => null),
     );
+    unawaited(_audioGuidance.preload());
 
     // Begin streaming device orientation; the reference is zeroed at the front
     // pose in _finalizeCalibration.
@@ -392,6 +406,19 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // Same fire-and-forget init pattern; classify() returns null until ready,
     // which cvConfirms already treats as "no CV signal, IMU decides alone".
     _orientationClassifier = ThumbOrientationClassifier()..initialize();
+  }
+
+  /// Runs the CV orientation classifier every other call, reusing the
+  /// previous prediction on skipped cycles (thumb orientation doesn't change
+  /// meaningfully within one ~90ms detect interval). See _cvCallCounter.
+  OrientationPrediction? _classifyThrottled(CameraImage image) {
+    final classifier = _orientationClassifier;
+    if (classifier == null) return null;
+    _cvCallCounter++;
+    if (_cvCallCounter.isOdd) {
+      _lastCvPrediction = classifier.classify(image, _sensorOrientation);
+    }
+    return _lastCvPrediction;
   }
 
   // ── Stream processing ──────────────────────────────────────────────────────
@@ -743,6 +770,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
           distanceToTarget: 180.0,
           landmarks: const <Landmark>[],
         );
+        _audioGuidance.updateDistance(180.0);
         // Quality-only fallback: thumb may be too close for MediaPipe to see
         // the full hand. Fire on image quality alone when thumb fills the frame.
         _checkQualityOnlyCapture(image);
@@ -785,7 +813,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // the model is sure, and IMU-only (unchanged) otherwise. cvConfirms can
     // only ever bring the thumb closer to firing, never block a capture the
     // IMU alone would already have allowed -- see _cvConfidenceThreshold.
-    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvPrediction = _classifyThrottled(image);
     final cvConfirms = cvPrediction != null &&
         cvPrediction.angleName == name &&
         cvPrediction.confidence >= _cvConfidenceThreshold;
@@ -825,6 +853,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
       guidanceMessage: guidanceMsg,
       axisGreenFrames: axisResult.consecutiveGreenFrames,
     );
+    _audioGuidance.updateDistance(effectiveDistance);
 
     // Transition detection is about genuine physical movement away from the
     // last captured angle -- always IMU-driven (raw distance), independent
@@ -875,7 +904,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // exactly the range the orientation classifier was trained for and the
     // hand-landmark angle extraction can't handle. Without this, quality-only
     // captures were purely IMU-driven with zero visual orientation check.
-    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvPrediction = _classifyThrottled(image);
     final cvConfirms = cvPrediction != null &&
         cvPrediction.angleName == name &&
         cvPrediction.confidence >= _cvConfidenceThreshold;
@@ -884,9 +913,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
     if (effectiveOrbitDistance > _lockFireDeg) {
       _state = _state.copyWith(
           guidanceMessage: _rotationMessage(name, effectiveOrbitDistance));
+      _audioGuidance.updateDistance(effectiveOrbitDistance);
       _qualityOnlyStreak = 0;
       return;
     }
+    _audioGuidance.updateDistance(effectiveOrbitDistance);
 
     final flashOn = _state.flashOn;
     final qualityOk = _gyroMagnitude <= _qualityOnlyGyroMax &&
@@ -962,6 +993,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   Future<void> _fireAngleCapture() async {
     if (_busy) return;
     _busy = true;
+    _audioGuidance.stop();
     final index = _state.currentAngleIndex;
     final name = ThumbAngleService.order[index];
     debugPrint('AXIS_GATE[$name]: focus=${_latestFocusNorm.toStringAsFixed(2)} '
@@ -1387,6 +1419,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _plugin?.dispose();
     _orientationClassifier?.dispose();
     unawaited(_successPlayer.dispose());
+    _audioGuidance.dispose();
     _orientation.dispose();
     super.dispose();
   }

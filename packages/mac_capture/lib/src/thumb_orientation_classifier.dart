@@ -72,16 +72,14 @@ class ThumbOrientationClassifier {
     if (!_ready || _interpreter == null) return null;
     try {
       final inputData = _preprocess(image, sensorOrientation);
-      final output = List.filled(1 * _classes.length, 0.0)
-          .reshape([1, _classes.length]);
-      _interpreter!.run(inputData, output);
-      final probs = (output[0] as List).cast<double>();
+      final outputBuffer = Float32List(_classes.length);
+      _interpreter!.runForMultipleInputs([inputData], {0: outputBuffer});
 
       var bestIdx = 0;
-      for (var i = 1; i < probs.length; i++) {
-        if (probs[i] > probs[bestIdx]) bestIdx = i;
+      for (var i = 1; i < outputBuffer.length; i++) {
+        if (outputBuffer[i] > outputBuffer[bestIdx]) bestIdx = i;
       }
-      return OrientationPrediction(_classes[bestIdx], probs[bestIdx]);
+      return OrientationPrediction(_classes[bestIdx], outputBuffer[bestIdx]);
     } catch (e) {
       debugPrint('[ThumbOrientation] classify error: $e');
       return null;
@@ -92,7 +90,14 @@ class ThumbOrientationClassifier {
   /// ThumbLandmarkerService._preprocess -- kept as its own copy rather than
   /// shared code so each model's preprocessing can evolve independently if a
   /// future retrain changes the contract for one but not the other.
-  List _preprocess(CameraImage image, int sensorOrientation) {
+  ///
+  /// Flat Float32List instead of nested List<List<List<double>>>: the nested
+  /// form allocated 150K+ boxed doubles across three levels of List on every
+  /// throttled detect cycle (~11x/sec), a measurable source of jank on budget
+  /// devices. tflite_flutter accepts a flat typed buffer for a fixed-shape
+  /// input tensor via runForMultipleInputs, same as ThumbLandmarkerService
+  /// already does -- the index math below is unchanged from the nested form.
+  Float32List _preprocess(CameraImage image, int sensorOrientation) {
     final plane = image.planes[0];
     final bytes = plane.bytes;
     final stride = plane.bytesPerRow;
@@ -104,10 +109,7 @@ class ThumbOrientationClassifier {
     final x0 = (rawW - cropW) ~/ 2;
     final y0 = (rawH - cropH) ~/ 2;
 
-    final out = List.generate(
-      _inputSize,
-      (_) => List.generate(_inputSize, (_) => List.filled(3, 0.0)),
-    );
+    final out = Float32List(_inputSize * _inputSize * 3);
 
     if (sensorOrientation == 90 || sensorOrientation == 270) {
       // Matches numpy.rot90(crop, k=1) exactly (verified: rotated[i][j] ==
@@ -124,9 +126,10 @@ class ThumbOrientationClassifier {
           final colInCrop = cropW - 1 - i;
           final byteIdx = (y0 + rowInCrop) * stride + (x0 + colInCrop);
           final luma = byteIdx < bytes.length ? bytes[byteIdx] / 255.0 : 0.0;
-          out[py][px][0] = luma;
-          out[py][px][1] = luma;
-          out[py][px][2] = luma;
+          final base = (py * _inputSize + px) * 3;
+          out[base] = luma;
+          out[base + 1] = luma;
+          out[base + 2] = luma;
         }
       }
     } else {
@@ -136,13 +139,14 @@ class ThumbOrientationClassifier {
           final sy = y0 + (py * cropH) ~/ _inputSize;
           final byteIdx = sy * stride + sx;
           final luma = byteIdx < bytes.length ? bytes[byteIdx] / 255.0 : 0.0;
-          out[py][px][0] = luma;
-          out[py][px][1] = luma;
-          out[py][px][2] = luma;
+          final base = (py * _inputSize + px) * 3;
+          out[base] = luma;
+          out[base + 1] = luma;
+          out[base + 2] = luma;
         }
       }
     }
-    return [out];
+    return out;
   }
 
   void dispose() {

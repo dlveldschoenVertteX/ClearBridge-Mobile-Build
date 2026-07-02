@@ -336,6 +336,14 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                                 ),
                               ],
                             ),
+                            if (s.distanceToTarget < 180.0)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: AngleDegreeText(
+                                  distanceToTarget: s.distanceToTarget,
+                                  isLocked: s.distanceToTarget <= 5,
+                                ),
+                              ),
                             const SizedBox(height: 12),
                             if (s.guidanceMessage.isNotEmpty)
                               Padding(

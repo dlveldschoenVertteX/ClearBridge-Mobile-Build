@@ -43,6 +43,42 @@ class CaptureGuidanceOverlay extends StatelessWidget {
   }
 }
 
+/// Live signed-degrees readout: counts up from a negative offset to 0° as the
+/// thumb approaches the current target angle, so the user has a numeric
+/// "getting warmer" signal alongside the visual/audio proximity cues.
+/// Snaps to a green "0°" once the angle is locked (distanceToTarget ≤ 5°).
+class AngleDegreeText extends StatelessWidget {
+  const AngleDegreeText({
+    super.key,
+    required this.distanceToTarget,
+    required this.isLocked,
+  });
+
+  final double distanceToTarget;
+  final bool isLocked;
+
+  @override
+  Widget build(BuildContext context) {
+    final degrees = isLocked ? 0 : -distanceToTarget.round();
+    final color = isLocked ? CaptureColors.success : CaptureColors.silverBright;
+
+    return AnimatedSwitcher(
+      duration: const Duration(milliseconds: 150),
+      transitionBuilder: (child, animation) =>
+          FadeTransition(opacity: animation, child: child),
+      child: Text(
+        '$degrees°',
+        key: ValueKey(degrees),
+        style: CaptureTypography.body.copyWith(
+          fontSize: 26,
+          fontWeight: FontWeight.w700,
+          color: color,
+        ),
+      ),
+    );
+  }
+}
+
 /// Two-phase progress arc around the HapticGuidanceCircle.
 ///
 /// Phase A (distanceToTarget > 5°): cyan arc fills as the thumb approaches the

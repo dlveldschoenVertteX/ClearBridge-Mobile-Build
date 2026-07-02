@@ -47,11 +47,12 @@ export 'src/spatial_anchor_overlay.dart' show SpatialAnchorOverlay;
 
 export 'src/angle_progress_circles.dart' show AngleProgressCircles;
 export 'src/capture_guidance_overlay.dart'
-    show CaptureGuidanceOverlay, RotationProgressArc;
+    show CaptureGuidanceOverlay, RotationProgressArc, AngleDegreeText;
 export 'src/capture_intro_animation.dart' show CaptureIntroAnimation;
 export 'src/distance_guidance_widget.dart' show DistanceGuidanceWidget;
 export 'src/focus_meter_widget.dart' show FocusMeterWidget;
 export 'src/haptic_guidance_circle.dart';
+export 'src/angle_audio_guidance_service.dart' show AngleAudioGuidanceService;
 export 'src/lighting_meter_widget.dart' show LightingMeterWidget;
 
 export 'src/capture_colors.dart' show CaptureColors;
