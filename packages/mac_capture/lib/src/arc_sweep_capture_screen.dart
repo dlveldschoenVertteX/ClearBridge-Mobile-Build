@@ -223,6 +223,19 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                       color: CaptureColors.silverBright,
                     ),
                   ),
+                  const SizedBox(height: 4),
+                  // The sweep's orientation reference locks in right as this
+                  // phase ends (first gyro sample after _sweepActive flips on)
+                  // — if the user's body turns around that moment, every
+                  // pitch/roll reading for the rest of the sweep is thrown off.
+                  Text(
+                    'Stay still — don\'t turn your body, only the phone moves',
+                    textAlign: TextAlign.center,
+                    style: CaptureTypography.body.copyWith(
+                      fontSize: 12,
+                      color: CaptureColors.silverDim,
+                    ),
+                  ),
                   const SizedBox(height: 8),
                   const LinearProgressIndicator(
                     backgroundColor: CaptureColors.steelMuted,
@@ -243,7 +256,8 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    'Hold your thumb still. Slowly tilt the phone through: '
+                    'Hold your thumb still and keep your body still — only '
+                    'the phone moves. Slowly tilt it through: '
                     'FRONT → LEFT → TOP → RIGHT.',
                     textAlign: TextAlign.center,
                     style: CaptureTypography.body.copyWith(

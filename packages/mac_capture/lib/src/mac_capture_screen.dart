@@ -457,7 +457,8 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        'Place your thumb in front of the camera',
+                        'Place your thumb in front of the camera. Keep your '
+                        'body still — move only the phone.',
                         textAlign: TextAlign.center,
                         style: CaptureTypography.body.copyWith(
                           fontSize: 14,
@@ -494,6 +495,21 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                         textAlign: TextAlign.center,
                         style: CaptureTypography.body
                             .copyWith(fontSize: 13),
+                      ),
+                      const SizedBox(height: 4),
+                      // This is the exact moment the orientation reference is
+                      // zeroed (DeviceOrientationService.captureReference()) —
+                      // if the user's body turns right now, every angle read
+                      // for the rest of the session is thrown off, since the
+                      // gyro can't tell "phone tilted relative to thumb" apart
+                      // from "phone and thumb both turned together with the body."
+                      Text(
+                        'Stay still — don\'t turn your body, only the phone moves',
+                        textAlign: TextAlign.center,
+                        style: CaptureTypography.body.copyWith(
+                          fontSize: 12,
+                          color: CaptureColors.silverDim,
+                        ),
                       ),
                     ],
                   ),
