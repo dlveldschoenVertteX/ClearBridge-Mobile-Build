@@ -464,6 +464,31 @@ class _CaptureGuideScreenState extends State<CaptureGuideScreen>
                             ),
                           ),
                         ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: () =>
+                                context.go(AppConstants.arcSweepCaptureRoute),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: ClearBridgeColors.cyan,
+                              side: BorderSide(
+                                  color:
+                                      ClearBridgeColors.cyan.withValues(alpha: 0.5)),
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: const StadiumBorder(),
+                            ),
+                            icon: const Icon(Icons.threesixty, size: 18),
+                            label: const Text(
+                              'Sweep Capture (beta)',
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.01,
+                              ),
+                            ),
+                          ),
+                        ),
                         const SizedBox(height: 16),
                         Row(
                           mainAxisAlignment: MainAxisAlignment.center,

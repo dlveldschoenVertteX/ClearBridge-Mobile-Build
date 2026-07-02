@@ -35,6 +35,7 @@ class AppConstants {
   static const String adminCapturesRoute = '/admin/captures';
   static const String adminPipelineRoute = '/admin/pipeline';
   static const String continuousCaptureRoute = '/capture/continuous';
+  static const String arcSweepCaptureRoute = '/capture/arc';
   static const String clearCoinRewardRoute = '/clearcoin-reward';
   static const String emailActionRoute = '/email-action';
   static const String logoPath = 'assets/images/app_logo.png';

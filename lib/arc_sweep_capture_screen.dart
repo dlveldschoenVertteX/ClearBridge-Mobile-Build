@@ -127,6 +127,12 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
             child: RepaintBoundary(child: _cameraLayer()),
           ),
 
+          // Vignette: fades background to black so only the centred thumb is
+          // prominent — same framing cue as the 4-angle capture screen.
+          const Positioned.fill(
+            child: RepaintBoundary(child: CaptureVignetteOverlay()),
+          ),
+
           // Left: lighting meter
           Positioned(
             left: 12,
