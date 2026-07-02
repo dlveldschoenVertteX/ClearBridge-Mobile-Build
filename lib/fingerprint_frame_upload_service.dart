@@ -17,7 +17,8 @@ const _uuid = Uuid();
 /// `processEnhanceAndScore` Cloud Function (africa-south1). Returns the
 /// captureId. This is the app's concrete [CaptureUploader] — the mac_capture
 /// package knows nothing about Firebase, only this interface.
-class FingerprintFrameUploadService implements CaptureUploader {
+class FingerprintFrameUploadService
+    implements CaptureUploader, ArcCaptureUploader {
   const FingerprintFrameUploadService();
 
   @override
@@ -200,6 +201,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
   /// are read from `frameMetadata[i]['binIndex']` when present so Storage
   /// filenames carry the true bin even if some bins were skipped; falls back
   /// to the list position otherwise.
+  @override
   Future<String> uploadArcAndProcess(
     List<Uint8List> frames, {
     required List<double> arcAngles,

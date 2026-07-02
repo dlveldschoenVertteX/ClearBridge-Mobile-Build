@@ -9,6 +9,15 @@ library mac_capture;
 
 export 'src/mac_capture_screen.dart' show MacCaptureScreen;
 
+export 'src/arc_capture_uploader.dart' show ArcCaptureUploader;
+export 'src/arc_sweep_capture_controller.dart'
+    show
+        ArcSweepCaptureController,
+        ArcSweepPhase,
+        ArcSweepState,
+        arcSweepCaptureControllerProvider;
+export 'src/arc_sweep_capture_screen.dart' show ArcSweepCaptureScreen;
+
 export 'src/capture_uploader.dart'
     show CaptureUploader, CaptureNetworkException;
 

@@ -1,19 +1,19 @@
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 
-import 'package:mac_capture/mac_capture.dart';
-
-import 'package:clearbridge/app_constants.dart';
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/clearbridge_typography.dart';
-import 'package:clearbridge/cb_ui.dart';
-import 'package:clearbridge/arc_sweep_capture_controller.dart';
-import 'package:clearbridge/fingerprint_frame_upload_service.dart';
+import 'arc_capture_uploader.dart';
+import 'arc_sweep_capture_controller.dart';
+import 'camera_service.dart';
+import 'capture_button.dart';
+import 'capture_colors.dart';
+import 'capture_intro_animation.dart';
+import 'capture_typography.dart';
+import 'capture_vignette_overlay.dart';
+import 'focus_meter_widget.dart';
+import 'lighting_meter_widget.dart';
 
 /// Arc-sweep capture screen.
 ///
@@ -21,7 +21,29 @@ import 'package:clearbridge/fingerprint_frame_upload_service.dart';
 /// stationary thumb. An arc progress indicator shows how much of the 200°
 /// span has been captured. No per-angle hold-steady gate — just sweep slowly.
 class ArcSweepCaptureScreen extends ConsumerStatefulWidget {
-  const ArcSweepCaptureScreen({super.key});
+  const ArcSweepCaptureScreen({
+    super.key,
+    required this.uploader,
+    required this.getUserId,
+    required this.onRequireLogin,
+    required this.onComplete,
+    required this.onClose,
+  });
+
+  /// Backend that persists the sweep (Firebase, or anything else).
+  final ArcCaptureUploader uploader;
+
+  /// Returns the current authenticated user's ID, or null if signed out.
+  final String? Function() getUserId;
+
+  /// Called when [getUserId] returns null as the sweep is about to start.
+  final VoidCallback onRequireLogin;
+
+  /// Called once the capture finishes uploading, with the capture ID.
+  final void Function(String captureId) onComplete;
+
+  /// Called when the user backs out of the screen.
+  final VoidCallback onClose;
 
   @override
   ConsumerState<ArcSweepCaptureScreen> createState() =>
@@ -50,7 +72,12 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
       );
       if (!mounted) return;
       setState(() => _ready = true);
-      ref.read(arcSweepCaptureControllerProvider).startIntro();
+      // No intro animation is rendered on this screen, so advance straight
+      // through showingAnimation to awaitingStart — without this the phase
+      // machine stalls and the Start button never appears.
+      ref.read(arcSweepCaptureControllerProvider)
+        ..startIntro()
+        ..onAnimationComplete();
     } catch (e) {
       if (mounted) setState(() => _initError = '$e');
     }
@@ -63,39 +90,27 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
   }
 
   Future<void> _onStart() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('Session expired — please log in again.'),
-          backgroundColor: ClearBridgeColors.error,
-        ));
-        context.go(AppConstants.loginRoute);
-      }
+    final userId = widget.getUserId();
+    if (userId == null) {
+      widget.onRequireLogin();
       return;
     }
     final cam = _camera;
     if (cam == null) return;
     await ref.read(arcSweepCaptureControllerProvider).startCaptureSequence(
           camera: cam,
-          uploadService: ref.read(fingerprintFrameUploadServiceProvider),
-          userId: user.uid,
+          uploadService: widget.uploader,
+          userId: userId,
         );
   }
 
-  void _close() {
-    if (context.canPop()) {
-      context.pop();
-    } else {
-      context.go(AppConstants.dashboardRoute);
-    }
-  }
+  void _close() => widget.onClose();
 
   void _onStateChanged(ArcSweepState s) {
     if (_navigated) return;
     if (s.phase == ArcSweepPhase.complete && s.captureId != null) {
       _navigated = true;
-      context.go('/capture/result', extra: s.captureId);
+      widget.onComplete(s.captureId!);
     }
   }
 
@@ -109,8 +124,8 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
     if (_initError != null) return _errorScaffold(_initError!);
     if (!_ready) {
       return const Scaffold(
-        backgroundColor: ClearBridgeColors.void_,
-        body: Center(child: CircularProgressIndicator(color: ClearBridgeColors.cyan)),
+        backgroundColor: CaptureColors.void_,
+        body: Center(child: CircularProgressIndicator(color: CaptureColors.cyan)),
       );
     }
 
@@ -119,7 +134,7 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
     );
 
     return Scaffold(
-      backgroundColor: ClearBridgeColors.void_,
+      backgroundColor: CaptureColors.void_,
       body: Stack(
         children: [
           // Camera preview
@@ -200,16 +215,16 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                   Text(
                     'Preparing camera…',
                     textAlign: TextAlign.center,
-                    style: ClearBridgeTypography.label.copyWith(
+                    style: CaptureTypography.label.copyWith(
                       fontSize: 13,
-                      color: ClearBridgeColors.silverBright,
+                      color: CaptureColors.silverBright,
                     ),
                   ),
                   const SizedBox(height: 8),
                   const LinearProgressIndicator(
-                    backgroundColor: ClearBridgeColors.steelMuted,
+                    backgroundColor: CaptureColors.steelMuted,
                     valueColor:
-                        AlwaysStoppedAnimation<Color>(ClearBridgeColors.cyan),
+                        AlwaysStoppedAnimation<Color>(CaptureColors.cyan),
                   ),
                 ],
               ),
@@ -227,13 +242,13 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                   Text(
                     'Hold thumb still. Sweep camera slowly around it.',
                     textAlign: TextAlign.center,
-                    style: ClearBridgeTypography.body.copyWith(
+                    style: CaptureTypography.body.copyWith(
                       fontSize: 14,
-                      color: ClearBridgeColors.silverBright,
+                      color: CaptureColors.silverBright,
                     ),
                   ),
                   const SizedBox(height: 20),
-                  CbButton(
+                  CaptureButton(
                     label: 'Start Sweep',
                     leadingIcon: Icons.rotate_right_rounded,
                     onPressed: _onStart,
@@ -258,9 +273,9 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                       Text(
                         '$pct% covered — keep sweeping',
                         textAlign: TextAlign.center,
-                        style: ClearBridgeTypography.label.copyWith(
+                        style: CaptureTypography.label.copyWith(
                           fontSize: 13,
-                          color: ClearBridgeColors.silverBright,
+                          color: CaptureColors.silverBright,
                         ),
                       ),
                     ],
@@ -305,7 +320,7 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
             child: GestureDetector(
               onTap: _close,
               child: const Icon(Icons.arrow_back_ios,
-                  color: ClearBridgeColors.silverBright, size: 22),
+                  color: CaptureColors.silverBright, size: 22),
             ),
           ),
 
@@ -318,15 +333,15 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
               child: Container(
                 padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 5),
                 decoration: BoxDecoration(
-                  color: ClearBridgeColors.cardBg,
+                  color: CaptureColors.cardBg,
                   borderRadius: BorderRadius.circular(14),
-                  border: Border.all(color: ClearBridgeColors.cyanBorder),
+                  border: Border.all(color: CaptureColors.cyanBorder),
                 ),
                 child: Text(
                   'ARC SWEEP',
-                  style: ClearBridgeTypography.label.copyWith(
+                  style: CaptureTypography.label.copyWith(
                     fontSize: 11,
-                    color: ClearBridgeColors.cyan,
+                    color: CaptureColors.cyan,
                     letterSpacing: 1.5,
                   ),
                 ),
@@ -342,12 +357,12 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
     if (flashIntensity == 0.0) {
       return const Opacity(
         opacity: 0.3,
-        child: Icon(Icons.flash_off, color: ClearBridgeColors.silverDim, size: 16),
+        child: Icon(Icons.flash_off, color: CaptureColors.silverDim, size: 16),
       );
     }
     return Icon(
       Icons.flash_on,
-      color: flashOn ? ClearBridgeColors.gold : ClearBridgeColors.silverDim,
+      color: flashOn ? CaptureColors.gold : CaptureColors.silverDim,
       size: 16,
     );
   }
@@ -355,7 +370,7 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
   Widget _cameraLayer() {
     final cam = _camera;
     if (cam == null || !cam.value.isInitialized) {
-      return const ColoredBox(color: ClearBridgeColors.void_);
+      return const ColoredBox(color: CaptureColors.void_);
     }
     final preview = cam.value.previewSize;
     final w = preview?.height ?? cam.value.previewSize?.width ?? 1080;
@@ -369,19 +384,19 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
 
   Widget _errorOverlay(String message) {
     return Container(
-      color: ClearBridgeColors.void_.withValues(alpha: 0.92),
+      color: CaptureColors.void_.withValues(alpha: 0.92),
       padding: const EdgeInsets.all(28),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.error_outline, color: ClearBridgeColors.error, size: 44),
+            const Icon(Icons.error_outline, color: CaptureColors.error, size: 44),
             const SizedBox(height: 14),
             Text(message,
                 textAlign: TextAlign.center,
-                style: ClearBridgeTypography.body.copyWith(fontSize: 14)),
+                style: CaptureTypography.body.copyWith(fontSize: 14)),
             const SizedBox(height: 22),
-            CbButton(label: 'Back', variant: CbButtonVariant.ghost, onPressed: _close),
+            CaptureButton(label: 'Back', variant: CaptureButtonVariant.ghost, onPressed: _close),
           ],
         ),
       ),
@@ -390,7 +405,7 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
 
   Widget _errorScaffold(String message) {
     return Scaffold(
-      backgroundColor: ClearBridgeColors.void_,
+      backgroundColor: CaptureColors.void_,
       body: SafeArea(child: _errorOverlay('Camera error: $message')),
     );
   }
@@ -435,9 +450,9 @@ class _ArcProgressWidget extends StatelessWidget {
           isActive
               ? '${binsFilledCount * 25}° / ${_arcTarget.toInt()}° covered'
               : 'Position thumb in centre',
-          style: ClearBridgeTypography.label.copyWith(
+          style: CaptureTypography.label.copyWith(
             fontSize: 13,
-            color: ClearBridgeColors.silverBright,
+            color: CaptureColors.silverBright,
           ),
         ),
       ],
@@ -472,7 +487,7 @@ class _ArcPainter extends CustomPainter {
 
     // Background track
     final trackPaint = Paint()
-      ..color = ClearBridgeColors.steelMuted.withValues(alpha: 0.5)
+      ..color = CaptureColors.steelMuted.withValues(alpha: 0.5)
       ..style = PaintingStyle.stroke
       ..strokeWidth = 10
       ..strokeCap = StrokeCap.round;
@@ -481,7 +496,7 @@ class _ArcPainter extends CustomPainter {
     // Filled progress
     if (fraction > 0.0) {
       final fillPaint = Paint()
-        ..color = isActive ? ClearBridgeColors.cyan : ClearBridgeColors.success
+        ..color = isActive ? CaptureColors.cyan : CaptureColors.success
         ..style = PaintingStyle.stroke
         ..strokeWidth = 10
         ..strokeCap = StrokeCap.round;
@@ -498,8 +513,8 @@ class _ArcPainter extends CustomPainter {
       final dy = math.sin(tickAngle);
       final tickPaint = Paint()
         ..color = i < binsFilledCount
-            ? ClearBridgeColors.cyan
-            : ClearBridgeColors.steelMuted
+            ? CaptureColors.cyan
+            : CaptureColors.steelMuted
         ..strokeWidth = i < binsFilledCount ? 2.5 : 1.5
         ..strokeCap = StrokeCap.round;
       canvas.drawLine(
@@ -512,14 +527,14 @@ class _ArcPainter extends CustomPainter {
     // Center circle
     final centerPaint = Paint()
       ..color = isActive
-          ? ClearBridgeColors.cyan.withValues(alpha: 0.15)
-          : ClearBridgeColors.steelMuted.withValues(alpha: 0.1)
+          ? CaptureColors.cyan.withValues(alpha: 0.15)
+          : CaptureColors.steelMuted.withValues(alpha: 0.1)
       ..style = PaintingStyle.fill;
     canvas.drawCircle(center, radius - 18, centerPaint);
 
     // Center icon (fingerprint — concentric arc set)
     final iconPaint = Paint()
-      ..color = isActive ? ClearBridgeColors.cyan : ClearBridgeColors.silverDim
+      ..color = isActive ? CaptureColors.cyan : CaptureColors.silverDim
       ..style = PaintingStyle.stroke
       ..strokeWidth = 1.5;
     for (var r = 12.0; r <= 30.0; r += 6) {
@@ -548,17 +563,10 @@ class _UploadingOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return ColoredBox(
-      color: ClearBridgeColors.void_,
+      color: CaptureColors.void_,
       child: Column(
         mainAxisAlignment: MainAxisAlignment.center,
         children: [
-          Image.asset(
-            AppConstants.logoPath,
-            width: 120,
-            height: 120,
-            fit: BoxFit.contain,
-          ),
-          const SizedBox(height: 48),
           SizedBox(
             width: 240,
             height: 240,
@@ -570,8 +578,8 @@ class _UploadingOverlay extends StatelessWidget {
           const SizedBox(height: 32),
           Text(
             'Loading...',
-            style: ClearBridgeTypography.body.copyWith(
-              color: ClearBridgeColors.silverBright,
+            style: CaptureTypography.body.copyWith(
+              color: CaptureColors.silverBright,
               fontSize: 15,
               letterSpacing: 1.2,
             ),

@@ -16,7 +16,7 @@ const _uuid = Uuid();
 /// mirroring `FingerprintFrameUploadService` in the main app. Lets the
 /// MAC3D capture flow be exercised against the production pipeline without
 /// building the full app.
-class BackendCaptureUploader implements CaptureUploader {
+class BackendCaptureUploader implements CaptureUploader, ArcCaptureUploader {
   const BackendCaptureUploader();
 
   @override
@@ -171,6 +171,85 @@ class BackendCaptureUploader implements CaptureUploader {
         }
       }();
     }
+
+    return id;
+  }
+
+  /// Arc-sweep upload — mirrors FingerprintFrameUploadService.uploadArcAndProcess
+  /// in the main app: frame_{N}_arc_{binIndex}.jpg filenames + arcAngles in the
+  /// callable payload, per the backend's _download_arc_frames / is_arc contract.
+  @override
+  Future<String> uploadArcAndProcess(
+    List<Uint8List> frames, {
+    required List<double> arcAngles,
+    required String userId,
+    String? captureId,
+    void Function(double progress)? onProgress,
+    List<Map<String, dynamic>> frameMetadata = const [],
+  }) async {
+    final authUser = FirebaseAuth.instance.currentUser;
+    if (authUser == null) {
+      throw Exception('[unauthenticated] No Firebase user — harness auth failed.');
+    }
+    if (frames.length != arcAngles.length) {
+      throw ArgumentError(
+          'frames (${frames.length}) and arcAngles (${arcAngles.length}) must be parallel');
+    }
+
+    final db = FirebaseFirestore.instance;
+    final id = captureId ?? _uuid.v4();
+    final basePath = 'captures/$userId/$id';
+
+    final uploadTasks = <(Uint8List, String)>[];
+    for (int i = 0; i < frames.length; i++) {
+      final binIndex = (i < frameMetadata.length
+              ? frameMetadata[i]['binIndex'] as int?
+              : null) ??
+          i;
+      uploadTasks.add((frames[i], '$basePath/frame_${i + 1}_arc_$binIndex.jpg'));
+    }
+
+    final firestoreFuture = db.collection('captures').doc(id).set({
+      'captureId': id,
+      'userId': userId,
+      'createdAt': FieldValue.serverTimestamp(),
+      'status': 'pending',
+      'source': 'capture_harness',
+      'captureMethod': 'arc_sweep',
+      'captureMode': 'arc_sweep',
+      'frameCount': frames.length,
+      'arcAngles': arcAngles,
+      'frames': frameMetadata,
+    }, SetOptions(merge: true));
+
+    final tokenFuture = authUser.getIdToken(true);
+
+    var completed = 0;
+    for (var i = 0; i < uploadTasks.length; i += 6) {
+      final batchEnd = math.min(i + 6, uploadTasks.length);
+      await Future.wait([
+        for (var j = i; j < batchEnd; j++)
+          _uploadFrame(uploadTasks[j].$1, uploadTasks[j].$2)
+              .then((_) => onProgress?.call(++completed / frames.length)),
+      ]);
+    }
+
+    await Future.wait([firestoreFuture, tokenFuture]);
+
+    () async {
+      try {
+        await FirebaseFunctions.instanceFor(region: 'africa-south1')
+            .httpsCallable('processEnhanceAndScore')
+            .call({
+          'captureId': id,
+          'userId': userId,
+          'basePath': basePath,
+          'arcAngles': arcAngles,
+        });
+      } catch (e) {
+        debugPrint('[processEnhanceAndScore] arc trigger failed (non-blocking): $e');
+      }
+    }();
 
     return id;
   }

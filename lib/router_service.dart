@@ -23,7 +23,6 @@ import 'package:clearbridge/service_tier_screen.dart';
 import 'package:clearbridge/personal_details_screen.dart';
 import 'package:clearbridge/popia_consent_screen.dart';
 import 'package:clearbridge/popia_consent_screen.dart' as capture_popia;
-import 'package:clearbridge/arc_sweep_capture_screen.dart';
 import 'package:clearbridge/capture_result_screen.dart';
 import 'package:clearbridge/privacy_policy_screen.dart';
 import 'package:clearbridge/profile_screen.dart';
@@ -317,7 +316,20 @@ GoRouter router(Ref ref) {
       GoRoute(
         path: AppConstants.arcSweepCaptureRoute,
         name: 'arcSweepCapture',
-        builder: (context, state) => const ArcSweepCaptureScreen(),
+        builder: (context, state) => ArcSweepCaptureScreen(
+          uploader: const FingerprintFrameUploadService(),
+          getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+          onRequireLogin: () => context.go(AppConstants.loginRoute),
+          onComplete: (captureId) =>
+              context.go('/capture/result', extra: captureId),
+          onClose: () {
+            if (context.canPop()) {
+              context.pop();
+            } else {
+              context.go(AppConstants.dashboardRoute);
+            }
+          },
+        ),
       ),
       GoRoute(
         path: '/capture/result',

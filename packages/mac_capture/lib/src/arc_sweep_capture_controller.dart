@@ -9,9 +9,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-import 'package:mac_capture/mac_capture.dart';
-
-import 'fingerprint_frame_upload_service.dart';
+import 'adaptive_flash_controller.dart';
+import 'arc_capture_uploader.dart';
+import 'frame_capture_service.dart';
 
 enum ArcSweepPhase {
   idle,
@@ -101,7 +101,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
   // ── State ─────────────────────────────────────────────────────────────────
   CameraController? _camera;
   AdaptiveFlashController? _flash;
-  FingerprintFrameUploadService? _upload;
+  ArcCaptureUploader? _upload;
   String? _userId;
 
   ArcSweepState _state = const ArcSweepState();
@@ -158,7 +158,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   Future<void> startCaptureSequence({
     required CameraController camera,
-    required FingerprintFrameUploadService uploadService,
+    required ArcCaptureUploader uploadService,
     required String userId,
   }) async {
     if (_streamRunning) return;
