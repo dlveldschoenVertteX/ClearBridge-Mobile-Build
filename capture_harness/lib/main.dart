@@ -6,6 +6,7 @@ import 'package:mac_capture/mac_capture.dart';
 
 import 'backend_capture_uploader.dart';
 import 'firebase_options.dart';
+import 'harness_splash_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -16,6 +17,10 @@ void main() async {
   runApp(const ProviderScope(child: CaptureHarnessApp()));
 }
 
+/// Survives route replacement (splash -> capture -> next capture) so result
+/// snackbars still show even though the widget under them just got swapped.
+final _scaffoldMessengerKey = GlobalKey<ScaffoldMessengerState>();
+
 class CaptureHarnessApp extends StatelessWidget {
   const CaptureHarnessApp({super.key});
 
@@ -23,24 +28,14 @@ class CaptureHarnessApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'MAC3D Capture Harness',
+      scaffoldMessengerKey: _scaffoldMessengerKey,
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
-      home: const _HarnessHome(),
-    );
-  }
-}
-
-class _HarnessHome extends StatelessWidget {
-  const _HarnessHome();
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: const Text('MAC3D Capture Harness')),
-      body: Center(
-        child: ElevatedButton.icon(
-          icon: const Icon(Icons.fingerprint),
-          label: const Text('Start capture'),
-          onPressed: () => Navigator.of(context).push(
+      // Splash -> straight into the capture flow. No intermediate
+      // "Start capture" button screen -- beta testers open the app and are
+      // immediately in MAC3D's own intro/start sequence.
+      home: Builder(
+        builder: (context) => HarnessSplashScreen(
+          onDone: () => Navigator.of(context).pushReplacement(
             MaterialPageRoute(builder: (_) => const _HarnessCaptureRoute()),
           ),
         ),
@@ -57,15 +52,23 @@ class _HarnessCaptureRoute extends StatelessWidget {
     return MacCaptureScreen(
       uploader: const BackendCaptureUploader(),
       getUserId: () => FirebaseAuth.instance.currentUser?.uid,
-      onRequireLogin: () => Navigator.of(context).pop(),
-      onComplete: (captureId) => _showResult(context, 'Uploaded: $captureId'),
-      onQueued: (captureId) => _showResult(context, 'Queued offline: $captureId'),
-      onClose: () => Navigator.of(context).pop(),
+      onRequireLogin: () => _restart(context),
+      onComplete: (captureId) => _restart(context, message: 'Uploaded: $captureId'),
+      onQueued: (captureId) => _restart(context, message: 'Queued offline: $captureId'),
+      onClose: () => _restart(context),
     );
   }
 
-  void _showResult(BuildContext context, String message) {
-    Navigator.of(context).pop();
-    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  /// There's no home screen to pop back to anymore -- loop straight into a
+  /// fresh capture session (MacCaptureScreen's controller is autoDispose, so
+  /// re-pushing this route gives a clean state machine each time).
+  void _restart(BuildContext context, {String? message}) {
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(builder: (_) => const _HarnessCaptureRoute()),
+    );
+    if (message != null) {
+      _scaffoldMessengerKey.currentState
+          ?.showSnackBar(SnackBar(content: Text(message)));
+    }
   }
 }
