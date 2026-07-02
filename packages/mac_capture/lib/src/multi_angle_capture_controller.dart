@@ -202,6 +202,14 @@ class MultiAngleCaptureController extends ChangeNotifier {
   final List<int> _angleTimingsMs = [];
   final List<Map<String, dynamic>> _burstStatsList = [];
   final List<Map<String, dynamic>> _axisGateLogs = [];
+  // Per-detect-cycle trajectory (~90ms cadence): the full approach curve for
+  // every angle, not just the fire-moment snapshot in _axisGateLogs. This is
+  // the dataset for retuning CaptureAxisController/ThumbAngleService targets
+  // and for CV retraining (ground truth angle vs. what the classifier saw).
+  // Capped so a long/retried session can't blow past Firestore's 1MB
+  // document limit.
+  final List<Map<String, dynamic>> _debugTelemetry = [];
+  static const _debugTelemetryCap = 3000;
   DateTime? _angleStart;
 
   // Live detection state.
@@ -341,6 +349,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _angleTimingsMs.clear();
     _burstStatsList.clear();
     _axisGateLogs.clear();
+    _debugTelemetry.clear();
     _brightnessSum = 0.0;
     _brightnessCount = 0;
     _pitchDarkActivated = false;
@@ -850,6 +859,16 @@ class MultiAngleCaptureController extends ChangeNotifier {
       cvPredictedAngle: cvPrediction?.angleName,
     );
     _captureAudio.updateGuidanceTone(effectiveDistance);
+    _logTelemetry(
+      targetAngle: name,
+      rawDistance: distance,
+      effectiveDistance: effectiveDistance,
+      cvConfirms: cvConfirms,
+      cvPrediction: cvPrediction,
+      thumbCoverageRatio: coverage,
+      axisGreenFrames: axisResult.consecutiveGreenFrames,
+      source: 'landmark',
+    );
 
     // Transition detection is about genuine physical movement away from the
     // last captured angle -- always IMU-driven (raw distance), independent
@@ -875,6 +894,43 @@ class MultiAngleCaptureController extends ChangeNotifier {
     if (axisResult.readyToCapture) {
       unawaited(_fireAngleCapture());
     }
+  }
+
+  /// Appends one row of the approach trajectory — ground truth angle vs.
+  /// what the IMU/CV actually saw at that moment. Uploaded with the capture
+  /// (see _finishAndUpload) as the dataset for retuning axis targets/
+  /// thresholds and for CV retraining. [source] distinguishes the detection
+  /// path: 'landmark' (MediaPipe sees the hand) vs 'quality_only' (thumb too
+  /// close for MediaPipe, CV-only fallback) since their axisGreenFrames
+  /// counters aren't the same scheme.
+  void _logTelemetry({
+    required String targetAngle,
+    required double rawDistance,
+    required double effectiveDistance,
+    required bool cvConfirms,
+    required OrientationPrediction? cvPrediction,
+    required double thumbCoverageRatio,
+    required int axisGreenFrames,
+    required String source,
+  }) {
+    if (_debugTelemetry.length >= _debugTelemetryCap) return;
+    _debugTelemetry.add({
+      't':                 DateTime.now().millisecondsSinceEpoch,
+      'source':            source,
+      'targetAngle':       targetAngle,
+      'rawDistance':       double.parse(rawDistance.toStringAsFixed(2)),
+      'effectiveDistance': double.parse(effectiveDistance.toStringAsFixed(2)),
+      'cvConfirms':        cvConfirms,
+      'cvPredictedAngle':  cvPrediction?.angleName,
+      'cvConfidence':      cvPrediction == null
+          ? null
+          : double.parse(cvPrediction.confidence.toStringAsFixed(3)),
+      'gyroMagnitude':     double.parse(_gyroMagnitude.toStringAsFixed(4)),
+      'focusNorm':         double.parse(_latestFocusNorm.toStringAsFixed(3)),
+      'brightness':        double.parse(_latestBrightness.toStringAsFixed(1)),
+      'thumbCoverageRatio': double.parse(thumbCoverageRatio.toStringAsFixed(3)),
+      'axisGreenFrames':   axisGreenFrames,
+    });
   }
 
   // Fires capture when MediaPipe cannot see the full hand (thumb fills the
@@ -905,6 +961,16 @@ class MultiAngleCaptureController extends ChangeNotifier {
         cvPrediction.angleName == name &&
         cvPrediction.confidence >= _cvConfidenceThreshold;
     final effectiveOrbitDistance = cvConfirms ? 0.0 : orbitDistance;
+    _logTelemetry(
+      targetAngle: name,
+      rawDistance: orbitDistance,
+      effectiveDistance: effectiveOrbitDistance,
+      cvConfirms: cvConfirms,
+      cvPrediction: cvPrediction,
+      thumbCoverageRatio: _state.thumbCoverageRatio,
+      axisGreenFrames: _qualityOnlyStreak,
+      source: 'quality_only',
+    );
 
     if (effectiveOrbitDistance > _lockFireDeg) {
       _state = _state.copyWith(
@@ -1283,6 +1349,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
         burstStats: List.unmodifiable(_burstStatsList),
         axisGateAtCapture: List.unmodifiable(_axisGateLogs),
         orbitAngles: orbitAngles,
+        debugTelemetry: List.unmodifiable(_debugTelemetry),
         onProgress: (p) =>
             _set(_state.copyWith(uploadProgress: p), notify: true),
       );

@@ -23,6 +23,7 @@ class LocalCaptureUploader implements CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    List<Map<String, dynamic>> debugTelemetry = const [],
   }) async {
     final id = captureId ?? _uuid.v4();
     final docsDir = await getApplicationDocumentsDirectory();

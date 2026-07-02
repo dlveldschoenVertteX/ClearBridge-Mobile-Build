@@ -31,6 +31,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    List<Map<String, dynamic>> debugTelemetry = const [],
   }) async {
     try {
       return await _uploadAndProcess(
@@ -43,6 +44,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
         burstStats: burstStats,
         axisGateAtCapture: axisGateAtCapture,
         orbitAngles: orbitAngles,
+        debugTelemetry: debugTelemetry,
       );
     } on FirebaseException catch (e) {
       final isNetwork = e.code == 'unavailable' ||
@@ -64,6 +66,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    List<Map<String, dynamic>> debugTelemetry = const [],
   }) async {
     // Fail fast before touching Storage/Firestore — both require auth.
     final authUser = FirebaseAuth.instance.currentUser;
@@ -164,6 +167,25 @@ class FingerprintFrameUploadService implements CaptureUploader {
         debugPrint('[processEnhanceAndScore] trigger failed (non-blocking): $e');
       }
     }();
+
+    // Debug telemetry (gyro/CV trajectory for retuning + CV retraining) is a
+    // separate collection/write on purpose -- it can be large enough to risk
+    // hitting Firestore's 1MB doc limit on a long/retried session, and it
+    // must never be able to fail the actual capture upload above.
+    if (debugTelemetry.isNotEmpty) {
+      () async {
+        try {
+          await db.collection('captureTelemetry').doc(id).set({
+            'captureId': id,
+            'userId': userId,
+            'createdAt': FieldValue.serverTimestamp(),
+            'telemetry': debugTelemetry,
+          });
+        } catch (e) {
+          debugPrint('[captureTelemetry] write failed (non-blocking): $e');
+        }
+      }();
+    }
 
     return id;
   }
