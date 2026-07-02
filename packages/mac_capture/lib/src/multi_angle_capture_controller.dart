@@ -71,6 +71,12 @@ class CaptureSessionState {
   final bool allCirclesGlow;
   // True for 1s after a failed capture burst — haptic circle shows amber "try again" state.
   final bool isRetrying;
+  // Debug-HUD fields (see MacCaptureScreen.showDebugHud) — raw values behind
+  // the axis/CV gates, not otherwise surfaced in the UI. Cheap to keep
+  // updated even when the HUD is off since they're plain doubles/strings.
+  final double gyroMagnitude; // rad/s, smoothed — see CaptureAxisController._gyroMax
+  final double? cvConfidence; // last orientation-classifier confidence, 0-1
+  final String? cvPredictedAngle; // last orientation-classifier prediction
 
   const CaptureSessionState({
     this.phase = CapturePhase.idle,
@@ -95,6 +101,9 @@ class CaptureSessionState {
     this.axisGreenFrames = 0,
     this.allCirclesGlow = false,
     this.isRetrying = false,
+    this.gyroMagnitude = 0.0,
+    this.cvConfidence,
+    this.cvPredictedAngle,
   });
 
   CaptureSessionState copyWith({
@@ -120,6 +129,9 @@ class CaptureSessionState {
     int? axisGreenFrames,
     bool? allCirclesGlow,
     bool? isRetrying,
+    double? gyroMagnitude,
+    double? cvConfidence,
+    String? cvPredictedAngle,
   }) {
     return CaptureSessionState(
       phase: phase ?? this.phase,
@@ -144,6 +156,9 @@ class CaptureSessionState {
       axisGreenFrames: axisGreenFrames ?? this.axisGreenFrames,
       allCirclesGlow: allCirclesGlow ?? this.allCirclesGlow,
       isRetrying: isRetrying ?? this.isRetrying,
+      gyroMagnitude: gyroMagnitude ?? this.gyroMagnitude,
+      cvConfidence: cvConfidence ?? this.cvConfidence,
+      cvPredictedAngle: cvPredictedAngle ?? this.cvPredictedAngle,
     );
   }
 }
@@ -830,6 +845,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
       landmarks: hands.first.landmarks,
       guidanceMessage: guidanceMsg,
       axisGreenFrames: axisResult.consecutiveGreenFrames,
+      gyroMagnitude: _gyroMagnitude,
+      cvConfidence: cvPrediction?.confidence,
+      cvPredictedAngle: cvPrediction?.angleName,
     );
     _captureAudio.updateGuidanceTone(effectiveDistance);
 
@@ -890,7 +908,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
 
     if (effectiveOrbitDistance > _lockFireDeg) {
       _state = _state.copyWith(
-          guidanceMessage: _rotationMessage(name, effectiveOrbitDistance));
+        guidanceMessage: _rotationMessage(name, effectiveOrbitDistance),
+        gyroMagnitude: _gyroMagnitude,
+        cvConfidence: cvPrediction?.confidence,
+        cvPredictedAngle: cvPrediction?.angleName,
+      );
       _captureAudio.updateGuidanceTone(effectiveOrbitDistance);
       _qualityOnlyStreak = 0;
       return;
@@ -979,11 +1001,18 @@ class MultiAngleCaptureController extends ChangeNotifier {
         'gyro=${_gyroMagnitude.toStringAsFixed(3)} '
         'greenFrames=${_state.axisGreenFrames}');
     _axisGateLogs.add({
-      'angle':         name,
-      'focusNorm':     double.parse(_latestFocusNorm.toStringAsFixed(3)),
-      'brightness':    double.parse(_latestBrightness.toStringAsFixed(1)),
-      'gyroMagnitude': double.parse(_gyroMagnitude.toStringAsFixed(4)),
-      'greenFrames':   _state.axisGreenFrames,
+      'angle':            name,
+      'focusNorm':        double.parse(_latestFocusNorm.toStringAsFixed(3)),
+      'brightness':       double.parse(_latestBrightness.toStringAsFixed(1)),
+      'gyroMagnitude':    double.parse(_gyroMagnitude.toStringAsFixed(4)),
+      'greenFrames':      _state.axisGreenFrames,
+      // CV confirmation snapshot at the fire moment — data for retuning
+      // _cvConfidenceThreshold / ThumbAngleService's per-angle targets once
+      // enough beta sessions have logged real confidence distributions.
+      'cvConfidence':     _state.cvConfidence == null
+          ? null
+          : double.parse(_state.cvConfidence!.toStringAsFixed(3)),
+      'cvPredictedAngle': _state.cvPredictedAngle,
     });
     try {
       // 0. Refocus at current thumb distance before the burst window.

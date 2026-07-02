@@ -40,6 +40,7 @@ class MacCaptureScreen extends ConsumerStatefulWidget {
     required this.onComplete,
     required this.onQueued,
     required this.onClose,
+    this.showDebugHud = false,
   });
 
   /// Backend that persists a finished capture (Firebase, or anything else).
@@ -62,6 +63,12 @@ class MacCaptureScreen extends ConsumerStatefulWidget {
 
   /// Called when the user backs out of the screen before/without capturing.
   final VoidCallback onClose;
+
+  /// Shows a live readout of the values behind the axis/CV gates (gyro
+  /// magnitude, CV confidence + prediction, distance to target, focus,
+  /// lighting) in the top-left corner. Off by default — for internal test
+  /// builds diagnosing capture-firing issues, not end users.
+  final bool showDebugHud;
 
   @override
   ConsumerState<MacCaptureScreen> createState() => _MacCaptureScreenState();
@@ -616,6 +623,21 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                     },
                   ),
                 ),
+
+              // Layer 10: debug HUD — internal test builds only.
+              if (widget.showDebugHud)
+                Positioned(
+                  top: 48,
+                  left: 48,
+                  child: Consumer(
+                    builder: (_, ref, __) {
+                      final s = ref
+                          .watch(multiAngleCaptureControllerProvider)
+                          .state;
+                      return _buildDebugHud(s);
+                    },
+                  ),
+                ),
             ],
           );
         },
@@ -758,6 +780,48 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
           ),
           const SizedBox(height: 4),
           pill,
+        ],
+      ),
+    );
+  }
+
+  /// Raw values behind the axis/CV gates — see [MacCaptureScreen.showDebugHud].
+  Widget _buildDebugHud(CaptureSessionState s) {
+    String row(String label, String value) => '$label: $value';
+    final lines = <String>[
+      row('angle', s.currentAngleIndex < ThumbAngleService.order.length
+          ? ThumbAngleService.order[s.currentAngleIndex]
+          : '?'),
+      row('dist°', s.distanceToTarget.toStringAsFixed(1)),
+      row('gyro', s.gyroMagnitude.toStringAsFixed(3)),
+      row('cv', s.cvPredictedAngle == null
+          ? '—'
+          : '${s.cvPredictedAngle} ${(s.cvConfidence ?? 0).toStringAsFixed(2)}'),
+      row('focus', s.focusValue.toStringAsFixed(2)),
+      row('light', s.lightingValue.toStringAsFixed(2)),
+      row('green', '${s.axisGreenFrames}/5'),
+    ];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.15)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final line in lines)
+            Text(
+              line,
+              style: const TextStyle(
+                color: Colors.greenAccent,
+                fontSize: 11,
+                fontFamily: 'monospace',
+                height: 1.4,
+              ),
+            ),
         ],
       ),
     );
