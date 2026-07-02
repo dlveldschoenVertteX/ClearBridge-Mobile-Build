@@ -24,10 +24,31 @@ enum ArcSweepPhase {
   error,
 }
 
+/// One leg of the sweep path between two checkpoints, in (pitch, roll)
+/// device-orientation degrees relative to the front pose. Mirrors
+/// [ThumbAngleService.targets] so the sweep traces the exact same physical
+/// positions as the 4-angle capture's front/left/top/right checkpoints.
+class _LegSpec {
+  final double p0, r0, p1, r1;
+  final String label;
+  final String instruction;
+  const _LegSpec({
+    required this.p0,
+    required this.r0,
+    required this.p1,
+    required this.r1,
+    required this.label,
+    required this.instruction,
+  });
+}
+
 class ArcSweepState {
   final ArcSweepPhase phase;
-  final double sweepAngleDeg;   // total angle swept so far (gyro-integrated)
-  final int binsFilledCount;    // how many 25° bins have a qualifying frame
+  final double pathFraction;    // 0.0-1.0 overall progress along front→left→top→right
+  final int activeLegIndex;     // 0=front→left, 1=left→top, 2=top→right, -1=idle
+  final int binsFilledCount;    // how many path bins have a qualifying frame
+  final int filledBinMask;      // bitmask of which of the 18 path bins are filled
+  final bool tooFast;           // phone turning too fast to bin — show "slow down"
   final double lightingValue;   // 0.0-1.0 EMA
   final double focusValue;      // 0.0-1.0 EMA
   final bool flashOn;
@@ -38,8 +59,11 @@ class ArcSweepState {
 
   const ArcSweepState({
     this.phase = ArcSweepPhase.idle,
-    this.sweepAngleDeg = 0.0,
+    this.pathFraction = 0.0,
+    this.activeLegIndex = -1,
     this.binsFilledCount = 0,
+    this.filledBinMask = 0,
+    this.tooFast = false,
     this.lightingValue = 0.0,
     this.focusValue = 0.0,
     this.flashOn = false,
@@ -51,8 +75,11 @@ class ArcSweepState {
 
   ArcSweepState copyWith({
     ArcSweepPhase? phase,
-    double? sweepAngleDeg,
+    double? pathFraction,
+    int? activeLegIndex,
     int? binsFilledCount,
+    int? filledBinMask,
+    bool? tooFast,
     double? lightingValue,
     double? focusValue,
     bool? flashOn,
@@ -63,8 +90,11 @@ class ArcSweepState {
   }) =>
       ArcSweepState(
         phase: phase ?? this.phase,
-        sweepAngleDeg: sweepAngleDeg ?? this.sweepAngleDeg,
+        pathFraction: pathFraction ?? this.pathFraction,
+        activeLegIndex: activeLegIndex ?? this.activeLegIndex,
         binsFilledCount: binsFilledCount ?? this.binsFilledCount,
+        filledBinMask: filledBinMask ?? this.filledBinMask,
+        tooFast: tooFast ?? this.tooFast,
         lightingValue: lightingValue ?? this.lightingValue,
         focusValue: focusValue ?? this.focusValue,
         flashOn: flashOn ?? this.flashOn,
@@ -77,21 +107,64 @@ class ArcSweepState {
 
 /// Arc-sweep capture controller.
 ///
-/// The user holds the phone in portrait and sweeps it around a stationary
-/// thumb. The total angular velocity is integrated from the gyroscope to
-/// measure how much of the arc has been covered. Frames are binned into 25°
-/// windows; the sharpest frame per bin is retained. When 8 bins (200°) are
-/// filled the session auto-completes and uploads.
+/// The user holds the thumb still and slowly tilts the phone through the same
+/// four checkpoints — and in the same order — as the 4-angle capture:
+/// front (0°,0°) → left (pitch −32°) → top (roll −20°) → right (pitch +32°).
+/// See [ThumbAngleService.targets]/[ThumbAngleService.order] for the source
+/// of truth on those positions; this controller re-derives pitch/roll from
+/// the same quaternion construction as [DeviceOrientationService] so the two
+/// capture modes agree on what "left"/"top"/"right" mean.
 ///
-/// Unlike MultiAngleCaptureController there is no MediaPipe or per-angle
-/// hold-steady gate — the user just sweeps continuously at a comfortable speed.
+/// Rather than four discrete holds, the sweep is captured continuously and
+/// densely: the front→left→top→right path is split into 3 legs of 6 bins
+/// each (18 bins total). Every frame is projected onto the nearest point of
+/// whichever leg it's closest to, and the sharpest frame per bin is kept.
+/// The session completes once each leg has at least 4 of its 6 bins filled —
+/// i.e. once the user has actually swept through all three legs, not just
+/// racked up 18 bins' worth of dithering on one.
+///
+/// Frames only bin while the phone is turning slowly (a gyro speed gate) — a
+/// fast, blurry, poorly-registered sweep fills nothing, which is what stops
+/// testers blasting straight through instead of sweeping deliberately.
 class ArcSweepCaptureController extends ChangeNotifier {
   ArcSweepCaptureController();
 
-  // ── Constants ─────────────────────────────────────────────────────────────
-  static const _binWidth = 25.0;     // degrees per bin
-  static const _binCount = 9;        // 9 bins × 25° = 225° max span
-  static const _arcTarget = 200.0;   // degrees to declare capture complete
+  // ── Path geometry ────────────────────────────────────────────────────────
+  // Same checkpoint values as ThumbAngleService.targets (left/right on the
+  // pitch axis at ±32°, top on the roll axis at −20°), traversed in
+  // ThumbAngleService.order: front → left → top → right.
+  static const _legs = <_LegSpec>[
+    _LegSpec(
+      p0: 0, r0: 0, p1: -32, r1: 0,
+      label: 'LEFT',
+      instruction: 'Tilt phone to the LEFT — capture left edge',
+    ),
+    _LegSpec(
+      p0: -32, r0: 0, p1: 0, r1: -20,
+      label: 'TOP',
+      instruction: 'Tilt toward THUMB TIP — capture top of thumbprint',
+    ),
+    _LegSpec(
+      p0: 0, r0: -20, p1: 32, r1: 0,
+      label: 'RIGHT',
+      instruction: 'Tilt phone to the RIGHT — capture right edge',
+    ),
+  ];
+  static const _binsPerLeg = 6;
+  static const _totalBins = _binsPerLeg * 3; // 18
+  // A leg counts as "covered" once most (not all) of its bins are filled —
+  // avoids stalling the whole sweep over one or two marginal frames near a
+  // checkpoint's exact endpoint.
+  static const _minBinsPerLegToComplete = 4;
+  // Frames whose (pitch, roll) land further than this from every leg are
+  // considered off the intended path (e.g. a stray yaw/roll combination) and
+  // are not binned — a generous sanity gate, not a strict one.
+  static const _offPathThresholdDeg = 25.0;
+
+  // Slow-motion gate: frames only bin when the phone is turning slowly enough
+  // for a sharp, well-registered view. Also stops testers blasting through the
+  // sweep — the whole point of the redesign.
+  static const _maxSweepSpeedRadPerSec = 0.7;
   static const _calibDurationMs = 2000;
   static const _emitThrottleMs = 80;
   static const _focusHistoryLen = 5;
@@ -126,11 +199,15 @@ class ArcSweepCaptureController extends ChangeNotifier {
   double _q0w = 1.0, _q0x = 0.0, _q0y = 0.0, _q0z = 0.0;
   bool _q0Captured = false;
 
-  // Sweep angle derived from relative quaternion (degrees from sweep start)
-  double _sweepAngleDeg = 0.0;
+  // Signed pitch/roll (degrees) relative to the sweep-start pose, using the
+  // same q_rel = q0⁻¹ ⊗ q_current construction and Euler formulas as
+  // DeviceOrientationService.relativeOrientation() so both capture modes
+  // agree on sign conventions.
+  double _sweepPitchDeg = 0.0;
+  double _sweepRollDeg = 0.0;
   DateTime? _lastGyroAt;
 
-  // Frame bins: bin_index → best frame so far
+  // Frame bins: global bin id (leg * _binsPerLeg + binInLeg) → best frame so far
   final Map<int, _BinFrame> _bestPerBin = {};
 
   // Calibration
@@ -172,7 +249,8 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _rawFocusHistory.clear();
     _gyroHistory.clear();
     _gyroMagnitude = 0.0;
-    _sweepAngleDeg = 0.0;
+    _sweepPitchDeg = 0.0;
+    _sweepRollDeg = 0.0;
     _lastGyroAt = null;
     _qw = 1.0; _qx = 0.0; _qy = 0.0; _qz = 0.0;
     _q0w = 1.0; _q0x = 0.0; _q0y = 0.0; _q0z = 0.0;
@@ -215,22 +293,32 @@ class ArcSweepCaptureController extends ChangeNotifier {
           _q0w = _qw; _q0x = _qx; _q0y = _qy; _q0z = _qz;
           _q0Captured = true;
         }
-        // Relative rotation: dq = q_current * q0.conjugate()
-        // q0.conj = [q0w, -q0x, -q0y, -q0z]
-        final rw =  _qw*_q0w + _qx*_q0x + _qy*_q0y + _qz*_q0z;
-        final rx = -_qw*_q0x + _qx*_q0w + _qy*_q0z - _qz*_q0y;
-        final ry = -_qw*_q0y - _qx*_q0z + _qy*_q0w + _qz*_q0x;
-        final rz = -_qw*_q0z + _qx*_q0y - _qy*_q0x + _qz*_q0w;
-        // Total rotation angle (axis-angle magnitude): θ = 2·asin(|sin(θ/2)|)
-        final sinHalf = math.sqrt(rx*rx + ry*ry + rz*rz).clamp(0.0, 1.0);
-        _sweepAngleDeg = 2.0 * math.asin(sinHalf) * 180.0 / math.pi;
+        // Relative rotation q_rel = q0⁻¹ ⊗ q_current — same construction as
+        // DeviceOrientationService.relativeOrientation(), so pitch/roll below
+        // match the 4-angle path's sign conventions exactly.
+        final aw = _q0w, ax = -_q0x, ay = -_q0y, az = -_q0z; // q0 conjugate
+        final rw = aw*_qw - ax*_qx - ay*_qy - az*_qz;
+        final rx = aw*_qx + ax*_qw + ay*_qz - az*_qy;
+        final ry = aw*_qy - ax*_qz + ay*_qw + az*_qx;
+        final rz = aw*_qz + ax*_qy - ay*_qx + az*_qw;
+
+        // Roll (about X).
+        final sinrCosp = 2.0 * (rw*rx + ry*rz);
+        final cosrCosp = 1.0 - 2.0 * (rx*rx + ry*ry);
+        _sweepRollDeg = math.atan2(sinrCosp, cosrCosp) * 180.0 / math.pi;
+
+        // Pitch (about Y), clamped at the gimbal poles.
+        final sinp = (2.0 * (rw*ry - rz*rx)).clamp(-1.0, 1.0);
+        _sweepPitchDeg = math.asin(sinp) * 180.0 / math.pi;
       }
     });
 
     _set(_state.copyWith(
       phase: ArcSweepPhase.calibrating,
-      sweepAngleDeg: 0.0,
+      pathFraction: 0.0,
+      activeLegIndex: -1,
       binsFilledCount: 0,
+      filledBinMask: 0,
     ));
 
     try {
@@ -274,13 +362,21 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   void _emitMeters(double lighting, double focus) {
     final now = DateTime.now();
+    final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
+    var mask = 0;
+    for (final k in _bestPerBin.keys) {
+      if (k >= 0 && k < _totalBins) mask |= (1 << k);
+    }
     final next = _state.copyWith(
       lightingValue: lighting,
       focusValue: focus,
       flashOn: _flash?.isFlashOn ?? false,
       flashIntensity: _flash?.intensity ?? 0.0,
-      sweepAngleDeg: _sweepAngleDeg,
+      pathFraction: (proj.legIndex + proj.t) / _legs.length,
+      activeLegIndex: proj.legIndex,
       binsFilledCount: _bestPerBin.length,
+      filledBinMask: mask,
+      tooFast: _sweepActive && _gyroMagnitude > _maxSweepSpeedRadPerSec,
     );
     if (_lastEmitAt == null ||
         now.difference(_lastEmitAt!).inMilliseconds >= _emitThrottleMs) {
@@ -344,15 +440,62 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _sweepActive = true;
     _set(_state.copyWith(
       phase: ArcSweepPhase.sweeping,
-      sweepAngleDeg: 0.0,
+      pathFraction: 0.0,
+      activeLegIndex: 0,
       binsFilledCount: 0,
+      filledBinMask: 0,
     ));
+  }
+
+  // ── Path projection ─────────────────────────────────────────────────────────
+
+  /// Projects a (pitch, roll) sample onto the nearest point of the nearest
+  /// leg of the front→left→top→right path. Returns the leg index, the
+  /// position along that leg (0..1), and the perpendicular distance in
+  /// degrees (used as an off-path sanity gate).
+  ({int legIndex, double t, double distDeg}) _projectToPath(
+      double pitch, double roll) {
+    var bestLeg = 0;
+    var bestT = 0.0;
+    var bestDist = double.infinity;
+    for (var i = 0; i < _legs.length; i++) {
+      final leg = _legs[i];
+      final dx = leg.p1 - leg.p0;
+      final dy = leg.r1 - leg.r0;
+      final len2 = dx * dx + dy * dy;
+      var t = len2 == 0
+          ? 0.0
+          : (((pitch - leg.p0) * dx + (roll - leg.r0) * dy) / len2);
+      t = t.clamp(0.0, 1.0);
+      final projP = leg.p0 + t * dx;
+      final projR = leg.r0 + t * dy;
+      final dp = pitch - projP;
+      final dr = roll - projR;
+      final dist = math.sqrt(dp * dp + dr * dr);
+      if (dist < bestDist) {
+        bestDist = dist;
+        bestLeg = i;
+        bestT = t;
+      }
+    }
+    return (legIndex: bestLeg, t: bestT, distDeg: bestDist);
   }
 
   // ── Frame binning ──────────────────────────────────────────────────────────
 
   void _binFrame(CameraImage image, double sharpness, double brightness) {
-    final bin = (_sweepAngleDeg / _binWidth).floor().clamp(0, _binCount - 1);
+    // Slow-motion gate: only accept frames while the phone is turning gently.
+    // A fast turn is both motion-blurred and poorly registered, and lets a
+    // tester rush the sweep — rejecting those frames is what enforces the
+    // deliberate pace the arc is supposed to have.
+    if (_gyroMagnitude > _maxSweepSpeedRadPerSec) return;
+
+    final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
+    if (proj.distDeg > _offPathThresholdDeg) return;
+
+    final binInLeg = (proj.t * _binsPerLeg).floor().clamp(0, _binsPerLeg - 1);
+    final bin = proj.legIndex * _binsPerLeg + binInLeg;
+
     final brightnessScore = _mapBrightnessScore(brightness);
     final score = sharpness * 0.6 + brightnessScore * 0.4;
     if (score < 0.05) return; // discard near-black / severely-blurred frames
@@ -365,7 +508,8 @@ class ArcSweepCaptureController extends ChangeNotifier {
           bytes: bytes,
           score: score,
           sharpness: sharpness,
-          angleDeg: _sweepAngleDeg,
+          pitchDeg: _sweepPitchDeg,
+          rollDeg: _sweepRollDeg,
           timestamp: DateTime.now(),
           flashOn: _flash?.isFlashOn ?? false,
           flashIntensity: _flash?.intensity ?? 0.0,
@@ -373,10 +517,22 @@ class ArcSweepCaptureController extends ChangeNotifier {
       }
     }
 
-    if (_bestPerBin.length * _binWidth >= _arcTarget && !_complete) {
+    if (!_complete && _allLegsCovered()) {
       _complete = true;
       unawaited(_finishAndUpload());
     }
+  }
+
+  bool _allLegsCovered() {
+    for (var leg = 0; leg < _legs.length; leg++) {
+      var count = 0;
+      final base = leg * _binsPerLeg;
+      for (var b = base; b < base + _binsPerLeg; b++) {
+        if (_bestPerBin.containsKey(b)) count++;
+      }
+      if (count < _minBinsPerLegToComplete) return false;
+    }
+    return true;
   }
 
   // ── Upload ─────────────────────────────────────────────────────────────────
@@ -396,11 +552,17 @@ class ArcSweepCaptureController extends ChangeNotifier {
         ..sort((a, b) => a.key.compareTo(b.key));
 
       final frameBytes = sortedBins.map((e) => e.value.bytes).toList();
-      final arcAngles = sortedBins.map((e) => e.value.angleDeg).toList();
+      // arcAngles carries pitch — the dominant axis for legs 0/2 and the
+      // continuation point for leg 1 — for backend compatibility with the
+      // existing single-angle-per-frame contract. Full pitch+roll travels in
+      // frameMetadata for anything that wants the true 2-axis position.
+      final arcAngles = sortedBins.map((e) => e.value.pitchDeg).toList();
       final frameMetadata = sortedBins
           .map((e) => <String, dynamic>{
-                'arcAngleDeg': e.value.angleDeg,
+                'pitchDeg': e.value.pitchDeg,
+                'rollDeg': e.value.rollDeg,
                 'binIndex': e.key,
+                'legIndex': e.key ~/ _binsPerLeg,
                 'laplacianScore': e.value.sharpness,
                 'flashOn': e.value.flashOn,
                 'flashIntensity': e.value.flashIntensity,
@@ -500,7 +662,8 @@ class _BinFrame {
   final Uint8List bytes;
   final double score;
   final double sharpness;
-  final double angleDeg;
+  final double pitchDeg;
+  final double rollDeg;
   final DateTime timestamp;
   final bool flashOn;
   final double flashIntensity;
@@ -509,7 +672,8 @@ class _BinFrame {
     required this.bytes,
     required this.score,
     required this.sharpness,
-    required this.angleDeg,
+    required this.pitchDeg,
+    required this.rollDeg,
     required this.timestamp,
     required this.flashOn,
     required this.flashIntensity,

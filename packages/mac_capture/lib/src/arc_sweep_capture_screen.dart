@@ -17,9 +17,11 @@ import 'lighting_meter_widget.dart';
 
 /// Arc-sweep capture screen.
 ///
-/// The user holds the phone in portrait orientation and sweeps it around a
-/// stationary thumb. An arc progress indicator shows how much of the 200°
-/// span has been captured. No per-angle hold-steady gate — just sweep slowly.
+/// The user holds the thumb still and slowly tilts the phone through the
+/// same checkpoints, in the same order, as the 4-angle capture: FRONT →
+/// LEFT → TOP → RIGHT. The arc indicator shows the four checkpoint markers,
+/// which of the 18 path bins are covered, and a live "you are here" position;
+/// a "slow down" hint appears if the phone is turned too fast to capture.
 class ArcSweepCaptureScreen extends ConsumerStatefulWidget {
   const ArcSweepCaptureScreen({
     super.key,
@@ -194,8 +196,9 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                   builder: (_, ref, __) {
                     final s = ref.watch(arcSweepCaptureControllerProvider).state;
                     return _ArcProgressWidget(
-                      sweepAngleDeg: s.sweepAngleDeg,
+                      pathFraction: s.pathFraction,
                       binsFilledCount: s.binsFilledCount,
+                      filledBinMask: s.filledBinMask,
                       phase: s.phase,
                     );
                   },
@@ -240,7 +243,8 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   Text(
-                    'Hold thumb still. Sweep camera slowly around it.',
+                    'Hold your thumb still. Slowly tilt the phone through: '
+                    'FRONT → LEFT → TOP → RIGHT.',
                     textAlign: TextAlign.center,
                     style: CaptureTypography.body.copyWith(
                       fontSize: 14,
@@ -266,16 +270,26 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
               child: Consumer(
                 builder: (_, ref, __) {
                   final s = ref.watch(arcSweepCaptureControllerProvider).state;
-                  final pct = (s.binsFilledCount * 25.0 / _arcTarget * 100).round().clamp(0, 100);
+                  final pct =
+                      (s.binsFilledCount / _totalBins * 100).round().clamp(0, 100);
+                  final tooFast = s.tooFast;
+                  final legLabel = (s.activeLegIndex >= 0 &&
+                          s.activeLegIndex < _legLabels.length)
+                      ? _legLabels[s.activeLegIndex]
+                      : '';
                   return Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        '$pct% covered — keep sweeping',
+                        tooFast
+                            ? 'Slow down — sweep gently'
+                            : '$pct% covered — tilt toward $legLabel',
                         textAlign: TextAlign.center,
                         style: CaptureTypography.label.copyWith(
                           fontSize: 13,
-                          color: CaptureColors.silverBright,
+                          color: tooFast
+                              ? CaptureColors.gold
+                              : CaptureColors.silverBright,
                         ),
                       ),
                     ],
@@ -411,45 +425,57 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
   }
 }
 
-// ── Arc target constant (matches controller) ───────────────────────────────────
-const _arcTarget = 200.0;
+// ── Arc geometry constants (mirror ArcSweepCaptureController) ────────────────────
+// The path has 3 legs (front→left, left→top, top→right) of 6 bins each — see
+// ArcSweepCaptureController._legs for the authoritative pitch/roll values.
+// Dart privacy is per-file, so leg labels are duplicated here for display.
+const _totalBins = 18;
+const _legLabels = <String>['LEFT', 'TOP', 'RIGHT'];
+// Checkpoint positions as fractions along the whole front→left→top→right path
+// (each leg is an equal third), matching ArcSweepState.pathFraction.
+const _checkpointFractions = <double>[0.0, 1 / 3, 2 / 3, 1.0];
 
 /// Circular arc progress indicator for the arc sweep capture.
+///
+/// The visual arc represents the full front→left→top→right path as a single
+/// bottom sweep. Each of the 18 path bins is drawn as its own segment (cyan
+/// once captured), the four checkpoints get emphasised markers, and a live
+/// dot shows the phone's current position along the path.
 class _ArcProgressWidget extends StatelessWidget {
   const _ArcProgressWidget({
-    required this.sweepAngleDeg,
+    required this.pathFraction,
     required this.binsFilledCount,
+    required this.filledBinMask,
     required this.phase,
   });
 
-  final double sweepAngleDeg;
+  final double pathFraction;
   final int binsFilledCount;
+  final int filledBinMask;
   final ArcSweepPhase phase;
 
   @override
   Widget build(BuildContext context) {
-    final coverageFraction = (binsFilledCount * 25.0 / _arcTarget).clamp(0.0, 1.0);
     final isActive = phase == ArcSweepPhase.sweeping;
+    final pct = (binsFilledCount / _totalBins * 100).round().clamp(0, 100);
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
-          width: 180,
-          height: 180,
+          width: 200,
+          height: 200,
           child: CustomPaint(
             painter: _ArcPainter(
-              fraction: coverageFraction,
+              pathFraction: pathFraction,
+              filledBinMask: filledBinMask,
               isActive: isActive,
-              binsFilledCount: binsFilledCount,
             ),
           ),
         ),
         const SizedBox(height: 16),
         Text(
-          isActive
-              ? '${binsFilledCount * 25}° / ${_arcTarget.toInt()}° covered'
-              : 'Position thumb in centre',
+          isActive ? '$pct% covered' : 'Position thumb in centre',
           style: CaptureTypography.label.copyWith(
             fontSize: 13,
             color: CaptureColors.silverBright,
@@ -462,30 +488,29 @@ class _ArcProgressWidget extends StatelessWidget {
 
 class _ArcPainter extends CustomPainter {
   const _ArcPainter({
-    required this.fraction,
+    required this.pathFraction,
+    required this.filledBinMask,
     required this.isActive,
-    required this.binsFilledCount,
   });
 
-  final double fraction;
+  final double pathFraction;
+  final int filledBinMask;
   final bool isActive;
-  final int binsFilledCount;
 
-  // The arc spans 200° centered on the bottom of the circle, sweeping from
-  // left to right. Start angle in Flutter convention (0° = 3 o'clock):
-  static const _spanDeg = _arcTarget;
-  static const _startDeg = 90.0 + (_spanDeg / 2);  // 190° → starts at ~7 o'clock
+  // The path is drawn as a bottom arc sweeping left→right. 0° = 3 o'clock.
+  static const _visualSpanDeg = 200.0;
+  static const _startDeg = 90.0 + (_visualSpanDeg / 2); // ~7 o'clock
 
   @override
   void paint(Canvas canvas, Size size) {
     final center = Offset(size.width / 2, size.height / 2);
-    final radius = size.width / 2 - 10;
+    final radius = size.width / 2 - 14;
     final rect = Rect.fromCircle(center: center, radius: radius);
 
     final startRad = _startDeg * math.pi / 180;
-    final spanRad = _spanDeg * math.pi / 180;
+    final spanRad = _visualSpanDeg * math.pi / 180;
 
-    // Background track
+    // Background track.
     final trackPaint = Paint()
       ..color = CaptureColors.steelMuted.withValues(alpha: 0.5)
       ..style = PaintingStyle.stroke
@@ -493,46 +518,62 @@ class _ArcPainter extends CustomPainter {
       ..strokeCap = StrokeCap.round;
     canvas.drawArc(rect, startRad, spanRad, false, trackPaint);
 
-    // Filled progress
-    if (fraction > 0.0) {
-      final fillPaint = Paint()
-        ..color = isActive ? CaptureColors.cyan : CaptureColors.success
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 10
-        ..strokeCap = StrokeCap.round;
-      canvas.drawArc(rect, startRad, spanRad * fraction, false, fillPaint);
+    // Per-bin segments: cyan once captured. Bin order along the path already
+    // matches drawing order left→right (each leg's fraction range is
+    // contiguous and increasing), so bin i just maps to the i-th segment.
+    final segGap = spanRad * 0.012;
+    final segSpan = spanRad / _totalBins;
+    final fillPaint = Paint()
+      ..color = isActive ? CaptureColors.cyan : CaptureColors.success
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 10
+      ..strokeCap = StrokeCap.round;
+    for (var i = 0; i < _totalBins; i++) {
+      if ((filledBinMask >> i) & 1 == 0) continue;
+      final a0 = startRad + i * segSpan + segGap / 2;
+      canvas.drawArc(rect, a0, segSpan - segGap, false, fillPaint);
     }
 
-    // Bin tick marks (every 25°)
-    const binCount = 8; // _spanDeg (200°) / 25°
-    for (var i = 0; i <= binCount; i++) {
-      final tickAngle = startRad + (i / binCount) * spanRad;
-      final outerR = radius + 5;
-      final innerR = radius - (i < binsFilledCount ? 8 : 4);
-      final dx = math.cos(tickAngle);
-      final dy = math.sin(tickAngle);
-      final tickPaint = Paint()
-        ..color = i < binsFilledCount
-            ? CaptureColors.cyan
-            : CaptureColors.steelMuted
-        ..strokeWidth = i < binsFilledCount ? 2.5 : 1.5
+    // Checkpoint markers (front / left / top / right) — emphasised radial ticks.
+    for (final f in _checkpointFractions) {
+      final ang = startRad + f * spanRad;
+      final dx = math.cos(ang), dy = math.sin(ang);
+      final cpPaint = Paint()
+        ..color = CaptureColors.silverBright
+        ..strokeWidth = 3
         ..strokeCap = StrokeCap.round;
       canvas.drawLine(
-        Offset(center.dx + dx * innerR, center.dy + dy * innerR),
-        Offset(center.dx + dx * outerR, center.dy + dy * outerR),
-        tickPaint,
+        Offset(center.dx + dx * (radius - 9), center.dy + dy * (radius - 9)),
+        Offset(center.dx + dx * (radius + 9), center.dy + dy * (radius + 9)),
+        cpPaint,
       );
     }
 
-    // Center circle
+    // Live "you are here" position dot at the current path fraction.
+    if (isActive) {
+      final ang = startRad + pathFraction.clamp(0.0, 1.0) * spanRad;
+      final dx = math.cos(ang), dy = math.sin(ang);
+      final pos = Offset(center.dx + dx * radius, center.dy + dy * radius);
+      canvas.drawCircle(pos, 9, Paint()..color = CaptureColors.cyan);
+      canvas.drawCircle(
+        pos,
+        9,
+        Paint()
+          ..color = CaptureColors.void_
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 2.5,
+      );
+    }
+
+    // Center circle.
     final centerPaint = Paint()
       ..color = isActive
           ? CaptureColors.cyan.withValues(alpha: 0.15)
           : CaptureColors.steelMuted.withValues(alpha: 0.1)
       ..style = PaintingStyle.fill;
-    canvas.drawCircle(center, radius - 18, centerPaint);
+    canvas.drawCircle(center, radius - 20, centerPaint);
 
-    // Center icon (fingerprint — concentric arc set)
+    // Center icon (fingerprint — concentric arc set).
     final iconPaint = Paint()
       ..color = isActive ? CaptureColors.cyan : CaptureColors.silverDim
       ..style = PaintingStyle.stroke
@@ -550,9 +591,9 @@ class _ArcPainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_ArcPainter old) =>
-      old.fraction != fraction ||
-      old.isActive != isActive ||
-      old.binsFilledCount != binsFilledCount;
+      old.pathFraction != pathFraction ||
+      old.filledBinMask != filledBinMask ||
+      old.isActive != isActive;
 }
 
 // ── Upload overlay ─────────────────────────────────────────────────────────────
