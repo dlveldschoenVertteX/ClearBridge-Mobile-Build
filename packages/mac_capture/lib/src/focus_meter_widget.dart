@@ -1,7 +1,7 @@
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/clearbridge_typography.dart';
+import 'capture_colors.dart';
+import 'capture_typography.dart';
 
 /// Right-edge vertical meter for focus sharpness. [value] is the normalized
 /// Laplacian (0–1, EMA smoothed); the fill fraction is mapped so a blurry frame
@@ -33,7 +33,7 @@ class FocusMeterWidget extends StatelessWidget {
         mainAxisAlignment: MainAxisAlignment.spaceBetween,
         children: [
           const Icon(Icons.remove_red_eye_outlined,
-              color: ClearBridgeColors.silverBright, size: 18),
+              color: CaptureColors.silverBright, size: 18),
           SizedBox(
             width: 10,
             height: 80,
@@ -44,7 +44,7 @@ class FocusMeterWidget extends StatelessWidget {
               builder: (context, fill, _) {
                 return Container(
                   decoration: BoxDecoration(
-                    color: ClearBridgeColors.steelMuted,
+                    color: CaptureColors.steelMuted,
                     borderRadius: BorderRadius.circular(5),
                   ),
                   child: Align(
@@ -57,8 +57,8 @@ class FocusMeterWidget extends StatelessWidget {
                             begin: Alignment.bottomCenter,
                             end: Alignment.topCenter,
                             colors: [
-                              ClearBridgeColors.silver,
-                              ClearBridgeColors.silverBright,
+                              CaptureColors.silver,
+                              CaptureColors.silverBright,
                             ],
                           ),
                           borderRadius: BorderRadius.circular(5),
@@ -71,9 +71,9 @@ class FocusMeterWidget extends StatelessWidget {
             ),
           ),
           Text('Focus',
-              style: ClearBridgeTypography.label.copyWith(
+              style: CaptureTypography.label.copyWith(
                 fontSize: 10,
-                color: ClearBridgeColors.silverDim,
+                color: CaptureColors.silverDim,
               )),
         ],
       ),

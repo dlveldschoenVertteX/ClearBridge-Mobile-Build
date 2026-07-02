@@ -2,8 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/spatial_anchor_service.dart';
+import 'capture_colors.dart';
+import 'spatial_anchor_service.dart';
 
 /// Additive overlay that paints the spatial anchor circles on top of the camera
 /// preview. Owns the pulse / ripple / leader-fade animations; all geometry comes
@@ -62,7 +62,7 @@ class _SpatialAnchorOverlayState extends State<SpatialAnchorOverlay>
               fontFamily: 'Manrope',
               fontSize: 11,
               fontWeight: FontWeight.w600,
-              color: ClearBridgeColors.silverBright,
+              color: CaptureColors.silverBright,
             ),
           ),
           textDirection: TextDirection.ltr,
@@ -189,14 +189,14 @@ class _AnchorPainter extends CustomPainter {
           pos,
           r,
           Paint()
-            ..color = ClearBridgeColors.cyan.withValues(alpha: 0.28)
+            ..color = CaptureColors.cyan.withValues(alpha: 0.28)
             ..style = PaintingStyle.stroke
             ..strokeWidth = 1.5,
         );
         canvas.drawCircle(
           pos,
           2.0,
-          Paint()..color = ClearBridgeColors.cyan.withValues(alpha: 0.28),
+          Paint()..color = CaptureColors.cyan.withValues(alpha: 0.28),
         );
 
       case AnchorState.active:
@@ -207,7 +207,7 @@ class _AnchorPainter extends CustomPainter {
           r + 6.0 * pulse,
           Paint()
             ..color =
-                ClearBridgeColors.gold.withValues(alpha: 0.25 + 0.35 * pulse)
+                CaptureColors.gold.withValues(alpha: 0.25 + 0.35 * pulse)
             ..style = PaintingStyle.stroke
             ..strokeWidth = 2.0
             ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
@@ -217,7 +217,7 @@ class _AnchorPainter extends CustomPainter {
           pos,
           r,
           Paint()
-            ..color = ClearBridgeColors.gold
+            ..color = CaptureColors.gold
             ..style = PaintingStyle.stroke
             ..strokeWidth = 2.0,
         );
@@ -225,7 +225,7 @@ class _AnchorPainter extends CustomPainter {
         canvas.drawCircle(
           pos,
           3.0,
-          Paint()..color = ClearBridgeColors.gold,
+          Paint()..color = CaptureColors.gold,
         );
         if (a.showLeaderLine) {
           _drawLeaderLine(canvas, a, labelOpacity[a.angleKey] ?? 1.0, size, labelPainters);
@@ -240,7 +240,7 @@ class _AnchorPainter extends CustomPainter {
             r + 24.0 * rp,
             Paint()
               ..color =
-                  ClearBridgeColors.success.withValues(alpha: 0.80 * (1.0 - rp))
+                  CaptureColors.success.withValues(alpha: 0.80 * (1.0 - rp))
               ..style = PaintingStyle.fill,
           );
         }
@@ -249,14 +249,14 @@ class _AnchorPainter extends CustomPainter {
           pos,
           r,
           Paint()
-            ..color = ClearBridgeColors.success.withValues(alpha: 0.85)
+            ..color = CaptureColors.success.withValues(alpha: 0.85)
             ..style = PaintingStyle.fill,
         );
         canvas.drawCircle(
           pos,
           r,
           Paint()
-            ..color = ClearBridgeColors.success
+            ..color = CaptureColors.success
             ..style = PaintingStyle.stroke
             ..strokeWidth = 1.5,
         );
@@ -288,12 +288,12 @@ class _AnchorPainter extends CustomPainter {
     // only during the fade (avoids TextPainter.layout() at 60fps).
     if (opacity >= 0.99) {
       canvas.drawLine(lineStart, lineEnd,
-          Paint()..color = ClearBridgeColors.gold.withValues(alpha: 0.7)..strokeWidth = 1.0);
+          Paint()..color = CaptureColors.gold.withValues(alpha: 0.7)..strokeWidth = 1.0);
       tp?.paint(canvas, labelPos);
     } else {
       canvas.saveLayer(null, Paint()..color = Colors.white.withValues(alpha: opacity));
       canvas.drawLine(lineStart, lineEnd,
-          Paint()..color = ClearBridgeColors.gold.withValues(alpha: 0.7)..strokeWidth = 1.0);
+          Paint()..color = CaptureColors.gold.withValues(alpha: 0.7)..strokeWidth = 1.0);
       tp?.paint(canvas, labelPos);
       canvas.restore();
     }

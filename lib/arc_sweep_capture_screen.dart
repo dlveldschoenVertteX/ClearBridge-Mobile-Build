@@ -6,16 +6,14 @@ import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:mac_capture/mac_capture.dart';
+
 import 'package:clearbridge/app_constants.dart';
 import 'package:clearbridge/clearbridge_colors.dart';
 import 'package:clearbridge/clearbridge_typography.dart';
 import 'package:clearbridge/cb_ui.dart';
 import 'package:clearbridge/arc_sweep_capture_controller.dart';
-import 'package:clearbridge/camera_service.dart';
 import 'package:clearbridge/fingerprint_frame_upload_service.dart';
-import 'package:clearbridge/capture_intro_animation.dart';
-import 'package:clearbridge/focus_meter_widget.dart';
-import 'package:clearbridge/lighting_meter_widget.dart';
 
 /// Arc-sweep capture screen.
 ///

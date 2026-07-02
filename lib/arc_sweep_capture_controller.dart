@@ -9,9 +9,9 @@ import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 
-import 'adaptive_flash_controller.dart';
+import 'package:mac_capture/mac_capture.dart';
+
 import 'fingerprint_frame_upload_service.dart';
-import 'frame_capture_service.dart';
 
 enum ArcSweepPhase {
   idle,

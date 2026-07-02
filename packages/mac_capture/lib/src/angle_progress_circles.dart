@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
+import 'capture_colors.dart';
 
 /// Row of four small circles tracking capture progress through the angles
 /// (front → left → top → right). The active circle fills as the thumb nears its
@@ -37,8 +37,8 @@ class AngleProgressCircles extends StatelessWidget {
     final complete = anglesComplete[i];
     final active = i == currentAngleIndex && !complete;
     final labelColor = (active || complete || glowAll)
-        ? ClearBridgeColors.cyan
-        : ClearBridgeColors.silverDim;
+        ? CaptureColors.cyan
+        : CaptureColors.silverDim;
 
     final dot = (complete || glowAll)
         ? AnimatedContainer(
@@ -48,8 +48,8 @@ class AngleProgressCircles extends StatelessWidget {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: glowAll && !complete
-                  ? ClearBridgeColors.success
-                  : ClearBridgeColors.cyan,
+                  ? CaptureColors.success
+                  : CaptureColors.cyan,
             ),
             child: const Icon(
               Icons.check,
@@ -68,11 +68,11 @@ class AngleProgressCircles extends StatelessWidget {
                 height: _size,
                 decoration: BoxDecoration(
                   shape: BoxShape.circle,
-                  color: ClearBridgeColors.cyan.withValues(alpha: f),
+                  color: CaptureColors.cyan.withValues(alpha: f),
                   border: Border.all(
                     color: active
-                        ? ClearBridgeColors.cyan
-                        : ClearBridgeColors.steelBorder,
+                        ? CaptureColors.cyan
+                        : CaptureColors.steelBorder,
                     width: 1.5,
                   ),
                 ),

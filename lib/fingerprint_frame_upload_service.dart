@@ -8,17 +8,53 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:uuid/uuid.dart';
 
-import 'package:clearbridge/multi_angle_capture.dart';
+import 'package:mac_capture/mac_capture.dart';
 
 const _uuid = Uuid();
 
 /// Uploads frames from a [MultiAngleCapture] to Firebase Storage, creates the
 /// `captures/{captureId}` Firestore document, and invokes the
-/// `processEnhanceAndScore` Cloud Function (africa-south1). Returns the captureId.
-class FingerprintFrameUploadService {
+/// `processEnhanceAndScore` Cloud Function (africa-south1). Returns the
+/// captureId. This is the app's concrete [CaptureUploader] — the mac_capture
+/// package knows nothing about Firebase, only this interface.
+class FingerprintFrameUploadService implements CaptureUploader {
   const FingerprintFrameUploadService();
 
+  @override
   Future<String> uploadAndProcess(
+    MultiAngleCapture capture, {
+    required String userId,
+    String? captureId,
+    void Function(double progress)? onProgress,
+    List<Map<String, dynamic>> frameMetadata = const [],
+    double? thumbWidthFraction,
+    List<Map<String, dynamic>> burstStats = const [],
+    List<Map<String, dynamic>> axisGateAtCapture = const [],
+    Map<String, double> orbitAngles = const {},
+  }) async {
+    try {
+      return await _uploadAndProcess(
+        capture,
+        userId: userId,
+        captureId: captureId,
+        onProgress: onProgress,
+        frameMetadata: frameMetadata,
+        thumbWidthFraction: thumbWidthFraction,
+        burstStats: burstStats,
+        axisGateAtCapture: axisGateAtCapture,
+        orbitAngles: orbitAngles,
+      );
+    } on FirebaseException catch (e) {
+      final isNetwork = e.code == 'unavailable' ||
+          e.code == 'deadline-exceeded' ||
+          e.code == 'network-request-failed' ||
+          (e.message?.toLowerCase().contains('network') ?? false);
+      if (isNetwork) throw CaptureNetworkException(e);
+      rethrow;
+    }
+  }
+
+  Future<String> _uploadAndProcess(
     MultiAngleCapture capture, {
     required String userId,
     String? captureId,

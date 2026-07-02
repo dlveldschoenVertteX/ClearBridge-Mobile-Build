@@ -2,7 +2,7 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
+import 'capture_colors.dart';
 
 /// Centre guidance circle that mirrors the haptic gradient visually: it stays
 /// still when far, "vibrates" (sinusoidal x-jitter) faster as the thumb nears
@@ -138,7 +138,7 @@ class _HapticGuidanceCircleState extends State<HapticGuidanceCircle>
         duration: const Duration(milliseconds: 200),
         child: Icon(
           hint > 0 ? Icons.rotate_right_rounded : Icons.rotate_left_rounded,
-          color: ClearBridgeColors.cyan.withValues(alpha: 0.75),
+          color: CaptureColors.cyan.withValues(alpha: 0.75),
           size: 52,
         ),
       ),
@@ -158,12 +158,12 @@ class _HapticGuidanceCircleState extends State<HapticGuidanceCircle>
         height: 1.5,
         decoration: BoxDecoration(
           gradient: const LinearGradient(
-            colors: [Colors.transparent, ClearBridgeColors.cyan, Colors.transparent],
+            colors: [Colors.transparent, CaptureColors.cyan, Colors.transparent],
           ),
           borderRadius: BorderRadius.circular(1),
           boxShadow: [
             BoxShadow(
-              color: ClearBridgeColors.cyan.withValues(alpha: 0.50),
+              color: CaptureColors.cyan.withValues(alpha: 0.50),
               blurRadius: 6,
             ),
           ],
@@ -197,18 +197,18 @@ class _HapticGuidanceCircleState extends State<HapticGuidanceCircle>
     final borderColor = widget.isRetrying
         ? _amberColor
         : (completionMode || widget.isLocked)
-            ? ClearBridgeColors.success
+            ? CaptureColors.success
             : (widget.isAtCorrectDistance
-                ? ClearBridgeColors.cyan
-                : ClearBridgeColors.cyan.withValues(alpha: 0.30));
+                ? CaptureColors.cyan
+                : CaptureColors.cyan.withValues(alpha: 0.30));
 
     final fillColor = completionMode
-        ? ClearBridgeColors.success.withValues(alpha: 0.20)
+        ? CaptureColors.success.withValues(alpha: 0.20)
         : widget.isRetrying
             ? _amberColor.withValues(alpha: 0.12)
             : (widget.isLocked
-                ? ClearBridgeColors.success.withValues(alpha: 0.25)
-                : ClearBridgeColors.cyanMuted.withValues(alpha: fillFraction));
+                ? CaptureColors.success.withValues(alpha: 0.25)
+                : CaptureColors.cyanMuted.withValues(alpha: fillFraction));
 
     return AnimatedBuilder(
       animation: Listenable.merge([_shake, _pulse, _scan, _breath]),
@@ -257,7 +257,7 @@ class _HapticGuidanceCircleState extends State<HapticGuidanceCircle>
                     const Center(
                       child: Icon(
                         Icons.check_circle_outline_rounded,
-                        color: ClearBridgeColors.success,
+                        color: CaptureColors.success,
                         size: 64,
                       ),
                     ),

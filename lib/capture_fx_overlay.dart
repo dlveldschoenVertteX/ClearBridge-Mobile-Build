@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/multi_angle_capture_controller.dart';
+import 'package:mac_capture/mac_capture.dart';
 
 // ── Color constants — mirrors splash palette ──────────────────────────────────
 const _cyan  = Color(0xFF00BFFF);

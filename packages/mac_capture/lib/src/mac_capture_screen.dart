@@ -1,37 +1,67 @@
 import 'package:camera/camera.dart';
-import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:go_router/go_router.dart';
 
-import 'package:clearbridge/app_constants.dart';
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/clearbridge_typography.dart';
-import 'package:clearbridge/cb_ui.dart';
-import 'package:clearbridge/camera_service.dart';
-import 'package:clearbridge/fingerprint_frame_upload_service.dart';
-import 'package:clearbridge/multi_angle_capture_controller.dart';
-import 'package:clearbridge/spatial_anchor_service.dart';
-import 'package:clearbridge/thumb_angle_service.dart';
-import 'package:clearbridge/angle_progress_circles.dart';
-import 'package:clearbridge/capture_guidance_overlay.dart';
-import 'package:clearbridge/capture_intro_animation.dart';
-import 'package:clearbridge/distance_guidance_widget.dart';
-import 'package:clearbridge/focus_meter_widget.dart';
-import 'package:clearbridge/haptic_guidance_circle.dart';
-import 'package:clearbridge/lighting_meter_widget.dart';
-import 'package:clearbridge/spatial_anchor_overlay.dart';
+import 'capture_colors.dart';
+import 'capture_typography.dart';
+import 'capture_button.dart';
+import 'camera_service.dart';
+import 'capture_uploader.dart';
+import 'multi_angle_capture_controller.dart';
+import 'spatial_anchor_service.dart';
+import 'thumb_angle_service.dart';
+import 'angle_progress_circles.dart';
+import 'capture_guidance_overlay.dart';
+import 'capture_intro_animation.dart';
+import 'distance_guidance_widget.dart';
+import 'focus_meter_widget.dart';
+import 'haptic_guidance_circle.dart';
+import 'lighting_meter_widget.dart';
+import 'spatial_anchor_overlay.dart';
 
 // ---------------------------------------------------------------------------
-// Thumb-rotation capture screen (routed at /fingerprint + /continuous-capture).
-// Full-bleed camera preview with overlay guidance: lighting/focus meters, a
-// central haptic guidance circle, the 4-angle progress row, and an intro
-// animation. Capture is driven by MultiAngleCaptureController (thumb angle from
-// MediaPipe — the IMU is no longer the capture axis).
+// Thumb-rotation capture screen. Full-bleed camera preview with overlay
+// guidance: lighting/focus meters, a central haptic guidance circle, the
+// 4-angle progress row, and an intro animation. Capture is driven by
+// MultiAngleCaptureController (thumb angle from TFLite hand detection — the
+// IMU is no longer the capture axis).
+//
+// This screen has no built-in backend or navigation: the host app supplies
+// a [CaptureUploader] and the four callbacks below, so this package has zero
+// dependency on any specific auth/routing/backend stack.
 // ---------------------------------------------------------------------------
 
 class MacCaptureScreen extends ConsumerStatefulWidget {
-  const MacCaptureScreen({super.key});
+  const MacCaptureScreen({
+    super.key,
+    required this.uploader,
+    required this.getUserId,
+    required this.onRequireLogin,
+    required this.onComplete,
+    required this.onQueued,
+    required this.onClose,
+  });
+
+  /// Backend that persists a finished capture (Firebase, or anything else).
+  final CaptureUploader uploader;
+
+  /// Returns the current authenticated user's ID, or null if signed out.
+  final String? Function() getUserId;
+
+  /// Called when [getUserId] returns null right as capture is about to
+  /// start — the host app should navigate to its login flow.
+  final VoidCallback onRequireLogin;
+
+  /// Called once the capture finishes uploading successfully, with the
+  /// resulting capture ID.
+  final void Function(String captureId) onComplete;
+
+  /// Called when the capture couldn't upload (e.g. offline) and was saved
+  /// to the local retry queue instead, with the resulting capture ID.
+  final void Function(String captureId) onQueued;
+
+  /// Called when the user backs out of the screen before/without capturing.
+  final VoidCallback onClose;
 
   @override
   ConsumerState<MacCaptureScreen> createState() => _MacCaptureScreenState();
@@ -79,14 +109,14 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
   }
 
   Future<void> _onStart() async {
-    final user = FirebaseAuth.instance.currentUser;
-    if (user == null) {
+    final userId = widget.getUserId();
+    if (userId == null) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
           content: Text('Session expired — please log in again.'),
-          backgroundColor: ClearBridgeColors.error,
+          backgroundColor: CaptureColors.error,
         ));
-        context.go(AppConstants.loginRoute);
+        widget.onRequireLogin();
       }
       return;
     }
@@ -95,30 +125,23 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     SpatialAnchorService.resetSession(); // fresh leader-line state per session
     await ref.read(multiAngleCaptureControllerProvider).startCaptureSequence(
           camera: cam,
-          uploadService: ref.read(fingerprintFrameUploadServiceProvider),
-          userId: user.uid,
+          uploadService: widget.uploader,
+          userId: userId,
           sensorOrientation: _sensorOrientation,
         );
   }
 
-  void _close() {
-    if (context.canPop()) {
-      context.pop();
-    } else {
-      context.go(AppConstants.dashboardRoute);
-    }
-  }
+  void _close() => widget.onClose();
 
   void _onStateChanged(CaptureSessionState s) {
     if (_navigated) return;
     if (s.captureId == null) return;
     if (s.phase == CapturePhase.complete) {
       _navigated = true;
-      context.go('/capture/result', extra: s.captureId);
+      widget.onComplete(s.captureId!);
     } else if (s.phase == CapturePhase.queued) {
       _navigated = true;
-      context.go('/capture/result',
-          extra: {'captureId': s.captureId, 'queued': true});
+      widget.onQueued(s.captureId!);
     }
   }
 
@@ -139,17 +162,17 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
             ..showSnackBar(SnackBar(
               content: const Row(
                 children: [
-                  Icon(Icons.flashlight_on_rounded, color: ClearBridgeColors.gold, size: 18),
+                  Icon(Icons.flashlight_on_rounded, color: CaptureColors.gold, size: 18),
                   SizedBox(width: 10),
                   Expanded(
                     child: Text(
                       'Flash ready — fires automatically on each capture',
-                      style: TextStyle(color: ClearBridgeColors.silverBright, fontSize: 13),
+                      style: TextStyle(color: CaptureColors.silverBright, fontSize: 13),
                     ),
                   ),
                 ],
               ),
-              backgroundColor: ClearBridgeColors.steel,
+              backgroundColor: CaptureColors.steel,
               duration: const Duration(seconds: 3),
               behavior: SnackBarBehavior.floating,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
@@ -163,9 +186,9 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     }
     if (!_ready) {
       return const Scaffold(
-        backgroundColor: ClearBridgeColors.void_,
+        backgroundColor: CaptureColors.void_,
         body: Center(
-          child: CircularProgressIndicator(color: ClearBridgeColors.cyan),
+          child: CircularProgressIndicator(color: CaptureColors.cyan),
         ),
       );
     }
@@ -178,7 +201,7 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     );
 
     return Scaffold(
-      backgroundColor: ClearBridgeColors.void_,
+      backgroundColor: CaptureColors.void_,
       body: LayoutBuilder(
         builder: (context, constraints) {
           final previewSize = constraints.biggest;
@@ -372,19 +395,19 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                           padding: const EdgeInsets.symmetric(
                               horizontal: 18, vertical: 9),
                           decoration: BoxDecoration(
-                            color: ClearBridgeColors.success
+                            color: CaptureColors.success
                                 .withValues(alpha: 0.15),
                             borderRadius: BorderRadius.circular(24),
                             border: Border.all(
-                              color: ClearBridgeColors.success
+                              color: CaptureColors.success
                                   .withValues(alpha: 0.40),
                             ),
                           ),
                           child: Text(
                             'Last angle!',
-                            style: ClearBridgeTypography.label.copyWith(
+                            style: CaptureTypography.label.copyWith(
                               fontSize: 15,
-                              color: ClearBridgeColors.success,
+                              color: CaptureColors.success,
                               fontWeight: FontWeight.w700,
                             ),
                           ),
@@ -406,13 +429,13 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                       Text(
                         'Place your thumb in front of the camera',
                         textAlign: TextAlign.center,
-                        style: ClearBridgeTypography.body.copyWith(
+                        style: CaptureTypography.body.copyWith(
                           fontSize: 14,
-                          color: ClearBridgeColors.silverBright,
+                          color: CaptureColors.silverBright,
                         ),
                       ),
                       const SizedBox(height: 20),
-                      CbButton(
+                      CaptureButton(
                         label: 'Start Capture',
                         leadingIcon: Icons.camera_alt_rounded,
                         onPressed: _onStart,
@@ -428,18 +451,18 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const CircularProgressIndicator(
-                          color: ClearBridgeColors.cyan),
+                          color: CaptureColors.cyan),
                       const SizedBox(height: 16),
                       Text(
                         'Calibrating…',
                         style:
-                            ClearBridgeTypography.h2.copyWith(fontSize: 17),
+                            CaptureTypography.h2.copyWith(fontSize: 17),
                       ),
                       const SizedBox(height: 6),
                       Text(
                         'Hold your thumb flat, pad facing the camera',
                         textAlign: TextAlign.center,
-                        style: ClearBridgeTypography.body
+                        style: CaptureTypography.body
                             .copyWith(fontSize: 13),
                       ),
                     ],
@@ -458,16 +481,16 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                       Text(
                         'Preparing camera...',
                         textAlign: TextAlign.center,
-                        style: ClearBridgeTypography.label.copyWith(
+                        style: CaptureTypography.label.copyWith(
                           fontSize: 13,
-                          color: ClearBridgeColors.silverBright,
+                          color: CaptureColors.silverBright,
                         ),
                       ),
                       const SizedBox(height: 8),
                       const LinearProgressIndicator(
-                        backgroundColor: ClearBridgeColors.steelMuted,
+                        backgroundColor: CaptureColors.steelMuted,
                         valueColor: AlwaysStoppedAnimation<Color>(
-                            ClearBridgeColors.cyan),
+                            CaptureColors.cyan),
                       ),
                     ],
                   ),
@@ -480,12 +503,12 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       const CircularProgressIndicator(
-                          color: ClearBridgeColors.cyan),
+                          color: CaptureColors.cyan),
                       const SizedBox(height: 16),
                       Text(
                         'Uploading…',
-                        style: ClearBridgeTypography.body.copyWith(
-                          color: ClearBridgeColors.silverBright,
+                        style: CaptureTypography.body.copyWith(
+                          color: CaptureColors.silverBright,
                           fontSize: 14,
                         ),
                       ),
@@ -524,7 +547,7 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                 child: GestureDetector(
                   onTap: _close,
                   child: const Icon(Icons.arrow_back_ios,
-                      color: ClearBridgeColors.silverBright, size: 22),
+                      color: CaptureColors.silverBright, size: 22),
                 ),
               ),
 
@@ -626,14 +649,14 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     final current = order[angleIndex].toUpperCase();
     final hasNext = angleIndex < order.length - 1;
     final next = hasNext ? order[angleIndex + 1].toUpperCase() : null;
-    final dotColor = locked ? ClearBridgeColors.success : ClearBridgeColors.cyan;
+    final dotColor = locked ? CaptureColors.success : CaptureColors.cyan;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
       decoration: BoxDecoration(
-        color: ClearBridgeColors.cardBg,
+        color: CaptureColors.cardBg,
         borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: ClearBridgeColors.cyanBorder),
+        border: Border.all(color: CaptureColors.cyanBorder),
       ),
       child: Row(
         mainAxisSize: MainAxisSize.min,
@@ -646,7 +669,7 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
           const SizedBox(width: 6),
           Text(
             current,
-            style: ClearBridgeTypography.label.copyWith(
+            style: CaptureTypography.label.copyWith(
               fontSize: 13,
               color: Colors.white,
               fontWeight: FontWeight.w600,
@@ -655,13 +678,13 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
           if (next != null) ...[
             const SizedBox(width: 8),
             const Icon(Icons.arrow_forward,
-                size: 12, color: ClearBridgeColors.silverDim),
+                size: 12, color: CaptureColors.silverDim),
             const SizedBox(width: 8),
             Text(
               next,
-              style: ClearBridgeTypography.label.copyWith(
+              style: CaptureTypography.label.copyWith(
                 fontSize: 12,
-                color: ClearBridgeColors.silverDim,
+                color: CaptureColors.silverDim,
               ),
             ),
           ],
@@ -678,14 +701,14 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     final isManualOn = s.manualFlashEnabled;
     final isActive = isAutoNight || isManualOn;
 
-    final iconColor = isActive ? ClearBridgeColors.gold : ClearBridgeColors.silverDim;
+    final iconColor = isActive ? CaptureColors.gold : CaptureColors.silverDim;
     final pillBg = isActive
-        ? ClearBridgeColors.gold.withValues(alpha: 0.15)
-        : ClearBridgeColors.cardBg;
+        ? CaptureColors.gold.withValues(alpha: 0.15)
+        : CaptureColors.cardBg;
     final pillBorder = isActive
-        ? ClearBridgeColors.gold.withValues(alpha: 0.45)
-        : ClearBridgeColors.silverDim.withValues(alpha: 0.28);
-    final pillTextColor = isActive ? ClearBridgeColors.gold : ClearBridgeColors.silverDim;
+        ? CaptureColors.gold.withValues(alpha: 0.45)
+        : CaptureColors.silverDim.withValues(alpha: 0.28);
+    final pillTextColor = isActive ? CaptureColors.gold : CaptureColors.silverDim;
     final pillLabel = isActive ? 'FLASH AUTO' : 'FLASH';
 
     final pill = Container(
@@ -695,12 +718,12 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
         borderRadius: BorderRadius.circular(5),
         border: Border.all(color: pillBorder),
         boxShadow: isActive
-            ? [BoxShadow(color: ClearBridgeColors.gold.withValues(alpha: 0.18), blurRadius: 6)]
+            ? [BoxShadow(color: CaptureColors.gold.withValues(alpha: 0.18), blurRadius: 6)]
             : null,
       ),
       child: Text(
         pillLabel,
-        style: ClearBridgeTypography.label.copyWith(
+        style: CaptureTypography.label.copyWith(
           fontSize: 9,
           color: pillTextColor,
           fontWeight: FontWeight.w800,
@@ -734,7 +757,7 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
   Widget _cameraLayer() {
     final cam = _camera;
     if (cam == null || !cam.value.isInitialized) {
-      return const ColoredBox(color: ClearBridgeColors.void_);
+      return const ColoredBox(color: CaptureColors.void_);
     }
     final preview = cam.value.previewSize;
     // previewSize is reported in sensor (landscape) orientation; swap for the
@@ -754,24 +777,24 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
 
   Widget _errorOverlay(String message) {
     return Container(
-      color: ClearBridgeColors.void_.withValues(alpha: 0.92),
+      color: CaptureColors.void_.withValues(alpha: 0.92),
       padding: const EdgeInsets.all(28),
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const Icon(Icons.error_outline,
-                color: ClearBridgeColors.error, size: 44),
+                color: CaptureColors.error, size: 44),
             const SizedBox(height: 14),
             Text(
               message,
               textAlign: TextAlign.center,
-              style: ClearBridgeTypography.body.copyWith(fontSize: 14),
+              style: CaptureTypography.body.copyWith(fontSize: 14),
             ),
             const SizedBox(height: 22),
-            CbButton(
+            CaptureButton(
               label: 'Back',
-              variant: CbButtonVariant.ghost,
+              variant: CaptureButtonVariant.ghost,
               onPressed: _close,
             ),
           ],
@@ -782,7 +805,7 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
 
   Widget _errorScaffold(String message) {
     return Scaffold(
-      backgroundColor: ClearBridgeColors.void_,
+      backgroundColor: CaptureColors.void_,
       body: SafeArea(child: _errorOverlay('Camera error: $message')),
     );
   }

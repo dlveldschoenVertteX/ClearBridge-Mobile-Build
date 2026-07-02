@@ -1,9 +1,10 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'package:mac_capture/mac_capture.dart';
+
 import 'package:clearbridge/fingerprint_frame_upload_service.dart';
 import 'connectivity_service.dart';
-import 'offline_capture_queue.dart';
 
 enum SyncState { idle, syncing }
 

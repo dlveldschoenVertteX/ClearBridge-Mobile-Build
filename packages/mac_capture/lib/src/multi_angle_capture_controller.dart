@@ -2,7 +2,6 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
-import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
@@ -10,12 +9,12 @@ import 'package:just_audio/just_audio.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
-import 'package:clearbridge/offline_capture_queue.dart';
-import 'package:clearbridge/capture_axis_controller.dart';
-import 'package:clearbridge/multi_angle_capture.dart';
+import 'offline_capture_queue.dart';
+import 'capture_axis_controller.dart';
+import 'capture_uploader.dart';
+import 'multi_angle_capture.dart';
 import 'adaptive_flash_controller.dart';
 import 'device_orientation_service.dart';
-import 'fingerprint_frame_upload_service.dart';
 import 'frame_capture_service.dart';
 import 'hand_types.dart';
 import 'thumb_angle_service.dart';
@@ -172,7 +171,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
 
   CameraController? _camera;
   AdaptiveFlashController? _flash;
-  FingerprintFrameUploadService? _upload;
+  CaptureUploader? _upload;
   ThumbLandmarkerService? _plugin;
   String? _userId;
   int _sensorOrientation = 0;
@@ -293,7 +292,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   /// User tapped Start: bring up flash + the live stream and begin detection.
   Future<void> startCaptureSequence({
     required CameraController camera,
-    required FingerprintFrameUploadService uploadService,
+    required CaptureUploader uploadService,
     required String userId,
     required int sensorOrientation,
   }) async {
@@ -1232,12 +1231,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
   }
 
   bool _isNetworkError(Object e) {
-    if (e is FirebaseException) {
-      return e.code == 'unavailable' ||
-          e.code == 'deadline-exceeded' ||
-          e.code == 'network-request-failed' ||
-          (e.message?.toLowerCase().contains('network') ?? false);
-    }
+    // CaptureUploader implementations should throw CaptureNetworkException
+    // for retryable network failures (e.g. wrapping backend-specific error
+    // codes this package has no knowledge of). The string heuristic below is
+    // a fallback for uploaders that don't.
+    if (e is CaptureNetworkException) return true;
     final msg = e.toString().toLowerCase();
     return msg.contains('network') ||
         msg.contains('socketexception') ||

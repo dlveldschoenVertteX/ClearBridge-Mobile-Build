@@ -1,0 +1,32 @@
+name: mac_capture
+description: >
+  Standalone MAC3D (Multi-Angle Capture) fingerprint capture flow — camera
+  control, quality gating, TFLite thumb/hand detection, guidance UI, and the
+  capture state machine. Decoupled from any specific backend: the host app
+  supplies upload/auth/navigation behavior via the CaptureUploader interface
+  and constructor callbacks on MacCaptureScreen.
+publish_to: "none"
+version: 0.1.0
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_riverpod: ^2.6.1
+  camera: ^0.11.4
+  tflite_flutter: ^0.12.1
+  sensors_plus: ^4.0.2
+  just_audio: ^0.9.41
+  uuid: ^4.5.3
+  path_provider: ^2.1.5
+  shared_preferences: ^2.3.0
+  google_fonts: ^6.2.1
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:

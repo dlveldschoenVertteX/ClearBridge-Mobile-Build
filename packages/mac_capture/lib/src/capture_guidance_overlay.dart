@@ -2,8 +2,8 @@ import 'dart:math' as math;
 
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/clearbridge_typography.dart';
+import 'capture_colors.dart';
+import 'capture_typography.dart';
 
 /// Plain-text guidance overlay shown below the capture circle during capture.
 /// Shows the current axis guidance message with a 150ms crossfade.
@@ -22,8 +22,8 @@ class CaptureGuidanceOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final textColor = isAllGreen
-        ? ClearBridgeColors.success
-        : ClearBridgeColors.silverBright;
+        ? CaptureColors.success
+        : CaptureColors.silverBright;
 
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 150),
@@ -33,7 +33,7 @@ class CaptureGuidanceOverlay extends StatelessWidget {
         message,
         key: ValueKey(message),
         textAlign: TextAlign.center,
-        style: ClearBridgeTypography.body.copyWith(
+        style: CaptureTypography.body.copyWith(
           fontSize: 16,
           fontWeight: FontWeight.w500,
           color: textColor,
@@ -72,10 +72,10 @@ class RotationProgressArc extends StatelessWidget {
     final Color arcColor;
     if (locked) {
       fraction = (axisGreenFrames / 5.0).clamp(0.0, 1.0);
-      arcColor = ClearBridgeColors.success;
+      arcColor = CaptureColors.success;
     } else {
       fraction = ((30.0 - distanceToTarget) / 25.0).clamp(0.0, 1.0);
-      arcColor = ClearBridgeColors.cyan;
+      arcColor = CaptureColors.cyan;
     }
     if (fraction <= 0) return const SizedBox.shrink();
     return SizedBox(

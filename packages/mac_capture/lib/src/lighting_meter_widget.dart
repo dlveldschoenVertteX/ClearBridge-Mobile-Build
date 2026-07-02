@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
+import 'capture_colors.dart';
 
 // Placeholder reconstruction — see cb_primary_button.dart header comment.
 // value is 0.0-1.0 normalized brightness (see HybridCaptureService.meanLuma).
@@ -14,10 +14,10 @@ class LightingMeterWidget extends StatelessWidget {
   Widget build(BuildContext context) {
     final v = value.clamp(0.0, 1.0);
     final color = v < 0.3
-        ? ClearBridgeColors.warning
+        ? CaptureColors.warning
         : v > 0.85
-            ? ClearBridgeColors.warning
-            : ClearBridgeColors.success;
+            ? CaptureColors.warning
+            : CaptureColors.success;
     return SizedBox(
       width: 10,
       height: 120,

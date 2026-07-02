@@ -2,8 +2,8 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/clearbridge_typography.dart';
+import 'capture_colors.dart';
+import 'capture_typography.dart';
 
 enum _DistanceZone { tooClose, perfect, approaching, tooFar }
 
@@ -83,7 +83,7 @@ class _DistanceGuidanceWidgetState extends State<DistanceGuidanceWidget> {
         child: _pill(
           icon: Icons.check_circle_outline,
           text: 'Perfect distance',
-          color: ClearBridgeColors.success,
+          color: CaptureColors.success,
         ),
       );
     }
@@ -92,7 +92,7 @@ class _DistanceGuidanceWidgetState extends State<DistanceGuidanceWidget> {
       return _pill(
         icon: Icons.arrow_upward,
         text: 'Move further back',
-        color: ClearBridgeColors.warning,
+        color: CaptureColors.warning,
       );
     }
 
@@ -100,7 +100,7 @@ class _DistanceGuidanceWidgetState extends State<DistanceGuidanceWidget> {
       return _pill(
         icon: Icons.arrow_downward,
         text: 'Getting closer — keep going',
-        color: ClearBridgeColors.cyan,
+        color: CaptureColors.cyan,
       );
     }
 
@@ -108,7 +108,7 @@ class _DistanceGuidanceWidgetState extends State<DistanceGuidanceWidget> {
     return _pill(
       icon: Icons.arrow_downward,
       text: 'Move much closer to camera',
-      color: ClearBridgeColors.warning,
+      color: CaptureColors.warning,
     );
   }
 
@@ -120,7 +120,7 @@ class _DistanceGuidanceWidgetState extends State<DistanceGuidanceWidget> {
         const SizedBox(width: 4),
         Text(
           text,
-          style: ClearBridgeTypography.label.copyWith(
+          style: CaptureTypography.label.copyWith(
             fontSize: 13,
             color: color,
             fontWeight: FontWeight.w600,

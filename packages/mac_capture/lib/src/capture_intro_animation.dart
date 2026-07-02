@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 
-import 'package:clearbridge/clearbridge_colors.dart';
+import 'capture_colors.dart';
 
 // Placeholder reconstruction — see cb_primary_button.dart header comment.
 //
@@ -61,7 +61,7 @@ class _CaptureIntroAnimationState extends State<CaptureIntroAnimation>
               child: Icon(
                 Icons.fingerprint,
                 size: 96,
-                color: ClearBridgeColors.cyan,
+                color: CaptureColors.cyan,
               ),
             ),
           ),

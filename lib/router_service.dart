@@ -3,7 +3,11 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:mac_capture/mac_capture.dart';
+
 import 'package:clearbridge/app_constants.dart';
+import 'package:clearbridge/fingerprint_frame_upload_service.dart';
 import 'package:clearbridge/splash_screen.dart';
 import 'package:clearbridge/phone_login_screen.dart';
 import 'package:clearbridge/otp_verification_screen.dart';
@@ -17,7 +21,6 @@ import 'package:clearbridge/history_screen.dart';
 import 'package:clearbridge/pdf_viewer_screen.dart';
 import 'package:clearbridge/service_tier_screen.dart';
 import 'package:clearbridge/personal_details_screen.dart';
-import 'package:clearbridge/mac_capture_screen.dart';
 import 'package:clearbridge/popia_consent_screen.dart';
 import 'package:clearbridge/popia_consent_screen.dart' as capture_popia;
 import 'package:clearbridge/capture_result_screen.dart';
@@ -45,6 +48,30 @@ import 'package:clearbridge/pipeline_health_screen.dart';
 import 'package:clearbridge/clearcoin_reward_screen.dart';
 import 'package:clearbridge/email_action_screen.dart';
 part 'router_service.g.dart';
+
+/// Wires the standalone mac_capture package's MacCaptureScreen up to this
+/// app's Firebase auth, Firestore-backed uploader, and go_router navigation
+/// -- the package itself has no dependency on any of the three.
+Widget _macCaptureScreen(BuildContext context) {
+  return MacCaptureScreen(
+    uploader: const FingerprintFrameUploadService(),
+    getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+    onRequireLogin: () => context.go(AppConstants.loginRoute),
+    onComplete: (captureId) =>
+        context.go('/capture/result', extra: captureId),
+    onQueued: (captureId) => context.go('/capture/result', extra: {
+      'captureId': captureId,
+      'queued': true,
+    }),
+    onClose: () {
+      if (context.canPop()) {
+        context.pop();
+      } else {
+        context.go(AppConstants.dashboardRoute);
+      }
+    },
+  );
+}
 
 @riverpod
 GoRouter router(Ref ref) {
@@ -279,12 +306,12 @@ GoRouter router(Ref ref) {
       ),
       GoRoute(
         path: AppConstants.fingerprintRoute,
-        builder: (context, state) => const MacCaptureScreen(),
+        builder: (context, state) => _macCaptureScreen(context),
       ),
       GoRoute(
         path: AppConstants.continuousCaptureRoute,
         name: 'continuousCapture',
-        builder: (context, state) => const MacCaptureScreen(),
+        builder: (context, state) => _macCaptureScreen(context),
       ),
       GoRoute(
         path: '/capture/result',

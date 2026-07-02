@@ -3,9 +3,10 @@ import 'dart:math' as math;
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
+import 'package:mac_capture/mac_capture.dart';
+
 import 'package:clearbridge/app_constants.dart';
 import 'package:clearbridge/clearbridge_colors.dart';
-import 'package:clearbridge/capture_intro_animation.dart';
 
 /// In-app port of the MAC3D Capture Guide HTML document.
 ///

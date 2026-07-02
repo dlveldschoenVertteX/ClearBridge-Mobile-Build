@@ -6,7 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
-import 'package:clearbridge/multi_angle_capture.dart';
+import 'multi_angle_capture.dart';
 
 const _kQueueKey = 'cb_offline_capture_queue';
 const _kMaxRetries = 5;
