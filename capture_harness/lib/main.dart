@@ -27,7 +27,7 @@ class CaptureHarnessApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'MAC3D Capture Harness',
+      title: 'ClearBridge Beta',
       scaffoldMessengerKey: _scaffoldMessengerKey,
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: Colors.teal),
       // Splash -> straight into the capture flow. No intermediate
