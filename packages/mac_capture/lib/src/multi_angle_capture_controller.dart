@@ -5,12 +5,11 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:just_audio/just_audio.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 import 'offline_capture_queue.dart';
-import 'angle_audio_guidance_service.dart';
+import 'capture_audio_service.dart';
 import 'capture_axis_controller.dart';
 import 'capture_uploader.dart';
 import 'multi_angle_capture.dart';
@@ -163,8 +162,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   final _thumbAngle = ThumbAngleService.instance;
   final _hybrid = HybridCaptureService();
   final _axisController = CaptureAxisController();
-  final _successPlayer = AudioPlayer();
-  final _audioGuidance = AngleAudioGuidanceService();
+  final _captureAudio = CaptureAudioService();
   final _orientation = DeviceOrientationService();
 
   /// Live device orientation relative to the front-pose reference. Step 1
@@ -241,14 +239,6 @@ class MultiAngleCaptureController extends ChangeNotifier {
   // Smooth retry: counts consecutive burst exceptions; escalates to error after 3.
   int _retryCount = 0;
 
-  // CV orientation classifier is advisory-only (see _classifyThrottled) --
-  // running it every other detect cycle instead of every cycle roughly halves
-  // its inference cost without materially affecting responsiveness, since a
-  // confident/correct prediction only ever speeds up a lock that IMU alone
-  // would eventually allow anyway.
-  int _cvCallCounter = 0;
-  OrientationPrediction? _lastCvPrediction;
-
   DateTime? _lastHandDetectedAt;
 
   // Last known thumb bounding box (normalized 0-1 Rect) for thumb-ROI focus scoring.
@@ -284,7 +274,15 @@ class MultiAngleCaptureController extends ChangeNotifier {
   // primary signal. Below this threshold (or on a different/no prediction),
   // fall back to the IMU distance check exactly as before, so a low-confidence
   // or wrong CV prediction never blocks a capture the IMU alone would allow.
-  static const _cvConfidenceThreshold = 0.6;
+  //
+  // Lowered from 0.6: 'top' (roll axis) was firing inconsistently -- the roll
+  // target requires an awkward phone tilt to hit on IMU alone, and users were
+  // bending their thumb down to find a reachable pose instead of orbiting the
+  // phone. The classifier scores confidently (very high scores in practice)
+  // when it's actually looking at 'top', so trusting it at a lower bar lets
+  // capture fire correctly however the user is holding the phone (up or
+  // down), without needing the exact roll angle IMU alone would require.
+  static const _cvConfidenceThreshold = 0.45;
 
   static const _qualityOnlyRequired = 5;
   static const _qualityOnlyGyroMax = 0.10;
@@ -345,20 +343,13 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _latestBrightness = 0.0;
     _latestFocusNorm = 0.0;
     _axisController.reset();
-    _audioGuidance.stop();
-    _cvCallCounter = 0;
-    _lastCvPrediction = null;
+    _captureAudio.silence();
     _smoothedAngle = 0.0;
     _smoothAngleInitialized = false;
     _retryCount = 0;
     _focusPeak = 1.0;
 
-    unawaited(
-      _successPlayer
-          .setAsset('assets/audio/capture_success.wav')
-          .catchError((_) => null),
-    );
-    unawaited(_audioGuidance.preload());
+    unawaited(_captureAudio.init());
 
     // Begin streaming device orientation; the reference is zeroed at the front
     // pose in _finalizeCalibration.
@@ -406,19 +397,6 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // Same fire-and-forget init pattern; classify() returns null until ready,
     // which cvConfirms already treats as "no CV signal, IMU decides alone".
     _orientationClassifier = ThumbOrientationClassifier()..initialize();
-  }
-
-  /// Runs the CV orientation classifier every other call, reusing the
-  /// previous prediction on skipped cycles (thumb orientation doesn't change
-  /// meaningfully within one ~90ms detect interval). See _cvCallCounter.
-  OrientationPrediction? _classifyThrottled(CameraImage image) {
-    final classifier = _orientationClassifier;
-    if (classifier == null) return null;
-    _cvCallCounter++;
-    if (_cvCallCounter.isOdd) {
-      _lastCvPrediction = classifier.classify(image, _sensorOrientation);
-    }
-    return _lastCvPrediction;
   }
 
   // ── Stream processing ──────────────────────────────────────────────────────
@@ -770,7 +748,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
           distanceToTarget: 180.0,
           landmarks: const <Landmark>[],
         );
-        _audioGuidance.updateDistance(180.0);
+        _captureAudio.updateGuidanceTone(null);
         // Quality-only fallback: thumb may be too close for MediaPipe to see
         // the full hand. Fire on image quality alone when thumb fills the frame.
         _checkQualityOnlyCapture(image);
@@ -813,7 +791,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // the model is sure, and IMU-only (unchanged) otherwise. cvConfirms can
     // only ever bring the thumb closer to firing, never block a capture the
     // IMU alone would already have allowed -- see _cvConfidenceThreshold.
-    final cvPrediction = _classifyThrottled(image);
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
     final cvConfirms = cvPrediction != null &&
         cvPrediction.angleName == name &&
         cvPrediction.confidence >= _cvConfidenceThreshold;
@@ -853,7 +831,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
       guidanceMessage: guidanceMsg,
       axisGreenFrames: axisResult.consecutiveGreenFrames,
     );
-    _audioGuidance.updateDistance(effectiveDistance);
+    _captureAudio.updateGuidanceTone(effectiveDistance);
 
     // Transition detection is about genuine physical movement away from the
     // last captured angle -- always IMU-driven (raw distance), independent
@@ -904,7 +882,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // exactly the range the orientation classifier was trained for and the
     // hand-landmark angle extraction can't handle. Without this, quality-only
     // captures were purely IMU-driven with zero visual orientation check.
-    final cvPrediction = _classifyThrottled(image);
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
     final cvConfirms = cvPrediction != null &&
         cvPrediction.angleName == name &&
         cvPrediction.confidence >= _cvConfidenceThreshold;
@@ -913,11 +891,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
     if (effectiveOrbitDistance > _lockFireDeg) {
       _state = _state.copyWith(
           guidanceMessage: _rotationMessage(name, effectiveOrbitDistance));
-      _audioGuidance.updateDistance(effectiveOrbitDistance);
+      _captureAudio.updateGuidanceTone(effectiveOrbitDistance);
       _qualityOnlyStreak = 0;
       return;
     }
-    _audioGuidance.updateDistance(effectiveOrbitDistance);
+    _captureAudio.updateGuidanceTone(effectiveOrbitDistance);
 
     final flashOn = _state.flashOn;
     final qualityOk = _gyroMagnitude <= _qualityOnlyGyroMax &&
@@ -993,7 +971,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   Future<void> _fireAngleCapture() async {
     if (_busy) return;
     _busy = true;
-    _audioGuidance.stop();
+    _captureAudio.silence();
     final index = _state.currentAngleIndex;
     final name = ThumbAngleService.order[index];
     debugPrint('AXIS_GATE[$name]: focus=${_latestFocusNorm.toStringAsFixed(2)} '
@@ -1100,7 +1078,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
         await Future<void>.delayed(const Duration(milliseconds: 120));
         HapticFeedback.heavyImpact();
       }
-      unawaited(_playSuccessSound());
+      unawaited(_captureAudio.playAngleSuccess(
+        isFinal: index == ThumbAngleService.order.length - 1,
+      ));
       _retryCount = 0;
 
       _set(_state.copyWith(
@@ -1365,13 +1345,6 @@ class MultiAngleCaptureController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _playSuccessSound() async {
-    try {
-      await _successPlayer.seek(Duration.zero);
-      await _successPlayer.play();
-    } catch (_) {}
-  }
-
   void _fail(String message) {
     unawaited(_flash?.deactivate());
     unawaited(_stopStream());
@@ -1418,8 +1391,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _hybrid.reset();
     _plugin?.dispose();
     _orientationClassifier?.dispose();
-    unawaited(_successPlayer.dispose());
-    _audioGuidance.dispose();
+    _captureAudio.dispose();
     _orientation.dispose();
     super.dispose();
   }

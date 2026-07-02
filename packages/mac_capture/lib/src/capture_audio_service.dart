@@ -12,7 +12,10 @@ import 'package:path_provider/path_provider.dart';
 ///   • Proximity guidance: pitch + tempo rise as angle closes in on target,
 ///     like a parking sensor. Four zones (far→lock) each backed by a
 ///     pre-generated WAV file where the silence padding bakes in the loop
-///     period — LoopMode.one provides gapless, timer-free repetition.
+///     period — LoopMode.one provides gapless, timer-free repetition (no
+///     manual Timer.periodic rescheduling, so a zone flickering back and
+///     forth near a boundary can never starve playback the way a
+///     cancel-and-restart timer would).
 class CaptureAudioService {
   final _successPlayer = AudioPlayer();
   final _finalPlayer   = AudioPlayer();

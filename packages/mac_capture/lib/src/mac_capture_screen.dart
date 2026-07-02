@@ -86,12 +86,13 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     try {
       await _cameraService.initializeCamera(
         lensDirection: CameraLensDirection.back,
-        // 1920x1080 per the camera-system spec. ResolutionPreset.max requests
-        // the sensor's full resolution (4K+ on many devices), which means
-        // every frame's Laplacian scoring and TFLite hand detection runs on
-        // 4x+ the pixel count for no quality benefit -- the backend NFIQ
-        // pipeline works from the same-sized JPEGs regardless.
-        resolution: ResolutionPreset.veryHigh,
+        // Full sensor resolution: the backend SFM/NFIQ pipeline works from raw
+        // Y-plane frames (not downscaled JPEGs), so more source detail
+        // directly improves reconstruction and NFIQ score. This costs more
+        // per-frame CPU in the live preprocessing loop (Laplacian scoring,
+        // TFLite hand detection) than the previous 1080p cap -- if that
+        // becomes a smoothness problem worth trading back, revisit here.
+        resolution: ResolutionPreset.max,
       );
       if (!mounted) return;
       _sensorOrientation = _cameraService.selectedCamera?.sensorOrientation ?? 0;
