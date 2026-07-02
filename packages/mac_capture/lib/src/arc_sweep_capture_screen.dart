@@ -9,6 +9,7 @@ import 'arc_sweep_capture_controller.dart';
 import 'camera_service.dart';
 import 'capture_button.dart';
 import 'capture_colors.dart';
+import 'capture_guidance_overlay.dart';
 import 'capture_intro_animation.dart';
 import 'capture_typography.dart';
 import 'capture_vignette_overlay.dart';
@@ -199,6 +200,7 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                       pathFraction: s.pathFraction,
                       binsFilledCount: s.binsFilledCount,
                       filledBinMask: s.filledBinMask,
+                      distanceToTargetDeg: s.distanceToTargetDeg,
                       phase: s.phase,
                     );
                   },
@@ -460,13 +462,19 @@ class _ArcProgressWidget extends StatelessWidget {
     required this.pathFraction,
     required this.binsFilledCount,
     required this.filledBinMask,
+    required this.distanceToTargetDeg,
     required this.phase,
   });
 
   final double pathFraction;
   final int binsFilledCount;
   final int filledBinMask;
+  final double distanceToTargetDeg;
   final ArcSweepPhase phase;
+
+  // Same lock threshold as the 4-angle flow's distanceToTarget <= 5 check —
+  // keeps the "counts down to zero" behaviour identical between both modes.
+  static const _lockThresholdDeg = 5.0;
 
   @override
   Widget build(BuildContext context) {
@@ -487,7 +495,18 @@ class _ArcProgressWidget extends StatelessWidget {
             ),
           ),
         ),
-        const SizedBox(height: 16),
+        // Same "count down to zero" readout as the 4-angle flow's
+        // AngleDegreeText — users don't need to know the target checkpoint's
+        // actual degree value, just to drive this number to 0° and stop.
+        if (isActive)
+          Padding(
+            padding: const EdgeInsets.only(top: 8),
+            child: AngleDegreeText(
+              distanceToTarget: distanceToTargetDeg,
+              isLocked: distanceToTargetDeg <= _lockThresholdDeg,
+            ),
+          ),
+        const SizedBox(height: 12),
         Text(
           isActive ? '$pct% covered' : 'Position thumb in centre',
           style: CaptureTypography.label.copyWith(

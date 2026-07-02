@@ -46,6 +46,11 @@ class ArcSweepState {
   final ArcSweepPhase phase;
   final double pathFraction;    // 0.0-1.0 overall progress along front→left→top→right
   final int activeLegIndex;     // 0=front→left, 1=left→top, 2=top→right, -1=idle
+  // Degrees from the current phone orientation to the checkpoint at the end
+  // of the active leg (LEFT/TOP/RIGHT) — converges to 0 exactly when the
+  // phone reaches that checkpoint, mirroring AngleDegreeText's countdown in
+  // the 4-angle flow so users have the same "drive it to zero" cue here.
+  final double distanceToTargetDeg;
   final int binsFilledCount;    // how many path bins have a qualifying frame
   final int filledBinMask;      // bitmask of which of the 18 path bins are filled
   final bool tooFast;           // phone turning too fast to bin — show "slow down"
@@ -61,6 +66,7 @@ class ArcSweepState {
     this.phase = ArcSweepPhase.idle,
     this.pathFraction = 0.0,
     this.activeLegIndex = -1,
+    this.distanceToTargetDeg = 0.0,
     this.binsFilledCount = 0,
     this.filledBinMask = 0,
     this.tooFast = false,
@@ -77,6 +83,7 @@ class ArcSweepState {
     ArcSweepPhase? phase,
     double? pathFraction,
     int? activeLegIndex,
+    double? distanceToTargetDeg,
     int? binsFilledCount,
     int? filledBinMask,
     bool? tooFast,
@@ -92,6 +99,7 @@ class ArcSweepState {
         phase: phase ?? this.phase,
         pathFraction: pathFraction ?? this.pathFraction,
         activeLegIndex: activeLegIndex ?? this.activeLegIndex,
+        distanceToTargetDeg: distanceToTargetDeg ?? this.distanceToTargetDeg,
         binsFilledCount: binsFilledCount ?? this.binsFilledCount,
         filledBinMask: filledBinMask ?? this.filledBinMask,
         tooFast: tooFast ?? this.tooFast,
@@ -363,6 +371,13 @@ class ArcSweepCaptureController extends ChangeNotifier {
   void _emitMeters(double lighting, double focus) {
     final now = DateTime.now();
     final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
+    // Straight-line distance from the current orientation to the checkpoint
+    // at the end of the active leg — this is what AngleDegreeText counts
+    // down to 0 with, exactly like the 4-angle flow's distanceToTarget.
+    final target = _legs[proj.legIndex];
+    final dp = _sweepPitchDeg - target.p1;
+    final dr = _sweepRollDeg - target.r1;
+    final distanceToTarget = math.sqrt(dp * dp + dr * dr);
     var mask = 0;
     for (final k in _bestPerBin.keys) {
       if (k >= 0 && k < _totalBins) mask |= (1 << k);
@@ -374,6 +389,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
       flashIntensity: _flash?.intensity ?? 0.0,
       pathFraction: (proj.legIndex + proj.t) / _legs.length,
       activeLegIndex: proj.legIndex,
+      distanceToTargetDeg: distanceToTarget,
       binsFilledCount: _bestPerBin.length,
       filledBinMask: mask,
       tooFast: _sweepActive && _gyroMagnitude > _maxSweepSpeedRadPerSec,
