@@ -31,6 +31,8 @@ export 'src/offline_capture_queue.dart'
 export 'src/thumb_angle_service.dart' show ThumbAngleService;
 export 'src/hand_types.dart';
 export 'src/thumb_landmarker_service.dart' show ThumbLandmarkerService;
+export 'src/thumb_orientation_classifier.dart'
+    show ThumbOrientationClassifier, OrientationPrediction;
 
 export 'src/camera_service.dart' show CameraService;
 export 'src/adaptive_flash_controller.dart' show AdaptiveFlashController;

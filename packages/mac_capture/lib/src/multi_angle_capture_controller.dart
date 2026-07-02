@@ -19,6 +19,7 @@ import 'frame_capture_service.dart';
 import 'hand_types.dart';
 import 'thumb_angle_service.dart';
 import 'thumb_landmarker_service.dart';
+import 'thumb_orientation_classifier.dart';
 
 const _uuid = Uuid();
 
@@ -173,6 +174,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   AdaptiveFlashController? _flash;
   CaptureUploader? _upload;
   ThumbLandmarkerService? _plugin;
+  ThumbOrientationClassifier? _orientationClassifier;
   String? _userId;
   int _sensorOrientation = 0;
 
@@ -265,6 +267,14 @@ class MultiAngleCaptureController extends ChangeNotifier {
   // preserve the green streak in the converging band between.
   static const _lockFireDeg = 12.0;
   static const _lockResetDeg = 18.0;
+
+  // Hybrid CV+IMU gate: when the orientation classifier's top prediction
+  // matches the current target angle at or above this confidence, treat the
+  // orientation as confirmed regardless of the IMU distance -- CV becomes the
+  // primary signal. Below this threshold (or on a different/no prediction),
+  // fall back to the IMU distance check exactly as before, so a low-confidence
+  // or wrong CV prediction never blocks a capture the IMU alone would allow.
+  static const _cvConfidenceThreshold = 0.6;
 
   static const _qualityOnlyRequired = 5;
   static const _qualityOnlyGyroMax = 0.10;
@@ -379,6 +389,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // stays not-ready (detect() returns []) until initialization completes,
     // which _detectAndDrive/_runCalibration already handle as "no hand yet".
     _plugin = ThumbLandmarkerService()..initialize();
+    // Same fire-and-forget init pattern; classify() returns null until ready,
+    // which cvConfirms already treats as "no CV signal, IMU decides alone".
+    _orientationClassifier = ThumbOrientationClassifier()..initialize();
   }
 
   // ── Stream processing ──────────────────────────────────────────────────────
@@ -732,7 +745,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
         );
         // Quality-only fallback: thumb may be too close for MediaPipe to see
         // the full hand. Fire on image quality alone when thumb fills the frame.
-        _checkQualityOnlyCapture();
+        _checkQualityOnlyCapture(image);
       }
       return;
     }
@@ -767,6 +780,17 @@ class MultiAngleCaptureController extends ChangeNotifier {
     }
     final distance = _thumbAngle.distanceToTarget(_smoothedAngle, target);
 
+    // Hybrid CV+IMU gate: a confident, correct CV prediction overrides the
+    // IMU distance to "locked" (0°) so orientation lock is CV-primary when
+    // the model is sure, and IMU-only (unchanged) otherwise. cvConfirms can
+    // only ever bring the thumb closer to firing, never block a capture the
+    // IMU alone would already have allowed -- see _cvConfidenceThreshold.
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvConfirms = cvPrediction != null &&
+        cvPrediction.angleName == name &&
+        cvPrediction.confidence >= _cvConfidenceThreshold;
+    final effectiveDistance = cvConfirms ? 0.0 : distance;
+
     // Hand height in frame (wrist→middle fingertip) as a distance proxy:
     // smaller value = farther away, larger value = too close.
     final wrist    = hands.first.landmarks[0];
@@ -789,21 +813,24 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // Show rotation direction+magnitude while the thumb hasn't reached the fire
     // threshold. Quality-gate messages only matter once the angle is close enough
     // to capture — showing them while far just confuses the user about why nothing fires.
-    final guidanceMsg = distance > _lockFireDeg
-        ? _rotationMessage(name, distance)
+    final guidanceMsg = effectiveDistance > _lockFireDeg
+        ? _rotationMessage(name, effectiveDistance)
         : axisResult.message;
 
     _state = _state.copyWith(
       thumbAngleDegrees: _smoothedAngle,
-      distanceToTarget: distance,
+      distanceToTarget: effectiveDistance,
       thumbCoverageRatio: coverage,
       landmarks: hands.first.landmarks,
       guidanceMessage: guidanceMsg,
       axisGreenFrames: axisResult.consecutiveGreenFrames,
     );
 
+    // Transition detection is about genuine physical movement away from the
+    // last captured angle -- always IMU-driven (raw distance), independent
+    // of whether CV currently confirms the *new* target.
     _checkTransition(_smoothedAngle, distance);
-    _checkLock(distance, axisResult);
+    _checkLock(effectiveDistance, axisResult);
   }
 
   // ── Lock + transition logic ─────────────────────────────────────────────────
@@ -832,7 +859,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   //   (a) _smoothedAngle retains the OLD axis value after an index advance
   //       (left=pitch−20° → top=roll−20°: stale pitch matches roll target → 0°)
   //   (b) the 30° window was wide enough to fire on natural device tilt alone.
-  void _checkQualityOnlyCapture() {
+  void _checkQualityOnlyCapture(CameraImage image) {
     if (_busy) return;
 
     // Gate on the live orbit reading for the current angle's axis. This is the
@@ -843,8 +870,20 @@ class MultiAngleCaptureController extends ChangeNotifier {
     final orbitLive     = _orbitAngle(orient, ThumbAngleService.axis[name]!);
     final orbitDistance = _thumbAngle.distanceToTarget(orbitLive, target);
 
-    if (orbitDistance > _lockFireDeg) {
-      _state = _state.copyWith(guidanceMessage: _rotationMessage(name, orbitDistance));
+    // Hybrid CV+IMU gate, same rationale as _detectAndDrive: this path only
+    // runs when MediaPipe can't see a full hand (thumb too close), which is
+    // exactly the range the orientation classifier was trained for and the
+    // hand-landmark angle extraction can't handle. Without this, quality-only
+    // captures were purely IMU-driven with zero visual orientation check.
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvConfirms = cvPrediction != null &&
+        cvPrediction.angleName == name &&
+        cvPrediction.confidence >= _cvConfidenceThreshold;
+    final effectiveOrbitDistance = cvConfirms ? 0.0 : orbitDistance;
+
+    if (effectiveOrbitDistance > _lockFireDeg) {
+      _state = _state.copyWith(
+          guidanceMessage: _rotationMessage(name, effectiveOrbitDistance));
       _qualityOnlyStreak = 0;
       return;
     }
@@ -1341,6 +1380,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     unawaited(_stopStream());
     _hybrid.reset();
     _plugin?.dispose();
+    _orientationClassifier?.dispose();
     unawaited(_successPlayer.dispose());
     _orientation.dispose();
     super.dispose();
