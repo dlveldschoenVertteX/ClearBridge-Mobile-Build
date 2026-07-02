@@ -301,12 +301,25 @@ class HybridCaptureService {
       ..sort((a, b) => b.score.compareTo(a.score));
     _window.clear();
 
+    // Reject anything below the same "good" bar used for the early-exit
+    // check above -- previously the burst returned its top-scoring frames
+    // unconditionally, so an angle that's physically harder to hold steady
+    // (faster/awkward orbit -> motion blur) could still fire and upload a
+    // blurry capture as long as SOME frame scored better than the others in
+    // that window, even if none were actually sharp. _fireAngleCapture
+    // already treats an empty return as "nothing usable — reset and let the
+    // user re-hold"; this makes that path also cover "the whole burst was
+    // too blurry", not just "no candidates were collected at all".
+    final qualifying =
+        candidates.where((c) => c.score >= _minBurstQuality).toList();
+    if (qualifying.isEmpty) return const [];
+
     // Compute shortest-arc angular error once (same for all frames in burst).
     final double? angularError = targetAngleDegrees != null
         ? _shortestArc(thumbAngleDegrees, targetAngleDegrees)
         : null;
 
-    return candidates.take(keep).map((c) {
+    return qualifying.take(keep).map((c) {
       return TaggedFrame(
         bytes: c.bytes,
         timestamp: c.timestamp,
