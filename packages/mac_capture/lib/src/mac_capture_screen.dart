@@ -13,6 +13,7 @@ import 'thumb_angle_service.dart';
 import 'angle_progress_circles.dart';
 import 'capture_guidance_overlay.dart';
 import 'capture_intro_animation.dart';
+import 'capture_vignette_overlay.dart';
 import 'distance_guidance_widget.dart';
 import 'focus_meter_widget.dart';
 import 'haptic_guidance_circle.dart';
@@ -221,6 +222,19 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
               Positioned.fill(
                 child: RepaintBoundary(child: _cameraLayer()),
               ),
+
+              // Layer 1a: vignette — smoothly fades the background to black
+              // so only the centred thumb region is visible, both as a
+              // framing cue for the user and to visually reinforce keeping
+              // busy backgrounds out of the shot. Shown whenever the guide
+              // circle itself would be shown.
+              if (phase == CapturePhase.capturing ||
+                  phase == CapturePhase.angleComplete ||
+                  phase == CapturePhase.awaitingStart ||
+                  phase == CapturePhase.calibrating)
+                const Positioned.fill(
+                  child: RepaintBoundary(child: CaptureVignetteOverlay()),
+                ),
 
               // Layer 1b: spatial anchors — Consumer subscribes per-frame during
               // active capture; RepaintBoundary isolates ripple animations.
