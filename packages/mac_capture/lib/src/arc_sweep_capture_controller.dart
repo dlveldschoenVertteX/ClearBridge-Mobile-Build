@@ -2,6 +2,8 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
+import 'dart:ui' as ui;
+import 'dart:ui' show Rect;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -12,6 +14,7 @@ import 'package:sensors_plus/sensors_plus.dart';
 import 'adaptive_flash_controller.dart';
 import 'arc_capture_uploader.dart';
 import 'frame_capture_service.dart';
+import 'thumb_landmarker_service.dart';
 
 enum ArcSweepPhase {
   idle,
@@ -54,6 +57,13 @@ class ArcSweepState {
   final int binsFilledCount;    // how many path bins have a qualifying frame
   final int filledBinMask;      // bitmask of which of the 18 path bins are filled
   final bool tooFast;           // phone turning too fast to bin — show "slow down"
+  // Thumb-coverage gate (same 0.35–0.85 window as the 4-angle flow). tooFar =
+  // thumb too small in frame (move closer); tooClose = filling too much
+  // (move back). Both false when coverage is in range or detection is stale.
+  final bool tooFar;
+  final bool tooClose;
+  final double thumbCoverageRatio;
+  final bool refocusing;        // per-leg AF re-run in progress — binning paused
   final double lightingValue;   // 0.0-1.0 EMA
   final double focusValue;      // 0.0-1.0 EMA
   final bool flashOn;
@@ -70,6 +80,10 @@ class ArcSweepState {
     this.binsFilledCount = 0,
     this.filledBinMask = 0,
     this.tooFast = false,
+    this.tooFar = false,
+    this.tooClose = false,
+    this.thumbCoverageRatio = 0.0,
+    this.refocusing = false,
     this.lightingValue = 0.0,
     this.focusValue = 0.0,
     this.flashOn = false,
@@ -87,6 +101,10 @@ class ArcSweepState {
     int? binsFilledCount,
     int? filledBinMask,
     bool? tooFast,
+    bool? tooFar,
+    bool? tooClose,
+    double? thumbCoverageRatio,
+    bool? refocusing,
     double? lightingValue,
     double? focusValue,
     bool? flashOn,
@@ -103,6 +121,10 @@ class ArcSweepState {
         binsFilledCount: binsFilledCount ?? this.binsFilledCount,
         filledBinMask: filledBinMask ?? this.filledBinMask,
         tooFast: tooFast ?? this.tooFast,
+        tooFar: tooFar ?? this.tooFar,
+        tooClose: tooClose ?? this.tooClose,
+        thumbCoverageRatio: thumbCoverageRatio ?? this.thumbCoverageRatio,
+        refocusing: refocusing ?? this.refocusing,
         lightingValue: lightingValue ?? this.lightingValue,
         focusValue: focusValue ?? this.focusValue,
         flashOn: flashOn ?? this.flashOn,
@@ -131,9 +153,21 @@ class ArcSweepState {
 /// i.e. once the user has actually swept through all three legs, not just
 /// racked up 18 bins' worth of dithering on one.
 ///
-/// Frames only bin while the phone is turning slowly (a gyro speed gate) — a
-/// fast, blurry, poorly-registered sweep fills nothing, which is what stops
-/// testers blasting straight through instead of sweeping deliberately.
+/// Capture-quality machinery (mirrors the 4-angle flow):
+///  * Focus/brightness scoring restricted to a centre ROI so a sharp
+///    background can't outscore a slightly-soft thumb.
+///  * Thumb-coverage gate via the TFLite hand landmarker (0.35–0.85 window,
+///    fail-open when detection is stale so a model failure can't brick capture).
+///  * Uploaded frames are centre-cropped from the Y plane with stride handled,
+///    and carry imageWidth/imageHeight/bytesPerRow in frameMetadata — the same
+///    raw-luma decode contract as the 4-angle path.
+///  * Torch alternation during the sweep retains the best ambient AND best
+///    torch-lit frame per bin so the backend has fusion material.
+///  * AF re-runs at each leg transition (binning pauses during the hunt).
+///  * EV steps down when the thumb ROI approaches blow-out, instead of
+///    discarding glared frames after the fact.
+///  * A full-resolution still (takePicture) fires as each checkpoint locks,
+///    decoded to raw luma client-side so it rides the same upload contract.
 class ArcSweepCaptureController extends ChangeNotifier {
   ArcSweepCaptureController();
 
@@ -179,6 +213,39 @@ class ArcSweepCaptureController extends ChangeNotifier {
   static const _focusStabilityRatio = 0.15;
   static const _focusMinAbsolute = 15.0;
 
+  // ── Quality-capture constants ────────────────────────────────────────────
+  // Tight centre ROI for focus/brightness *scoring* — the guidance UI centres
+  // the thumb here, so judging sharpness on this window (instead of the whole
+  // frame) stops a crisp background from outscoring a soft thumb.
+  static const _scoreRoi = Rect.fromLTRB(0.30, 0.30, 0.70, 0.70);
+  // Looser ROI for the *upload* crop: generous margin around a centred thumb
+  // so the backend's segmentation still has context, while cutting well over
+  // half the background pixels (better ridge-resolution per uploaded byte).
+  static const _uploadRoi = Rect.fromLTRB(0.18, 0.15, 0.82, 0.85);
+  // Same coverage window the 4-angle screen gates on (thumb fills 35–85%).
+  static const _coverageMin = 0.35;
+  static const _coverageMax = 0.85;
+  // Landmark detection cadence (frames) and staleness horizon. Detection is
+  // ~tens of ms of CPU; the 4-angle flow runs it far more often, so this is
+  // conservative. Past the horizon the gate fails OPEN — a landmarker failure
+  // must never brick the arc capture.
+  static const _landmarkEveryNFrames = 6;
+  static const _coverageStaleMs = 2000;
+  // Torch alternation period while sweeping (normal mode only) — yields both
+  // ambient and torch-lit frames per bin for backend Mertens-style fusion.
+  static const _torchAlternateMs = 600;
+  // Glare guard: EV steps down when ambient ROI luma exceeds the high mark,
+  // restores when it falls below the low mark. Values chosen against
+  // _mapBrightnessScore, which zeroes frames above 220 — prevention > rejection.
+  static const _glareHighLuma = 205.0;
+  static const _glareLowLuma = 165.0;
+  static const _glareEvStep = -0.7;
+  // Still capture: fires once per leg when the checkpoint locks (same ≤5°
+  // threshold as the 4-angle lock). Decoded at this max width to bound the
+  // transient RGBA buffer (~2048×1536×4 ≈ 12.6 MB) on low-end devices.
+  static const _stillLockThresholdDeg = 5.0;
+  static const _stillDecodeTargetWidth = 2048;
+
   // ── State ─────────────────────────────────────────────────────────────────
   CameraController? _camera;
   AdaptiveFlashController? _flash;
@@ -201,6 +268,15 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   final _hybrid = HybridCaptureService();
 
+  // Thumb landmarker (coverage gate). Initialized once per controller —
+  // ThumbLandmarkerService.initialize() is async and loads a TFLite model.
+  final _landmarker = ThumbLandmarkerService();
+  bool _landmarkerInitStarted = false;
+  int _sensorOrientation = 0;
+  int _frameCounter = 0;
+  double _lastCoverage = 0.0;
+  DateTime? _lastCoverageAt;
+
   // Quaternion orientation tracker (unit quaternion in device frame)
   double _qw = 1.0, _qx = 0.0, _qy = 0.0, _qz = 0.0;
   // Reference quaternion captured at sweep start
@@ -215,8 +291,26 @@ class ArcSweepCaptureController extends ChangeNotifier {
   double _sweepRollDeg = 0.0;
   DateTime? _lastGyroAt;
 
-  // Frame bins: global bin id (leg * _binsPerLeg + binInLeg) → best frame so far
-  final Map<int, _BinFrame> _bestPerBin = {};
+  // Frame bins, split by illumination so the backend gets fusion material:
+  // global bin id (leg * _binsPerLeg + binInLeg) → best frame of that type.
+  final Map<int, _BinFrame> _bestAmbientPerBin = {};
+  final Map<int, _BinFrame> _bestFlashPerBin = {};
+
+  // Full-resolution checkpoint stills (one per leg, opportunistic).
+  final List<_StillFrame> _stills = [];
+  final Set<int> _stillCapturedLegs = {};
+  bool _takingStill = false;
+
+  // Torch alternation + glare guard.
+  DateTime? _lastTorchToggleAt;
+  double _lastStableBrightness = 128.0;
+  double _appliedEvOffset = 0.0;
+  bool _evChangeInFlight = false;
+
+  // Per-leg refocus. Tracks the furthest leg reached (not the current one)
+  // so projection flapping at a checkpoint corner can't re-trigger AF.
+  int _maxLegReached = -1;
+  bool _refocusing = false;
 
   // Calibration
   DateTime? _calibStart;
@@ -251,8 +345,18 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _upload = uploadService;
     _userId = userId;
     _flash = AdaptiveFlashController(camera);
+    _sensorOrientation = camera.description.sensorOrientation;
 
-    _bestPerBin.clear();
+    if (!_landmarkerInitStarted) {
+      _landmarkerInitStarted = true;
+      _landmarker.initialize();
+    }
+
+    _bestAmbientPerBin.clear();
+    _bestFlashPerBin.clear();
+    _stills.clear();
+    _stillCapturedLegs.clear();
+    _takingStill = false;
     _brightnessSamples.clear();
     _rawFocusHistory.clear();
     _gyroHistory.clear();
@@ -268,6 +372,20 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _complete = false;
     _calibStart = null;
     _focusPeak = 1.0;
+    _frameCounter = 0;
+    _lastCoverage = 0.0;
+    _lastCoverageAt = null;
+    _lastTorchToggleAt = null;
+    _lastStableBrightness = 128.0;
+    _appliedEvOffset = 0.0;
+    _evChangeInFlight = false;
+    _maxLegReached = -1;
+    _refocusing = false;
+
+    // Neutral EV baseline — the glare guard applies offsets relative to this.
+    try {
+      await camera.setExposureOffset(0.0);
+    } catch (_) {}
 
     _gyroSub?.cancel();
     _gyroSub = gyroscopeEventStream().listen((e) {
@@ -346,9 +464,16 @@ class ArcSweepCaptureController extends ChangeNotifier {
     final phase = _state.phase;
     if (phase != ArcSweepPhase.calibrating && phase != ArcSweepPhase.sweeping) return;
 
-    final brightness = HybridCaptureService.meanLuma(image);
+    _frameCounter++;
+
+    // Brightness measured on the scoring ROI (not the whole frame) so the
+    // meters and quality scores reflect the thumb, not the background.
+    final brightness =
+        HybridCaptureService.meanLuma(image, roi: _scoreRoi);
+    if (!(_flash?.isFlashOn ?? false)) _lastStableBrightness = brightness;
     final lightingNorm = (brightness / 255.0).clamp(0.0, 1.0);
-    final rawFocus = _hybrid.offerFrame(image);
+    // Sharpness scored on the same centre ROI.
+    final rawFocus = _hybrid.offerFrame(image, thumbRoi: _scoreRoi);
     if (rawFocus > _focusPeak) _focusPeak = rawFocus;
     _focusPeak *= 0.999;
     final focusNorm = (rawFocus / (_focusPeak + 1e-6)).clamp(0.0, 1.0);
@@ -358,19 +483,36 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _rawFocusHistory.add(rawFocus);
     if (_rawFocusHistory.length > _focusHistoryLen) _rawFocusHistory.removeAt(0);
 
+    // Thumb-coverage detection at reduced cadence (same model + formula as
+    // the 4-angle flow: coverage = |thumbTip.y − wrist.y| in landmark space).
+    if (_frameCounter % _landmarkEveryNFrames == 0 && _landmarker.isReady) {
+      final hands = _landmarker.detect(image, _sensorOrientation);
+      if (hands.isNotEmpty && hands.first.landmarks.length > 4) {
+        final lms = hands.first.landmarks;
+        _lastCoverage = (lms[4].y - lms[0].y).abs().clamp(0.0, 1.0);
+        _lastCoverageAt = DateTime.now();
+      }
+    }
+
+    final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
+
     if (phase == ArcSweepPhase.calibrating) {
       _brightnessSamples.add(brightness);
       _runCalibration(rawFocus);
     } else if (_sweepActive && !_complete) {
-      _binFrame(image, rawFocus, brightness);
+      _maybeToggleTorch();
+      _maybeAdjustExposure();
+      _maybeRefocusForLeg(proj.legIndex);
+      _maybeCaptureStill(proj.legIndex);
+      _binFrame(image, rawFocus, brightness, proj);
     }
 
-    _emitMeters(lighting, focus);
+    _emitMeters(lighting, focus, proj);
   }
 
-  void _emitMeters(double lighting, double focus) {
+  void _emitMeters(double lighting, double focus,
+      ({int legIndex, double t, double distDeg}) proj) {
     final now = DateTime.now();
-    final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
     // Straight-line distance from the current orientation to the checkpoint
     // at the end of the active leg — this is what AngleDegreeText counts
     // down to 0 with, exactly like the 4-angle flow's distanceToTarget.
@@ -379,9 +521,11 @@ class ArcSweepCaptureController extends ChangeNotifier {
     final dr = _sweepRollDeg - target.r1;
     final distanceToTarget = math.sqrt(dp * dp + dr * dr);
     var mask = 0;
-    for (final k in _bestPerBin.keys) {
-      if (k >= 0 && k < _totalBins) mask |= (1 << k);
+    for (var b = 0; b < _totalBins; b++) {
+      if (_binFilled(b)) mask |= (1 << b);
     }
+    final coverageFresh = _lastCoverageAt != null &&
+        now.difference(_lastCoverageAt!).inMilliseconds < _coverageStaleMs;
     final next = _state.copyWith(
       lightingValue: lighting,
       focusValue: focus,
@@ -390,9 +534,13 @@ class ArcSweepCaptureController extends ChangeNotifier {
       pathFraction: (proj.legIndex + proj.t) / _legs.length,
       activeLegIndex: proj.legIndex,
       distanceToTargetDeg: distanceToTarget,
-      binsFilledCount: _bestPerBin.length,
+      binsFilledCount: _filledBinCount(),
       filledBinMask: mask,
       tooFast: _sweepActive && _gyroMagnitude > _maxSweepSpeedRadPerSec,
+      tooFar: _sweepActive && coverageFresh && _lastCoverage < _coverageMin,
+      tooClose: _sweepActive && coverageFresh && _lastCoverage > _coverageMax,
+      thumbCoverageRatio: _lastCoverage,
+      refocusing: _refocusing,
     );
     if (_lastEmitAt == null ||
         now.difference(_lastEmitAt!).inMilliseconds >= _emitThrottleMs) {
@@ -449,8 +597,14 @@ class ArcSweepCaptureController extends ChangeNotifier {
     // the camera moves from face-on to side-on views of the finger.
     unawaited(_lockFocusOnly());
 
-    // Torch on for the entire sweep if the scene is dark.
-    _flash?.activate();
+    // Torch policy: in bright ambient (isNeeded == false) the torch degrades
+    // ridge contrast — leave it off. Otherwise start torch-on; the sweep-time
+    // alternation in _maybeToggleTorch takes over from here (except pitch
+    // dark, where the torch is the only light source and stays on).
+    if (_flash?.isNeeded ?? false) {
+      _flash?.activate();
+    }
+    _lastTorchToggleAt = DateTime.now();
 
     _q0Captured = false; // reference will be captured on first gyro event
     _sweepActive = true;
@@ -461,6 +615,187 @@ class ArcSweepCaptureController extends ChangeNotifier {
       binsFilledCount: 0,
       filledBinMask: 0,
     ));
+  }
+
+  // ── Torch alternation / exposure guard / per-leg refocus ──────────────────
+
+  /// Alternates the torch while sweeping so bins collect both an ambient and
+  /// a torch-lit frame — the same fl/amb pairing the 4-angle flow gives the
+  /// backend for Mertens fusion. Skipped in pitch dark (torch is the sole
+  /// light source; deactivate() is a no-op there anyway) and in bright mode
+  /// (torch never activated). Paused while a still is in flight so the
+  /// checkpoint still isn't captured mid-lighting-change.
+  void _maybeToggleTorch() {
+    final flash = _flash;
+    if (flash == null || !flash.isNeeded || flash.isPitchDark) return;
+    if (_takingStill) return;
+    final now = DateTime.now();
+    if (_lastTorchToggleAt != null &&
+        now.difference(_lastTorchToggleAt!).inMilliseconds < _torchAlternateMs) {
+      return;
+    }
+    _lastTorchToggleAt = now;
+    if (flash.isFlashOn) {
+      unawaited(flash.deactivate());
+    } else {
+      unawaited(flash.activate());
+    }
+  }
+
+  /// Steps EV down when the ambient-measured thumb ROI approaches blow-out
+  /// (glare kills ridge contrast and _mapBrightnessScore would zero those
+  /// frames anyway) and restores it once the reading falls back. Uses only
+  /// torch-off readings so torch light can't trigger a spurious pull-down.
+  void _maybeAdjustExposure() {
+    if (_evChangeInFlight) return;
+    final c = _camera;
+    if (c == null || !c.value.isInitialized) return;
+    double? target;
+    if (_lastStableBrightness > _glareHighLuma && _appliedEvOffset == 0.0) {
+      target = _glareEvStep;
+    } else if (_lastStableBrightness < _glareLowLuma && _appliedEvOffset != 0.0) {
+      target = 0.0;
+    }
+    if (target == null) return;
+    _evChangeInFlight = true;
+    final t = target;
+    () async {
+      try {
+        final minEv = await c.getMinExposureOffset();
+        final maxEv = await c.getMaxExposureOffset();
+        await c.setExposureOffset(t.clamp(minEv, maxEv));
+        _appliedEvOffset = t;
+      } catch (_) {
+        // Device doesn't support EV offsets — leave the guard disarmed.
+        _appliedEvOffset = t; // don't retry every frame
+      } finally {
+        _evChangeInFlight = false;
+      }
+    }();
+  }
+
+  /// Re-runs autofocus when the sweep first crosses into a new leg. Focus was
+  /// locked at the front pose during calibration; users pivot the phone in
+  /// place rather than orbiting perfectly, so lens-to-thumb distance drifts
+  /// across legs and the locked focus goes soft at the edges. Binning pauses
+  /// (via [_refocusing]) while the lens hunts. Only a *forward* leg advance
+  /// triggers AF — the projection flaps between adjacent legs right at a
+  /// checkpoint corner, and re-triggering there would stall binning.
+  void _maybeRefocusForLeg(int legIndex) {
+    if (legIndex <= _maxLegReached) return;
+    final first = _maxLegReached == -1;
+    _maxLegReached = legIndex;
+    if (first || _refocusing) return; // initial leg uses the calibration lock
+    _refocusing = true;
+    () async {
+      try {
+        await _beginAutofocus();
+        await Future<void>.delayed(const Duration(milliseconds: 350));
+        await _lockFocusOnly();
+      } catch (_) {
+      } finally {
+        _refocusing = false;
+      }
+    }();
+  }
+
+  // ── Checkpoint stills ──────────────────────────────────────────────────────
+
+  /// Fires a full-resolution still capture the first time each leg's
+  /// checkpoint locks (≤5° — same threshold as the 4-angle angle lock).
+  /// Stills come from the ISP's still pipeline (multi-frame NR, proper
+  /// sharpening, full sensor resolution) rather than the preview stream, and
+  /// are decoded to raw luma client-side so they ride the exact same
+  /// raw-Y-plane upload contract as stream frames. Failures are swallowed:
+  /// stills are opportunistic bonus material, never a capture dependency.
+  void _maybeCaptureStill(int legIndex) {
+    if (_takingStill || _stillCapturedLegs.contains(legIndex)) return;
+    final target = _legs[legIndex];
+    final dp = _sweepPitchDeg - target.p1;
+    final dr = _sweepRollDeg - target.r1;
+    if (math.sqrt(dp * dp + dr * dr) > _stillLockThresholdDeg) return;
+    final c = _camera;
+    if (c == null || !c.value.isInitialized) return;
+
+    _takingStill = true;
+    _stillCapturedLegs.add(legIndex);
+    final pitchAtCapture = _sweepPitchDeg;
+    final rollAtCapture = _sweepRollDeg;
+    () async {
+      try {
+        final xfile = await c.takePicture();
+        final jpeg = await xfile.readAsBytes();
+        final luma = await _decodeJpegToBufferLuma(jpeg);
+        if (luma != null && !_disposed) {
+          _stills.add(_StillFrame(
+            bytes: luma.bytes,
+            width: luma.width,
+            height: luma.height,
+            pitchDeg: pitchAtCapture,
+            rollDeg: rollAtCapture,
+            legIndex: legIndex,
+            timestamp: DateTime.now(),
+            flashOn: _flash?.isFlashOn ?? false,
+            flashIntensity: _flash?.intensity ?? 0.0,
+          ));
+          HapticFeedback.lightImpact();
+        }
+      } catch (e) {
+        debugPrint('[arc] checkpoint still failed (non-blocking): $e');
+      } finally {
+        _takingStill = false;
+      }
+    }();
+  }
+
+  /// Decodes a JPEG still to a raw luma buffer in the SAME orientation as the
+  /// preview-stream Y planes, so the backend sees a consistent set of frames.
+  ///
+  /// The stream buffer is in sensor (landscape) orientation; takePicture JPEGs
+  /// decode EXIF-upright (portrait on a 90°/270° sensor). For those sensors
+  /// the upright image is rotated 90° CW back into buffer orientation —
+  /// the inverse of ThumbLandmarkerService's buffer→upright CCW rotation.
+  Future<({Uint8List bytes, int width, int height})?> _decodeJpegToBufferLuma(
+      Uint8List jpeg) async {
+    final codec = await ui.instantiateImageCodec(
+      jpeg,
+      targetWidth: _stillDecodeTargetWidth,
+    );
+    final frame = await codec.getNextFrame();
+    codec.dispose();
+    final image = frame.image;
+    try {
+      final byteData =
+          await image.toByteData(format: ui.ImageByteFormat.rawRgba);
+      if (byteData == null) return null;
+      final rgba = byteData.buffer.asUint8List();
+      final w = image.width;
+      final h = image.height;
+
+      // RGBA → luma (BT.601 integer approximation).
+      final luma = Uint8List(w * h);
+      for (var i = 0, p = 0; i < luma.length; i++, p += 4) {
+        luma[i] =
+            (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
+      }
+
+      if (_sensorOrientation == 90 || _sensorOrientation == 270) {
+        // Rotate 90° CW: dst is h wide × w tall; dst(x,y) = src(y, h-1-x).
+        final rotated = Uint8List(w * h);
+        final dstW = h;
+        final dstH = w;
+        for (var y = 0; y < dstH; y++) {
+          final srcCol = y;
+          for (var x = 0; x < dstW; x++) {
+            rotated[y * dstW + x] = luma[(h - 1 - x) * w + srcCol];
+          }
+        }
+        return (bytes: rotated, width: dstW, height: dstH);
+      }
+      return (bytes: luma, width: w, height: h);
+    } finally {
+      image.dispose();
+    }
   }
 
   // ── Path projection ─────────────────────────────────────────────────────────
@@ -499,35 +834,67 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   // ── Frame binning ──────────────────────────────────────────────────────────
 
-  void _binFrame(CameraImage image, double sharpness, double brightness) {
+  bool _binFilled(int bin) =>
+      _bestAmbientPerBin.containsKey(bin) || _bestFlashPerBin.containsKey(bin);
+
+  int _filledBinCount() {
+    var n = 0;
+    for (var b = 0; b < _totalBins; b++) {
+      if (_binFilled(b)) n++;
+    }
+    return n;
+  }
+
+  void _binFrame(CameraImage image, double sharpness, double brightness,
+      ({int legIndex, double t, double distDeg}) proj) {
     // Slow-motion gate: only accept frames while the phone is turning gently.
     // A fast turn is both motion-blurred and poorly registered, and lets a
     // tester rush the sweep — rejecting those frames is what enforces the
     // deliberate pace the arc is supposed to have.
     if (_gyroMagnitude > _maxSweepSpeedRadPerSec) return;
 
-    final proj = _projectToPath(_sweepPitchDeg, _sweepRollDeg);
+    // No binning while the lens is hunting between legs.
+    if (_refocusing) return;
+
+    // Thumb-coverage gate (fail-open on stale/absent detection): frames where
+    // the thumb is too small or overflowing the frame don't count, same
+    // 0.35–0.85 window the 4-angle screen enforces.
+    final covAt = _lastCoverageAt;
+    if (covAt != null &&
+        DateTime.now().difference(covAt).inMilliseconds < _coverageStaleMs &&
+        (_lastCoverage < _coverageMin || _lastCoverage > _coverageMax)) {
+      return;
+    }
+
     if (proj.distDeg > _offPathThresholdDeg) return;
 
     final binInLeg = (proj.t * _binsPerLeg).floor().clamp(0, _binsPerLeg - 1);
     final bin = proj.legIndex * _binsPerLeg + binInLeg;
 
-    final brightnessScore = _mapBrightnessScore(brightness);
+    // Score with the stable (torch-off) brightness during torch-lit frames so
+    // torch light can't inflate a frame's score — same trick as the 4-angle
+    // burst path (_lastStableBrightness).
+    final flashOn = _flash?.isFlashOn ?? false;
+    final scoredBrightness = flashOn ? _lastStableBrightness : brightness;
+    final brightnessScore = _mapBrightnessScore(scoredBrightness);
     final score = sharpness * 0.6 + brightnessScore * 0.4;
     if (score < 0.05) return; // discard near-black / severely-blurred frames
 
-    final existing = _bestPerBin[bin];
+    final bins = flashOn ? _bestFlashPerBin : _bestAmbientPerBin;
+    final existing = bins[bin];
     if (existing == null || score > existing.score) {
-      final bytes = _extractBytes(image);
-      if (bytes != null) {
-        _bestPerBin[bin] = _BinFrame(
-          bytes: bytes,
+      final crop = _extractRoiBytes(image);
+      if (crop != null) {
+        bins[bin] = _BinFrame(
+          bytes: crop.bytes,
+          width: crop.width,
+          height: crop.height,
           score: score,
           sharpness: sharpness,
           pitchDeg: _sweepPitchDeg,
           rollDeg: _sweepRollDeg,
           timestamp: DateTime.now(),
-          flashOn: _flash?.isFlashOn ?? false,
+          flashOn: flashOn,
           flashIntensity: _flash?.intensity ?? 0.0,
         );
       }
@@ -544,7 +911,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
       var count = 0;
       final base = leg * _binsPerLeg;
       for (var b = base; b < base + _binsPerLeg; b++) {
-        if (_bestPerBin.containsKey(b)) count++;
+        if (_binFilled(b)) count++;
       }
       if (count < _minBinsPerLegToComplete) return false;
     }
@@ -556,6 +923,13 @@ class ArcSweepCaptureController extends ChangeNotifier {
   Future<void> _finishAndUpload() async {
     _sweepActive = false;
     _flash?.deactivate();
+    // Restore neutral EV for whatever uses the camera next.
+    final cam = _camera;
+    if (cam != null && cam.value.isInitialized && _appliedEvOffset != 0.0) {
+      try {
+        await cam.setExposureOffset(0.0);
+      } catch (_) {}
+    }
     _set(_state.copyWith(phase: ArcSweepPhase.uploading, uploadProgress: 0.0));
     await _stopStream();
 
@@ -564,27 +938,83 @@ class ArcSweepCaptureController extends ChangeNotifier {
     if (upload == null || userId == null) return;
 
     try {
-      final sortedBins = _bestPerBin.entries.toList()
-        ..sort((a, b) => a.key.compareTo(b.key));
+      // Assemble: per-bin frames (ambient first, then torch-lit) in bin
+      // order, then the checkpoint stills. Stills are tagged onto their
+      // leg's final bin so filenames stay within the frame_{N}_arc_{bin}
+      // contract; 'still': true in metadata distinguishes them.
+      final frameBytes = <Uint8List>[];
+      final arcAngles = <double>[];
+      final frameMetadata = <Map<String, dynamic>>[];
 
-      final frameBytes = sortedBins.map((e) => e.value.bytes).toList();
-      // arcAngles carries pitch — the dominant axis for legs 0/2 and the
-      // continuation point for leg 1 — for backend compatibility with the
-      // existing single-angle-per-frame contract. Full pitch+roll travels in
-      // frameMetadata for anything that wants the true 2-axis position.
-      final arcAngles = sortedBins.map((e) => e.value.pitchDeg).toList();
-      final frameMetadata = sortedBins
-          .map((e) => <String, dynamic>{
-                'pitchDeg': e.value.pitchDeg,
-                'rollDeg': e.value.rollDeg,
-                'binIndex': e.key,
-                'legIndex': e.key ~/ _binsPerLeg,
-                'laplacianScore': e.value.sharpness,
-                'flashOn': e.value.flashOn,
-                'flashIntensity': e.value.flashIntensity,
-                'timestamp': e.value.timestamp.toIso8601String(),
-              })
-          .toList();
+      void addEntry({
+        required Uint8List bytes,
+        required int width,
+        required int height,
+        required int bin,
+        required double pitch,
+        required double roll,
+        required bool flashOn,
+        required double flashIntensity,
+        required DateTime timestamp,
+        double? laplacianScore,
+        bool still = false,
+      }) {
+        frameBytes.add(bytes);
+        arcAngles.add(pitch);
+        frameMetadata.add(<String, dynamic>{
+          'pitchDeg': pitch,
+          'rollDeg': roll,
+          'binIndex': bin,
+          'legIndex': bin ~/ _binsPerLeg,
+          if (laplacianScore != null) 'laplacianScore': laplacianScore,
+          'flashOn': flashOn,
+          'flashIntensity': flashIntensity,
+          'still': still,
+          'thumbCoverageRatio':
+              double.parse(_lastCoverage.toStringAsFixed(3)),
+          'evOffsetApplied': _appliedEvOffset,
+          'timestamp': timestamp.toIso8601String(),
+          // Raw Y-plane geometry — same decode contract as the 4-angle path:
+          //   np.frombuffer(data, uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
+          // Crops are copied densely, so bytesPerRow == imageWidth.
+          'imageWidth': width,
+          'imageHeight': height,
+          'bytesPerRow': width,
+        });
+      }
+
+      for (var bin = 0; bin < _totalBins; bin++) {
+        for (final bins in [_bestAmbientPerBin, _bestFlashPerBin]) {
+          final f = bins[bin];
+          if (f == null) continue;
+          addEntry(
+            bytes: f.bytes,
+            width: f.width,
+            height: f.height,
+            bin: bin,
+            pitch: f.pitchDeg,
+            roll: f.rollDeg,
+            flashOn: f.flashOn,
+            flashIntensity: f.flashIntensity,
+            timestamp: f.timestamp,
+            laplacianScore: f.sharpness,
+          );
+        }
+      }
+      for (final s in _stills) {
+        addEntry(
+          bytes: s.bytes,
+          width: s.width,
+          height: s.height,
+          bin: s.legIndex * _binsPerLeg + _binsPerLeg - 1,
+          pitch: s.pitchDeg,
+          roll: s.rollDeg,
+          flashOn: s.flashOn,
+          flashIntensity: s.flashIntensity,
+          timestamp: s.timestamp,
+          still: true,
+        );
+      }
 
       HapticFeedback.heavyImpact();
 
@@ -655,10 +1085,38 @@ class ArcSweepCaptureController extends ChangeNotifier {
     return 1.0 - ((brightness - 180) / 40).clamp(0.0, 1.0);
   }
 
-  Uint8List? _extractBytes(CameraImage image) {
+  /// Copies the [_uploadRoi] centre crop out of the Y plane, row by row with
+  /// the device stride handled, into a dense buffer (bytesPerRow == width).
+  /// Cropping cuts over half the background pixels (better ridge resolution
+  /// per uploaded byte, less for backend segmentation to strip) and fixes
+  /// the stride-skew risk of uploading padded full planes verbatim.
+  ({Uint8List bytes, int width, int height})? _extractRoiBytes(
+      CameraImage image) {
     if (image.planes.isEmpty) return null;
     try {
-      return Uint8List.fromList(image.planes[0].bytes);
+      final plane = image.planes[0];
+      final bytes = plane.bytes;
+      final w = image.width;
+      final h = image.height;
+      if (w < 8 || h < 8) return null;
+      // Same defensive stride cap as HybridCaptureService: some devices
+      // report bytesPerRow > width but deliver a width×height buffer.
+      final stride =
+          h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+
+      final x0 = (_uploadRoi.left * w).floor().clamp(0, w - 2);
+      final x1 = (_uploadRoi.right * w).ceil().clamp(x0 + 1, w);
+      final y0 = (_uploadRoi.top * h).floor().clamp(0, h - 2);
+      final y1 = (_uploadRoi.bottom * h).ceil().clamp(y0 + 1, h);
+      final cw = x1 - x0;
+      final ch = y1 - y0;
+
+      final out = Uint8List(cw * ch);
+      for (var y = 0; y < ch; y++) {
+        final srcStart = (y0 + y) * stride + x0;
+        out.setRange(y * cw, (y + 1) * cw, bytes, srcStart);
+      }
+      return (bytes: out, width: cw, height: ch);
     } on RangeError {
       return null;
     }
@@ -669,6 +1127,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _disposed = true;
     _flash?.deactivate();
     _gyroSub?.cancel();
+    _landmarker.dispose();
     unawaited(_stopStream());
     super.dispose();
   }
@@ -676,6 +1135,8 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
 class _BinFrame {
   final Uint8List bytes;
+  final int width;
+  final int height;
   final double score;
   final double sharpness;
   final double pitchDeg;
@@ -686,10 +1147,36 @@ class _BinFrame {
 
   const _BinFrame({
     required this.bytes,
+    required this.width,
+    required this.height,
     required this.score,
     required this.sharpness,
     required this.pitchDeg,
     required this.rollDeg,
+    required this.timestamp,
+    required this.flashOn,
+    required this.flashIntensity,
+  });
+}
+
+class _StillFrame {
+  final Uint8List bytes;
+  final int width;
+  final int height;
+  final double pitchDeg;
+  final double rollDeg;
+  final int legIndex;
+  final DateTime timestamp;
+  final bool flashOn;
+  final double flashIntensity;
+
+  const _StillFrame({
+    required this.bytes,
+    required this.width,
+    required this.height,
+    required this.pitchDeg,
+    required this.rollDeg,
+    required this.legIndex,
     required this.timestamp,
     required this.flashOn,
     required this.flashIntensity,

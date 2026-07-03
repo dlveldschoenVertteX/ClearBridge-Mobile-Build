@@ -288,22 +288,39 @@ class _ArcSweepCaptureScreenState extends ConsumerState<ArcSweepCaptureScreen> {
                   final s = ref.watch(arcSweepCaptureControllerProvider).state;
                   final pct =
                       (s.binsFilledCount / _totalBins * 100).round().clamp(0, 100);
-                  final tooFast = s.tooFast;
                   final legLabel = (s.activeLegIndex >= 0 &&
                           s.activeLegIndex < _legLabels.length)
                       ? _legLabels[s.activeLegIndex]
                       : '';
+                  // Priority order: motion first (worst for quality), then
+                  // framing, then focus state, then plain progress.
+                  final String message;
+                  final bool warn;
+                  if (s.tooFast) {
+                    message = 'Slow down — sweep gently';
+                    warn = true;
+                  } else if (s.tooClose) {
+                    message = 'Move back — thumb overflowing frame';
+                    warn = true;
+                  } else if (s.tooFar) {
+                    message = 'Move closer — thumb too small in frame';
+                    warn = true;
+                  } else if (s.refocusing) {
+                    message = 'Refocusing — hold on…';
+                    warn = false;
+                  } else {
+                    message = '$pct% covered — tilt toward $legLabel';
+                    warn = false;
+                  }
                   return Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        tooFast
-                            ? 'Slow down — sweep gently'
-                            : '$pct% covered — tilt toward $legLabel',
+                        message,
                         textAlign: TextAlign.center,
                         style: CaptureTypography.label.copyWith(
                           fontSize: 13,
-                          color: tooFast
+                          color: warn
                               ? CaptureColors.gold
                               : CaptureColors.silverBright,
                         ),
