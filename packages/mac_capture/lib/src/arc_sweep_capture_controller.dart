@@ -312,6 +312,9 @@ class ArcSweepCaptureController extends ChangeNotifier {
   int _maxLegReached = -1;
   bool _refocusing = false;
 
+  // Active leg, as a one-way ratchet (see _projectToPath) — never regresses.
+  int _currentLegIndex = 0;
+
   // Calibration
   DateTime? _calibStart;
   final List<double> _brightnessSamples = [];
@@ -381,6 +384,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
     _evChangeInFlight = false;
     _maxLegReached = -1;
     _refocusing = false;
+    _currentLegIndex = 0;
 
     // Neutral EV baseline — the glare guard applies offsets relative to this.
     try {
@@ -683,6 +687,11 @@ class ArcSweepCaptureController extends ChangeNotifier {
   /// checkpoint corner, and re-triggering there would stall binning.
   void _maybeRefocusForLeg(int legIndex) {
     if (legIndex <= _maxLegReached) return;
+    // Defer (don't consume the leg-advance yet) while a still capture has the
+    // stream stopped — an AF call racing takePicture()'s stream stop/restart
+    // is the same class of concurrent-camera-control hazard the still-capture
+    // fix above addresses. Retried next frame; harmless to be a bit late.
+    if (_takingStill) return;
     final first = _maxLegReached == -1;
     _maxLegReached = legIndex;
     if (first || _refocusing) return; // initial leg uses the calibration lock
@@ -709,7 +718,12 @@ class ArcSweepCaptureController extends ChangeNotifier {
   /// raw-Y-plane upload contract as stream frames. Failures are swallowed:
   /// stills are opportunistic bonus material, never a capture dependency.
   void _maybeCaptureStill(int legIndex) {
-    if (_takingStill || _stillCapturedLegs.contains(legIndex)) return;
+    // _refocusing check: don't fire a still capture (which stops/restarts the
+    // stream) while an AF call from _maybeRefocusForLeg is in flight — same
+    // concurrent-camera-control hazard, guarded from the other direction.
+    if (_takingStill || _refocusing || _stillCapturedLegs.contains(legIndex)) {
+      return;
+    }
     final target = _legs[legIndex];
     final dp = _sweepPitchDeg - target.p1;
     final dr = _sweepRollDeg - target.r1;
@@ -722,7 +736,15 @@ class ArcSweepCaptureController extends ChangeNotifier {
     final pitchAtCapture = _sweepPitchDeg;
     final rollAtCapture = _sweepRollDeg;
     () async {
+      // takePicture() while an image stream is active is unreliable on
+      // Android — some vendor camera HALs never resolve the still-capture
+      // request when a repeating preview/stream request is also attached,
+      // hanging the Future indefinitely. Stopping the stream first and
+      // restarting it after is the plugin-sanctioned way to interleave a
+      // still capture with streaming.
+      final wasStreaming = _streamRunning;
       try {
+        if (wasStreaming) await _stopStream();
         final xfile = await c.takePicture();
         final jpeg = await xfile.readAsBytes();
         final luma = await _decodeJpegToBufferLuma(jpeg);
@@ -744,6 +766,14 @@ class ArcSweepCaptureController extends ChangeNotifier {
         debugPrint('[arc] checkpoint still failed (non-blocking): $e');
       } finally {
         _takingStill = false;
+        if (wasStreaming && !_disposed && _sweepActive) {
+          try {
+            await c.startImageStream(_onFrame);
+            _streamRunning = true;
+          } catch (e) {
+            debugPrint('[arc] failed to resume image stream after still: $e');
+          }
+        }
       }
     }();
   }
@@ -800,36 +830,50 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   // ── Path projection ─────────────────────────────────────────────────────────
 
-  /// Projects a (pitch, roll) sample onto the nearest point of the nearest
-  /// leg of the front→left→top→right path. Returns the leg index, the
-  /// position along that leg (0..1), and the perpendicular distance in
-  /// degrees (used as an off-path sanity gate).
+  /// Returns the phone's position relative to the ACTIVE leg of the
+  /// front→left→top→right path: the leg index, position along it (0..1),
+  /// and perpendicular distance in degrees.
+  ///
+  /// The active leg is a one-way ratchet (advances once the phone gets within
+  /// [_stillLockThresholdDeg] of the current leg's checkpoint; never
+  /// regresses) rather than a fresh "nearest of all 3 legs" search every
+  /// frame. The naive nearest-leg approach breaks under overshoot: once the
+  /// phone passes a checkpoint (e.g. pitch beyond LEFT's −32°), both the leg
+  /// just finished and the leg that should start next clamp their projection
+  /// to the SAME corner point and report the SAME distance — the tie always
+  /// resolves to the earlier leg, so continued motion just grows the "distance
+  /// to LEFT" reading instead of ever being recognised as progress toward
+  /// TOP. That is what produced the frozen "tilt toward LEFT" / stalled
+  /// coverage bug: the user visibly reached the tip while the projection
+  /// stayed pinned on leg 0. The ratchet can't get confused this way — an
+  /// overshoot just makes the countdown climb again until the user corrects
+  /// back onto the checkpoint they're actually meant to be closing in on.
   ({int legIndex, double t, double distDeg}) _projectToPath(
       double pitch, double roll) {
-    var bestLeg = 0;
-    var bestT = 0.0;
-    var bestDist = double.infinity;
-    for (var i = 0; i < _legs.length; i++) {
-      final leg = _legs[i];
-      final dx = leg.p1 - leg.p0;
-      final dy = leg.r1 - leg.r0;
-      final len2 = dx * dx + dy * dy;
-      var t = len2 == 0
-          ? 0.0
-          : (((pitch - leg.p0) * dx + (roll - leg.r0) * dy) / len2);
-      t = t.clamp(0.0, 1.0);
-      final projP = leg.p0 + t * dx;
-      final projR = leg.r0 + t * dy;
-      final dp = pitch - projP;
-      final dr = roll - projR;
-      final dist = math.sqrt(dp * dp + dr * dr);
-      if (dist < bestDist) {
-        bestDist = dist;
-        bestLeg = i;
-        bestT = t;
+    while (_currentLegIndex < _legs.length - 1) {
+      final leg = _legs[_currentLegIndex];
+      final dp = pitch - leg.p1;
+      final dr = roll - leg.r1;
+      if (math.sqrt(dp * dp + dr * dr) <= _stillLockThresholdDeg) {
+        _currentLegIndex++;
+      } else {
+        break;
       }
     }
-    return (legIndex: bestLeg, t: bestT, distDeg: bestDist);
+    final leg = _legs[_currentLegIndex];
+    final dx = leg.p1 - leg.p0;
+    final dy = leg.r1 - leg.r0;
+    final len2 = dx * dx + dy * dy;
+    var t = len2 == 0
+        ? 0.0
+        : (((pitch - leg.p0) * dx + (roll - leg.r0) * dy) / len2);
+    t = t.clamp(0.0, 1.0);
+    final projP = leg.p0 + t * dx;
+    final projR = leg.r0 + t * dy;
+    final dp = pitch - projP;
+    final dr = roll - projR;
+    final dist = math.sqrt(dp * dp + dr * dr);
+    return (legIndex: _currentLegIndex, t: t, distDeg: dist);
   }
 
   // ── Frame binning ──────────────────────────────────────────────────────────
