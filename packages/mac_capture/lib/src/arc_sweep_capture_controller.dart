@@ -261,6 +261,14 @@ class ArcSweepCaptureController extends ChangeNotifier {
 
   bool _disposed = false;
   bool _streamRunning = false;
+  // Set synchronously at the top of startCaptureSequence, before any await.
+  // _streamRunning alone isn't set until AFTER startImageStream() succeeds,
+  // which left a race window: a rapid double-tap on "Start Sweep" (or any
+  // other quick re-invocation) could see _streamRunning still false on both
+  // calls and let both race into camera.startImageStream() — the loser hits
+  // CameraException("startImageStream was called while a camera was
+  // streaming images."), a real observed on-device failure.
+  bool _starting = false;
   bool _calibrated = false;
   bool _sweepActive = false;
   bool _complete = false;
@@ -347,7 +355,8 @@ class ArcSweepCaptureController extends ChangeNotifier {
     required ArcCaptureUploader uploadService,
     required String userId,
   }) async {
-    if (_streamRunning) return;
+    if (_streamRunning || _starting) return;
+    _starting = true;
     _camera = camera;
     _upload = uploadService;
     _userId = userId;
@@ -458,10 +467,23 @@ class ArcSweepCaptureController extends ChangeNotifier {
     try {
       await _beginAutofocus();
       await Future<void>.delayed(const Duration(milliseconds: 500));
+      // Defensive: this controller talks to the raw CameraController
+      // directly rather than through CameraService, so it never got
+      // CameraService.startImageStream()'s "already streaming? stop first"
+      // guard. Check the controller's own authoritative state (not our
+      // _streamRunning flag, which only reflects what THIS controller
+      // instance did) in case a prior session left it streaming.
+      if (camera.value.isStreamingImages) {
+        try {
+          await camera.stopImageStream();
+        } catch (_) {}
+      }
       await camera.startImageStream(_onFrame);
       _streamRunning = true;
     } catch (e) {
       _fail('Could not start camera stream: $e');
+    } finally {
+      _starting = false;
     }
   }
 
