@@ -16,6 +16,7 @@ dependencies:
     sdk: flutter
   flutter_riverpod: ^2.6.1
   camera: ^0.11.4
+  image: ^4.2.0
   tflite_flutter: ^0.12.1
   sensors_plus: ^4.0.2
   just_audio: ^0.9.41

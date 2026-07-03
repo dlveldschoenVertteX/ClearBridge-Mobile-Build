@@ -9,6 +9,7 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
+import 'package:image/image.dart' as imglib;
 import 'package:sensors_plus/sensors_plus.dart';
 
 import 'adaptive_flash_controller.dart';
@@ -159,8 +160,11 @@ class ArcSweepState {
 ///  * Thumb-coverage gate via the TFLite hand landmarker (0.35–0.85 window,
 ///    fail-open when detection is stale so a model failure can't brick capture).
 ///  * Uploaded frames are centre-cropped from the Y plane with stride handled,
-///    and carry imageWidth/imageHeight/bytesPerRow in frameMetadata — the same
-///    raw-luma decode contract as the 4-angle path.
+///    then JPEG-encoded (unlike the 4-angle path, which uploads full,
+///    uncropped native-resolution raw Y-plane bytes — the backend's raw-
+///    buffer decode fallback only matches a handful of hardcoded standard
+///    camera resolutions, and a crop's dimensions never land on one of those
+///    by chance, so a real encode is what makes the crop decodable at all).
 ///  * Torch alternation during the sweep retains the best ambient AND best
 ///    torch-lit frame per bin so the backend has fusion material.
 ///  * AF re-runs at each leg transition (binning pauses during the hunt).
@@ -778,13 +782,20 @@ class ArcSweepCaptureController extends ChangeNotifier {
     }();
   }
 
-  /// Decodes a JPEG still to a raw luma buffer in the SAME orientation as the
-  /// preview-stream Y planes, so the backend sees a consistent set of frames.
+  /// Decodes a JPEG still to a JPEG-re-encoded luma buffer in the SAME
+  /// orientation as the preview-stream Y planes, so the backend sees a
+  /// consistent set of frames.
   ///
   /// The stream buffer is in sensor (landscape) orientation; takePicture JPEGs
   /// decode EXIF-upright (portrait on a 90°/270° sensor). For those sensors
   /// the upright image is rotated 90° CW back into buffer orientation —
   /// the inverse of ThumbLandmarkerService's buffer→upright CCW rotation.
+  ///
+  /// Re-encoded as JPEG rather than left as a raw buffer for the same reason
+  /// as [_extractRoiBytes]: the backend's decoder only reliably handles
+  /// either a real image decode or a byte count matching one of a handful of
+  /// hardcoded standard camera resolutions, and this decoded-then-rotated
+  /// still's dimensions won't reliably match either by chance.
   Future<({Uint8List bytes, int width, int height})?> _decodeJpegToBufferLuma(
       Uint8List jpeg) async {
     final codec = await ui.instantiateImageCodec(
@@ -820,9 +831,13 @@ class ArcSweepCaptureController extends ChangeNotifier {
             rotated[y * dstW + x] = luma[(h - 1 - x) * w + srcCol];
           }
         }
-        return (bytes: rotated, width: dstW, height: dstH);
+        return (
+          bytes: _encodeGrayscaleJpeg(rotated, dstW, dstH),
+          width: dstW,
+          height: dstH,
+        );
       }
-      return (bytes: luma, width: w, height: h);
+      return (bytes: _encodeGrayscaleJpeg(luma, w, h), width: w, height: h);
     } finally {
       image.dispose();
     }
@@ -1018,12 +1033,12 @@ class ArcSweepCaptureController extends ChangeNotifier {
               double.parse(_lastCoverage.toStringAsFixed(3)),
           'evOffsetApplied': _appliedEvOffset,
           'timestamp': timestamp.toIso8601String(),
-          // Raw Y-plane geometry — same decode contract as the 4-angle path:
-          //   np.frombuffer(data, uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
-          // Crops are copied densely, so bytesPerRow == imageWidth.
+          // `bytes` is a real JPEG (see _encodeGrayscaleJpeg /
+          // _decodeJpegToBufferLuma) — decodes directly server-side, no raw-
+          // buffer reshape needed. Dimensions are carried here only for
+          // diagnostics/logging, not as a decode instruction.
           'imageWidth': width,
           'imageHeight': height,
-          'bytesPerRow': width,
         });
       }
 
@@ -1130,10 +1145,17 @@ class ArcSweepCaptureController extends ChangeNotifier {
   }
 
   /// Copies the [_uploadRoi] centre crop out of the Y plane, row by row with
-  /// the device stride handled, into a dense buffer (bytesPerRow == width).
-  /// Cropping cuts over half the background pixels (better ridge resolution
-  /// per uploaded byte, less for backend segmentation to strip) and fixes
-  /// the stride-skew risk of uploading padded full planes verbatim.
+  /// the device stride handled, then JPEG-encodes it. Cropping cuts over half
+  /// the background pixels (better ridge resolution per uploaded byte, less
+  /// for backend segmentation to strip) — but JPEG-encoding (rather than
+  /// uploading the raw crop bytes) is what actually makes that crop
+  /// *decodable* server-side: the backend's decoder tries a real image
+  /// decode first and only falls back to matching the byte count against a
+  /// short hardcoded list of standard full-frame camera resolutions. A
+  /// crop's dimensions are an arbitrary fraction of the native resolution
+  /// and essentially never land on one of those by chance — raw cropped
+  /// bytes would silently fail to decode for every single frame. A real
+  /// JPEG decodes directly regardless of its dimensions.
   ({Uint8List bytes, int width, int height})? _extractRoiBytes(
       CameraImage image) {
     if (image.planes.isEmpty) return null;
@@ -1160,10 +1182,27 @@ class ArcSweepCaptureController extends ChangeNotifier {
         final srcStart = (y0 + y) * stride + x0;
         out.setRange(y * cw, (y + 1) * cw, bytes, srcStart);
       }
-      return (bytes: out, width: cw, height: ch);
+      final jpeg = _encodeGrayscaleJpeg(out, cw, ch);
+      return (bytes: jpeg, width: cw, height: ch);
     } on RangeError {
       return null;
+    } catch (e) {
+      // JPEG encode failed for some other reason (OOM, corrupt buffer) —
+      // drop this one frame rather than crash the sweep over it.
+      debugPrint('[arc] JPEG encode failed for cropped frame: $e');
+      return null;
     }
+  }
+
+  /// Encodes a dense (bytesPerRow == width) 8-bit grayscale buffer as JPEG.
+  static Uint8List _encodeGrayscaleJpeg(Uint8List gray, int w, int h) {
+    final image = imglib.Image.fromBytes(
+      width: w,
+      height: h,
+      bytes: gray.buffer,
+      numChannels: 1,
+    );
+    return Uint8List.fromList(imglib.encodeJpg(image, quality: 90));
   }
 
   @override
