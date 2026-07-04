@@ -3,6 +3,8 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 
+import 'package:clearbridge/app_constants.dart';
+
 part 'auth_repository.g.dart';
 
 @riverpod
@@ -51,7 +53,7 @@ class AuthRepository {
       ActionCodeSettings(
         url: continueUrl ?? 'https://$_authDomain/auth/done',
         handleCodeInApp: true,
-        androidPackageName: 'com.clearbridge.app',
+        androidPackageName: AppConstants.androidPackageName,
         androidInstallApp: true,
         androidMinimumVersion: '24',
         iOSBundleId: 'com.clearbridge.app',

@@ -61,6 +61,14 @@ class AppConstants {
   static String get activeCaptureRoute =>
       isArcSweepBuild ? arcSweepCaptureRoute : continuousCaptureRoute;
 
+  /// The actual Android applicationId for this build — must match
+  /// android/app/build.gradle.kts's productFlavors (arcSweep gets the
+  /// ".arcsweep" applicationIdSuffix). Used wherever Firebase Auth needs the
+  /// exact package name (e.g. ActionCodeSettings for email links), since a
+  /// mismatch there causes Firebase to reject the request.
+  static String get androidPackageName =>
+      isArcSweepBuild ? 'com.clearbridge.app.arcsweep' : 'com.clearbridge.app';
+
   // Paystack Configuration
   // Provide these via --dart-define=PAYSTACK_PUBLIC_KEY=your_key
   static const String paystackPublicKey = String.fromEnvironment(
