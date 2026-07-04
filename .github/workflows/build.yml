@@ -24,12 +24,21 @@ jobs:
 
       - run: flutter pub get
 
-      - run: flutter build apk --release --target-platform android-arm64
+      - name: Build four-angle APK
+        run: flutter build apk --release --target-platform android-arm64 --flavor fourAngle --dart-define=CAPTURE_MODE=fourAngle
+
+      - name: Build arc-sweep APK
+        run: flutter build apk --release --target-platform android-arm64 --flavor arcSweep --dart-define=CAPTURE_MODE=arcSweep
 
       - uses: actions/upload-artifact@v4
         with:
-          name: flutter-apk
-          path: build/app/outputs/flutter-apk/app-release.apk
+          name: flutter-apk-four-angle
+          path: build/app/outputs/flutter-apk/app-fourAngle-release.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: flutter-apk-arc-sweep
+          path: build/app/outputs/flutter-apk/app-arcSweep-release.apk
 
   build-capture-harness:
     runs-on: ubuntu-latest

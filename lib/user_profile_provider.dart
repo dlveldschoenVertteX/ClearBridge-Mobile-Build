@@ -117,12 +117,13 @@ class UserProfileCompleted extends _$UserProfileCompleted {
     }
   }
 
-  /// Checks if the user profile has all required fields
+  /// Checks if the user profile has all required fields.
+  /// SA ID is intentionally not required — the beta flow doesn't collect one
+  /// (see BetaConsentScreen), to keep onboarding friction low.
   bool _isProfileComplete(ApplicationData profile) {
     return profile.firstName.isNotEmpty &&
         profile.surname.isNotEmpty &&
-        profile.phone.isNotEmpty &&
-        profile.idNumber.isNotEmpty;
+        profile.phone.isNotEmpty;
   }
 
   /// Signs out the current user

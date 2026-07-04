@@ -446,7 +446,7 @@ class _CaptureGuideScreenState extends State<CaptureGuideScreen>
                           width: double.infinity,
                           child: FilledButton.icon(
                             onPressed: () =>
-                                context.go(AppConstants.continuousCaptureRoute),
+                                context.go(AppConstants.activeCaptureRoute),
                             style: FilledButton.styleFrom(
                               backgroundColor: ClearBridgeColors.cyan,
                               foregroundColor: ClearBridgeColors.void_,

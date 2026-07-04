@@ -46,6 +46,7 @@ import 'package:clearbridge/admin_login_screen.dart';
 import 'package:clearbridge/captures_screen.dart';
 import 'package:clearbridge/pipeline_health_screen.dart';
 import 'package:clearbridge/clearcoin_reward_screen.dart';
+import 'package:clearbridge/beta_thank_you_screen.dart';
 import 'package:clearbridge/email_action_screen.dart';
 part 'router_service.g.dart';
 
@@ -204,6 +205,7 @@ GoRouter router(Ref ref) {
       const captureRoutes = {
         AppConstants.fingerprintRoute,
         AppConstants.continuousCaptureRoute,
+        AppConstants.arcSweepCaptureRoute,
       };
       if (captureRoutes.contains(path)) {
         final consentState = ref.read(captureConsentProvider);
@@ -380,6 +382,11 @@ GoRouter router(Ref ref) {
         path: AppConstants.clearCoinRewardRoute,
         name: 'clearCoinReward',
         builder: (context, state) => const ClearCoinRewardScreen(),
+      ),
+      GoRoute(
+        path: AppConstants.betaThankYouRoute,
+        name: 'betaThankYou',
+        builder: (context, state) => const BetaThankYouScreen(),
       ),
       // Firebase Auth email action URL — Android App Links cold-start +
       // Flutter web. iOS cold-start is handled by DeepLinkService.getInitialLink.

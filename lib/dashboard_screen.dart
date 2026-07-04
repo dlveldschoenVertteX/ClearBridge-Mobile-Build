@@ -50,7 +50,7 @@ class _DashboardScreenState extends ConsumerState<DashboardScreen>
     super.dispose();
   }
 
-  void _startCapture() => context.push(AppConstants.fingerprintRoute);
+  void _startCapture() => context.push(AppConstants.activeCaptureRoute);
 
   void _openHelp() {
     showModalBottomSheet(

@@ -58,7 +58,7 @@ class _CaptureResultScreenState extends State<CaptureResultScreen> {
         body: SafeArea(
           child: _ErrorBody(
             message: 'Enhancement took too long. Please check your connection and try again.',
-            onRetake: () => context.go(AppConstants.continuousCaptureRoute),
+            onRetake: () => context.go(AppConstants.activeCaptureRoute),
           ),
         ),
       );
@@ -89,7 +89,7 @@ class _CaptureResultScreenState extends State<CaptureResultScreen> {
               return _ErrorBody(
                 message: snapshot.error.toString(),
                 onRetake: () =>
-                    context.go(AppConstants.continuousCaptureRoute),
+                    context.go(AppConstants.activeCaptureRoute),
               );
             }
 
@@ -128,7 +128,7 @@ class _CaptureResultScreenState extends State<CaptureResultScreen> {
                 nfiqScore: nfiqScore,
                 henryClass: henryClass,
                 sfmCoverage: sfmCoverage,
-                onRetake: () => context.go(AppConstants.continuousCaptureRoute),
+                onRetake: () => context.go(AppConstants.activeCaptureRoute),
               );
             }
 
@@ -138,7 +138,7 @@ class _CaptureResultScreenState extends State<CaptureResultScreen> {
               return _ErrorBody(
                 message: reason,
                 onRetake: () =>
-                    context.go(AppConstants.continuousCaptureRoute),
+                    context.go(AppConstants.activeCaptureRoute),
               );
             }
 
