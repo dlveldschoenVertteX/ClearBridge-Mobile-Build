@@ -33,12 +33,14 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: flutter-apk-four-angle
-          path: build/app/outputs/flutter-apk/app-fourAngle-release.apk
+          # Gradle lowercases the flavor name in the output filename
+          # regardless of how it's declared in build.gradle.kts.
+          path: build/app/outputs/flutter-apk/app-fourangle-release.apk
 
       - uses: actions/upload-artifact@v4
         with:
           name: flutter-apk-arc-sweep
-          path: build/app/outputs/flutter-apk/app-arcSweep-release.apk
+          path: build/app/outputs/flutter-apk/app-arcsweep-release.apk
 
   build-capture-harness:
     runs-on: ubuntu-latest
