@@ -164,6 +164,10 @@ class _ReportHeader extends StatelessWidget {
           'assets/images/app_logo.png',
           height: 44,
           fit: BoxFit.contain,
+          // app_logo.png is a 2400x1792 source (~6.6MB) meant for splash/
+          // marketing use -- without cacheHeight, Flutter decodes it at full
+          // resolution (~17MB in memory) just to show a 44px-tall thumbnail.
+          cacheHeight: 88, // 2x for high-DPI screens
         ),
         const SizedBox(height: 16),
         Row(

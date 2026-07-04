@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Matches the ClearBridge logo's own dark backdrop, so the adaptive-icon
+         mask (circle/squircle/rounded-square depending on OEM) never shows an
+         awkward seam around the foreground mark. -->
+    <color name="ic_launcher_background">#13191E</color>
+</resources>
