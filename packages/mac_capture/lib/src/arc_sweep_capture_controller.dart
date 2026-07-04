@@ -176,22 +176,28 @@ class ArcSweepCaptureController extends ChangeNotifier {
   ArcSweepCaptureController();
 
   // ── Path geometry ────────────────────────────────────────────────────────
-  // Same checkpoint values as ThumbAngleService.targets (left/right on the
-  // pitch axis at ±32°, top on the roll axis at −20°), traversed in
-  // ThumbAngleService.order: front → left → top → right.
+  // Eased from the original ±32°/−20° (matching ThumbAngleService.targets)
+  // after real-device testing showed the continuous sweep plateaus well
+  // short of those checkpoints — closing from 90° to ~43° away and no
+  // further, well beyond a couple of degrees' slack. Unlike the 4-angle
+  // flow's independent per-checkpoint hold, the sweep accumulates gyro
+  // drift over one continuous motion and has no per-angle recalibration, so
+  // it needs a more conservative target than a discrete hold does even
+  // though both mirror the same nominal geometry. Retune these from fresh
+  // on-device distanceToTarget readings if testers still plateau short.
   static const _legs = <_LegSpec>[
     _LegSpec(
-      p0: 0, r0: 0, p1: -32, r1: 0,
+      p0: 0, r0: 0, p1: -22, r1: 0,
       label: 'LEFT',
       instruction: 'Tilt phone to the LEFT — capture left edge',
     ),
     _LegSpec(
-      p0: -32, r0: 0, p1: 0, r1: -20,
+      p0: -22, r0: 0, p1: 0, r1: -13,
       label: 'TOP',
       instruction: 'Tilt toward THUMB TIP — capture top of thumbprint',
     ),
     _LegSpec(
-      p0: 0, r0: -20, p1: 32, r1: 0,
+      p0: 0, r0: -13, p1: 22, r1: 0,
       label: 'RIGHT',
       instruction: 'Tilt phone to the RIGHT — capture right edge',
     ),
