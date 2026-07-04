@@ -20,6 +20,12 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
+    // AGP disables resValue generation by default; the flavors below rely on
+    // it for their per-flavor app_name.
+    buildFeatures {
+        resValues = true
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.clearbridge.app"
