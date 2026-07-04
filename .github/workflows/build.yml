@@ -42,6 +42,20 @@ jobs:
           name: flutter-apk-arc-sweep
           path: build/app/outputs/flutter-apk/app-arcsweep-release.apk
 
+      - name: Publish APKs to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-apk --yes 2>/dev/null || true
+          git push --delete origin latest-apk 2>/dev/null || true
+          gh release create latest-apk \
+            --title "Latest APKs (build ${{ github.run_number }})" \
+            --notes "Commit: ${{ github.sha }}" \
+            "build/app/outputs/flutter-apk/app-fourangle-release.apk#clearbridge-four-angle.apk" \
+            "build/app/outputs/flutter-apk/app-arcsweep-release.apk#clearbridge-arc-sweep.apk"
+          echo "Four-angle: https://github.com/${{ github.repository }}/releases/download/latest-apk/clearbridge-four-angle.apk"
+          echo "Arc-sweep:  https://github.com/${{ github.repository }}/releases/download/latest-apk/clearbridge-arc-sweep.apk"
+
       - name: Upload APKs to Firebase Storage
         env:
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
@@ -121,6 +135,18 @@ jobs:
         with:
           name: capture-harness-apk
           path: capture_harness/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish harness APK to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-harness-apk --yes 2>/dev/null || true
+          git push --delete origin latest-harness-apk 2>/dev/null || true
+          gh release create latest-harness-apk \
+            --title "Latest Harness APK (build ${{ github.run_number }})" \
+            --notes "Commit: ${{ github.sha }}" \
+            "capture_harness/build/app/outputs/flutter-apk/app-release.apk#clearbridge-harness.apk"
+          echo "Harness: https://github.com/${{ github.repository }}/releases/download/latest-harness-apk/clearbridge-harness.apk"
 
       - name: Upload harness APK to Firebase Storage
         env:
