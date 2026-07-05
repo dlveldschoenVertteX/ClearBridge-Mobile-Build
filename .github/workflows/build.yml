@@ -5,6 +5,8 @@ on: [push]
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -105,6 +107,8 @@ jobs:
 
   build-capture-harness:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     # Standalone camera-only test build (capture_harness/) -- depends only on
     # the mac_capture package, no Firebase/Paystack/MLKit/dashboard, so it's
     # a small APK for testing just the MAC3D capture flow.
