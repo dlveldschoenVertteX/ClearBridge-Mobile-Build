@@ -117,7 +117,7 @@ class _StatusPanel extends StatelessWidget {
           Text(
             _phaseLabel(state.phase),
             style: CaptureTypography.label
-                .copyWith(color: CaptureColors.tealBright, fontSize: 11),
+                .copyWith(color: CaptureColors.cyan, fontSize: 11),
           ),
           const SizedBox(height: 4),
           Text(
@@ -156,7 +156,7 @@ class _StatusPanel extends StatelessWidget {
               child: LinearProgressIndicator(
                 value: state.progress > 0 ? state.progress : null,
                 backgroundColor: CaptureColors.silverDim.withOpacity(0.3),
-                color: CaptureColors.tealBright,
+                color: CaptureColors.cyan,
                 minHeight: 6,
               ),
             ),
@@ -238,7 +238,7 @@ class _CoverageBar extends StatelessWidget {
                     .copyWith(color: CaptureColors.silverDim, fontSize: 11)),
             Text('${(ratio * 100).toStringAsFixed(0)}%',
                 style: CaptureTypography.label.copyWith(
-                  color: inZone ? CaptureColors.tealBright : Colors.orange,
+                  color: inZone ? CaptureColors.cyan : Colors.orange,
                   fontSize: 11,
                 )),
           ],
@@ -251,7 +251,7 @@ class _CoverageBar extends StatelessWidget {
               child: LinearProgressIndicator(
                 value: ratio.clamp(0.0, 1.0),
                 backgroundColor: CaptureColors.silverDim.withOpacity(0.3),
-                color: inZone ? CaptureColors.tealBright : Colors.orange,
+                color: inZone ? CaptureColors.cyan : Colors.orange,
                 minHeight: 8,
               ),
             ),
@@ -311,7 +311,7 @@ class _DotRow extends StatelessWidget {
             decoration: BoxDecoration(
               shape: BoxShape.circle,
               color: filled
-                  ? CaptureColors.tealBright
+                  ? CaptureColors.cyan
                   : CaptureColors.silverDim.withOpacity(0.3),
             ),
           );

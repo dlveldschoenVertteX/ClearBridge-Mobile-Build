@@ -284,7 +284,7 @@ class FrontBurstController extends ChangeNotifier {
 
   Future<double> _waitForCoverage() async {
     final sensorOrientation =
-        _camera.selectedCamera?.sensorRotationDegrees ?? 90;
+        _camera.selectedCamera?.sensorOrientation ?? 90;
     final completer = Completer<double>();
     DateTime? firstGoodTime;
 
