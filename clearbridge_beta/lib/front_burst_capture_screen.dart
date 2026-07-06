@@ -73,7 +73,7 @@ class _FrontBurstCaptureScreenState extends State<FrontBurstCaptureScreen> {
           fit: StackFit.expand,
           children: [
             if (camera != null && camera.value.isInitialized)
-              CameraPreview(camera),
+              Positioned.fill(child: RepaintBoundary(child: _cameraLayer(camera))),
 
             if (showGuidance)
               Positioned(
@@ -137,6 +137,28 @@ class _FrontBurstCaptureScreenState extends State<FrontBurstCaptureScreen> {
       ),
     );
   }
+}
+
+/// Full-bleed camera preview, scaled/cropped (not stretched) to fill the
+/// screen. `previewSize` is reported in sensor (landscape) orientation, so
+/// width/height are swapped for the portrait cover fit — mirrors
+/// mac_capture_screen.dart's `_cameraLayer`. Without this, embedding
+/// [CameraPreview] directly in a `Stack(fit: StackFit.expand)` gives it tight
+/// full-screen constraints that defeat its internal `AspectRatio`, stretching
+/// the live image.
+Widget _cameraLayer(CameraController cam) {
+  final preview = cam.value.previewSize;
+  final w = preview?.height ?? 1080;
+  final h = preview?.width ?? 1920;
+  return FittedBox(
+    fit: BoxFit.cover,
+    clipBehavior: Clip.hardEdge,
+    child: SizedBox(
+      width: w,
+      height: h,
+      child: CameraPreview(cam),
+    ),
+  );
 }
 
 class _StatusPanel extends StatelessWidget {

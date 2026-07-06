@@ -369,9 +369,30 @@ class FrontBurstCaptureController extends ChangeNotifier {
     return (max - min) / max <= _focusStabilityRatio;
   }
 
-  // ─── One quality-gated shot ──────────────────────────────────────────────
+  // ─── One quality-gated shot, with bounded in-place retries ───────────────
+
+  // A single 700ms window can legitimately come back empty (hand tremor,
+  // AE still settling, a transient focus hunt) without the thumb actually
+  // being out of range — retrying the same slot a couple of times before
+  // giving up on it recovers most of those instead of silently burning
+  // through all 6 slots and ending up with too few usable frames.
+  static const int _maxAttemptsPerShot = 3;
 
   Future<TaggedFrame?> _captureOne({
+    required bool torchOn,
+    required String zoneId,
+  }) async {
+    for (int attempt = 0; attempt < _maxAttemptsPerShot; attempt++) {
+      final frame = await _captureWindow(torchOn: torchOn, zoneId: '${zoneId}_a$attempt');
+      if (frame != null) return frame;
+      if (attempt < _maxAttemptsPerShot - 1) {
+        await Future<void>.delayed(const Duration(milliseconds: 120));
+      }
+    }
+    return null;
+  }
+
+  Future<TaggedFrame?> _captureWindow({
     required bool torchOn,
     required String zoneId,
   }) async {
@@ -381,7 +402,9 @@ class FrontBurstCaptureController extends ChangeNotifier {
     } catch (_) {}
     _flashOn = torchOn;
     _flashIntensity = torchOn ? 1.0 : 0.0;
-    await Future<void>.delayed(const Duration(milliseconds: 180)); // exposure settle
+    // Exposure settle before the quality window opens — long enough for AE
+    // to catch up on the torch on/off brightness swing at close range.
+    await Future<void>.delayed(const Duration(milliseconds: 220));
 
     final pitchNow = _orientation.relativeOrientation().pitch;
     final frames = await _hybrid.captureAngleBurst(
