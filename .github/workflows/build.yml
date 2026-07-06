@@ -191,3 +191,91 @@ jobs:
           else:
             print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
           PYEOF
+
+  build-clearbridge-beta:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    # Standalone consumer-facing beta build (clearbridge_beta/) -- single-pass
+    # front-only capture, no arc-sweep or four-angle code at all, decoupled
+    # from both the main app and capture_harness so none of the three need
+    # to change in lockstep.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-beta-${{ runner.os }}-${{ hashFiles('clearbridge_beta/android/**/*.gradle*', 'clearbridge_beta/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-beta-${{ runner.os }}-
+
+      - run: flutter pub get
+        working-directory: clearbridge_beta
+
+      - run: flutter build apk --release --target-platform android-arm64
+        working-directory: clearbridge_beta
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clearbridge-beta-apk
+          path: clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk
+
+      - name: Publish beta APK to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-clearbridge-beta-apk --yes 2>/dev/null || true
+          git push --delete origin latest-clearbridge-beta-apk 2>/dev/null || true
+          gh release create latest-clearbridge-beta-apk \
+            --title "Latest ClearBridge Beta APK (build ${{ github.run_number }})" \
+            --notes "Commit: ${{ github.sha }}" \
+            "clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk#clearbridge-beta.apk"
+          echo "Beta: https://github.com/${{ github.repository }}/releases/download/latest-clearbridge-beta-apk/clearbridge-beta.apk"
+
+      - name: Upload beta APK to Firebase Storage
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        run: |
+          pip install google-auth requests --quiet
+          python3 - <<'PYEOF'
+          import json, os, requests, google.auth.transport.requests as gtr
+          from google.oauth2 import service_account
+
+          sa = json.loads(os.environ['FIREBASE_SA_KEY'])
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=['https://www.googleapis.com/auth/cloud-platform'])
+          creds.refresh(gtr.Request())
+          token = creds.token
+          bucket = 'clearbridge-dc699.firebasestorage.app'
+          name = 'clearbridge-beta-latest.apk'
+          path = 'clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk'
+
+          with open(path, 'rb') as f:
+            data = f.read()
+          r = requests.post(
+            f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
+            f'?uploadType=media&name=apk-builds/{name}',
+            headers={'Authorization': f'Bearer {token}',
+                     'Content-Type': 'application/vnd.android.package-archive'},
+            data=data, timeout=120)
+          if r.status_code in (200, 201):
+            obj_name = f'apk-builds/{name}'.replace('/', '%2F')
+            requests.put(
+              f'https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj_name}/iam',
+              headers={'Authorization': f'Bearer {token}',
+                       'Content-Type': 'application/json'},
+              json={'bindings': [{'role': 'roles/storage.objectViewer',
+                                  'members': ['allUsers']}]},
+              timeout=15)
+            print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
+          else:
+            print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
+          PYEOF
