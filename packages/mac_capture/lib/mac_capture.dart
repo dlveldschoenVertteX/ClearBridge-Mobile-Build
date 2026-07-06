@@ -67,3 +67,4 @@ export 'src/lighting_meter_widget.dart' show LightingMeterWidget;
 export 'src/capture_colors.dart' show CaptureColors;
 export 'src/capture_typography.dart' show CaptureTypography;
 export 'src/capture_button.dart' show CaptureButton, CaptureButtonVariant;
+export 'src/capture_audio_service.dart' show CaptureAudioService;

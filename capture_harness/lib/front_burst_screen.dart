@@ -60,6 +60,10 @@ class _FrontBurstScreenState extends State<FrontBurstScreen> {
   @override
   Widget build(BuildContext context) {
     final s = _ctrl.state;
+    final showGuidance = s.phase == FrontBurstPhase.calibrating ||
+        s.phase == FrontBurstPhase.scanning ||
+        s.phase == FrontBurstPhase.focusing;
+
     return Scaffold(
       backgroundColor: CaptureColors.void_,
       body: SafeArea(
@@ -70,6 +74,52 @@ class _FrontBurstScreenState extends State<FrontBurstScreen> {
             if (_ctrl.cameraController != null &&
                 _ctrl.cameraController!.value.isInitialized)
               CameraPreview(_ctrl.cameraController!),
+
+            // Focus meter — right edge, matches ARC/four-angle layout.
+            if (showGuidance)
+              Positioned(
+                right: 12,
+                top: 0,
+                bottom: 140,
+                child: RepaintBoundary(
+                  child: Center(child: FocusMeterWidget(value: s.focusValue)),
+                ),
+              ),
+
+            // Reticle + guidance text — centred, visible from idle onward so
+            // the user always knows exactly where to line up their thumb.
+            Center(
+              child: RepaintBoundary(
+                child: Padding(
+                  padding: const EdgeInsets.only(bottom: 140),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      HapticGuidanceCircle(
+                        distanceToTarget: 0.0,
+                        isLocked: s.isFocusLocked,
+                        isPulsing: false,
+                        isAtCorrectDistance: s.thumbCoverageRatio == 0 ||
+                            (s.thumbCoverageRatio >= 0.35 &&
+                                s.thumbCoverageRatio <= 0.85),
+                        isRetrying: s.isRetrying,
+                      ),
+                      if (showGuidance) ...[
+                        const SizedBox(height: 16),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 24),
+                          child: CaptureGuidanceOverlay(
+                            message: s.message,
+                            isAllGreen: s.isFocusLocked,
+                            greenFraction: s.isFocusLocked ? 1.0 : 0.0,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+            ),
 
             // Top: back button
             Positioned(
@@ -113,7 +163,6 @@ class _StatusPanel extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          // Phase label + message
           Text(
             _phaseLabel(state.phase),
             style: CaptureTypography.label
@@ -121,36 +170,24 @@ class _StatusPanel extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            state.message.isNotEmpty ? state.message : 'Ready',
+            state.phase == FrontBurstPhase.idle
+                ? 'Front Burst (training)'
+                : (state.message.isNotEmpty ? state.message : 'Ready'),
             style: CaptureTypography.body
                 .copyWith(color: CaptureColors.silverBright),
           ),
           const SizedBox(height: 12),
 
-          // Coverage bar (only during waitingForCoverage)
-          if (state.phase == FrontBurstPhase.waitingForCoverage) ...[
-            _CoverageBar(ratio: state.thumbCoverageRatio),
-            const SizedBox(height: 12),
-          ],
-
-          // Pass 1 dots
-          if (state.phase == FrontBurstPhase.scanning ||
-              state.pass1Done > 0) ...[
+          if (state.phase == FrontBurstPhase.scanning || state.pass1Done > 0) ...[
             _DotRow(label: 'Pass 1', done: state.pass1Done, total: 8),
             const SizedBox(height: 6),
           ],
-
-          // Pass 2 dots
-          if (state.phase == FrontBurstPhase.focusing ||
-              state.pass2Done > 0) ...[
+          if (state.phase == FrontBurstPhase.focusing || state.pass2Done > 0) ...[
             _DotRow(label: 'Pass 2', done: state.pass2Done, total: 10),
             const SizedBox(height: 6),
           ],
 
-          // Generic progress bar (processing / uploading)
-          if (state.phase == FrontBurstPhase.processing ||
-              state.phase == FrontBurstPhase.uploading ||
-              state.phase == FrontBurstPhase.calibrating) ...[
+          if (state.phase == FrontBurstPhase.uploading) ...[
             ClipRRect(
               borderRadius: BorderRadius.circular(3),
               child: LinearProgressIndicator(
@@ -163,7 +200,6 @@ class _StatusPanel extends StatelessWidget {
             const SizedBox(height: 12),
           ],
 
-          // Error message
           if (state.phase == FrontBurstPhase.error && state.error != null) ...[
             Container(
               padding: const EdgeInsets.all(10),
@@ -182,7 +218,6 @@ class _StatusPanel extends StatelessWidget {
             const SizedBox(height: 12),
           ],
 
-          // CTA button
           if (state.phase == FrontBurstPhase.idle ||
               state.phase == FrontBurstPhase.error)
             CaptureButton(
@@ -206,91 +241,20 @@ class _StatusPanel extends StatelessWidget {
   }
 
   static String _phaseLabel(FrontBurstPhase p) => switch (p) {
-        FrontBurstPhase.idle             => 'FRONT BURST',
-        FrontBurstPhase.waitingForCoverage => 'COVERAGE GATE',
-        FrontBurstPhase.calibrating      => 'CALIBRATING',
-        FrontBurstPhase.scanning         => 'PASS 1 / 2',
-        FrontBurstPhase.focusing         => 'PASS 2 / 2',
-        FrontBurstPhase.processing       => 'PROCESSING',
-        FrontBurstPhase.uploading        => 'UPLOADING',
-        FrontBurstPhase.done             => 'COMPLETE',
-        FrontBurstPhase.error            => 'ERROR',
+        FrontBurstPhase.idle => 'FRONT BURST',
+        FrontBurstPhase.calibrating => 'CALIBRATING',
+        FrontBurstPhase.scanning => 'PASS 1 / 2',
+        FrontBurstPhase.focusing => 'PASS 2 / 2',
+        FrontBurstPhase.uploading => 'UPLOADING',
+        FrontBurstPhase.done => 'COMPLETE',
+        FrontBurstPhase.error => 'ERROR',
       };
-}
-
-// ─── Coverage bar ─────────────────────────────────────────────────────────────
-
-class _CoverageBar extends StatelessWidget {
-  const _CoverageBar({required this.ratio});
-  final double ratio;
-
-  @override
-  Widget build(BuildContext context) {
-    final inZone = ratio >= 0.50 && ratio <= 0.70;
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Row(
-          mainAxisAlignment: MainAxisAlignment.spaceBetween,
-          children: [
-            Text('Thumb coverage',
-                style: CaptureTypography.label
-                    .copyWith(color: CaptureColors.silverDim, fontSize: 11)),
-            Text('${(ratio * 100).toStringAsFixed(0)}%',
-                style: CaptureTypography.label.copyWith(
-                  color: inZone ? CaptureColors.cyan : Colors.orange,
-                  fontSize: 11,
-                )),
-          ],
-        ),
-        const SizedBox(height: 4),
-        Stack(
-          children: [
-            ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: ratio.clamp(0.0, 1.0),
-                backgroundColor: CaptureColors.silverDim.withOpacity(0.3),
-                color: inZone ? CaptureColors.cyan : Colors.orange,
-                minHeight: 8,
-              ),
-            ),
-            // Target zone markers at 50% and 70%
-            Positioned.fill(
-              child: LayoutBuilder(builder: (_, constraints) {
-                final w = constraints.maxWidth;
-                return Stack(children: [
-                  Positioned(
-                    left: w * 0.50 - 1,
-                    top: 0,
-                    bottom: 0,
-                    child: Container(
-                        width: 2,
-                        color: Colors.white.withOpacity(0.6)),
-                  ),
-                  Positioned(
-                    left: w * 0.70 - 1,
-                    top: 0,
-                    bottom: 0,
-                    child: Container(
-                        width: 2,
-                        color: Colors.white.withOpacity(0.6)),
-                  ),
-                ]);
-              }),
-            ),
-          ],
-        ),
-      ],
-    );
-  }
 }
 
 // ─── Pass dot row ─────────────────────────────────────────────────────────────
 
 class _DotRow extends StatelessWidget {
-  const _DotRow(
-      {required this.label, required this.done, required this.total});
+  const _DotRow({required this.label, required this.done, required this.total});
   final String label;
   final int done;
   final int total;
