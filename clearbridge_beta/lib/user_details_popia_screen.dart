@@ -32,6 +32,7 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
   bool _reuseConsent = false;
   bool _durationConsent = false;
   bool _trainingOptIn = false;
+  bool _trainingAnswered = false;
   bool _saving = false;
 
   @override
@@ -64,7 +65,8 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
 
   bool get _allRequired =>
       _detailsValid &&
-      _captureConsent && _superprintConsent && _reuseConsent && _durationConsent;
+      _captureConsent && _superprintConsent && _reuseConsent && _durationConsent &&
+      _trainingAnswered;
 
   Future<void> _save() async {
     if (!_allRequired) return;
@@ -222,25 +224,43 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
 
                     _card(
                       icon: Icons.psychology_outlined,
-                      title: 'HELP IMPROVE CLEARBRIDGE (OPTIONAL)',
-                      child: Row(
+                      title: 'HELP IMPROVE CLEARBRIDGE',
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          Switch(
-                            value: _trainingOptIn,
-                            onChanged: (v) => setState(() => _trainingOptIn = v),
-                            activeThumbColor: Colors.white,
-                            activeTrackColor: ClearBridgeColors.cyan,
-                            inactiveThumbColor: ClearBridgeColors.silverDim,
-                            inactiveTrackColor: ClearBridgeColors.rim,
+                          Row(
+                            children: [
+                              Switch(
+                                value: _trainingOptIn,
+                                onChanged: (v) => setState(() {
+                                  _trainingOptIn = v;
+                                  _trainingAnswered = true;
+                                }),
+                                activeThumbColor: Colors.white,
+                                activeTrackColor: ClearBridgeColors.cyan,
+                                inactiveThumbColor: ClearBridgeColors.silverDim,
+                                inactiveTrackColor: ClearBridgeColors.rim,
+                              ),
+                              const SizedBox(width: 12),
+                              Expanded(
+                                child: Text(
+                                  'Allow anonymised fingerprint data to train our AI '
+                                  'model. Improves accuracy for all users.',
+                                  style: ClearBridgeTypography.caption.copyWith(fontSize: 12, height: 1.4),
+                                ),
+                              ),
+                            ],
                           ),
-                          const SizedBox(width: 12),
-                          Expanded(
-                            child: Text(
-                              'Allow anonymised fingerprint data to train our AI '
-                              'model. Improves accuracy for all users.',
-                              style: ClearBridgeTypography.caption.copyWith(fontSize: 12, height: 1.4),
+                          if (!_trainingAnswered) ...[
+                            const SizedBox(height: 6),
+                            Text(
+                              'Please make a selection to continue.',
+                              style: ClearBridgeTypography.caption.copyWith(
+                                color: ClearBridgeColors.cyan,
+                                fontSize: 11,
+                              ),
                             ),
-                          ),
+                          ],
                         ],
                       ),
                     ),

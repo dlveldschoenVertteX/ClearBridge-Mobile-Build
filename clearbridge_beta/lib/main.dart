@@ -61,6 +61,7 @@ class _CaptureRoute extends StatelessWidget {
       onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
         MaterialPageRoute(
           builder: (_) => ClearCoinScreen(
+            userId: FirebaseAuth.instance.currentUser?.uid ?? '',
             onContinue: () => _navigatorKey.currentState?.pushReplacement(
               MaterialPageRoute(
                 builder: (_) => BetaThankYouScreen(onCaptureAgain: _goToCapture),

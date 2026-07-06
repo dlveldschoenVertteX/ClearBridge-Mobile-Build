@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:typed_data';
-import 'dart:ui' show Rect;
+import 'dart:ui' show Offset, Rect;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
@@ -327,9 +327,6 @@ class FrontBurstCaptureController extends ChangeNotifier {
         thumbCoverageRatio: _liveCoverage,
         message: _guidanceMessage(),
       ));
-      if (!_calibrated) {
-        _audio.updateGuidanceTone(45.0 * (1.0 - focusNorm));
-      }
     } else {
       _state = _state.copyWith(focusValue: focus, thumbCoverageRatio: _liveCoverage);
     }
@@ -351,7 +348,6 @@ class FrontBurstCaptureController extends ChangeNotifier {
         now.difference(_calibStart!).inMilliseconds >= _calibDurationMs;
     if (stable || timedOut) {
       _calibrated = true;
-      _audio.silence();
       final c = _calibCompleter;
       if (c != null && !c.isCompleted) c.complete();
     }
@@ -402,9 +398,23 @@ class FrontBurstCaptureController extends ChangeNotifier {
     } catch (_) {}
     _flashOn = torchOn;
     _flashIntensity = torchOn ? 1.0 : 0.0;
-    // Exposure settle before the quality window opens — long enough for AE
-    // to catch up on the torch on/off brightness swing at close range.
-    await Future<void>.delayed(const Duration(milliseconds: 220));
+
+    // Steer AF to the thumb ROI centre before each quality window so the
+    // camera re-runs a one-shot focus scan at exactly the right spot instead
+    // of using whatever locked position it had from calibration.
+    if (_lastThumbRoi != null) {
+      try {
+        await camera.setFocusPoint(Offset(
+          (_lastThumbRoi!.left + _lastThumbRoi!.right) / 2,
+          (_lastThumbRoi!.top + _lastThumbRoi!.bottom) / 2,
+        ));
+      } catch (_) {}
+    }
+    try {
+      await camera.setFocusMode(FocusMode.auto);
+    } catch (_) {}
+    // Allow AE + AF to converge after torch switch and focus scan.
+    await Future<void>.delayed(const Duration(milliseconds: 450));
 
     final pitchNow = _orientation.relativeOrientation().pitch;
     final frames = await _hybrid.captureAngleBurst(
