@@ -2,6 +2,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:clearbridge_beta/beta_thank_you_screen.dart';
 import 'package:clearbridge_beta/clearbridge_colors.dart';
@@ -35,11 +36,19 @@ class ClearBridgeBetaApp extends StatelessWidget {
       navigatorKey: _navigatorKey,
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: ClearBridgeColors.cyan),
       home: SplashScreen(
-        onDone: () => _navigatorKey.currentState?.pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => UserDetailsPopiaScreen(onContinue: _goToCapture),
-          ),
-        ),
+        onDone: () async {
+          final prefs = await SharedPreferences.getInstance();
+          final done = prefs.getBool('popia_completed') ?? false;
+          if (done) {
+            _goToCapture();
+          } else {
+            _navigatorKey.currentState?.pushReplacement(
+              MaterialPageRoute(
+                builder: (_) => UserDetailsPopiaScreen(onContinue: _goToCapture),
+              ),
+            );
+          }
+        },
       ),
     );
   }

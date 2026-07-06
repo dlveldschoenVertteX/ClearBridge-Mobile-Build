@@ -1,6 +1,7 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:clearbridge_beta/cb_input_field.dart';
 import 'package:clearbridge_beta/cb_primary_button.dart';
@@ -106,6 +107,8 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
       return;
     }
 
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('popia_completed', true);
     if (mounted) widget.onContinue();
   }
 
