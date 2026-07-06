@@ -6,6 +6,7 @@ import 'package:mac_capture/mac_capture.dart';
 
 import 'backend_capture_uploader.dart';
 import 'firebase_options.dart';
+import 'front_burst_screen.dart';
 import 'harness_splash_screen.dart';
 import 'last_capture_review_screen.dart';
 
@@ -94,6 +95,16 @@ class _ModeChooserScreen extends StatelessWidget {
                   MaterialPageRoute(builder: (_) => const _HarnessArcRoute()),
                 ),
               ),
+              const SizedBox(height: 16),
+              CaptureButton(
+                label: 'Front Burst (training)',
+                leadingIcon: Icons.science_outlined,
+                variant: CaptureButtonVariant.ghost,
+                onPressed: () => _navigatorKey.currentState?.pushReplacement(
+                  MaterialPageRoute(
+                      builder: (_) => const _HarnessFrontBurstRoute()),
+                ),
+              ),
             ],
           ),
         ),
@@ -109,6 +120,29 @@ class _HarnessArcRoute extends StatelessWidget {
   Widget build(BuildContext context) {
     return ArcSweepCaptureScreen(
       uploader: const BackendCaptureUploader(),
+      getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+      onRequireLogin: () => _restart(message: 'Auth expired — restarting'),
+      onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => LastCaptureReviewScreen(
+            captureId: captureId,
+            onCaptureAgain: _restart,
+          ),
+        ),
+      ),
+      onClose: () => _navigatorKey.currentState?.pushReplacement(
+        MaterialPageRoute(builder: (_) => const _ModeChooserScreen()),
+      ),
+    );
+  }
+}
+
+class _HarnessFrontBurstRoute extends StatelessWidget {
+  const _HarnessFrontBurstRoute();
+
+  @override
+  Widget build(BuildContext context) {
+    return FrontBurstScreen(
       getUserId: () => FirebaseAuth.instance.currentUser?.uid,
       onRequireLogin: () => _restart(message: 'Auth expired — restarting'),
       onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
