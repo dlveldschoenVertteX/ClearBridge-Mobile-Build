@@ -85,20 +85,11 @@ jobs:
               data = f.read()
             r = requests.post(
               f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
-              f'?uploadType=media&name=apk-builds/{name}',
+              f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
               headers={'Authorization': f'Bearer {token}',
                        'Content-Type': 'application/vnd.android.package-archive'},
               data=data, timeout=120)
             if r.status_code in (200, 201):
-              # Make the object publicly readable
-              obj_name = f'apk-builds/{name}'.replace('/', '%2F')
-              requests.put(
-                f'https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj_name}/iam',
-                headers={'Authorization': f'Bearer {token}',
-                         'Content-Type': 'application/json'},
-                json={'bindings': [{'role': 'roles/storage.objectViewer',
-                                    'members': ['allUsers']}]},
-                timeout=15)
               url = f'https://storage.googleapis.com/{bucket}/apk-builds/{name}'
               print(f'✓ {name}: {url}')
             else:
@@ -174,19 +165,11 @@ jobs:
             data = f.read()
           r = requests.post(
             f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
-            f'?uploadType=media&name=apk-builds/{name}',
+            f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
             headers={'Authorization': f'Bearer {token}',
                      'Content-Type': 'application/vnd.android.package-archive'},
             data=data, timeout=120)
           if r.status_code in (200, 201):
-            obj_name = f'apk-builds/{name}'.replace('/', '%2F')
-            requests.put(
-              f'https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj_name}/iam',
-              headers={'Authorization': f'Bearer {token}',
-                       'Content-Type': 'application/json'},
-              json={'bindings': [{'role': 'roles/storage.objectViewer',
-                                  'members': ['allUsers']}]},
-              timeout=15)
             print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
           else:
             print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
@@ -262,19 +245,11 @@ jobs:
             data = f.read()
           r = requests.post(
             f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
-            f'?uploadType=media&name=apk-builds/{name}',
+            f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
             headers={'Authorization': f'Bearer {token}',
                      'Content-Type': 'application/vnd.android.package-archive'},
             data=data, timeout=120)
           if r.status_code in (200, 201):
-            obj_name = f'apk-builds/{name}'.replace('/', '%2F')
-            requests.put(
-              f'https://storage.googleapis.com/storage/v1/b/{bucket}/o/{obj_name}/iam',
-              headers={'Authorization': f'Bearer {token}',
-                       'Content-Type': 'application/json'},
-              json={'bindings': [{'role': 'roles/storage.objectViewer',
-                                  'members': ['allUsers']}]},
-              timeout=15)
             print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
           else:
             print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
