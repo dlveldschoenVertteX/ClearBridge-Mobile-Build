@@ -1,0 +1,13 @@
+{
+  "hosting": {
+    "public": "landing",
+    "ignore": ["firebase-hosting.json"],
+    "rewrites": [{"source": "**", "destination": "/index.html"}],
+    "headers": [
+      {
+        "source": "*.apk",
+        "headers": [{"key": "Content-Type", "value": "application/vnd.android.package-archive"}]
+      }
+    ]
+  }
+}
