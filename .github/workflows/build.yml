@@ -220,13 +220,13 @@ jobs:
       - run: flutter pub get
         working-directory: clearbridge_beta
 
-      - run: flutter build apk --release --target-platform android-arm64
+      - run: flutter build apk --release --split-per-abi
         working-directory: clearbridge_beta
 
       - uses: actions/upload-artifact@v4
         with:
           name: clearbridge-beta-apk
-          path: clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk
+          path: clearbridge_beta/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
 
       - name: Publish beta APK to GitHub Release
         env:
@@ -237,7 +237,7 @@ jobs:
           gh release create latest-clearbridge-beta-apk \
             --title "Latest ClearBridge Beta APK (build ${{ github.run_number }})" \
             --notes "Commit: ${{ github.sha }}" \
-            "clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk#clearbridge-beta.apk"
+            "clearbridge_beta/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk#clearbridge-beta.apk"
           echo "Beta: https://github.com/${{ github.repository }}/releases/download/latest-clearbridge-beta-apk/clearbridge-beta.apk"
 
       - name: Upload beta APK to Firebase Storage
@@ -256,7 +256,7 @@ jobs:
           token = creds.token
           bucket = 'clearbridge-dc699.firebasestorage.app'
           name = 'clearbridge-beta-latest.apk'
-          path = 'clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk'
+          path = 'clearbridge_beta/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk'
 
           with open(path, 'rb') as f:
             data = f.read()
