@@ -33,6 +33,12 @@ jobs:
         run: flutter build apk --release --target-platform android-arm64 --flavor arcSweep --dart-define=CAPTURE_MODE=arcSweep
 
       - uses: actions/upload-artifact@v4
+        # Best-effort: the CI-downloadable artifact is a convenience, not a
+        # dependency of the publish steps below (they read the APK straight
+        # off disk). Storage-quota exhaustion here must not block the
+        # GitHub Release / Firebase Storage publish, which is what users
+        # actually download from.
+        continue-on-error: true
         with:
           name: flutter-apk-four-angle
           # Gradle lowercases the flavor name in the output filename
@@ -40,6 +46,7 @@ jobs:
           path: build/app/outputs/flutter-apk/app-fourangle-release.apk
 
       - uses: actions/upload-artifact@v4
+        continue-on-error: true
         with:
           name: flutter-apk-arc-sweep
           path: build/app/outputs/flutter-apk/app-arcsweep-release.apk
@@ -127,6 +134,9 @@ jobs:
         working-directory: capture_harness
 
       - uses: actions/upload-artifact@v4
+        # See the "build" job's four-angle upload-artifact step for why this
+        # is best-effort: it's not a dependency of the publish steps below.
+        continue-on-error: true
         with:
           name: capture-harness-apk
           path: capture_harness/build/app/outputs/flutter-apk/app-release.apk
@@ -207,6 +217,9 @@ jobs:
         working-directory: clearbridge_beta
 
       - uses: actions/upload-artifact@v4
+        # See the "build" job's four-angle upload-artifact step for why this
+        # is best-effort: it's not a dependency of the publish steps below.
+        continue-on-error: true
         with:
           name: clearbridge-beta-apk
           path: clearbridge_beta/build/app/outputs/flutter-apk/app-arm64-v8a-release.apk
