@@ -7,6 +7,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     steps:
       - uses: actions/checkout@v4
 
@@ -32,6 +33,17 @@ jobs:
       - name: Build arc-sweep APK
         run: flutter build apk --release --target-platform android-arm64 --flavor arcSweep --dart-define=CAPTURE_MODE=arcSweep
 
+      - name: Delete old four-angle artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "flutter-apk-four-angle" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
       - uses: actions/upload-artifact@v4
         # Best-effort: the CI-downloadable artifact is a convenience, not a
         # dependency of the publish steps below (they read the APK straight
@@ -44,12 +56,25 @@ jobs:
           # Gradle lowercases the flavor name in the output filename
           # regardless of how it's declared in build.gradle.kts.
           path: build/app/outputs/flutter-apk/app-fourangle-release.apk
+          retention-days: 7
+
+      - name: Delete old arc-sweep artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "flutter-apk-arc-sweep" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
 
       - uses: actions/upload-artifact@v4
         continue-on-error: true
         with:
           name: flutter-apk-arc-sweep
           path: build/app/outputs/flutter-apk/app-arcsweep-release.apk
+          retention-days: 7
 
       - name: Publish APKs to GitHub Release
         env:
@@ -107,6 +132,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     # Standalone camera-only test build (capture_harness/) -- depends only on
     # the mac_capture package, no Firebase/Paystack/MLKit/dashboard, so it's
     # a small APK for testing just the MAC3D capture flow.
@@ -133,6 +159,17 @@ jobs:
       - run: flutter build apk --release --target-platform android-arm64
         working-directory: capture_harness
 
+      - name: Delete old harness artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "capture-harness-apk" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
       - uses: actions/upload-artifact@v4
         # See the "build" job's four-angle upload-artifact step for why this
         # is best-effort: it's not a dependency of the publish steps below.
@@ -140,6 +177,7 @@ jobs:
         with:
           name: capture-harness-apk
           path: capture_harness/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
 
       - name: Publish harness APK to GitHub Release
         env:
@@ -189,6 +227,7 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      actions: write
     # Standalone consumer-facing beta build (clearbridge_beta/) -- single-pass
     # front-only capture, no arc-sweep or four-angle code at all, decoupled
     # from both the main app and capture_harness so none of the three need
@@ -227,6 +266,17 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
 
+      - name: Delete old beta artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "clearbridge-beta-apk" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
       - uses: actions/upload-artifact@v4
         # See the "build" job's four-angle upload-artifact step for why this
         # is best-effort: it's not a dependency of the publish steps below.
@@ -234,6 +284,7 @@ jobs:
         with:
           name: clearbridge-beta-apk
           path: clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
 
       - name: Publish beta APK to GitHub Release
         env:
