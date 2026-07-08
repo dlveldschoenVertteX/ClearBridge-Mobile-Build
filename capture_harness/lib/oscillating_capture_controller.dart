@@ -5,6 +5,7 @@ import 'dart:ui' show Offset, Rect;
 
 import 'package:camera/camera.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
@@ -210,6 +211,15 @@ class _CapturedFrame {
   final double velocityDegPerSec; // 0 for burst stills
   final DateTime timestamp;
   final bool isBurst;
+  final bool flashOn;
+  // Raw (unsmoothed) Laplacian sharpness at capture time — for transition
+  // frames this is the exact per-frame value from HybridCaptureService; for
+  // burst stills it's the live preview-stream reading from immediately
+  // before the burst started (the actual full-res ISP still can't be
+  // cheaply scored without decoding it, and burst frames are already
+  // preferred server-side by type, not by score — this is a documented
+  // approximation, not an exact per-shot measurement).
+  final double? laplacianScore;
   const _CapturedFrame({
     required this.bytes,
     required this.phaseNumber,
@@ -217,6 +227,8 @@ class _CapturedFrame {
     required this.velocityDegPerSec,
     required this.timestamp,
     required this.isBurst,
+    required this.flashOn,
+    this.laplacianScore,
   });
 }
 
@@ -224,22 +236,36 @@ class _CapturedFrame {
 /// alternating real-ISP burst stills at each hold position with guided
 /// video-frame-extraction transitions between them.
 ///
+/// Feeds the same backend SfM reconstruction pipeline the other capture
+/// modes use (`processEnhanceAndScore`, `captureMode: 'oscillating_8phase'`)
+/// — see the backend's `_download_oscillating_frames` for how the dense
+/// frame stream this controller produces gets binned down into a
+/// cylindrical-projection input. To reconstruct well it tracks, per frame:
+/// the exact device angle (pitch axis, via [DeviceOrientationService]),
+/// raw Laplacian sharpness (so the backend can pick the best frame per
+/// angle bin), and ambient/torch pairing (so flash-diff segmentation — the
+/// most reliable segmentation tier on every other capture mode — has real
+/// pairs to work with, not just single ambient frames).
+///
 /// Deliberately lean compared to the package's other capture controllers
-/// (no ML thumb-coverage gate, no torch/flash logic, a fixed-delay
-/// calibration instead of a focus-stability tracker) — this mode is purely
-/// angle-and-timing driven per its spec, and staying minimal keeps it fast
-/// to retune while the geometry itself is still being worked out.
+/// (no ML thumb-coverage gate, brightness-only calibration instead of a
+/// focus-stability tracker) — this mode is purely angle-and-timing driven
+/// per its spec, and staying minimal keeps it fast to retune while the
+/// geometry itself is still being worked out.
 class OscillatingCaptureController extends ChangeNotifier {
   static const double _holdToleranceDeg = 5.0;
   static const double _waypointToleranceDeg = 5.0;
   static const int _holdDurationMs = 1500;
   static const int _burstFrameCount = 6; // spec range: 5-8
   static const int _burstShotDelayMs = 90;
+  static const int _burstFlashSettleMs = 120; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
   static const int _videoFrameMinIntervalMs = 33; // caps extraction at ~30fps
   static const int _maxVideoFramesPerTransition = 150; // safety cap
   static const int _emitThrottleMs = 80;
   static const int _confirmationDisplayMs = 700;
+  static const int _calibDurationMs = 500; // brightness sampling for AdaptiveFlashController
+  static const int _torchAlternateMs = 500; // transition-phase torch toggle cadence
 
   // Loose centre crop for transition frames — cuts background while leaving
   // margin for a wandering thumb during the move (unlike a burst hold, the
@@ -248,12 +274,13 @@ class OscillatingCaptureController extends ChangeNotifier {
 
   CameraController? _camera;
   String? _userId;
+  AdaptiveFlashController? _flash;
 
   OscillatingCaptureState _state = const OscillatingCaptureState();
   OscillatingCaptureState get state => _state;
 
   final _orientation = DeviceOrientationService();
-  final _hybrid = HybridCaptureService(); // live focus meter only — no gating
+  final _hybrid = HybridCaptureService(); // live focus meter + per-frame sharpness tag
 
   bool _disposed = false;
   bool _starting = false;
@@ -269,6 +296,11 @@ class OscillatingCaptureController extends ChangeNotifier {
   bool _waypointFired = false;
   DateTime? _lastVideoFrameAt;
   DateTime? _lastEmitAt;
+  DateTime? _lastTorchToggleAt;
+
+  DateTime? _calibStart;
+  bool _calibDone = false;
+  final List<double> _brightnessSamples = [];
 
   double _focusValue = 0;
   double _focusPeak = 1.0;
@@ -298,8 +330,12 @@ class OscillatingCaptureController extends ChangeNotifier {
     _lastAngleAt = null;
     _angularVelocity = 0;
     _lastVideoFrameAt = null;
+    _lastTorchToggleAt = null;
     _focusPeak = 1.0;
     _hybrid.reset();
+    _flash = AdaptiveFlashController(camera);
+    _brightnessSamples.clear();
+    _calibDone = false;
 
     _state = const OscillatingCaptureState(phase: OscillatingPhase.calibrating);
     notifyListeners();
@@ -308,24 +344,22 @@ class OscillatingCaptureController extends ChangeNotifier {
       await camera.setFocusMode(FocusMode.auto);
       await camera.setFocusPoint(const Offset(0.5, 0.5));
     } catch (_) {}
-    // Fixed settle delay rather than a focus-stability tracker: every burst
-    // frame is a real takePicture() still (the ISP re-focuses/re-meters each
-    // shot), so this only needs to get the lens roughly pointed before the
-    // stream starts — not lock in a perfect calibration.
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-    if (_disposed) return;
 
     _orientation.start();
-    await Future<void>.delayed(const Duration(milliseconds: 150));
+    await Future<void>.delayed(const Duration(milliseconds: 50));
     if (_disposed) return;
     _orientation.captureReference();
 
+    _calibStart = DateTime.now();
     try {
       if (camera.value.isStreamingImages) {
         try {
           await camera.stopImageStream();
         } catch (_) {}
       }
+      // Calibration proceeds through _onFrame's `calibrating`-phase branch
+      // (brightness sampling to feed AdaptiveFlashController) — one
+      // continuous stream, no stop/restart between calibrating and running.
       await camera.startImageStream(_onFrame);
       _streamRunning = true;
     } catch (e) {
@@ -335,6 +369,16 @@ class OscillatingCaptureController extends ChangeNotifier {
     }
 
     _starting = false;
+  }
+
+  Future<void> _finalizeCalibration() async {
+    if (_calibDone) return;
+    _calibDone = true;
+    final avg = _brightnessSamples.isEmpty
+        ? 128.0
+        : _brightnessSamples.reduce((a, b) => a + b) / _brightnessSamples.length;
+    await _flash?.calibrate(avg);
+    if (_disposed) return;
     HapticFeedback.mediumImpact();
     _enterStep(0, force: true);
   }
@@ -392,17 +436,26 @@ class OscillatingCaptureController extends ChangeNotifier {
   // ── Stream processing ─────────────────────────────────────────────────
 
   void _onFrame(CameraImage image) {
-    if (_disposed || _state.phase != OscillatingPhase.running) return;
+    if (_disposed) return;
     if (_burstInFlight) return; // stream is stopped during a burst anyway
 
-    // Live sharpness readout — diagnostic only, never gates capture.
+    if (_state.phase == OscillatingPhase.calibrating) {
+      _runCalibrationSample(image);
+      return;
+    }
+    if (_state.phase != OscillatingPhase.running) return;
+
+    // Sharpness — feeds both the live meter (smoothed) and, for transition
+    // frames, the exact per-frame tag the backend uses to pick the best
+    // frame in each angle bin (see _download_oscillating_frames).
+    double rawFocus = 0;
     try {
-      final raw = _hybrid.offerFrame(image);
-      if (raw > _focusPeak) _focusPeak = raw;
+      rawFocus = _hybrid.offerFrame(image);
+      if (rawFocus > _focusPeak) _focusPeak = rawFocus;
       _focusPeak *= 0.995;
       _focusValue = HybridCaptureService.ema(
         _focusValue,
-        (raw / (_focusPeak + 1e-6)).clamp(0.0, 1.0),
+        (rawFocus / (_focusPeak + 1e-6)).clamp(0.0, 1.0),
       );
     } catch (_) {}
 
@@ -422,7 +475,39 @@ class OscillatingCaptureController extends ChangeNotifier {
     if (step is _BurstStep) {
       _handleBurstFrame(angle, step);
     } else if (step is _TransitionStep) {
-      _handleTransitionFrame(image, angle, step);
+      _maybeToggleTorchForTransition();
+      _handleTransitionFrame(image, angle, rawFocus, step);
+    }
+  }
+
+  void _runCalibrationSample(CameraImage image) {
+    _brightnessSamples.add(HybridCaptureService.meanLuma(image));
+    final start = _calibStart;
+    if (start != null &&
+        DateTime.now().difference(start).inMilliseconds >= _calibDurationMs) {
+      unawaited(_finalizeCalibration());
+    }
+  }
+
+  /// Alternates the torch during transition steps so both an ambient and a
+  /// torch-lit frame get extracted across the sweep — the same real
+  /// ambient/flash pairing the burst loop produces at each hold, needed for
+  /// flash-diff segmentation server-side (see _segment_via_flash_diff).
+  /// Skipped when torch isn't needed (bright ambient) or stays on
+  /// permanently (pitch dark) — mirrors ArcSweepCaptureController's policy.
+  void _maybeToggleTorchForTransition() {
+    final flash = _flash;
+    if (flash == null || !flash.isNeeded || flash.isPitchDark) return;
+    final now = DateTime.now();
+    if (_lastTorchToggleAt != null &&
+        now.difference(_lastTorchToggleAt!).inMilliseconds < _torchAlternateMs) {
+      return;
+    }
+    _lastTorchToggleAt = now;
+    if (flash.isFlashOn) {
+      unawaited(flash.deactivate());
+    } else {
+      unawaited(flash.activate());
     }
   }
 
@@ -459,7 +544,12 @@ class OscillatingCaptureController extends ChangeNotifier {
     }
   }
 
-  void _handleTransitionFrame(CameraImage image, double angle, _TransitionStep step) {
+  void _handleTransitionFrame(
+    CameraImage image,
+    double angle,
+    double rawFocus,
+    _TransitionStep step,
+  ) {
     // Video-frame extraction, throttled to ~30fps and capped defensively.
     final now = DateTime.now();
     if ((_lastVideoFrameAt == null ||
@@ -478,6 +568,8 @@ class OscillatingCaptureController extends ChangeNotifier {
             velocityDegPerSec: _angularVelocity,
             timestamp: now,
             isBurst: false,
+            flashOn: _flash?.isFlashOn ?? false,
+            laplacianScore: rawFocus,
           ));
           _lastVideoFrameAt = now;
         }
@@ -520,12 +612,31 @@ class OscillatingCaptureController extends ChangeNotifier {
 
     final cam = _camera;
     final wasStreaming = _streamRunning;
+    final preburstFocus = _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null;
+    final torchCapable = _flash?.isNeeded ?? false;
 
     try {
       if (cam == null) return;
       if (wasStreaming) await _stopStream();
 
       for (var i = 0; i < _burstFrameCount; i++) {
+        // Alternate ambient/torch across the burst so this hold position
+        // also yields a real ambient/flash pair for segmentation, same as
+        // every other frame in the session — not just single ambient shots.
+        // Pitch-dark mode leaves torch on for every shot (deactivate() is a
+        // documented no-op there), which is the correct behaviour: there's
+        // no usable "ambient" variant when the torch is the only light.
+        final wantTorch = torchCapable && i.isOdd;
+        if (torchCapable) {
+          try {
+            if (wantTorch) {
+              await _flash!.activate();
+            } else {
+              await _flash!.deactivate();
+            }
+            await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+          } catch (_) {}
+        }
         try {
           final xfile = await cam.takePicture();
           final bytes = await xfile.readAsBytes();
@@ -540,6 +651,8 @@ class OscillatingCaptureController extends ChangeNotifier {
             velocityDegPerSec: 0,
             timestamp: DateTime.now(),
             isBurst: true,
+            flashOn: _flash?.isFlashOn ?? false,
+            laplacianScore: preburstFocus,
           ));
         } catch (e) {
           debugPrint('[osc] burst shot $i failed (non-fatal): $e');
@@ -547,6 +660,11 @@ class OscillatingCaptureController extends ChangeNotifier {
         if (i < _burstFrameCount - 1) {
           await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
         }
+      }
+      if (torchCapable) {
+        try {
+          await _flash!.deactivate();
+        } catch (_) {}
       }
 
       HapticFeedback.heavyImpact();
@@ -620,11 +738,11 @@ class OscillatingCaptureController extends ChangeNotifier {
 
   // ── Upload ─────────────────────────────────────────────────────────────
   //
-  // No backend pipeline understands this frame layout yet (8 phases mixing
-  // real-ISP burst stills with stream-extracted transition frames is a new
-  // schema), so this uploads raw frames + rich per-frame metadata to
-  // Storage/Firestore for inspection and pipeline development, and does NOT
-  // trigger processEnhanceAndScore.
+  // Uploads frames + rich per-frame metadata to Storage/Firestore, then
+  // triggers processEnhanceAndScore with captureMode: 'oscillating_8phase'
+  // so the backend's _download_oscillating_frames path picks it up — see
+  // that function for how the dense frame stream gets binned down into a
+  // cylindrical-projection input.
 
   Future<void> _finishAndUpload() async {
     _apply((s) => s.copyWith(phase: OscillatingPhase.uploading, uploadProgress: 0), force: true);
@@ -662,6 +780,9 @@ class OscillatingCaptureController extends ChangeNotifier {
           'phaseNumber': f.phaseNumber,
           'type': f.isBurst ? 'burst' : 'transition',
           'angleDeg': double.parse(f.angleDeg.toStringAsFixed(2)),
+          'flashOn': f.flashOn,
+          if (f.laplacianScore != null)
+            'laplacianScore': double.parse(f.laplacianScore!.toStringAsFixed(1)),
           if (!f.isBurst)
             'angularVelocityDegPerSec': double.parse(f.velocityDegPerSec.toStringAsFixed(1)),
           'timestamp': f.timestamp.toIso8601String(),
@@ -672,7 +793,7 @@ class OscillatingCaptureController extends ChangeNotifier {
         'captureId': id,
         'userId': userId,
         'createdAt': FieldValue.serverTimestamp(),
-        'status': 'captured_unprocessed',
+        'status': 'pending',
         'source': 'capture_harness',
         'captureMode': 'oscillating_8phase',
         'captureMethod': 'oscillating_8phase_v1',
@@ -710,6 +831,26 @@ class OscillatingCaptureController extends ChangeNotifier {
       }
       await firestoreFuture;
 
+      // Fire-and-forget, matching every other capture mode's uploader
+      // (BackendCaptureUploader.uploadAndProcess /
+      // ArcCaptureUploader.uploadArcAndProcess) — the callable's own
+      // Firestore writes (status: enhancing -> scored/failed) are the
+      // durable record of processing outcome, not this call's return value.
+      () async {
+        try {
+          await FirebaseFunctions.instanceFor(region: 'africa-south1')
+              .httpsCallable('processEnhanceAndScore')
+              .call({
+            'captureId': id,
+            'userId': userId,
+            'basePath': basePath,
+            'captureMode': 'oscillating_8phase',
+          });
+        } catch (e) {
+          debugPrint('[osc] processEnhanceAndScore trigger failed (non-blocking): $e');
+        }
+      }();
+
       _apply(
         (s) => s.copyWith(
           phase: OscillatingPhase.complete,
@@ -734,6 +875,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   }
 
   void _fail(String message) {
+    unawaited(_flash?.deactivate());
     unawaited(_stopStream());
     _apply((s) => s.copyWith(phase: OscillatingPhase.error, error: message), force: true);
   }
@@ -753,6 +895,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    unawaited(_flash?.deactivate());
     _orientation.dispose();
     unawaited(_stopStream());
     super.dispose();
