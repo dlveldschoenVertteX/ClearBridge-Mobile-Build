@@ -9,6 +9,8 @@ import 'firebase_options.dart';
 import 'front_burst_screen.dart';
 import 'harness_splash_screen.dart';
 import 'last_capture_review_screen.dart';
+import 'oscillating_capture_review_screen.dart';
+import 'oscillating_capture_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -105,6 +107,16 @@ class _ModeChooserScreen extends StatelessWidget {
                       builder: (_) => const _HarnessFrontBurstRoute()),
                 ),
               ),
+              const SizedBox(height: 16),
+              CaptureButton(
+                label: '8-Phase Oscillating (experimental)',
+                leadingIcon: Icons.swap_horiz_rounded,
+                variant: CaptureButtonVariant.ghost,
+                onPressed: () => _navigatorKey.currentState?.pushReplacement(
+                  MaterialPageRoute(
+                      builder: (_) => const _HarnessOscillatingRoute()),
+                ),
+              ),
             ],
           ),
         ),
@@ -148,6 +160,29 @@ class _HarnessFrontBurstRoute extends StatelessWidget {
       onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
         MaterialPageRoute(
           builder: (_) => LastCaptureReviewScreen(
+            captureId: captureId,
+            onCaptureAgain: _restart,
+          ),
+        ),
+      ),
+      onClose: () => _navigatorKey.currentState?.pushReplacement(
+        MaterialPageRoute(builder: (_) => const _ModeChooserScreen()),
+      ),
+    );
+  }
+}
+
+class _HarnessOscillatingRoute extends StatelessWidget {
+  const _HarnessOscillatingRoute();
+
+  @override
+  Widget build(BuildContext context) {
+    return OscillatingCaptureScreen(
+      getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+      onRequireLogin: () => _restart(message: 'Auth expired — restarting'),
+      onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => OscillatingCaptureReviewScreen(
             captureId: captureId,
             onCaptureAgain: _restart,
           ),
