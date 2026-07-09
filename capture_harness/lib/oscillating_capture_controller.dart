@@ -216,6 +216,7 @@ class OscillatingCaptureState {
   final int waypointTotal;
   final double angularVelocityDegPerSec;
   final bool tooFast;
+  final int distanceHint; // -1 too far (move closer), +1 too close (back off), 0 ok
   final bool isCapturingBurst;
   final int burstShotIndex; // shots fired so far this burst, for the UI countdown
   final int burstShotTotal;
@@ -240,6 +241,7 @@ class OscillatingCaptureState {
     this.waypointTotal = 3,
     this.angularVelocityDegPerSec = 0,
     this.tooFast = false,
+    this.distanceHint = 0,
     this.isCapturingBurst = false,
     this.burstShotIndex = 0,
     this.burstShotTotal = 0,
@@ -265,6 +267,7 @@ class OscillatingCaptureState {
     int? waypointTotal,
     double? angularVelocityDegPerSec,
     bool? tooFast,
+    int? distanceHint,
     bool? isCapturingBurst,
     int? burstShotIndex,
     int? burstShotTotal,
@@ -290,6 +293,7 @@ class OscillatingCaptureState {
         angularVelocityDegPerSec:
             angularVelocityDegPerSec ?? this.angularVelocityDegPerSec,
         tooFast: tooFast ?? this.tooFast,
+        distanceHint: distanceHint ?? this.distanceHint,
         isCapturingBurst: isCapturingBurst ?? this.isCapturingBurst,
         burstShotIndex: burstShotIndex ?? this.burstShotIndex,
         burstShotTotal: burstShotTotal ?? this.burstShotTotal,
@@ -412,6 +416,23 @@ class OscillatingCaptureController extends ChangeNotifier {
   // off and a refocus is kicked instead of banking a blurry set of stills.
   static const double _burstFocusGateFrac = 0.55;
 
+  // On-device thumb detection (MediaPipe hand landmarker) drives a DYNAMIC
+  // ROI: focus/exposure/sharpness all target the actual thumb pixels instead
+  // of the fixed centre box, so an off-centre thumb is still metered
+  // correctly. Run at reduced cadence (same as ArcSweepCaptureController) —
+  // the model is too heavy for every frame but a few detections a second is
+  // plenty to keep the ROI tracking a slowly-orbiting thumb.
+  static const int _landmarkEveryNFrames = 6;
+  static const int _thumbRoiStaleMs = 1500; // fall back to centre if detection lapses
+  // Thumb bbox (MediaPipe landmarks 1–4) is padded by this fraction of its
+  // size so focus/metering include the ridge field around the tip, not just
+  // the skeleton line.
+  static const double _thumbRoiPad = 0.18;
+  // Coverage = normalised thumb-tip↔wrist span; same 0.35–0.85 "not too far /
+  // not too close" window the 4-angle and arc-sweep flows gate on.
+  static const double _coverageMin = 0.35;
+  static const double _coverageMax = 0.85;
+
   CameraController? _camera;
   String? _userId;
   AdaptiveFlashController? _flash;
@@ -429,6 +450,15 @@ class OscillatingCaptureController extends ChangeNotifier {
   double _appliedEvOffset = 0.0; // current EV offset applied to the camera
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0; // ambient thumb-ROI luma (torch-off)
+
+  // Dynamic thumb ROI from the on-device landmarker (null → use centre box).
+  final _landmarker = ThumbLandmarkerService();
+  bool _landmarkerInitStarted = false;
+  int _frameCounter = 0;
+  Rect? _thumbRoi;
+  DateTime? _thumbRoiAt;
+  double _lastCoverage = 0.0;
+  DateTime? _lastCoverageAt;
 
   OscillatingCaptureState _state = const OscillatingCaptureState();
   OscillatingCaptureState get state => _state;
@@ -500,6 +530,15 @@ class OscillatingCaptureController extends ChangeNotifier {
     _appliedEvOffset = 0.0;
     _evChangeInFlight = false;
     _lastStableBrightness = 128.0;
+    _frameCounter = 0;
+    _thumbRoi = null;
+    _thumbRoiAt = null;
+    _lastCoverage = 0.0;
+    _lastCoverageAt = null;
+    if (!_landmarkerInitStarted) {
+      _landmarkerInitStarted = true;
+      _landmarker.initialize();
+    }
     _focusPeak = 1.0;
     _hybrid.reset();
     _flash = AdaptiveFlashController(camera);
@@ -569,18 +608,89 @@ class OscillatingCaptureController extends ChangeNotifier {
     _enterStep(0, force: true);
   }
 
+  // ── Thumb ROI (on-device landmarker) ──────────────────────────────────────
+
+  /// The ROI focus/exposure/sharpness should target: the live thumb bbox when
+  /// a fresh detection exists, else the fixed centre box.
+  Rect get _activeRoi {
+    final roi = _thumbRoi;
+    final at = _thumbRoiAt;
+    if (roi != null &&
+        at != null &&
+        DateTime.now().difference(at).inMilliseconds < _thumbRoiStaleMs) {
+      return roi;
+    }
+    return _scoreRoi;
+  }
+
+  /// Runs the hand landmarker (reduced cadence) and updates the thumb bbox +
+  /// coverage. Landmarks 1–4 are the thumb (CMC→tip); their padded bounds make
+  /// the ROI. Coverage = |tip.y − wrist.y| feeds the too-far/too-close hint.
+  void _updateThumbRoi(CameraImage image) {
+    if (!_landmarker.isReady) return;
+    if (_frameCounter % _landmarkEveryNFrames != 0) return;
+    final hands = _landmarker.detect(image, _sensorOrientation);
+    if (hands.isEmpty || hands.first.landmarks.length <= 4) return;
+    final lms = hands.first.landmarks;
+    double minX = 1.0, minY = 1.0, maxX = 0.0, maxY = 0.0;
+    for (var i = 1; i <= 4; i++) {
+      final p = lms[i];
+      if (p.x < minX) minX = p.x;
+      if (p.y < minY) minY = p.y;
+      if (p.x > maxX) maxX = p.x;
+      if (p.y > maxY) maxY = p.y;
+    }
+    final padX = (maxX - minX) * _thumbRoiPad;
+    final padY = (maxY - minY) * _thumbRoiPad;
+    final l = (minX - padX).clamp(0.0, 1.0);
+    final t = (minY - padY).clamp(0.0, 1.0);
+    final r = (maxX + padX).clamp(0.0, 1.0);
+    final b = (maxY + padY).clamp(0.0, 1.0);
+    if (r - l < 0.08 || b - t < 0.08) return; // implausibly small — ignore
+    _thumbRoi = Rect.fromLTRB(l, t, r, b);
+    _thumbRoiAt = DateTime.now();
+    _lastCoverage = (lms[4].y - lms[0].y).abs().clamp(0.0, 1.0);
+    _lastCoverageAt = DateTime.now();
+  }
+
+  /// Distance hint from the latest coverage reading: -1 = too far (move
+  /// closer), +1 = too close (move back), 0 = in range or detection stale.
+  int get _distanceHint {
+    final at = _lastCoverageAt;
+    if (at == null ||
+        DateTime.now().difference(at).inMilliseconds > _thumbRoiStaleMs) {
+      return 0;
+    }
+    if (_lastCoverage < _coverageMin) return -1;
+    if (_lastCoverage > _coverageMax) return 1;
+    return 0;
+  }
+
   // ── Focus / exposure control (ported from ArcSweepCaptureController) ───────
 
-  /// Puts the lens into continuous AF aimed at the centre (thumb) point.
+  /// Centre of the active ROI — where focus/exposure should be aimed.
+  Offset get _roiCentre {
+    final r = _activeRoi;
+    return Offset(
+      ((r.left + r.right) / 2).clamp(0.0, 1.0),
+      ((r.top + r.bottom) / 2).clamp(0.0, 1.0),
+    );
+  }
+
+  /// Puts the lens into continuous AF aimed at the thumb (ROI centre).
   Future<void> _beginAutofocus() async {
     final c = _camera;
     if (c == null || !c.value.isInitialized) return;
     _focusLocked = false;
+    final pt = _roiCentre;
     try {
       await c.setFocusMode(FocusMode.auto);
     } catch (_) {}
     try {
-      await c.setFocusPoint(const Offset(0.5, 0.5));
+      await c.setFocusPoint(pt);
+    } catch (_) {}
+    try {
+      await c.setExposurePoint(pt);
     } catch (_) {}
   }
 
@@ -703,20 +813,28 @@ class OscillatingCaptureController extends ChangeNotifier {
     if (_disposed) return;
     if (_burstInFlight) return; // stream is stopped during a burst anyway
 
+    // Track the thumb bbox (reduced cadence) in every live phase so the ROI
+    // is warm before the first hold and keeps following the thumb as it
+    // orbits. Cheap when it's not the Nth frame (early return inside).
+    _frameCounter++;
+    _updateThumbRoi(image);
+
     if (_state.phase == OscillatingPhase.calibrating) {
       _runCalibrationSample(image);
       return;
     }
     if (_state.phase != OscillatingPhase.running) return;
 
+    final roi = _activeRoi;
+
     // Sharpness — feeds both the live meter (smoothed) and, for transition
     // frames, the exact per-frame tag the backend uses to pick the best
     // frame in each angle bin (see _download_oscillating_frames).
     double rawFocus = 0;
     try {
-      // Score sharpness on the thumb ROI, not the whole frame, so a crisp
-      // background can't outscore a soft thumb.
-      rawFocus = _hybrid.offerFrame(image, thumbRoi: _scoreRoi);
+      // Score sharpness on the live thumb ROI, not the whole frame, so a
+      // crisp background can't outscore a soft thumb.
+      rawFocus = _hybrid.offerFrame(image, thumbRoi: roi);
       if (rawFocus > _focusPeak) _focusPeak = rawFocus;
       _focusPeak *= 0.995;
       _focusValue = HybridCaptureService.ema(
@@ -729,10 +847,17 @@ class OscillatingCaptureController extends ChangeNotifier {
     // thumb correctly exposed — this is what fixes the underexposed, dark
     // captures that buried ridge contrast in noise.
     if (!(_flash?.isFlashOn ?? false)) {
-      _lastStableBrightness =
-          HybridCaptureService.meanLuma(image, roi: _scoreRoi);
+      _lastStableBrightness = HybridCaptureService.meanLuma(image, roi: roi);
     }
     if (!_refocusing) _maybeAdjustExposure();
+
+    // Surface the macro-distance hint (too far / too close) so the user frames
+    // the thumb large enough to resolve ridges but still within the lens's
+    // focus range. Only emit on a change to avoid extra rebuilds.
+    final hint = _distanceHint;
+    if (hint != _state.distanceHint) {
+      _apply((s) => s.copyWith(distanceHint: hint));
+    }
 
     final step = oscillatingSteps[_state.stepIndex];
     // TOP is the only step measured on roll rather than pitch -- see
@@ -782,7 +907,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   }
 
   void _runCalibrationSample(CameraImage image) {
-    _brightnessSamples.add(HybridCaptureService.meanLuma(image, roi: _scoreRoi));
+    _brightnessSamples.add(HybridCaptureService.meanLuma(image, roi: _activeRoi));
     final start = _calibStart;
     if (start != null &&
         DateTime.now().difference(start).inMilliseconds >= _calibDurationMs) {
@@ -1369,6 +1494,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     _orientation.dispose();
     unawaited(_stopStream());
     _cvClassifier?.dispose();
+    _landmarker.dispose();
     _audio.dispose();
     super.dispose();
   }

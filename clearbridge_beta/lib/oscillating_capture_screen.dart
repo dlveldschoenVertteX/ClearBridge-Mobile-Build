@@ -384,6 +384,18 @@ class _GuidancePanel extends StatelessWidget {
             color: state.tooFast ? CaptureColors.warning : CaptureColors.silverDim,
           ),
         ),
+        if (state.distanceHint != 0) ...[
+          const SizedBox(height: 6),
+          Text(
+            state.distanceHint < 0
+                ? '↑ Move phone CLOSER to the thumb'
+                : '↓ Move phone BACK a little',
+            style: CaptureTypography.label.copyWith(
+              fontSize: 12,
+              color: CaptureColors.warning,
+            ),
+          ),
+        ],
         const SizedBox(height: 10),
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 24),
