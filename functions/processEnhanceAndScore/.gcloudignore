@@ -1,0 +1,23 @@
+# Exclude local venv (installed on Windows — wrong platform for Cloud Functions Linux runtime)
+venv/
+Include/
+Lib/
+Scripts/
+pyvenv.cfg
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Windows-compiled binaries
+*.dll
+*.exe
+
+# Model files — stored in Firebase Storage, downloaded to /tmp/ at cold-start
+model/
+
+# Local evaluation harness — not a Cloud Function
+eval_pipeline.py
+eval_output/

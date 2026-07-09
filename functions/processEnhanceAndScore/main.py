@@ -1,0 +1,1677 @@
+"""
+processEnhanceAndScore — Firebase Cloud Function (africa-south1)
+Full pipeline: SfM unwrap → NNS enhancement → NFIQ scoring → Henry classification
+
+Input:  Firebase callable { captureId, userId, basePath }
+Output: Firestore captures/{captureId} updated with scoring result
+"""
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
+
+import firebase_admin
+from firebase_admin import firestore, storage
+from firebase_functions import https_fn, options
+
+# cv2 / numpy / sfm_pipeline / enhancement_pipeline are heavy (DLL load on Windows).
+# Deferring them to first function invocation keeps module import <1 s so that the
+# Firebase CLI local analysis server (10 s timeout) can return functions.yaml.
+cv2 = None              # type: ignore[assignment]
+np  = None              # type: ignore[assignment]
+enhancement_pipeline = None   # type: ignore[assignment]
+sfm_pipeline         = None   # type: ignore[assignment]
+CaptureQualityError  = Exception  # placeholder; replaced by _init_heavy_deps()
+
+def _init_heavy_deps() -> None:
+    """Import scientific libraries on first call. No-op on subsequent calls."""
+    global cv2, np, enhancement_pipeline, sfm_pipeline, CaptureQualityError
+    if cv2 is not None:
+        return
+    import cv2 as _cv2
+    import numpy as _np
+    import enhancement_pipeline as _ep
+    import sfm_pipeline as _sfm
+    from sfm_pipeline import CaptureQualityError as _CQE
+    cv2 = _cv2
+    np  = _np
+    enhancement_pipeline = _ep
+    sfm_pipeline         = _sfm
+    CaptureQualityError  = _CQE
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# ── Constants ─────────────────────────────────────────────────────────────────
+# Models live in Firebase Storage and are downloaded to /tmp/ on cold start.
+_STORAGE_MODEL_PREFIX = 'models'
+_NFIQ_PATH      = '/tmp/nfiq_resnet18.onnx'
+_NNS_PATH       = '/tmp/nns_stage3.pt'    # Stage 3 UNet; falls back to nns_stage1.pt in enhancement_pipeline
+_NNS_PATH_S1    = '/tmp/nns_stage1.pt'
+_THUMB_SEG_PATH = '/tmp/thumb_seg_unet.onnx'   # bootstrap segmentation fallback; see sfm_pipeline._segment_via_ml_model
+_PASS_THRESHOLD_BETA       = 35.0   # collect all prints for training
+_PASS_THRESHOLD_PRODUCTION = 80.0   # API quality gate — switch when going live
+_PASS_THRESHOLD = _PASS_THRESHOLD_BETA
+_TARGET_SIZE    = (500, 500)
+_RATE_LIMIT_SEC = 60   # minimum seconds between pipeline calls per user
+
+# Beta phase flag — retains ALL raw frames globally for pipeline training.
+# Set to False before production launch; frame deletion then reverts to the
+# per-capture preserveRawFrames / isTestParticipant / dev-UID rules only.
+_BETA_PHASE = True
+
+# Developer UID — frames are never deleted for this account so the SFM optimizer
+# can replay any capture offline without needing preserveRawFrames set manually.
+_DEV_UID = 'S7B5LAvXiJdKjHTbpAFMoINv4Um2'
+
+
+@firestore.transactional
+def _check_rate_limit_tx(transaction, user_ref):
+    """Atomically check rate-limit and stamp lastCaptureCallAt. Returns remaining
+    seconds to wait, or None if the call is allowed."""
+    snap = user_ref.get(transaction=transaction)
+    last_call = (snap.to_dict() or {}).get('lastCaptureCallAt')
+    if last_call is not None:
+        try:
+            elapsed = time.time() - last_call.timestamp()
+            if elapsed < _RATE_LIMIT_SEC:
+                return int(_RATE_LIMIT_SEC - elapsed)
+        except AttributeError:
+            pass  # field is not a Timestamp — treat as no limit
+    transaction.set(user_ref, {'lastCaptureCallAt': firestore.SERVER_TIMESTAMP}, merge=True)
+    return None
+
+# Angle order matches Flutter upload: front, right, top, left (index 0–3)
+_ANGLE_NAMES = ['front', 'right', 'top', 'left']
+
+# Standard phone Y-plane resolutions for raw-frame fallback decoding
+_KNOWN_DIMS = [
+    (1600, 1200), (1200, 1600),
+    (1280,  960), ( 960, 1280),
+    (1920, 1080), (1080, 1920),
+    (1280,  720), ( 720, 1280),
+    ( 640,  480), ( 480,  640),
+]
+
+# ── Firebase initialisation ───────────────────────────────────────────────────
+# Must run at module level so the callable SDK middleware can verify ID tokens
+# before user code (processEnhanceAndScore) executes. Lazy init inside
+# _get_firebase() caused "default Firebase app does not exist" auth failures.
+#
+# K_SERVICE is set by the Cloud Run runtime (all Cloud Functions Gen2).
+# It is NOT set during Firebase CLI local analysis, which would otherwise
+# hang for 10s on the GCP metadata server 169.254.169.254.
+if not firebase_admin._apps and os.environ.get('K_SERVICE'):
+    firebase_admin.initialize_app()
+
+_db     = None
+_bucket = None
+_nfiq_session = None
+
+
+def _get_firebase():
+    global _db, _bucket
+    if _db is None:
+        _db     = firestore.client()
+        _bucket = storage.bucket()
+    return _db, _bucket
+
+
+def _ensure_models():
+    """Load model files into /tmp/: bundled source copy first, Storage fallback."""
+    import shutil
+    _, bucket = _get_firebase()
+    # (required=True) models abort the function on failure; optional models degrade gracefully
+    model_specs = [
+        (_NFIQ_PATH,      'nfiq_resnet18.onnx', True),
+        (_NNS_PATH,       'nns_stage3.pt',       False),
+        (_NNS_PATH_S1,    'nns_stage1.pt',       False),
+        (_THUMB_SEG_PATH, 'thumb_seg_unet.onnx', False),
+    ]
+    src_dir = os.path.dirname(os.path.abspath(__file__))
+    for local_path, remote_name, required in model_specs:
+        if not os.path.exists(local_path):
+            # Prefer the model bundled with the function source (faster cold start,
+            # no Storage round-trip). Fall back to Firebase Storage if absent.
+            bundled = os.path.join(src_dir, remote_name)
+            if os.path.exists(bundled):
+                shutil.copy(bundled, local_path)
+                logger.info(f'Model loaded from bundle: {remote_name} ({os.path.getsize(local_path) // 1024 // 1024} MB)')
+                continue
+            remote_path = f'{_STORAGE_MODEL_PREFIX}/{remote_name}'
+            try:
+                logger.info(f'Downloading model {remote_path} → {local_path}')
+                bucket.blob(remote_path).download_to_filename(local_path)
+                logger.info(f'Model ready: {local_path} ({os.path.getsize(local_path) // 1024 // 1024} MB)')
+            except Exception as e:
+                if required:
+                    raise
+                logger.warning(f'Optional model {remote_name} not found in Storage (skipping): {e}')
+
+
+def _get_nfiq_session():
+    global _nfiq_session
+    if _nfiq_session is None:
+        _ensure_models()
+        import onnxruntime as ort
+        _nfiq_session = ort.InferenceSession(_NFIQ_PATH, providers=['CPUExecutionProvider'])
+        logger.info("NFIQ ONNX session initialised")
+    return _nfiq_session
+
+
+# ── Cloud Function ────────────────────────────────────────────────────────────
+
+@https_fn.on_call(
+    region='africa-south1',
+    timeout_sec=120,
+    memory=options.MemoryOption.GB_4,
+    cpu=4,
+    min_instances=1,
+)
+def processEnhanceAndScore(req: https_fn.CallableRequest):
+    """
+    Flutter callable. Receives { captureId, userId, basePath }.
+    Runs full SfM → enhancement → NFIQ pipeline.
+    Writes result to Firestore captures/{captureId}.
+    Returns { nfiqScore, nfiqPass, henryClass }.
+    """
+    if not req.auth:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.UNAUTHENTICATED,
+            message='User must be authenticated to process a capture',
+        )
+
+    data       = req.data or {}
+    capture_id = (data.get('captureId') or '').strip()
+    user_id    = (data.get('userId')    or '').strip()
+    base_path  = (data.get('basePath')  or '').strip()
+    # Normalized thumb width (0-1 fraction of frame width) from MediaPipe.
+    # Used by SfM to skip unreliable in-frame silhouette detection.
+    raw_twf = data.get('thumbWidthFraction')
+    thumb_width_fraction: Optional[float] = float(raw_twf) if raw_twf is not None else None
+    # Per-angle device orbit angles passed from Flutter to avoid a second
+    # Firestore read during SfM seeding.  e.g. {'front': 0.0, 'left': -18.5}
+    payload_orbit_angles: dict = data.get('orbitAngles') or {}
+    arc_angles_raw: list = data.get('arcAngles') or []
+    arc_angles: Optional[list[float]] = [float(a) for a in arc_angles_raw] if arc_angles_raw else None
+    is_arc = bool(arc_angles)
+    is_oscillating = (data.get('captureMode') or '') == 'oscillating_8phase'
+
+    if not capture_id or not user_id or not base_path:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INVALID_ARGUMENT,
+            message='captureId, userId, and basePath are required',
+        )
+
+    if req.auth.uid != user_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='userId does not match authenticated user',
+        )
+
+    _init_heavy_deps()  # cv2 / numpy / sfm_pipeline / enhancement_pipeline
+
+    logger.info(f"Processing capture={capture_id} user={user_id} path={base_path}")
+    t_start = time.monotonic()
+    db, _ = _get_firebase()   # initialise db + bucket on first request
+
+    # ── Rate limit: 60 s per user ─────────────────────────────────────────────
+    # Prevents cost-bomb abuse — each invocation runs a 4 GB / 4 vCPU pipeline.
+    # Transaction ensures the check+write is atomic so concurrent requests
+    # cannot both slip through before either stamps lastCaptureCallAt.
+    # Admin SDK writes lastCaptureCallAt; Firestore rules block client resets.
+    user_ref = db.collection('users').document(user_id)
+    remaining = _check_rate_limit_tx(db.transaction(), user_ref)
+    if remaining is not None:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.RESOURCE_EXHAUSTED,
+            message=f'Please wait {remaining}s before submitting another capture.',
+        )
+
+    _ensure_models()  # copy bundled NFIQ + NNS models to /tmp/ on cold start; Storage fallback if absent
+
+    # Mark as enhancing
+    _update_firestore(capture_id, {'status': 'enhancing', 'processingStartedAt': firestore.SERVER_TIMESTAMP})
+
+    try:
+        # ── 1. Download frames from Storage ───────────────────────────────────
+        logger.info('stage=download_start elapsed=%.1fs', time.monotonic() - t_start)
+        ambient_frames = None
+        flash_frames   = None
+        arc_frame_wts  = None
+        osc_theta_deg  = None
+        if is_arc:
+            frames, frame_meta, arc_sfm_angles, arc_sweep_stats, arc_frame_wts = _download_arc_frames(capture_id, base_path)
+            actual_angles = arc_sfm_angles
+            _update_firestore(capture_id, {
+                'captureMode':  'arc_sweep',
+                'arcAnglesDeg': [round(a, 1) for a in arc_sfm_angles],
+                # Physical sweep span in degrees (left + right actual pitch range).
+                # arcAnglesDeg now always spans ~±90° (normalised to actual data)
+                # so the raw SfM range is no longer meaningful for diagnostics.
+                'arcSpanDeg': round(
+                    arc_sweep_stats['arcActualLeftDeg'] + arc_sweep_stats['arcActualRightDeg'], 1
+                ),
+                **arc_sweep_stats,
+            })
+        elif is_oscillating:
+            (frames, frame_meta, osc_angles, osc_stats,
+             arc_frame_wts, ambient_frames, flash_frames) = _download_oscillating_frames(capture_id, base_path)
+            actual_angles = osc_angles
+            # Tight output span instead of the default ±120°: this mode is a
+            # single dense sweep, not four sparse checkpoints, so the ±65°
+            # per-frame margin the adaptive-span logic uses elsewhere would
+            # massively overshoot real coverage (e.g. a ±45° sweep would
+            # otherwise get a ±110° output texture, hallucinating ~60° of
+            # gap-filled edge on each side). Half the observed range plus a
+            # small margin keeps the texture matched to what was actually
+            # swept.
+            _range_half   = (max(osc_angles) - min(osc_angles)) / 2.0
+            osc_theta_deg = min(120.0, max(40.0, _range_half + 15.0))
+            _update_firestore(capture_id, {
+                'captureMode':    'oscillating_8phase',
+                'oscAnglesDeg':   [round(a, 1) for a in osc_angles],
+                **osc_stats,
+            })
+        else:
+            frames, frame_meta, actual_angles, ambient_frames, flash_frames = _download_best_frames(base_path)
+        t_download = time.monotonic()
+        logger.info('stage=download_done  elapsed=%.1fs', t_download - t_start)
+
+        # ── 1b. Build IMU-seeded cylindrical angles (orbit mode only) ─────────
+        # Replace the hardcoded 0°/90°/180°/270° nominal cylindrical positions
+        # with estimates derived from the device orbit angles recorded by the
+        # Flutter app at capture time.  When a user fires slightly short of a
+        # target (e.g. pitch=−17° instead of −20° for the left angle), the seed
+        # places that frame at ~283° instead of 270°, giving the phase-correlation
+        # refinement a more accurate starting point.
+        # Top (roll axis) and front are kept at their nominal cylindrical values;
+        # only left/right (pitch axis) are scaled.  Falls back to actual_angles
+        # (nominal 0/90/180/270) when orbit data is unavailable.
+        # Prefer payload-supplied orbit angles (eliminates a serial Firestore read)
+        # and fall back to Firestore only when the Flutter client is older.
+        if is_arc:
+            # Already computed correctly (Firestore-ordered, roll-aware) by
+            # _download_arc_frames above — nothing to redo here.
+            angles_for_sfm = arc_sfm_angles
+            orbit_angles   = {}
+            logger.info('Arc-sweep angles: %s', [round(a, 1) for a in arc_sfm_angles])
+        elif is_oscillating:
+            # Already computed (binned, angle-sorted) by
+            # _download_oscillating_frames above.
+            angles_for_sfm = osc_angles
+            orbit_angles   = {}
+            logger.info('Oscillating angles: %s', [round(a, 1) for a in osc_angles])
+        elif payload_orbit_angles:
+            orbit_angles = {k: float(v) for k, v in payload_orbit_angles.items()}
+            logger.info('Orbit angles from payload: %s', orbit_angles)
+        else:
+            orbit_angles = _extract_orbit_angles(capture_id)
+        _nominal_cyl = {'front': 0.0, 'right': 90.0, 'top': 180.0, 'left': 270.0}
+
+        # Guard: skip IMU seeding when all orbit values are near-zero (≤1°).
+        # This happens when the Flutter app sends thumbAngleDegrees (MediaPipe thumb
+        # tilt, typically ~0° when thumb is held still) instead of the device's
+        # azimuthal orbit position.  Near-zero deltas clamp to scale=0.2 and
+        # produce angles like [0°,18°,180°,342°] — a 162° gap that exceeds the
+        # SFM 120° limit and silently triggers fallback_front_only.
+        _orbit_all_near_zero = (
+            orbit_angles
+            and all(abs(float(v)) <= 1.0 for v in orbit_angles.values())
+        )
+        if _orbit_all_near_zero:
+            logger.info(
+                'Orbit sensor not calibrated (all values ≤1°) — using nominal angles'
+            )
+            orbit_angles = {}
+
+        if is_arc or is_oscillating:
+            # angles_for_sfm already final — set above by the respective
+            # downloader. Skip the IMU/protocol-target seeding entirely;
+            # falling through to the nominal-angle `else` branch below would
+            # silently overwrite the already-correct oscillating/arc angles
+            # with the unrelated four-angle protocol's 0/±32/-20 targets.
+            pass
+        elif orbit_angles:
+            # Zero-point relative: subtract front orbit reading so any device-level
+            # sensor offset cancels out.  Front is always φ=0 by definition; all
+            # other angles are expressed as deltas from that reference.
+            # The device orbiting the thumb by Δ degrees changes the viewing
+            # azimuth by Δ degrees — use the measured orbit delta DIRECTLY as
+            # the cylindrical angle. The previous mapping scaled Δ up to a
+            # ±90° "nominal cylindrical target" (orbit 15° → 90°), a 3–6×
+            # exaggeration that placed adjacent frames on non-overlapping
+            # cylinder sectors; phase correlation then had nothing real to
+            # correlate (observed as phaseCorrPairs=[None,None,None] on every
+            # production capture with these seeds).
+            front_orbit = float(orbit_angles.get('front', 0.0))
+            angles_for_sfm = []
+            for meta_entry in frame_meta:
+                name  = meta_entry['angle']
+                orbit = orbit_angles.get(name)
+                if name == 'front':
+                    angles_for_sfm.append(0.0)
+                elif name == 'top':
+                    # Roll-axis motion — no azimuthal displacement; contributes
+                    # redundant coverage (SNR) around the front sector.
+                    angles_for_sfm.append(0.0)
+                elif orbit is not None:
+                    delta = float(orbit) - front_orbit
+                    # Clamp to a plausible physical orbit range.
+                    angles_for_sfm.append(float(np.clip(delta, -75.0, 75.0)))
+                else:
+                    angles_for_sfm.append(_nominal_cyl.get(name, 0.0))
+            logger.info(
+                'IMU angles (direct orbit deltas, front_orbit=%.1f): %s',
+                front_orbit,
+                {m['angle']: round(a, 1) for m, a in zip(frame_meta, angles_for_sfm)},
+            )
+            # Sanity check: needs a real spread to stitch; degenerate orbit
+            # data (all near-identical) → fall back to protocol targets.
+            _imu_span = max(angles_for_sfm) - min(angles_for_sfm)
+            if _imu_span < 15.0:
+                logger.warning(
+                    'IMU orbit data degenerate (span=%.1f° < 15°) — '
+                    'falling back to protocol target angles', _imu_span,
+                )
+                _protocol_targets = _extract_target_angles(capture_id)
+                angles_for_sfm = [
+                    _protocol_targets.get(m['angle'], 0.0) for m in frame_meta
+                ]
+        else:
+            # No usable IMU data. The old behaviour projected the four views at
+            # nominal 0°/90°/180°/270° — but the capture protocol only orbits
+            # the device ±32° (right/left targets) and −20° roll (top), so the
+            # frames were being placed ~3× too far apart on the cylinder.
+            # Consequences observed on every production capture: near-zero
+            # genuine overlap between adjacent projections (phase correlation
+            # returned None on all pairs), and the same thumb surface duplicated
+            # into disjoint sectors. Place the frames at the protocol's actual
+            # orbit targets read from the client's frame metadata
+            # (targetAngleDegrees), falling back to the current protocol
+            # constants. Left/right are azimuthal (pitch-axis); top is a roll
+            # motion with no azimuthal displacement — it sits at 0° and
+            # contributes redundant coverage (SNR) around the front sector.
+            _protocol_targets = _extract_target_angles(capture_id)
+            angles_for_sfm = []
+            for meta_entry in frame_meta:
+                name = meta_entry['angle']
+                angles_for_sfm.append(_protocol_targets.get(name, 0.0))
+            logger.info(
+                'No IMU orbit data — using protocol target angles: %s',
+                {m['angle']: round(a, 1) for m, a in zip(frame_meta, angles_for_sfm)},
+            )
+
+        # ── 2. Cylindrical superprint unwrap ──────────────────────────────────
+        # Projects views onto a virtual cylinder.  Initial angles come from
+        # IMU-seeded estimates (see above) or fall back to the nominal 90° step
+        # convention.  Phase-correlation refinement in the SfM pipeline further
+        # adjusts each angle based on ridge signal alignment across adjacent frames.
+        # When 3 frames are present (top/180° missing), allows a 185° gap so
+        # front+right+left together still produce a valid superprint.
+        # Falls back to front-frame-only on segmentation failure (coverage < 20%).
+        logger.info('stage=sfm_start      elapsed=%.1fs', time.monotonic() - t_start)
+        n_frames = len(frames)
+        # Internal-gap semantics (wrap-around gap no longer counted — see
+        # reconstruct_and_unwrap): the default 120° limit works for every
+        # mode, including 3-frame captures missing the top view.
+        gap_limit = None
+        sfm_coverage    = 0.0
+        sfm_diagnostics: dict = {}
+        fallback_mask   = None
+        try:
+            sfm_cfg = {'out_theta_deg': osc_theta_deg} if osc_theta_deg is not None else None
+            unwrapped, sfm_coverage, sfm_refined_angles, sfm_diagnostics = (
+                sfm_pipeline.reconstruct_and_unwrap(
+                    frames, angles_deg=angles_for_sfm, max_angle_gap_deg=gap_limit,
+                    thumb_width_fraction=thumb_width_fraction,
+                    ambient_frames=ambient_frames, flash_frames=flash_frames,
+                    frame_weights=arc_frame_wts,
+                    sfm_config=sfm_cfg,
+                )
+            )
+            if is_oscillating:
+                sfm_status = 'success_oscillating'
+            elif is_arc:
+                sfm_status = 'success_arc'
+            elif n_frames == 4:
+                sfm_status = 'success'
+            else:
+                sfm_status = 'success_3view'
+            sfm_fields = {
+                'sfmStatus':        sfm_status,
+                'sfmCoverage':      float(round(sfm_coverage, 3)),
+                'sfmRefinedAngles': [float(round(a, 2)) for a in sfm_refined_angles],
+                'sfmOrbitSeeds':    {m['angle']: float(round(a, 1))
+                                     for m, a in zip(frame_meta, angles_for_sfm)}
+                                    if (not is_arc and orbit_angles) else None,
+            }
+            if not is_arc and n_frames == 3:
+                sfm_fields['sfmMissingAngle'] = 'top'
+            _update_firestore(capture_id, sfm_fields)
+        except CaptureQualityError as e:
+            logger.warning(f"Cylindrical projection failed — falling back to front frame: {e}")
+            try:
+                # Pick the fallback frame deliberately. frames[0] is only the
+                # front view in four-angle mode; arc AND oscillating frames
+                # are both sorted by angle, so [0] is the extreme-left view —
+                # the worst possible single-frame print. Use the sharpest
+                # frame nearest mid-sweep.
+                if (is_arc or is_oscillating) and len(frames) > 1:
+                    def _fb_key(i):
+                        meta = frame_meta[i] if i < len(frame_meta) else {}
+                        lap  = float(meta.get('laplacianScore') or 0.0)
+                        ang  = abs(float(angles_for_sfm[i])) if i < len(angles_for_sfm) else 90.0
+                        return (0 if ang <= 30.0 else 1, -lap)
+                    fb_idx = min(range(len(frames)), key=_fb_key)
+                else:
+                    fb_idx = 0
+                front_sq = sfm_pipeline._prepare(frames[fb_idx])
+                unwrapped = cv2.cvtColor(front_sq, cv2.COLOR_BGR2GRAY)
+                # The SfM path excludes background via the segmentation mask
+                # baked into the cylindrical warp; this single-frame fallback
+                # skipped that entirely and fed the *whole* photo (thumb +
+                # room background) into enhancement. Segment here too, but
+                # DON'T blank the background yet — masking before Gabor/NNS
+                # enhancement creates a hard edge between real content and a
+                # flat fill, and the ridge filters ring on that edge, painting
+                # concentric wave artefacts across the print. Instead keep
+                # `unwrapped` untouched, remember the mask, and composite it
+                # in afterwards once `enhanced` exists (see below).
+                fb_out_size       = unwrapped.shape[0]
+                _, _, fb_ksize    = sfm_pipeline._scale_params(fb_out_size)
+                fb_cx = fb_cy     = fb_out_size / 2.0
+                fb_mask, _, _, _  = sfm_pipeline._segment_and_locate(
+                    unwrapped, fb_ksize, fb_cx, fb_cy,
+                )
+                fallback_mask = fb_mask
+                sfm_coverage  = float(np.mean(fb_mask > 0)) if fb_mask is not None else 0.0
+            except Exception as frame_err:
+                _update_firestore(capture_id, {
+                    'status':         'failed',
+                    'sfmStatus':      'fallback_failed',
+                    'failureReason':  f'SfM + front-frame fallback both failed: {str(frame_err)[:200]}',
+                }, critical=False)
+                raise https_fn.HttpsError(
+                    code=https_fn.FunctionsErrorCode.INTERNAL,
+                    message='Capture data corrupted — please retake.',
+                ) from frame_err
+            _update_firestore(capture_id, {
+                'sfmStatus':  'fallback_front_only',
+                'sfmError':   str(e)[:200],
+                'needsRecapture': True,
+            })
+        t_sfm = time.monotonic()
+        logger.info('stage=sfm_done       elapsed=%.1fs', t_sfm - t_start)
+
+        # Signal low-coverage captures so Flutter can prompt a recapture.
+        recapture_threshold = (
+            0.45 if is_arc else
+            0.35 if is_oscillating else
+            (0.40 if n_frames == 4 else 0.28)
+        )
+        if 0.0 < sfm_coverage < recapture_threshold:
+            _update_firestore(capture_id, {'needsRecapture': True, 'sfmCoverage': round(sfm_coverage, 3)})
+
+        # ── 3. NNS Enhancement ─────────────────────────────────────────────────
+        logger.info('stage=nns_start      elapsed=%.1fs', time.monotonic() - t_start)
+        # Bilateral pre-denoise: removes stitching seam artefacts before UNet.
+        unwrapped_d = cv2.bilateralFilter(unwrapped, d=5, sigmaColor=20, sigmaSpace=20)
+        enhanced, enhancement_params = enhancement_pipeline.enhance(unwrapped_d, sfm_coverage=sfm_coverage)
+        if fallback_mask is not None and 0.0 < sfm_coverage < 1.0:
+            # Composite the background out now that ridge filtering is done,
+            # with a feathered edge (not a hard cut) so no new ringing gets
+            # introduced at this stage either.
+            mask_rs = cv2.resize(fallback_mask, (enhanced.shape[1], enhanced.shape[0]),
+                                  interpolation=cv2.INTER_NEAREST)
+            mask_f  = cv2.GaussianBlur(mask_rs, (31, 31), 0).astype(np.float32) / 255.0
+            bg      = np.full_like(enhanced, 245)
+            enhanced = (enhanced.astype(np.float32) * mask_f
+                        + bg.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+        t_nns = time.monotonic()
+        logger.info('stage=nns_done       elapsed=%.1fs', t_nns - t_start)
+
+        # ── 4. NFIQ Scoring ────────────────────────────────────────────────────
+        logger.info('stage=nfiq_start     elapsed=%.1fs', time.monotonic() - t_start)
+        nfiq_result = _score_nfiq(enhanced, sfm_coverage=sfm_coverage)
+        t_nfiq = time.monotonic()
+        logger.info('stage=nfiq_done      elapsed=%.1fs', t_nfiq - t_start)
+        if nfiq_result.get('error'):
+            _fail(capture_id, f"NFIQ error: {nfiq_result['error']}")
+            return {'nfiqScore': 0, 'nfiqPass': False, 'henryClass': 'U'}
+
+        nfiq_score  = nfiq_result['nfiq_score']
+        nfiq_pass   = nfiq_score >= _PASS_THRESHOLD
+        best_enhanced = nfiq_result.get('best_image', enhanced)
+
+        # ── 4b. Save enhanced flat print ──────────────────────────────────────
+        # Scoring/classification below run on `best_enhanced` unmodified; the
+        # ink/livescan contrast curve is cosmetic and only applied to the copy
+        # that gets saved and shown to the user.
+        display_image = enhancement_pipeline.ink_scanner_style(best_enhanced)
+        enhanced_path = _save_enhanced_flat(display_image, user_id, capture_id)
+
+        # ── 5. Henry classification ────────────────────────────────────────────
+        # Use best TTA variant image — same preprocessing that scored highest.
+        henry_class = _classify_henry(best_enhanced)
+        t_henry = time.monotonic()
+
+        processing_ms = int((t_henry - t_start) * 1000)
+        nns_stage     = getattr(enhancement_pipeline, '_nns_stage', 1)
+        logger.info(
+            f"capture={capture_id} nfiq={nfiq_score:.1f} pass={nfiq_pass} "
+            f"henry={henry_class} nns_stage={nns_stage} ms={processing_ms}"
+        )
+
+        # ── Write result to Firestore ──────────────────────────────────────────
+        _update_firestore(capture_id, {
+            'status':           'scored',
+            'nfiqScore':        round(nfiq_score, 2),
+            'nfiqPass':         nfiq_pass,
+            'henryClass':       henry_class,
+            'processingTimeMs': processing_ms,
+            'scoredAt':         firestore.SERVER_TIMESTAMP,
+            'nnsStage':         nns_stage,
+            'pipelineVersion':  'MAC3D-v30',
+            'stagingLatencyMs': {
+                'download': round((t_download - t_start) * 1000),
+                'sfm':      round((t_sfm      - t_download) * 1000),
+                'nns':      round((t_nns      - t_sfm)      * 1000),
+                'nfiq':     round((t_nfiq     - t_nns)      * 1000),
+                'henry':    round((t_henry    - t_nfiq)     * 1000),
+            },
+            'sfmDiagnostics':    sfm_diagnostics or None,
+            'nfiqTtaScores':     nfiq_result.get('tta_scores'),
+            'enhancementParams': enhancement_params,
+            'enhancedImagePath': enhanced_path,
+        }, critical=True)
+
+        # POPIA data minimization: raw frames served their purpose (pipeline input).
+        # Skip deletion when preserveRawFrames=true OR when the capture belongs to the
+        # developer account (_DEV_UID) so that optimize_sfm.py / run_sfm_test.py can
+        # replay any capture without needing the flag set manually.
+        cap_snap  = db.collection('captures').document(capture_id).get()
+        user_snap = db.collection('users').document(user_id).get()
+        is_test_participant = (user_snap.to_dict() or {}).get('isTestParticipant', False)
+        cap_data = cap_snap.to_dict() or {}
+        preserve = (
+            _BETA_PHASE                                   # global beta retention
+            or cap_data.get('preserveRawFrames', False)   # per-capture flag
+            or (user_id == _DEV_UID)                      # dev account
+            or is_test_participant                         # beta group
+        )
+        if preserve:
+            logger.info(
+                f'Skipping frame deletion for {capture_id} '
+                f'(beta={_BETA_PHASE} dev={user_id==_DEV_UID} '
+                f'flag={cap_data.get("preserveRawFrames",False)} '
+                f'testParticipant={is_test_participant})'
+            )
+        else:
+            try:
+                _delete_capture_frames(base_path)
+            except Exception as _del_exc:
+                logger.warning(f'Frame deletion failed (non-critical): {_del_exc}')
+
+        return {
+            'nfiqScore':  round(nfiq_score, 2),
+            'nfiqPass':   nfiq_pass,
+            'henryClass': henry_class,
+        }
+
+    except Exception as e:
+        logger.exception(f"Fatal error for capture={capture_id}: {e}")
+        _fail(capture_id, str(e)[:500])
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.INTERNAL,
+            message=f'Pipeline failed: {e}',
+        )
+
+
+# ── Frame download ─────────────────────────────────────────────────────────────
+
+
+def _best_frame_from_paths(paths: list) -> 'tuple[Optional[np.ndarray], float, Optional[str]]':
+    """Download all paths in parallel, return (best_arr, lap_score, best_path) by Laplacian variance."""
+    best_path:  Optional[str]        = None
+    best_score: float                = -1.0
+    best_arr:   Optional[np.ndarray] = None
+
+    def _fetch_and_score(path: str):
+        img_bytes = _download_storage_file(path)
+        arr       = _decode_image(img_bytes)
+        gray      = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+        score     = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return path, arr, score
+
+    with ThreadPoolExecutor(max_workers=min(len(paths), 6)) as ex:
+        futures = {ex.submit(_fetch_and_score, p): p for p in paths}
+        for fut in as_completed(futures):
+            path, arr, score = fut.result()
+            if score > best_score:
+                best_score = score
+                best_path  = path
+                best_arr   = arr
+
+    return best_arr, best_score, best_path
+
+
+def _fuse_frames(amb_arr: np.ndarray, fl_arr: np.ndarray) -> 'tuple[np.ndarray, float]':
+    """Mertens exposure fusion of ambient + flash frames. Returns (fused_bgr, lap_score)."""
+    merge    = cv2.createMergeMertens()
+    fused    = merge.process([amb_arr, fl_arr])
+    fused_u8 = np.clip(fused * 255, 0, 255).astype(np.uint8)
+    gray     = cv2.cvtColor(fused_u8, cv2.COLOR_BGR2GRAY)
+    lap      = float(cv2.Laplacian(gray, cv2.CV_64F).var())
+    return fused_u8, lap
+
+
+def _download_best_frames(base_path: str):
+    """
+    Download all frames per angle from Firebase Storage, then select the best
+    per angle. When both ambient (_amb_) and flash (_fl_) frames are present,
+    fuses the sharpest of each via Mertens exposure fusion for ridge detail from
+    both natural contrast and torch fill.
+
+    All four angles are fetched concurrently to cut serial download latency.
+
+    Storage path formats:
+      New:    {basePath}/frame_{N}_{angleName}_amb_{idx}.jpg  (ambient)
+              {basePath}/frame_{N}_{angleName}_fl_{idx}.jpg   (torch-lit)
+      Legacy: {basePath}/frame_{N}_{angleName}_{idx}.jpg      (treated as ambient)
+
+    Returns (bgr_frames, meta_out, actual_angles_deg).
+    """
+    _, bucket = _get_firebase()
+    blobs     = list(bucket.list_blobs(prefix=base_path))
+    blob_map_amb: dict[str, list] = {a: [] for a in _ANGLE_NAMES}
+    blob_map_fl:  dict[str, list] = {a: [] for a in _ANGLE_NAMES}
+    for blob in blobs:
+        fname = blob.name.split('/')[-1]
+        parts = fname.replace('.jpg', '').split('_')
+        # New format:    frame_{num}_{angle}_{type}_{idx}  — parts[3] in {'amb','fl'}
+        # Legacy format: frame_{num}_{angle}_{idx}         — parts[3] is a digit string
+        if len(parts) >= 3 and parts[0] == 'frame':
+            angle = parts[2]
+            if angle not in blob_map_amb:
+                continue
+            frame_type = parts[3] if len(parts) >= 5 and parts[3] in ('amb', 'fl') else 'amb'
+            (blob_map_fl if frame_type == 'fl' else blob_map_amb)[angle].append(blob.name)
+
+    def _fetch_one_angle(angle_idx: int, angle: str):
+        """Download + select best frame for one angle. Returns (angle_idx, arr, meta, amb_arr, fl_arr) or None for missing top."""
+        amb_paths = blob_map_amb.get(angle, [])
+        fl_paths  = blob_map_fl.get(angle, [])
+        has_amb   = bool(amb_paths)
+        has_fl    = bool(fl_paths)
+        amb_arr   = None
+        fl_arr    = None
+
+        if not has_amb and not has_fl:
+            if angle == 'top':
+                logger.warning("Top (180°) frame missing — continuing with 3 views")
+                return None
+            raise CaptureQualityError(
+                f"No Storage frames found for angle '{angle}' under '{base_path}'"
+            )
+
+        if has_amb and has_fl:
+            amb_arr, amb_lap, amb_path = _best_frame_from_paths(amb_paths)
+            fl_arr,  fl_lap,  fl_path  = _best_frame_from_paths(fl_paths)
+            fused_arr, fused_lap = _fuse_frames(amb_arr, fl_arr)
+            # Guard: fall back to single best if fusion severely degraded sharpness.
+            # 0.58 is intentionally permissive — Mertens fused ambient+flash yields
+            # better ridge-valley contrast even when Laplacian is slightly lower,
+            # because complementary lighting fills shadows that single frames miss.
+            threshold = 0.58 * max(amb_lap, fl_lap)
+            if fused_lap >= threshold:
+                best_arr, best_score = fused_arr, fused_lap
+                best_path            = f'mertens({amb_path},{fl_path})'
+                frame_source         = 'mertens_fused'
+            else:
+                logger.warning(
+                    f"  Mertens degraded {angle} (fused={fused_lap:.1f} < "
+                    f"0.58×{max(amb_lap, fl_lap):.1f}) — using single best"
+                )
+                if amb_lap >= fl_lap:
+                    best_arr, best_score, best_path = amb_arr, amb_lap, amb_path
+                else:
+                    best_arr, best_score, best_path = fl_arr,  fl_lap,  fl_path
+                frame_source = 'fallback_single'
+        elif has_amb:
+            best_arr, best_score, best_path = _best_frame_from_paths(amb_paths)
+            frame_source = 'ambient_only'
+        else:
+            best_arr, best_score, best_path = _best_frame_from_paths(fl_paths)
+            frame_source = 'flash_only'
+
+        # Center-square crop at native resolution.
+        h, w = best_arr.shape[:2]
+        side = min(h, w)
+        y0 = (h - side) // 2
+        x0 = (w - side) // 2
+        best_arr = best_arr[y0:y0 + side, x0:x0 + side]
+
+        meta = {
+            'angle': angle,
+            'storagePath': best_path,
+            'laplacianScore': best_score,
+            'frameSource': frame_source,
+        }
+        logger.info(f"  angle={angle} source={frame_source} lap={best_score:.1f}")
+        return angle_idx, best_arr, meta, amb_arr, fl_arr
+
+    # Fetch all angles concurrently — iterate futures in submission order to
+    # preserve front/right/top/left ordering and propagate any exceptions cleanly.
+    with ThreadPoolExecutor(max_workers=len(_ANGLE_NAMES)) as pool:
+        futures = [
+            pool.submit(_fetch_one_angle, i, angle)
+            for i, angle in enumerate(_ANGLE_NAMES)
+        ]
+        raw_results = [f.result() for f in futures]   # raises if any angle errored
+
+    bgr_frames     = []
+    meta_out       = []
+    ambient_frames = []
+    flash_frames   = []
+    actual_angles_filtered = []
+    _cylindrical = [0.0, 90.0, 180.0, 270.0]
+    for r in raw_results:
+        if r is None:
+            continue   # missing top angle
+        angle_idx, arr, meta, amb_arr, fl_arr = r
+        bgr_frames.append(arr)
+        meta_out.append(meta)
+        ambient_frames.append(amb_arr)
+        flash_frames.append(fl_arr)
+        actual_angles_filtered.append(angle_idx)
+
+    actual_angles = [_cylindrical[i] for i in actual_angles_filtered]
+    return bgr_frames, meta_out, actual_angles, ambient_frames, flash_frames
+
+
+
+def _download_arc_frames(capture_id: str, base_path: str):
+    """
+    Download arc-sweep frames using the Firestore `frames` metadata array as the
+    single source of truth for frame order AND per-frame SFM angle — NOT a
+    Storage blob listing.
+
+    Why not a Storage listing (the previous approach): frame_{N}_arc_{binIndex}.jpg
+    filenames are not unique on binIndex alone — ambient + torch-lit frames share
+    a bin, and checkpoint stills are tagged onto their leg's last bin too. GCS
+    lists blobs in lexicographic filename order, so e.g. "frame_36_arc_5.jpg"
+    (a still, uploaded near the end of the session) sorts BEFORE
+    "frame_6_arc_5.jpg" (that bin's regular ambient frame) because '3' < '6' as
+    characters — the opposite of true upload order. `reconstruct_and_unwrap`
+    zips frames[i] with angles_deg[i] purely positionally, so that reordering
+    silently paired each frame with a DIFFERENT frame's angle whenever a still
+    or a flash-paired frame shared a bin — true of every arc-sweep capture now
+    that stills and torch alternation are both in play. The Firestore `frames`
+    array is written by the Flutter client in exact upload order (the same loop
+    that assigns frame_{i+1}), so indexing into it directly is the only
+    architecturally sound source of truth for this correspondence.
+
+    Also computes the SFM cylindrical angle per frame here instead of trusting
+    the flat pitch-only `arcAngles` payload: the cylindrical projection model
+    (Px = R*sin(theta-phi) in reconstruct_and_unwrap) is a single-axis azimuthal
+    rotation with no roll dimension at all. Passing raw pitch for the TOP leg
+    (legIndex 1, a roll-dominant motion) made those frames' angles overlap the
+    LEFT leg's pitch range (both traverse pitch through [-22, 0]) and get
+    attributed to the wrong sector. LEFT/RIGHT legs are genuine azimuthal
+    (pitch-axis) motions and get a real angle scaled from pitch.
+
+    The scaling is derived from THIS capture's actual measured pitch/roll
+    extremes, not a hardcoded checkpoint magnitude. The ±22°/-13° targets in
+    ArcSweepCaptureController guide the user and gate leg transitions, but real
+    users land anywhere in a ±5° window around those targets (the Flutter ratchet
+    fires at 5° leeway). Normalising to actual extremes means whatever range was
+    genuinely swept maps to the full ±90°/10° cylindrical span — frames are
+    correctly distributed across the cylinder regardless of whether the user hit
+    the exact checkpoint. Hardcoded targets serve as fallback only when a leg
+    has fewer than two usable frames. TOP gets the same nominal angle treatment
+    as the 4-angle flow's top view (roll has no clean azimuthal interpretation)
+    — spread lightly (180-190 deg) via actual roll range so its frames don't
+    collapse onto one identical angle.
+
+    Individual frame download/decode failures are skipped (not fatal) so one
+    bad blob can't sink an otherwise-good capture.
+
+    Raises CaptureQualityError if fewer than 3 frames download successfully.
+    """
+    db, _ = _get_firebase()
+    doc = db.collection('captures').document(capture_id).get()
+    frames_meta_fs = (doc.to_dict() or {}).get('frames', [])
+
+    # --- Derive angle scales from this capture's actual measured extremes ---
+    # Flutter checkpoint targets (±22° pitch / 13° roll) guide the user and
+    # serve as fallback; real users stop within ±5° of those targets.
+    # Normalising to what was actually swept ensures frames span the full
+    # cylindrical coordinate range regardless of whether exact targets were hit.
+    _PITCH_CHECKPOINT = 22.0
+    _ROLL_CHECKPOINT  = 13.0
+    _MIN_SCALE_DEG    = 5.0  # guard against degenerate / nearly-static captures
+
+    left_pitches  = [float(e.get('pitchDeg', 0.0)) for e in frames_meta_fs
+                     if int(e.get('legIndex', 0)) == 0 and float(e.get('pitchDeg', 0.0)) < -1.0]
+    right_pitches = [float(e.get('pitchDeg', 0.0)) for e in frames_meta_fs
+                     if int(e.get('legIndex', 0)) == 2 and float(e.get('pitchDeg', 0.0)) >  1.0]
+    top_rolls     = [float(e.get('rollDeg',  0.0)) for e in frames_meta_fs
+                     if int(e.get('legIndex', 0)) == 1 and float(e.get('rollDeg', 0.0))  < -1.0]
+
+    actual_left  = abs(min(left_pitches))  if len(left_pitches)  >= 2 else _PITCH_CHECKPOINT
+    actual_right = max(right_pitches)      if len(right_pitches) >= 2 else _PITCH_CHECKPOINT
+    actual_top   = abs(min(top_rolls))     if len(top_rolls)     >= 2 else _ROLL_CHECKPOINT
+
+    pitch_left_scale  = 90.0 / max(actual_left,  _MIN_SCALE_DEG)
+    pitch_right_scale = 90.0 / max(actual_right, _MIN_SCALE_DEG)
+    roll_scale_top    = 1.0  / max(actual_top,   2.0)
+
+    logger.info(
+        'Arc angle scales — actual left=%.1f° right=%.1f° top_roll=%.1f° '
+        '→ pitch_left=%.3f pitch_right=%.3f roll=%.3f',
+        actual_left, actual_right, actual_top,
+        pitch_left_scale, pitch_right_scale, roll_scale_top,
+    )
+
+    def _sfm_angle_for(entry: dict) -> Optional[float]:
+        # Current client schema: pitchDeg/rollDeg/legIndex per frame.
+        # Legacy clients (pre-July-4 APKs) wrote only arcAngleDeg — a
+        # cumulative sweep angle. A capture whose frames lack BOTH schemas
+        # yields None so the caller can fail loudly instead of silently
+        # assigning every frame 0.0° (which is exactly what happened to the
+        # first production arc capture: all angles defaulted to 0, the gap
+        # check saw a 360° hole, and the whole capture fell back to
+        # front-only with no diagnostic trail).
+        if entry.get('pitchDeg') is not None or entry.get('legIndex') is not None:
+            leg_index = int(entry.get('legIndex') or 0)
+            pitch     = float(entry.get('pitchDeg') or 0.0)
+            roll      = float(entry.get('rollDeg') or 0.0)
+            if leg_index == 1:  # TOP leg — roll-dominant, no azimuthal meaning
+                t = float(np.clip(roll * roll_scale_top, 0.0, 1.0))
+                return 0.0 + t * 10.0
+            if pitch < 0:       # LEFT leg
+                return pitch * pitch_left_scale
+            return pitch * pitch_right_scale  # RIGHT leg
+        if entry.get('arcAngleDeg') is not None:
+            # Legacy: cumulative sweep angle (0 → span). Centre it so the
+            # mid-sweep frame sits at 0° (front), matching the cylindrical
+            # convention. Uses the capture's own extremes for the range.
+            return float(entry['arcAngleDeg'])
+        return None
+
+    def _fetch(i: int, entry: dict):
+        try:
+            bin_idx   = int(entry.get('binIndex', i))
+            path      = f'{base_path}/frame_{i + 1}_arc_{bin_idx}.jpg'
+            img_bytes = _download_storage_file(path)
+            arr       = _decode_image(img_bytes)
+            h, w      = arr.shape[:2]
+            side      = min(h, w)
+            arr       = arr[(h - side) // 2:(h - side) // 2 + side,
+                            (w - side) // 2:(w - side) // 2 + side]
+            angle = _sfm_angle_for(entry)
+            meta  = {
+                'angle':          f'arc_{bin_idx}',
+                'storagePath':    path,
+                'laplacianScore': entry.get('laplacianScore'),
+                'frameSource':    'arc_still' if entry.get('still') else 'arc',
+                'legIndex':       entry.get('legIndex'),
+                'pitchDeg':       entry.get('pitchDeg'),
+                'rollDeg':        entry.get('rollDeg'),
+            }
+            return i, arr, meta, angle
+        except Exception as e:
+            logger.warning(
+                'Arc frame %d (bin=%s) failed to download/decode — skipping: %s',
+                i, entry.get('binIndex'), e,
+            )
+            return i, None, None, None
+
+    with ThreadPoolExecutor(max_workers=min(max(len(frames_meta_fs), 1), 8)) as ex:
+        futures = [ex.submit(_fetch, i, entry) for i, entry in enumerate(frames_meta_fs)]
+        raw_results = sorted([f.result() for f in as_completed(futures)], key=lambda x: x[0])
+
+    results = [r for r in raw_results if r[1] is not None]
+    if len(results) < 3:
+        raise CaptureQualityError(
+            f'Arc sweep requires at least 3 successfully-downloaded frames; '
+            f'got {len(results)} of {len(frames_meta_fs)} Firestore frames[] '
+            f'entries for {capture_id}'
+        )
+
+    # ── Angle sanity: fail LOUDLY on missing/degenerate metadata ─────────────
+    n_missing = sum(1 for r in results if r[3] is None)
+    if n_missing > len(results) // 2:
+        raise CaptureQualityError(
+            f'Arc frame metadata missing angle data on {n_missing}/{len(results)} '
+            f'frames (no pitchDeg/legIndex, no arcAngleDeg) — client/backend '
+            f'schema mismatch; cannot assign cylindrical angles.'
+        )
+    results = [r for r in results if r[3] is not None]
+
+    # Legacy arcAngleDeg values are cumulative (0 → span); centre the whole
+    # set so mid-sweep sits at 0° and clamp to the cylindrical ±90° range.
+    legacy = [r for r in results if r[2].get('pitchDeg') is None and not r[2].get('legIndex')]
+    if len(legacy) == len(results):
+        a_vals = [r[3] for r in results]
+        mid    = 0.5 * (min(a_vals) + max(a_vals))
+        results = [
+            (i, arr, meta, float(np.clip(a - mid, -90.0, 90.0)))
+            for (i, arr, meta, a) in results
+        ]
+        logger.info('Legacy arcAngleDeg schema: centred %d frames around mid-sweep %.1f°', len(results), mid)
+
+    angle_vals = [r[3] for r in results]
+    if max(angle_vals) - min(angle_vals) < 10.0:
+        raise CaptureQualityError(
+            f'Arc angle span {max(angle_vals) - min(angle_vals):.1f}° < 10° — '
+            f'degenerate sweep metadata; cannot stitch.'
+        )
+
+    # ── Blur filter: drop motion-smeared frames ──────────────────────────────
+    # Arc frames are grabbed while the device is moving; half of a real
+    # capture's frames can be motion smear (observed Laplacian 3.6–10 next to
+    # 100–200 on the same sweep). Averaging those into the cylindrical
+    # texture destroys ridge contrast in exactly the sectors they cover.
+    laps = [float(r[2].get('laplacianScore') or 0.0) for r in results]
+    lap_med = float(np.median([l for l in laps if l > 0]) or 0.0)
+    if lap_med > 0 and len(results) > 4:
+        keep_thr = max(15.0, 0.25 * lap_med)
+        kept = [r for r, l in zip(results, laps) if l <= 0 or l >= keep_thr]
+        if len(kept) >= 3:
+            dropped = len(results) - len(kept)
+            if dropped:
+                logger.info('Blur filter: dropped %d/%d arc frames (lap < %.1f)',
+                            dropped, len(results), keep_thr)
+            results = kept
+
+    # Sort by computed SFM angle (not upload order) before returning.
+    # _refine_angles correlates frames[i] against frames[i+1] and propagates
+    # corrections cumulatively forward — it assumes array-adjacent frames are
+    # angularly adjacent. Firestore upload order puts all 3 checkpoint stills
+    # at the end regardless of their angle, and leg transitions are large jumps
+    # mid-array; the overlap/confidence checks in _correlate_overlap should
+    # reject most resulting mismatched pairs, but sorting by angle first
+    # removes the risk by construction instead of counting on that safety net.
+    results = sorted(results, key=lambda r: r[3])
+
+    bgr_frames     = [r[1] for r in results]
+    meta_out       = [r[2] for r in results]
+    angles_for_sfm = [r[3] for r in results]
+    # Sharpness weights: sharper frames dominate where projections overlap.
+    # Normalised to the sweep's own best frame; floor keeps every retained
+    # frame contributing (the blur filter above already dropped the smear).
+    kept_laps = [float(r[2].get('laplacianScore') or 0.0) for r in results]
+    lap_top   = max(kept_laps) or 1.0
+    frame_wts = [max(0.3, l / lap_top) if l > 0 else 0.7 for l in kept_laps]
+    logger.info(
+        'Arc frames downloaded: %d/%d (angle-ordered, range %.1f..%.1f deg)',
+        len(results), len(frames_meta_fs), min(angles_for_sfm), max(angles_for_sfm),
+    )
+    # Return actual physical extremes so the caller can write meaningful sweep
+    # stats to Firestore (the normalised SfM angles always span ~±90° now).
+    sweep_stats = {
+        'arcActualLeftDeg':    round(actual_left,  1),
+        'arcActualRightDeg':   round(actual_right, 1),
+        'arcActualTopRollDeg': round(actual_top,   1),
+    }
+    return bgr_frames, meta_out, angles_for_sfm, sweep_stats, frame_wts
+
+
+def _download_oscillating_frames(capture_id: str, base_path: str):
+    """
+    Download frames for the 8-phase oscillating capture mode (front <-> left
+    <-> right <-> top — see the Flutter OscillatingCaptureController for the
+    capture geometry).
+
+    FRONT/LEFT/RIGHT are a single continuous pitch-axis sweep and their
+    angleDeg values are directly comparable. TOP is measured on roll — a
+    physically different rotation (tilting the phone's top up/back, not
+    panning left-right) — so its angleDeg values live on a DIFFERENT axis
+    entirely and are not comparable to the sweep's. Mixing them into one
+    bin-range computation would misattribute TOP frames to wherever their
+    roll value numerically falls on the pitch scale (e.g. a ~20° roll
+    landing inside the RIGHT leg's bin range) — the same bug
+    _download_arc_frames' docstring documents for its own TOP leg, fixed
+    there via a leg-aware nominal angle. TOP frames are identified via the
+    Firestore `phases[]` array (whichever phaseNumber has label == 'TOP')
+    and excluded from the sweep's angle-range computation; they get one
+    dedicated bin at a small nominal angle near FRONT instead of their raw
+    roll value.
+
+    Unlike the four-angle/arc-sweep flows this mode captures densely: up to
+    ~400 frames mixing full-resolution ISP burst stills (at the 4 hold
+    positions) with preview-stream frames extracted continuously during the
+    guided transitions between them. Feeding all of that into
+    reconstruct_and_unwrap directly would blow the Cloud Function's
+    time/memory budget (full-res JPEG decode + segmentation per frame) for
+    no reconstruction benefit — frames a couple of degrees apart carry
+    near-duplicate information.
+
+    This bins the frames by angle (BIN_WIDTH_DEG-wide bins spanning the
+    sweep's observed angle range) and keeps at most one frame per
+    (bin, flashOn) cell: a burst-anchor frame if the bin contains one (real
+    ISP quality, captured during a steady hold — always preferred over a
+    transition frame), else the sharpest frame in the bin by the client's
+    reported laplacianScore. When a bin has both an ambient and a flash-lit
+    frame, both are kept and threaded through as an ambient/flash pair so
+    flash-diff segmentation can run (see sfm_pipeline._segment_via_flash_diff
+    — the single most reliable segmentation tier on every other capture
+    mode). Burst-anchor frames are weighted more heavily than
+    transition-derived ones in the final projection (steady real-ISP still
+    vs. best-effort preview-stream frame grabbed mid-motion).
+
+    Raises CaptureQualityError if fewer than 5 SWEEP bins have a usable
+    frame — SfM needs real angular spread to stitch. TOP's single bin
+    doesn't count toward that floor (it's auxiliary texture, not part of
+    the azimuthal sweep the reconstruction actually needs coverage of).
+    """
+    db, _ = _get_firebase()
+    doc = db.collection('captures').document(capture_id).get()
+    doc_dict = doc.to_dict() or {}
+    frames_meta_fs = doc_dict.get('frames', [])
+    if not frames_meta_fs:
+        raise CaptureQualityError(f'No frames[] metadata for oscillating capture {capture_id}')
+
+    BIN_WIDTH_DEG     = 5.0
+    BURST_WEIGHT      = 1.0
+    TRANSITION_WEIGHT = 0.7
+    TOP_NOMINAL_DEG   = 5.0  # placed just past FRONT (0°), distinguishable from the sweep
+
+    phases_meta = doc_dict.get('phases', [])
+    top_phase_numbers = {
+        int(p.get('phaseNumber', 0)) for p in phases_meta if p.get('label') == 'TOP'
+    }
+
+    sweep_meta = [e for e in frames_meta_fs if int(e.get('phaseNumber', 0)) not in top_phase_numbers]
+    top_meta   = [e for e in frames_meta_fs if int(e.get('phaseNumber', 0)) in top_phase_numbers]
+
+    if not sweep_meta:
+        raise CaptureQualityError(f'No non-TOP (sweep) frames for oscillating capture {capture_id}')
+
+    angles = [float(e.get('angleDeg', 0.0)) for e in sweep_meta]
+    lo, hi = min(angles), max(angles)
+    n_bins = max(1, int((hi - lo) / BIN_WIDTH_DEG) + 2)
+    top_bin = n_bins  # one dedicated bin, past the sweep's bin range
+
+    def _bin_of(angle: float) -> int:
+        return int(np.clip(round((angle - lo) / BIN_WIDTH_DEG), 0, n_bins - 1))
+
+    # Group Firestore entries by (bin, flashOn) so a bin can retain a real
+    # ambient/flash pair when both exist. Sweep entries bin by their real
+    # angleDeg; TOP entries all collapse into the single top_bin regardless
+    # of their (roll-axis, not-comparable) angleDeg value.
+    buckets: dict = {}
+    for e in sweep_meta:
+        key = (_bin_of(float(e.get('angleDeg', 0.0))), bool(e.get('flashOn', False)))
+        buckets.setdefault(key, []).append(e)
+    for e in top_meta:
+        key = (top_bin, bool(e.get('flashOn', False)))
+        buckets.setdefault(key, []).append(e)
+
+    def _pick_best(entries: list) -> dict:
+        # Burst anchors (real ISP stills) always outrank transition frames;
+        # within the same tier, prefer the highest reported sharpness.
+        return max(
+            entries,
+            key=lambda e: (e.get('type') == 'burst', float(e.get('laplacianScore') or 0.0)),
+        )
+
+    bin_entries: dict = {}  # bin -> {'amb': entry, 'fl': entry}
+    for (b, flash_on), entries in buckets.items():
+        best = _pick_best(entries)
+        bin_entries.setdefault(b, {})['fl' if flash_on else 'amb'] = best
+
+    def _fetch(bin_idx: int, tag: str, entry: dict):
+        try:
+            img_bytes = _download_storage_file(entry['path'])
+            arr = _decode_image(img_bytes)
+            h, w = arr.shape[:2]
+            side = min(h, w)
+            arr = arr[(h - side) // 2:(h - side) // 2 + side,
+                      (w - side) // 2:(w - side) // 2 + side]
+            return bin_idx, tag, arr, entry
+        except Exception as e:
+            logger.warning(
+                'Oscillating frame bin=%d tag=%s failed to download/decode: %s', bin_idx, tag, e
+            )
+            return bin_idx, tag, None, entry
+
+    fetch_jobs = [
+        (b, tag, entry) for b, tags in bin_entries.items() for tag, entry in tags.items()
+    ]
+    with ThreadPoolExecutor(max_workers=min(max(len(fetch_jobs), 1), 12)) as ex:
+        futures = [ex.submit(_fetch, b, tag, entry) for b, tag, entry in fetch_jobs]
+        raw = [f.result() for f in as_completed(futures)]
+
+    by_bin: dict = {}  # bin -> {'amb': (arr, entry), 'fl': (arr, entry)}
+    for bin_idx, tag, arr, entry in raw:
+        if arr is None:
+            continue
+        by_bin.setdefault(bin_idx, {})[tag] = (arr, entry)
+
+    sweep_bins_downloaded = len({b for b in by_bin if b != top_bin})
+    if sweep_bins_downloaded < 5:
+        raise CaptureQualityError(
+            f'Oscillating capture has only {sweep_bins_downloaded} usable sweep angle bins '
+            f'(need >=5) for {capture_id}'
+        )
+
+    results = []
+    for b in sorted(by_bin.keys()):
+        pair = by_bin[b]
+        amb = pair.get('amb')
+        fl = pair.get('fl')
+        if amb and fl:
+            # Primary projected frame is whichever of the pair is the burst
+            # anchor; if neither/both are, prefer ambient (matches the other
+            # flows' convention of scoring ambient brightness, not torch-lit).
+            primary_arr, primary_entry = (
+                fl if fl[1].get('type') == 'burst' and amb[1].get('type') != 'burst' else amb
+            )
+            ambient_arr, flash_arr = amb[0], fl[0]
+        elif amb:
+            primary_arr, primary_entry = amb
+            ambient_arr, flash_arr = amb[0], None
+        else:
+            primary_arr, primary_entry = fl
+            ambient_arr, flash_arr = None, fl[0]
+
+        # TOP's raw angleDeg is roll-axis and not comparable to the sweep's
+        # pitch-axis scale (see docstring) -- use the fixed nominal instead.
+        angle = TOP_NOMINAL_DEG if b == top_bin else float(primary_entry.get('angleDeg', 0.0))
+        is_burst = primary_entry.get('type') == 'burst'
+        results.append({
+            'angle': angle,
+            'frame': primary_arr,
+            'ambient': ambient_arr,
+            'flash': flash_arr,
+            'weight': BURST_WEIGHT if is_burst else TRANSITION_WEIGHT,
+            'meta': {
+                'angle': 'osc_top' if b == top_bin else f'osc_bin_{b}',
+                'binIndex': b,
+                'storagePath': primary_entry.get('path'),
+                'laplacianScore': primary_entry.get('laplacianScore'),
+                'frameSource': primary_entry.get('type'),
+            },
+        })
+
+    results.sort(key=lambda r: r['angle'])
+
+    bgr_frames     = [r['frame'] for r in results]
+    ambient_frames = [r['ambient'] for r in results]
+    flash_frames   = [r['flash'] for r in results]
+    angles_for_sfm = [r['angle'] for r in results]
+    frame_weights  = [r['weight'] for r in results]
+    meta_out       = [r['meta'] for r in results]
+
+    osc_stats = {
+        'oscBinsUsed':       len(results),
+        'oscAngleRangeDeg':  [round(lo, 1), round(hi, 1)],
+        'oscBurstAnchors':   sum(1 for r in results if r['weight'] == BURST_WEIGHT),
+        'oscTopIncluded':    top_bin in by_bin,
+    }
+    logger.info(
+        'Oscillating frames binned: %d sweep bins (%.1f..%.1f deg) + top=%s, %d burst-anchored',
+        sweep_bins_downloaded, lo, hi, osc_stats['oscTopIncluded'], osc_stats['oscBurstAnchors'],
+    )
+    return bgr_frames, meta_out, angles_for_sfm, osc_stats, frame_weights, ambient_frames, flash_frames
+
+
+def _extract_orbit_angles(capture_id: str) -> dict:
+    """
+    Read per-angle device orbit angles from the Firestore captures document.
+
+    The Flutter app stores the IMU orbit angle at the moment each burst was
+    captured under frames[*].deviceOrbitDegrees alongside the zone label
+    frames[*].zoneHint (e.g. 'angle_left').  We take the first ambient frame
+    for each angle — all frames in a burst share the same orbit reading.
+
+    Returns {angle_name: orbit_deg} for whichever angles have data.
+    Silently returns {} on any error (Firestore unavailable, missing field).
+    """
+    try:
+        db, _ = _get_firebase()
+        doc        = db.collection('captures').document(capture_id).get()
+        frames_meta = (doc.to_dict() or {}).get('frames', [])
+        orbits: dict = {}
+        for frame in frames_meta:
+            zone  = frame.get('zoneHint', '')
+            orbit = frame.get('deviceOrbitDegrees')
+            if orbit is None:
+                continue
+            for name in _ANGLE_NAMES:
+                if zone == f'angle_{name}' and name not in orbits:
+                    orbits[name] = float(orbit)
+                    break
+        return orbits
+    except Exception as exc:
+        logger.warning(f"Could not read orbit angles from Firestore: {exc}")
+        return {}
+
+
+def _extract_target_angles(capture_id: str) -> dict:
+    """
+    Read the capture protocol's per-angle orbit TARGETS from the client's
+    frame metadata (frames[*].targetAngleDegrees keyed by zoneHint), falling
+    back to the current protocol constants. These are the angles the capture
+    UI actually guides the user to — the correct cylindrical seed when IMU
+    orbit telemetry is absent or dead (deviceOrbitDegrees=0.0 on every frame,
+    which is what production clients currently send).
+
+    'top' is a roll-axis motion with no azimuthal displacement — seeded at 0°.
+    """
+    # Signs follow the client's targetAngleDegrees convention (observed on
+    # production capture docs: right=+32, left=−32, top=−20 roll).
+    fallback = {'front': 0.0, 'right': 32.0, 'top': 0.0, 'left': -32.0}
+    try:
+        db, _ = _get_firebase()
+        doc         = db.collection('captures').document(capture_id).get()
+        frames_meta = (doc.to_dict() or {}).get('frames', [])
+        targets: dict = {}
+        for frame in frames_meta:
+            zone   = frame.get('zoneHint', '')
+            target = frame.get('targetAngleDegrees')
+            if target is None:
+                continue
+            for name in _ANGLE_NAMES:
+                if zone == f'angle_{name}' and name not in targets:
+                    # Roll-axis top has no azimuthal meaning; pin to 0°.
+                    targets[name] = 0.0 if name == 'top' else float(target)
+                    break
+        return {**fallback, **targets}
+    except Exception as exc:
+        logger.warning(f"Could not read target angles from Firestore: {exc}")
+        return fallback
+
+
+def _download_storage_file(path: str) -> bytes:
+    _, bucket = _get_firebase()
+    return bucket.blob(path).download_as_bytes(timeout=60)
+
+
+def _decode_image(img_bytes: bytes) -> np.ndarray:
+    """Decode a frame uploaded by the Flutter capture service.
+    The upload is labelled image/jpeg but the bytes are the raw Y-plane
+    from CameraImage.planes[0] — uncompressed grayscale at whatever
+    resolution the device camera reported.
+    """
+    arr = np.frombuffer(img_bytes, dtype=np.uint8)
+    bgr = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is not None:
+        return bgr
+
+    # Raw Y-plane fallback: match byte count against standard phone resolutions
+    n = len(img_bytes)
+    for w, h in _KNOWN_DIMS:
+        if w * h == n:
+            gray = arr.reshape(h, w)
+            logger.info(f'Decoded raw Y-plane {w}×{h}')
+            return cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+
+    raise ValueError(
+        f'Failed to decode frame: {n} bytes — not JPEG and no standard '
+        f'Y-plane dimensions match. Add dimensions to _KNOWN_DIMS.'
+    )
+
+
+# ── NFIQ scoring ──────────────────────────────────────────────────────────────
+
+def _score_nfiq(image: np.ndarray, sfm_coverage: float = 1.0) -> dict:
+    try:
+        _init_heavy_deps()
+        from PIL import Image as PILImage
+
+        session     = _get_nfiq_session()
+        input_name  = session.get_inputs()[0].name
+        output_name = session.get_outputs()[0].name
+
+        # Coverage-aware crop: central region has real ridge data; periphery is
+        # gap-filled KDTree noise. Crop to sqrt(coverage) fraction of each axis,
+        # clamped so we keep at least 75% of the image even for low coverage.
+        crop_frac = float(min(1.0, max(0.75, sfm_coverage ** 0.5 + 0.05)))
+        if crop_frac < 0.99:
+            h, w  = image.shape[:2]
+            ch    = int(h * crop_frac)
+            cw    = int(w * crop_frac)
+            y0    = (h - ch) // 2
+            x0    = (w - cw) // 2
+            image = image[y0:y0 + ch, x0:x0 + cw]
+
+        def _score_once(img: np.ndarray) -> float:
+            pil    = PILImage.fromarray(img).convert('L').resize(_TARGET_SIZE, PILImage.LANCZOS)
+            arr    = np.array(pil, dtype=np.float32) / 255.0
+            tensor = arr[np.newaxis, np.newaxis, :, :]
+            result = session.run([output_name], {input_name: tensor})[0]
+            return float(np.clip(result.flatten()[0], 0.0, 1.0))
+
+        lo, hi = int(np.percentile(image, 1)), int(np.percentile(image, 99))
+        v2 = np.clip((image.astype(np.float32) - lo) / max(hi - lo, 1) * 255, 0, 255).astype(np.uint8) if hi > lo else image
+        v3 = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(4, 4)).apply(image)   # tile=4 (optimizer winner)
+        v4 = cv2.bilateralFilter(image, d=9, sigmaColor=35, sigmaSpace=35)
+        v5 = np.clip((image.astype(np.float32) / 255.0) ** 0.8 * 255, 0, 255).astype(np.uint8)
+        blur6 = cv2.GaussianBlur(v2, (0, 0), 1.5)
+        v6 = np.clip(v2.astype(np.float32) * 1.4 - blur6.astype(np.float32) * 0.4, 0, 255).astype(np.uint8)
+
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            f1 = ex.submit(_score_once, image)
+            f2 = ex.submit(_score_once, v2)
+            f3 = ex.submit(_score_once, v3)
+            f4 = ex.submit(_score_once, v4)
+            f5 = ex.submit(_score_once, v5)
+            f6 = ex.submit(_score_once, v6)
+            s1, s2, s3, s4, s5, s6 = (
+                f1.result(), f2.result(), f3.result(),
+                f4.result(), f5.result(), f6.result(),
+            )
+
+        scores     = [s1, s2, s3, s4, s5, s6]
+        confidence = max(scores)
+        winner_idx = scores.index(confidence)
+        names      = ('raw', 'stretched', 'clahe', 'bilateral', 'gamma', 'unsharp')
+        images     = (image, v2, v3, v4, v5, v6)
+        winner     = names[winner_idx]
+        best_image = images[winner_idx]
+        logger.info(
+            f"NFIQ TTA6: {s1*100:.1f}/{s2*100:.1f}/{s3*100:.1f}/"
+            f"{s4*100:.1f}/{s5*100:.1f}/{s6*100:.1f} -> {confidence*100:.1f} ({winner})"
+        )
+        return {
+            'nfiq_score': round(confidence * 100.0, 2),
+            'best_image': best_image,
+            'tta_scores': {
+                'raw':            round(s1 * 100.0, 1),
+                'stretched':      round(s2 * 100.0, 1),
+                'clahe':          round(s3 * 100.0, 1),
+                'bilateral':      round(s4 * 100.0, 1),
+                'gamma':          round(s5 * 100.0, 1),
+                'unsharp':        round(s6 * 100.0, 1),
+                'winningVariant': winner,
+            },
+            'error': None,
+        }
+    except Exception as e:
+        logger.error(f"NFIQ error: {e}")
+        return {'nfiq_score': 0.0, 'error': str(e)}
+
+
+# ── Extended Henry Classification ─────────────────────────────────────────────
+# Codes:  PA  Plain Arch       TA  Tented Arch
+#         UL  Ulnar Loop       RL  Radial Loop
+#         PW  Plain Whorl      CPW Central Pocket Loop Whorl
+#         DLW Double Loop      AW  Accidental Whorl
+#         U   Unknown
+
+_HB = 16    # orientation block size (px) — 256-px image → 16×16 block grid
+_HR = 2     # Poincaré trace radius (blocks)
+_HT = 0.45  # singular point threshold (|score| must exceed this)
+
+
+def _henry_preprocess(image: np.ndarray) -> np.ndarray:
+    img = cv2.resize(image, (256, 256), interpolation=cv2.INTER_AREA)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    return clahe.apply(img.astype(np.uint8))
+
+
+def _henry_orientation(img: np.ndarray, block: int) -> np.ndarray:
+    """
+    Block-wise ridge orientation via double-angle Sobel averaging.
+    Returns (R, C) float32 array with values in [-π/2, π/2].
+    Using the doubled-angle trick avoids ±π aliasing when averaging orientations.
+    """
+    H, W = img.shape
+    R, C = H // block, W // block
+    f  = img.astype(np.float32)
+    gx = cv2.Sobel(f, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(f, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = gx * gx - gy * gy   # |G|² cos2θ
+    gxy = 2.0 * gx * gy        # |G|² sin2θ
+    orient = np.zeros((R, C), np.float32)
+    for r in range(R):
+        for c in range(C):
+            y0, y1 = r * block, (r + 1) * block
+            x0, x1 = c * block, (c + 1) * block
+            orient[r, c] = 0.5 * np.arctan2(
+                float(gxy[y0:y1, x0:x1].sum()),
+                float(gxx[y0:y1, x0:x1].sum()),
+            )
+    return orient
+
+
+def _poincare_at(orient: np.ndarray, r: int, c: int, radius: int) -> float:
+    """
+    Poincaré index at grid cell (r, c). Traces 8 equally-spaced points around a
+    circle of `radius` cells and sums wrapped angular differences in orientation.
+
+    Return value (in our π-periodic convention):
+        ≈ +1  →  core   (ridges rotate +π around this point)
+        ≈ -1  →  delta  (ridges rotate -π around this point)
+        ≈  0  →  ordinary point
+    """
+    R, C = orient.shape
+    circle_angles = np.linspace(0.0, 2.0 * np.pi, 9)[:-1]
+    pts = []
+    for a in circle_angles:
+        ri = int(round(r + radius * np.sin(a)))
+        ci = int(round(c + radius * np.cos(a)))
+        pts.append(orient[max(0, min(R - 1, ri)), max(0, min(C - 1, ci))])
+    total = 0.0
+    for i in range(len(pts)):
+        d = pts[(i + 1) % len(pts)] - pts[i]
+        # Wrap difference to [-π/2, π/2] (orientation is π-periodic)
+        d = (d + np.pi / 2.0) % np.pi - np.pi / 2.0
+        total += d
+    return total / np.pi
+
+
+def _find_singular(orient: np.ndarray, radius: int,
+                   thresh: float) -> list[tuple[int, int, str]]:
+    """
+    Locate cores and deltas via Poincaré index + non-maximum suppression.
+    Returns list of (row, col, 'core'|'delta').
+    """
+    R, C = orient.shape
+    margin = radius + 1
+    scores = np.zeros_like(orient)
+    for r in range(margin, R - margin):
+        for c in range(margin, C - margin):
+            scores[r, c] = _poincare_at(orient, r, c, radius)
+
+    singular: list[tuple[int, int, str]] = []
+    used = np.zeros((R, C), bool)
+
+    def _nms_pass(sorted_indices, sign: int, label: str) -> None:
+        for idx in sorted_indices:
+            r, c = divmod(int(idx), C)
+            val = scores[r, c]
+            if sign * val < thresh:
+                break
+            if used[r, c]:
+                continue
+            singular.append((r, c, label))
+            r0, r1 = max(0, r - radius), min(R, r + radius + 1)
+            c0, c1 = max(0, c - radius), min(C, c + radius + 1)
+            used[r0:r1, c0:c1] = True
+
+    flat = scores.ravel()
+    _nms_pass(np.argsort(-flat),  +1, 'core')   # highest scores first; break when val < +thresh
+    used[:] = False
+    _nms_pass(np.argsort(flat),   -1, 'delta')  # lowest (most negative) first; break when val > -thresh
+
+    return singular
+
+
+def _classify_arch(orient: np.ndarray) -> str:
+    """
+    Distinguish Plain Arch (PA) from Tented Arch (TA).
+    Tented arches have a steep upthrust at the centre — the local orientation
+    at the mid-column is significantly more vertical (|angle| > 30°).
+    """
+    R, C = orient.shape
+    rm, cm = R // 2, C // 2
+    # 3×3 block around the centre cell
+    centre = orient[max(0, rm - 1):rm + 2, max(0, cm - 1):cm + 2]
+    mean_abs_angle = float(np.mean(np.abs(centre)))
+    return 'TA' if mean_abs_angle > np.radians(30) else 'PA'
+
+
+def _classify_loop(deltas: list[tuple[int, int]], orient: np.ndarray) -> str:
+    """
+    Ulnar Loop (UL) vs Radial Loop (RL) from delta position.
+
+    In our cylindrical superprint the front of the thumb is centred; left and
+    right flank sides of the image. For the right thumb (which ClearBridge
+    captures), the ulnar side is the left half of the print:
+        delta left  of centre → loop opens right (ulnar)  → UL
+        delta right of centre → loop opens left  (radial) → RL
+    """
+    _, C = orient.shape
+    dr, dc = deltas[0]
+    return 'UL' if dc < C // 2 else 'RL'
+
+
+def _line_crosses_inner(d1: tuple[int, int], d2: tuple[int, int],
+                        cores: list[tuple[int, int]],
+                        orient: np.ndarray) -> bool:
+    """
+    Heuristic for Plain Whorl vs Central Pocket Loop Whorl.
+
+    An imaginary line between the two deltas "crosses" the innermost pattern
+    when the ridge flow at the midpoint of that line is perpendicular (circular)
+    to the line itself — i.e. the recurving ridges cross it.
+
+    Returns True → PW (line crosses);  False → CPW (line doesn't cross).
+    """
+    R, C = orient.shape
+    (r1, c1), (r2, c2) = d1, d2
+    rm, cm = (r1 + r2) / 2.0, (c1 + c2) / 2.0
+    line_angle = np.arctan2(r2 - r1, c2 - c1)
+    # Expected ridge orientation perpendicular to the delta-delta line
+    perp = line_angle + np.pi / 2.0
+    ri, ci = int(round(rm)), int(round(cm))
+    ri = max(0, min(R - 1, ri))
+    ci = max(0, min(C - 1, ci))
+    ridge_angle = float(orient[ri, ci])
+    diff = abs(ridge_angle - perp)
+    diff = min(diff, np.pi - diff)
+    return diff < np.radians(45)
+
+
+def _classify_whorl(deltas: list[tuple[int, int]],
+                    cores:  list[tuple[int, int]],
+                    orient: np.ndarray) -> str:
+    """
+    Distinguish the four whorl subtypes from singular point topology:
+
+    Plain Whorl (PW)         — 2 deltas, 1 core, delta line crosses inner circuit
+    Central Pocket Loop (CPW)— 2 deltas, 1 core, inner whorl NOT crossed by line
+    Double Loop (DLW)        — 2 deltas, 2+ cores (two independent loop systems)
+    Accidental Whorl (AW)    — ≥3 deltas, or 2 deltas with no core (irregular)
+    """
+    n_d = len(deltas)
+    n_c = len(cores)
+
+    if n_d >= 3:
+        return 'AW'
+
+    # 2 deltas
+    if n_c >= 2:
+        return 'DLW'
+    if n_c == 0:
+        return 'AW'
+
+    # 1 core — check line-crossing test
+    d1, d2 = deltas[0], deltas[1]
+    return 'PW' if _line_crosses_inner(d1, d2, cores, orient) else 'CPW'
+
+
+def _classify_henry(image: np.ndarray) -> str:
+    try:
+        _init_heavy_deps()
+        img    = _henry_preprocess(image)
+        orient = _henry_orientation(img, _HB)
+        pts    = _find_singular(orient, _HR, _HT)
+
+        deltas = [(r, c) for r, c, t in pts if t == 'delta']
+        cores  = [(r, c) for r, c, t in pts if t == 'core']
+
+        n_d = len(deltas)
+        if n_d == 0:
+            return _classify_arch(orient)
+        if n_d == 1:
+            return _classify_loop(deltas, orient)
+        return _classify_whorl(deltas, cores, orient)
+
+    except Exception as e:
+        logger.warning(f'Henry classification error: {e}')
+        return 'U'
+
+
+# ── Storage helpers ───────────────────────────────────────────────────────────
+
+def _save_enhanced_flat(image: np.ndarray, user_id: str, capture_id: str) -> str | None:
+    """JPEG-encode the NNS-enhanced flat print and upload to Storage. Non-blocking on failure."""
+    try:
+        _, bucket = _get_firebase()
+        ok, buf = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        if not ok:
+            logger.warning('cv2.imencode failed for enhanced_flat.jpg')
+            return None
+        path = f'captures/{user_id}/{capture_id}/enhanced_flat.jpg'
+        bucket.blob(path).upload_from_string(buf.tobytes(), content_type='image/jpeg')
+        logger.info('Enhanced flat print saved → %s', path)
+        return path
+    except Exception as exc:
+        logger.warning('Failed to save enhanced_flat.jpg (non-critical): %s', exc)
+        return None
+
+
+# ── Firestore helpers ─────────────────────────────────────────────────────────
+
+def _update_firestore(capture_id: str, data: dict, critical: bool = False) -> None:
+    db, _ = _get_firebase()
+    ref = db.collection('captures').document(capture_id)
+    last_exc: Exception | None = None
+    for attempt in range(3):
+        try:
+            ref.update(data)
+            return
+        except Exception as e:
+            last_exc = e
+            if attempt < 2:
+                time.sleep(0.25 * (2 ** attempt))
+    logger.warning(f"Firestore update failed after 3 attempts: {last_exc}")
+    if critical:
+        raise last_exc
+
+
+def _fail(capture_id: str, reason: str) -> None:
+    _update_firestore(capture_id, {
+        'status':        'failed',
+        'failureReason': reason[:500],
+    })
+
+
+def _delete_capture_frames(base_path: str) -> None:
+    """Delete all raw frame blobs from Storage (POPIA data minimization).
+    Called after status='scored' — the superprint + Firestore metadata are the
+    durable artifacts; raw JPEG frames are no longer needed."""
+    _, bucket = _get_firebase()
+    blobs = list(bucket.list_blobs(prefix=base_path))
+    if not blobs:
+        return
+    for blob in blobs:
+        try:
+            blob.delete()
+        except Exception as exc:
+            logger.warning(f'Could not delete frame {blob.name}: {exc}')
+    logger.info(f'Deleted {len(blobs)} raw frames under {base_path} (POPIA minimization)')
+
+
