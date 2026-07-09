@@ -48,11 +48,13 @@ build-clearbridge-beta:
     # previous download links already point at, so nothing else changes.
     - |
       if [ -n "$FIREBASE_SA_KEY" ]; then
-        # This image has python3 but no `pip` binary on PATH at all (not
-        # just an externally-managed-environment block) -- ensurepip installs
-        # pip from its bundled wheel with no network call, then invoke it via
-        # `python3 -m pip` rather than relying on a `pip`/`pip3` executable.
-        python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+        # This image's python3 has no working `ensurepip` (confirmed via CI
+        # log: "No module named pip" even after `python3 -m ensurepip`) --
+        # its bundled wheel must be stripped from this image. apt has a real
+        # python3-pip package, so use that as the primary path and keep
+        # ensurepip only as a fallback in case apt is ever unavailable.
+        (apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-pip) >/dev/null 2>&1 || true
+        python3 -m pip --version >/dev/null 2>&1 || python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
         python3 -m pip install --quiet google-auth requests --break-system-packages 2>/dev/null \
           || python3 -m pip install --quiet google-auth requests
         python3 - <<'PYEOF'
