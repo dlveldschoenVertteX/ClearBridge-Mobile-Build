@@ -295,7 +295,7 @@ class _GuidancePanel extends StatelessWidget {
   // Phase 8 (index 7) is the only step with a different dial range — see
   // the plan's axis-decision note in oscillating_capture_controller.dart.
   static const _defaultRange = (min: -20.0, max: 20.0);
-  static const _topRange = (min: -40.0, max: 0.0);
+  static const _topRange = (min: -20.0, max: 0.0);
 
   @override
   Widget build(BuildContext context) {
@@ -350,7 +350,11 @@ class _GuidancePanel extends StatelessWidget {
             child: ClipRRect(
               borderRadius: BorderRadius.circular(3),
               child: LinearProgressIndicator(
-                value: state.holdProgress,
+                value: state.isCapturingBurst
+                    ? (state.burstShotTotal > 0
+                        ? state.burstShotIndex / state.burstShotTotal
+                        : 0)
+                    : state.holdProgress,
                 minHeight: 5,
                 backgroundColor: CaptureColors.silverDim.withValues(alpha: 0.25),
                 color: state.isCapturingBurst ? CaptureColors.gold : CaptureColors.success,
@@ -359,7 +363,9 @@ class _GuidancePanel extends StatelessWidget {
           ),
           const SizedBox(height: 4),
           Text(
-            state.isCapturingBurst ? 'Capturing…' : 'Holding steady…',
+            state.isCapturingBurst
+                ? 'Capturing… ${state.burstShotIndex}/${state.burstShotTotal}'
+                : 'Holding steady…',
             style: CaptureTypography.label.copyWith(fontSize: 11),
           ),
         ],

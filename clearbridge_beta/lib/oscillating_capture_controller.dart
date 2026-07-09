@@ -189,7 +189,7 @@ final List<Object> oscillatingSteps = [
     instruction: 'Move SLOWLY back to FRONT.',
   ),
   const _BurstStep(
-    targetDeg: -30,
+    targetDeg: -15,
     label: 'TOP',
     // Positive roll tilts the camera's aim upward (see _AngleAxis) -- to
     // see over the top of the thumb tip the phone needs to tilt DOWN
@@ -217,6 +217,8 @@ class OscillatingCaptureState {
   final double angularVelocityDegPerSec;
   final bool tooFast;
   final bool isCapturingBurst;
+  final int burstShotIndex; // shots fired so far this burst, for the UI countdown
+  final int burstShotTotal;
   final String? confirmationText; // "✓ FRONT captured" banner, ~700ms
   final int totalFramesCaptured;
   final double uploadProgress;
@@ -239,6 +241,8 @@ class OscillatingCaptureState {
     this.angularVelocityDegPerSec = 0,
     this.tooFast = false,
     this.isCapturingBurst = false,
+    this.burstShotIndex = 0,
+    this.burstShotTotal = 0,
     this.confirmationText,
     this.totalFramesCaptured = 0,
     this.uploadProgress = 0,
@@ -262,6 +266,8 @@ class OscillatingCaptureState {
     double? angularVelocityDegPerSec,
     bool? tooFast,
     bool? isCapturingBurst,
+    int? burstShotIndex,
+    int? burstShotTotal,
     Object? confirmationText = _sentinel,
     int? totalFramesCaptured,
     double? uploadProgress,
@@ -285,6 +291,8 @@ class OscillatingCaptureState {
             angularVelocityDegPerSec ?? this.angularVelocityDegPerSec,
         tooFast: tooFast ?? this.tooFast,
         isCapturingBurst: isCapturingBurst ?? this.isCapturingBurst,
+        burstShotIndex: burstShotIndex ?? this.burstShotIndex,
+        burstShotTotal: burstShotTotal ?? this.burstShotTotal,
         confirmationText: identical(confirmationText, _sentinel)
             ? this.confirmationText
             : confirmationText as String?,
@@ -355,7 +363,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const double _holdToleranceDeg = 5.0;
   static const double _waypointToleranceDeg = 5.0;
   static const int _holdDurationMs = 1500;
-  static const int _burstFrameCount = 5; // spec floor -- see plan for why
+  static const int _burstFrameCount = 3; // reduced from 5 per field-test feedback on burst duration
   static const int _burstShotDelayMs = 50;
   static const int _burstFlashSettleMs = 70; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
@@ -808,7 +816,14 @@ class OscillatingCaptureController extends ChangeNotifier {
   Future<void> _fireBurst(_BurstStep step) async {
     if (_burstInFlight) return;
     _burstInFlight = true;
-    _apply((s) => s.copyWith(isCapturingBurst: true), force: true);
+    _apply(
+      (s) => s.copyWith(
+        isCapturingBurst: true,
+        burstShotIndex: 0,
+        burstShotTotal: _burstFrameCount,
+      ),
+      force: true,
+    );
 
     final cam = _camera;
     final wasStreaming = _streamRunning;
@@ -897,6 +912,7 @@ class OscillatingCaptureController extends ChangeNotifier {
         } catch (e) {
           debugPrint('[osc] burst shot $i failed (non-fatal): $e');
         }
+        _apply((s) => s.copyWith(burstShotIndex: i + 1), force: true);
         if (i < _burstFrameCount - 1) {
           await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
         }
