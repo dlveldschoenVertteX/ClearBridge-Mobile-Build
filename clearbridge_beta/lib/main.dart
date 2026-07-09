@@ -8,7 +8,7 @@ import 'package:clearbridge_beta/beta_thank_you_screen.dart';
 import 'package:clearbridge_beta/clearbridge_colors.dart';
 import 'package:clearbridge_beta/clearcoin_screen.dart';
 import 'package:clearbridge_beta/firebase_options.dart';
-import 'package:clearbridge_beta/front_burst_capture_screen.dart';
+import 'package:clearbridge_beta/oscillating_capture_screen.dart';
 import 'package:clearbridge_beta/splash_screen.dart';
 import 'package:clearbridge_beta/user_details_popia_screen.dart';
 
@@ -72,8 +72,13 @@ class _CaptureRoute extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return FrontBurstCaptureScreen(
+    return OscillatingCaptureScreen(
       getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+      // No login screen in this single-flow app -- anonymous sign-in already
+      // ran in main() before runApp(). This only fires if that sign-in
+      // failed (see main.dart's try/catch), so retry it silently; the user
+      // can press "Start Sequence" again once it succeeds.
+      onRequireLogin: () => FirebaseAuth.instance.signInAnonymously(),
       onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
         MaterialPageRoute(
           builder: (_) => ClearCoinScreen(

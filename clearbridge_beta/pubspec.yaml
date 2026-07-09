@@ -1,13 +1,14 @@
 name: clearbridge_beta
 description: >
-  Standalone "ClearBridge Beta" app: front-only single-pass MAC3D fingerprint
-  capture for beta testers. Splash -> user details & POPIA consent -> front
-  burst capture -> ClearCoin reward -> thank you. Anonymous Firebase auth
-  against the real ClearBridge backend (Storage/Firestore/
-  processEnhanceAndScore) -- no arc-sweep or four-angle capture code, no
-  Paystack, no dashboard, no login flow. Deliberately decoupled from
-  capture_harness and the main app so none of the three ever need to change
-  in lockstep.
+  Standalone "ClearBridge Beta" app: 8-phase orientation-guided oscillating
+  MAC3D fingerprint capture for beta testers. Splash -> user details & POPIA
+  consent -> oscillating arc-sweep capture -> ClearCoin reward -> thank you.
+  Anonymous Firebase auth against the real ClearBridge backend (Storage/
+  Firestore/processEnhanceAndScore) -- no four-angle flavor-based capture
+  code, no Paystack, no dashboard, no login flow. Deliberately decoupled
+  from capture_harness and the main app so none of the three ever need to
+  change in lockstep, even though the capture controller/screen originated
+  in capture_harness and is kept in sync by copying, not sharing code.
 publish_to: "none"
 version: 0.1.0+1
 
