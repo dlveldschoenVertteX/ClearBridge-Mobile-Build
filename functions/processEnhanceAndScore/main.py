@@ -172,7 +172,7 @@ def _get_nfiq_session():
     timeout_sec=120,
     memory=options.MemoryOption.GB_4,
     cpu=4,
-    min_instances=1,
+    min_instances=0,
 )
 def processEnhanceAndScore(req: https_fn.CallableRequest):
     """
