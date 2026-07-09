@@ -2,19 +2,18 @@ import 'dart:async';
 import 'dart:collection';
 import 'dart:math' as math;
 import 'dart:typed_data';
-import 'dart:ui' as ui;
 import 'dart:ui' show Rect;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:image/image.dart' as imglib;
 import 'package:sensors_plus/sensors_plus.dart';
 
 import 'adaptive_flash_controller.dart';
 import 'arc_capture_uploader.dart';
 import 'frame_capture_service.dart';
+import 'still_jpeg_downscaler.dart';
 import 'thumb_landmarker_service.dart';
 
 enum ArcSweepPhase {
@@ -779,12 +778,16 @@ class ArcSweepCaptureController extends ChangeNotifier {
         if (wasStreaming) await _stopStream();
         final xfile = await c.takePicture();
         final jpeg = await xfile.readAsBytes();
-        final luma = await _decodeJpegToBufferLuma(jpeg);
-        if (luma != null && !_disposed) {
+        final decoded = await decodeStillJpegToLuma(
+          jpeg,
+          _sensorOrientation,
+          targetWidth: _stillDecodeTargetWidth,
+        );
+        if (decoded != null && !_disposed) {
           _stills.add(_StillFrame(
-            bytes: luma.bytes,
-            width: luma.width,
-            height: luma.height,
+            bytes: encodeGrayscaleJpeg(decoded.luma, decoded.width, decoded.height),
+            width: decoded.width,
+            height: decoded.height,
             pitchDeg: pitchAtCapture,
             rollDeg: rollAtCapture,
             legIndex: legIndex,
@@ -810,66 +813,9 @@ class ArcSweepCaptureController extends ChangeNotifier {
     }();
   }
 
-  /// Decodes a JPEG still to a JPEG-re-encoded luma buffer in the SAME
-  /// orientation as the preview-stream Y planes, so the backend sees a
-  /// consistent set of frames.
-  ///
-  /// The stream buffer is in sensor (landscape) orientation; takePicture JPEGs
-  /// decode EXIF-upright (portrait on a 90°/270° sensor). For those sensors
-  /// the upright image is rotated 90° CW back into buffer orientation —
-  /// the inverse of ThumbLandmarkerService's buffer→upright CCW rotation.
-  ///
-  /// Re-encoded as JPEG rather than left as a raw buffer for the same reason
-  /// as [_extractRoiBytes]: the backend's decoder only reliably handles
-  /// either a real image decode or a byte count matching one of a handful of
-  /// hardcoded standard camera resolutions, and this decoded-then-rotated
-  /// still's dimensions won't reliably match either by chance.
-  Future<({Uint8List bytes, int width, int height})?> _decodeJpegToBufferLuma(
-      Uint8List jpeg) async {
-    final codec = await ui.instantiateImageCodec(
-      jpeg,
-      targetWidth: _stillDecodeTargetWidth,
-    );
-    final frame = await codec.getNextFrame();
-    codec.dispose();
-    final image = frame.image;
-    try {
-      final byteData =
-          await image.toByteData(format: ui.ImageByteFormat.rawRgba);
-      if (byteData == null) return null;
-      final rgba = byteData.buffer.asUint8List();
-      final w = image.width;
-      final h = image.height;
-
-      // RGBA → luma (BT.601 integer approximation).
-      final luma = Uint8List(w * h);
-      for (var i = 0, p = 0; i < luma.length; i++, p += 4) {
-        luma[i] =
-            (77 * rgba[p] + 150 * rgba[p + 1] + 29 * rgba[p + 2]) >> 8;
-      }
-
-      if (_sensorOrientation == 90 || _sensorOrientation == 270) {
-        // Rotate 90° CW: dst is h wide × w tall; dst(x,y) = src(y, h-1-x).
-        final rotated = Uint8List(w * h);
-        final dstW = h;
-        final dstH = w;
-        for (var y = 0; y < dstH; y++) {
-          final srcCol = y;
-          for (var x = 0; x < dstW; x++) {
-            rotated[y * dstW + x] = luma[(h - 1 - x) * w + srcCol];
-          }
-        }
-        return (
-          bytes: _encodeGrayscaleJpeg(rotated, dstW, dstH),
-          width: dstW,
-          height: dstH,
-        );
-      }
-      return (bytes: _encodeGrayscaleJpeg(luma, w, h), width: w, height: h);
-    } finally {
-      image.dispose();
-    }
-  }
+  // decodeStillJpegToLuma (still_jpeg_downscaler.dart) replaces what used to
+  // be a private _decodeJpegToBufferLuma here -- same decode/luma/rotation
+  // logic, now shared with OscillatingCaptureController's burst stills.
 
   // ── Path projection ─────────────────────────────────────────────────────────
 
@@ -1061,10 +1007,11 @@ class ArcSweepCaptureController extends ChangeNotifier {
               double.parse(_lastCoverage.toStringAsFixed(3)),
           'evOffsetApplied': _appliedEvOffset,
           'timestamp': timestamp.toIso8601String(),
-          // `bytes` is a real JPEG (see _encodeGrayscaleJpeg /
-          // _decodeJpegToBufferLuma) — decodes directly server-side, no raw-
-          // buffer reshape needed. Dimensions are carried here only for
-          // diagnostics/logging, not as a decode instruction.
+          // `bytes` is a real JPEG (see encodeGrayscaleJpeg /
+          // decodeStillJpegToLuma in still_jpeg_downscaler.dart) — decodes
+          // directly server-side, no raw-buffer reshape needed. Dimensions
+          // are carried here only for diagnostics/logging, not as a decode
+          // instruction.
           'imageWidth': width,
           'imageHeight': height,
         });
@@ -1210,7 +1157,7 @@ class ArcSweepCaptureController extends ChangeNotifier {
         final srcStart = (y0 + y) * stride + x0;
         out.setRange(y * cw, (y + 1) * cw, bytes, srcStart);
       }
-      final jpeg = _encodeGrayscaleJpeg(out, cw, ch);
+      final jpeg = encodeGrayscaleJpeg(out, cw, ch);
       return (bytes: jpeg, width: cw, height: ch);
     } on RangeError {
       return null;
@@ -1220,17 +1167,6 @@ class ArcSweepCaptureController extends ChangeNotifier {
       debugPrint('[arc] JPEG encode failed for cropped frame: $e');
       return null;
     }
-  }
-
-  /// Encodes a dense (bytesPerRow == width) 8-bit grayscale buffer as JPEG.
-  static Uint8List _encodeGrayscaleJpeg(Uint8List gray, int w, int h) {
-    final image = imglib.Image.fromBytes(
-      width: w,
-      height: h,
-      bytes: gray.buffer,
-      numChannels: 1,
-    );
-    return Uint8List.fromList(imglib.encodeJpg(image, quality: 90));
   }
 
   @override

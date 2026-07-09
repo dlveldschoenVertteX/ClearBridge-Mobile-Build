@@ -44,6 +44,8 @@ export 'src/thumb_orientation_classifier.dart'
     show ThumbOrientationClassifier, OrientationPrediction;
 
 export 'src/camera_service.dart' show CameraService;
+export 'src/still_jpeg_downscaler.dart'
+    show DecodedStillLuma, decodeStillJpegToLuma, encodeGrayscaleJpeg;
 export 'src/adaptive_flash_controller.dart' show AdaptiveFlashController;
 export 'src/device_orientation_service.dart'
     show DeviceOrientationService, RelativeOrientation;

@@ -40,6 +40,42 @@ Uint8List _encodeGrayJpegIsolate(_GrayCrop crop) {
   return Uint8List.fromList(imglib.encodeJpg(imgObj, quality: 88));
 }
 
+/// Decoded-but-not-yet-JPEG-encoded burst still, ready for
+/// [_encodeBurstStillIsolate]. See _fireBurst -- the raw ISP JPEG a burst
+/// shot decodes to is already downscaled by decodeStillJpegToLuma (from
+/// package:mac_capture) by the time this exists, so this buffer is small
+/// (~2048px wide luma) even though the source JPEG was 11-29MB.
+class _BurstEncodeArgs {
+  final Uint8List luma;
+  final int width;
+  final int height;
+  const _BurstEncodeArgs(this.luma, this.width, this.height);
+}
+
+/// Top-level so it can run in a compute() isolate -- see _fireBurst for why
+/// only the encode (not the decode) is deferred like this.
+Uint8List _encodeBurstStillIsolate(_BurstEncodeArgs args) =>
+    encodeGrayscaleJpeg(args.luma, args.width, args.height);
+
+/// A burst shot's metadata, captured synchronously at shot time, paired
+/// with its still-encoding JPEG bytes future -- see _fireBurst.
+class _PendingBurstShot {
+  final int phaseNumber;
+  final double angleDeg;
+  final DateTime timestamp;
+  final bool flashOn;
+  final double? laplacianScore;
+  final Future<Uint8List> encodedBytes;
+  const _PendingBurstShot({
+    required this.phaseNumber,
+    required this.angleDeg,
+    required this.timestamp,
+    required this.flashOn,
+    required this.laplacianScore,
+    required this.encodedBytes,
+  });
+}
+
 /// Which Euler component of [RelativeOrientation] a burst step's targetDeg
 /// is measured against. LEFT/RIGHT are a left-right pan (device Y axis =
 /// pitch, per DeviceOrientationService's naming); TOP is a nose-up/down tilt
@@ -739,6 +775,18 @@ class OscillatingCaptureController extends ChangeNotifier {
     final preburstFocus = _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null;
     final torchCapable = _flash?.isNeeded ?? false;
 
+    // Raw ISP stills at ResolutionPreset.max are 11-29MB each -- verified
+    // against a real capture in Storage. Uploading 24 of those (~400-500MB)
+    // was the dominant driver of both client upload lag and the backend
+    // sitting in `enhancing` for 15+ minutes. Every shot gets downscaled to
+    // ~2048px-wide grayscale before it ever reaches _capturedFrames, via the
+    // same decodeStillJpegToLuma/encodeGrayscaleJpeg pair
+    // ArcSweepCaptureController already ships for its own checkpoint
+    // stills (see packages/mac_capture/lib/src/still_jpeg_downscaler.dart)
+    // -- 2048px is ~4x the 500x500 the backend's NFIQ scoring normalizes to
+    // anyway, so this is well above the pipeline's actual quality floor.
+    final pendingShots = <_PendingBurstShot>[];
+
     try {
       if (cam == null) return;
       if (wasStreaming) await _stopStream();
@@ -763,7 +811,7 @@ class OscillatingCaptureController extends ChangeNotifier {
         }
         try {
           final xfile = await cam.takePicture();
-          final bytes = await xfile.readAsBytes();
+          final jpeg = await xfile.readAsBytes();
           // DeviceOrientationService reads a native EventChannel independent
           // of the camera image stream, so it keeps updating even while the
           // stream is stopped for takePicture() — read fresh per shot rather
@@ -773,16 +821,28 @@ class OscillatingCaptureController extends ChangeNotifier {
           // doesn't reflect the actual tilt, corrupting the backend's
           // per-frame geometry for that phase.
           final freshOrient = _orientation.relativeOrientation();
-          _capturedFrames.add(_CapturedFrame(
-            bytes: bytes,
-            phaseNumber: _state.stepIndex + 1,
-            angleDeg: step.axis == _AngleAxis.roll ? freshOrient.roll : freshOrient.pitch,
-            velocityDegPerSec: 0,
-            timestamp: DateTime.now(),
-            isBurst: true,
-            flashOn: _flash?.isFlashOn ?? false,
-            laplacianScore: preburstFocus,
-          ));
+          final angleDeg = step.axis == _AngleAxis.roll ? freshOrient.roll : freshOrient.pitch;
+          final flashOn = _flash?.isFlashOn ?? false;
+          final shotTimestamp = DateTime.now();
+          // dart:ui decode must stay on this isolate (Flutter-engine API,
+          // unavailable inside compute()) -- but it's a single hardware-
+          // accelerated decode-at-reduced-size, not the continuous 30fps
+          // loop that made transition-frame *encoding* worth backgrounding.
+          // Only the CPU-bound JPEG re-encode below is deferred to compute().
+          final decoded = await decodeStillJpegToLuma(jpeg, _sensorOrientation);
+          if (decoded != null) {
+            pendingShots.add(_PendingBurstShot(
+              phaseNumber: _state.stepIndex + 1,
+              angleDeg: angleDeg,
+              timestamp: shotTimestamp,
+              flashOn: flashOn,
+              laplacianScore: preburstFocus,
+              encodedBytes: compute(
+                _encodeBurstStillIsolate,
+                _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+              ),
+            ));
+          }
         } catch (e) {
           debugPrint('[osc] burst shot $i failed (non-fatal): $e');
         }
@@ -794,6 +854,23 @@ class OscillatingCaptureController extends ChangeNotifier {
         try {
           await _flash!.deactivate();
         } catch (_) {}
+      }
+
+      if (pendingShots.isNotEmpty) {
+        final encoded = await Future.wait(pendingShots.map((p) => p.encodedBytes));
+        for (var i = 0; i < pendingShots.length; i++) {
+          final p = pendingShots[i];
+          _capturedFrames.add(_CapturedFrame(
+            bytes: encoded[i],
+            phaseNumber: p.phaseNumber,
+            angleDeg: p.angleDeg,
+            velocityDegPerSec: 0,
+            timestamp: p.timestamp,
+            isBurst: true,
+            flashOn: p.flashOn,
+            laplacianScore: p.laplacianScore,
+          ));
+        }
       }
 
       HapticFeedback.heavyImpact();
