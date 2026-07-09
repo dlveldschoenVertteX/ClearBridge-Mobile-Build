@@ -16,15 +16,17 @@ plugins {
 val debugKeystore = file(System.getProperty("user.home") + "/.android/debug.keystore")
 if (!debugKeystore.exists()) {
     debugKeystore.parentFile.mkdirs()
-    exec {
-        commandLine(
-            "keytool", "-genkeypair", "-v",
-            "-keystore", debugKeystore.absolutePath,
-            "-storepass", "android", "-alias", "androiddebugkey", "-keypass", "android",
-            "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
-            "-dname", "CN=Android Debug,O=Android,C=US",
-        )
-    }
+    // Plain ProcessBuilder rather than Gradle's exec {} DSL -- the latter
+    // isn't resolvable at this script scope on every AGP/Gradle version
+    // (confirmed broken here), while ProcessBuilder is just JVM stdlib.
+    val process = ProcessBuilder(
+        "keytool", "-genkeypair", "-v",
+        "-keystore", debugKeystore.absolutePath,
+        "-storepass", "android", "-alias", "androiddebugkey", "-keypass", "android",
+        "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+        "-dname", "CN=Android Debug,O=Android,C=US",
+    ).redirectErrorStream(true).start()
+    process.waitFor()
 }
 
 android {
