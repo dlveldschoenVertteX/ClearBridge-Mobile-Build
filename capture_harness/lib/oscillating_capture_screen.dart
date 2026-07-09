@@ -244,7 +244,7 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
     );
   }
 
-  Widget _errorOverlay(String message) {
+  Widget _errorOverlay(String message, {VoidCallback? onRetry}) {
     return Container(
       color: CaptureColors.void_.withValues(alpha: 0.92),
       padding: const EdgeInsets.all(28),
@@ -256,6 +256,10 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
             const SizedBox(height: 14),
             Text(message, textAlign: TextAlign.center, style: CaptureTypography.body.copyWith(fontSize: 14)),
             const SizedBox(height: 22),
+            if (onRetry != null) ...[
+              CaptureButton(label: 'Retry', onPressed: onRetry),
+              const SizedBox(height: 10),
+            ],
             CaptureButton(label: 'Back', variant: CaptureButtonVariant.ghost, onPressed: _close),
           ],
         ),
@@ -266,7 +270,18 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
   Widget _errorScaffold(String message) {
     return Scaffold(
       backgroundColor: CaptureColors.void_,
-      body: SafeArea(child: _errorOverlay('Camera error: $message')),
+      body: SafeArea(
+        child: _errorOverlay(
+          'Camera error: $message',
+          // Camera init failures are frequently transient (cold HAL warm-up,
+          // capability negotiation on budget hardware) -- let the user retry
+          // in place rather than forcing a full navigation restart.
+          onRetry: () {
+            setState(() => _initError = null);
+            _init();
+          },
+        ),
+      ),
     );
   }
 }

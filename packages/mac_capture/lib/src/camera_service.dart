@@ -31,6 +31,38 @@ class CameraService {
     ResolutionPreset resolution = ResolutionPreset.max,
     CameraDescription? cameraDescription,
   }) async {
+    // Budget devices (e.g. CameraX capability negotiation at
+    // ResolutionPreset.max on a cold HAL start) occasionally exceed a single
+    // 10s attempt without the hardware actually being unavailable -- retry
+    // once with a longer budget before surfacing a hard failure to the user.
+    try {
+      await _initializeCameraAttempt(
+        lensDirection: lensDirection,
+        resolution: resolution,
+        cameraDescription: cameraDescription,
+        timeout: const Duration(seconds: 12),
+      );
+    } on TimeoutException {
+      debugPrint('CameraService: First init attempt timed out, retrying once');
+      try {
+        await _initializeCameraAttempt(
+          lensDirection: lensDirection,
+          resolution: resolution,
+          cameraDescription: cameraDescription,
+          timeout: const Duration(seconds: 20),
+        );
+      } on TimeoutException {
+        throw Exception('Camera initialization timed out');
+      }
+    }
+  }
+
+  Future<void> _initializeCameraAttempt({
+    required CameraLensDirection lensDirection,
+    required ResolutionPreset resolution,
+    required CameraDescription? cameraDescription,
+    required Duration timeout,
+  }) async {
     try {
       // Get available cameras if not already fetched
       _cameras ??= await availableCameras();
@@ -55,9 +87,7 @@ class CameraService {
         '(direction=${camera.lensDirection}, type=${camera.lensType})',
       );
 
-      _pendingInitialization = controller.initialize().timeout(
-        const Duration(seconds: 10),
-      );
+      _pendingInitialization = controller.initialize().timeout(timeout);
 
       await _pendingInitialization;
 
@@ -84,9 +114,6 @@ class CameraService {
         await _disposeController(pendingController);
       }
       debugPrint('CameraService: Error initializing camera: $e');
-      if (e is TimeoutException) {
-        throw Exception('Camera initialization timed out');
-      }
       rethrow;
     }
   }
