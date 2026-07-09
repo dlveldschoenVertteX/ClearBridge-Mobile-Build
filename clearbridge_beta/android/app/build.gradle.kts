@@ -27,9 +27,15 @@ android {
 
     signingConfigs {
         create("release") {
+            // Only use KEYSTORE_PATH if that file actually exists -- CI sets
+            // the env var unconditionally, but only decodes/writes the file
+            // when the KEYSTORE_BASE64 secret is configured. Falling back to
+            // the env var's mere presence (rather than checking the file)
+            // broke the build the moment this signing config was added,
+            // since the keystore secret hadn't been set up yet.
             val keystorePath = System.getenv("KEYSTORE_PATH")
-            storeFile = if (keystorePath != null) file(keystorePath)
-                        else signingConfigs.getByName("debug").storeFile
+            val keystoreFile = keystorePath?.let { file(it) }?.takeIf { it.exists() }
+            storeFile = keystoreFile ?: signingConfigs.getByName("debug").storeFile
             storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
             keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
             keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
