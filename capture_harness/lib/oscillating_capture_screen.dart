@@ -294,7 +294,7 @@ class _GuidancePanel extends StatelessWidget {
 
   // Phase 8 (index 7) is the only step with a different dial range — see
   // the plan's axis-decision note in oscillating_capture_controller.dart.
-  static const _defaultRange = (min: -36.0, max: 36.0);
+  static const _defaultRange = (min: -20.0, max: 20.0);
   static const _topRange = (min: 0.0, max: 40.0);
 
   @override

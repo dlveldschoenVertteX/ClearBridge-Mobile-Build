@@ -57,6 +57,26 @@ class _BurstEncodeArgs {
 Uint8List _encodeBurstStillIsolate(_BurstEncodeArgs args) =>
     encodeGrayscaleJpeg(args.luma, args.width, args.height);
 
+/// A single burst shot straight off the ISP, before decode/downscale --
+/// held only long enough to get through the shot loop at full cadence, see
+/// _fireBurst for why decode/encode happen after the loop instead of inline.
+class _RawBurstShot {
+  final Uint8List jpeg;
+  final int phaseNumber;
+  final double angleDeg;
+  final DateTime timestamp;
+  final bool flashOn;
+  final double? laplacianScore;
+  const _RawBurstShot({
+    required this.jpeg,
+    required this.phaseNumber,
+    required this.angleDeg,
+    required this.timestamp,
+    required this.flashOn,
+    required this.laplacianScore,
+  });
+}
+
 /// A burst shot's metadata, captured synchronously at shot time, paired
 /// with its still-encoding JPEG bytes future -- see _fireBurst.
 class _PendingBurstShot {
@@ -132,39 +152,39 @@ final List<Object> oscillatingSteps = [
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: -36,
-    waypoints: [-12, -24, -36],
+    toDeg: -20,
+    waypoints: [-7, -13, -20],
     label: 'LEFT',
     instruction: 'Move SLOWLY to the LEFT.',
   ),
   const _BurstStep(
-    targetDeg: -36,
+    targetDeg: -20,
     label: 'LEFT',
-    instruction: 'Hold STEADY at LEFT (-36°). Capturing…',
+    instruction: 'Hold STEADY at LEFT (-20°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: -36,
+    fromDeg: -20,
     toDeg: 0,
-    waypoints: [-24, -12, 0],
+    waypoints: [-13, -7, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: 36,
-    waypoints: [12, 24, 36],
+    toDeg: 20,
+    waypoints: [7, 13, 20],
     label: 'RIGHT',
     instruction: 'Move SLOWLY to the RIGHT.',
   ),
   const _BurstStep(
-    targetDeg: 36,
+    targetDeg: 20,
     label: 'RIGHT',
-    instruction: 'Hold STEADY at RIGHT (+36°). Capturing…',
+    instruction: 'Hold STEADY at RIGHT (+20°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: 36,
+    fromDeg: 20,
     toDeg: 0,
-    waypoints: [24, 12, 0],
+    waypoints: [13, 7, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
@@ -332,7 +352,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const double _holdToleranceDeg = 5.0;
   static const double _waypointToleranceDeg = 5.0;
   static const int _holdDurationMs = 1500;
-  static const int _burstFrameCount = 6; // spec range: 5-8
+  static const int _burstFrameCount = 5; // spec floor -- see plan for why
   static const int _burstShotDelayMs = 90;
   static const int _burstFlashSettleMs = 120; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
@@ -596,8 +616,21 @@ class OscillatingCaptureController extends ChangeNotifier {
     _lastAngle = angle;
     _lastAngleAt = now;
 
+    // Hybrid CV+IMU gate infrastructure, shared by burst holds and (for the
+    // final/destination waypoint only, see _handleTransitionFrame)
+    // transitions. Throttled to ~6-7Hz rather than full camera frame-rate --
+    // see _handleBurstFrame's original comment: the hold window is 1.5s, so
+    // a few classifications a second is plenty, and running tflite
+    // inference every frame risked reintroducing preview lag.
+    final classifyNow = DateTime.now();
+    if (_lastCvClassifyAt == null ||
+        classifyNow.difference(_lastCvClassifyAt!).inMilliseconds >= _cvClassifyMinIntervalMs) {
+      _lastCvClassifyAt = classifyNow;
+      _lastCvPrediction = _cvClassifier?.classify(image, _sensorOrientation);
+    }
+
     if (step is _BurstStep) {
-      _handleBurstFrame(image, angle, step);
+      _handleBurstFrame(angle, step);
     } else if (step is _TransitionStep) {
       _maybeToggleTorchForTransition();
       _handleTransitionFrame(image, angle, rawFocus, step);
@@ -635,18 +668,9 @@ class OscillatingCaptureController extends ChangeNotifier {
     }
   }
 
-  void _handleBurstFrame(CameraImage image, double angle, _BurstStep step) {
-    // Throttled to ~6-7Hz rather than full camera frame-rate: the hold
-    // window is 1.5s, so a few classifications a second is plenty to
-    // confirm a held-steady position, and running tflite inference on
-    // every single frame risked reintroducing the exact preview lag the
-    // async JPEG-encode change (see _cropFrameGray) was fixing.
-    final classifyNow = DateTime.now();
-    if (_lastCvClassifyAt == null ||
-        classifyNow.difference(_lastCvClassifyAt!).inMilliseconds >= _cvClassifyMinIntervalMs) {
-      _lastCvClassifyAt = classifyNow;
-      _lastCvPrediction = _cvClassifier?.classify(image, _sensorOrientation);
-    }
+  void _handleBurstFrame(double angle, _BurstStep step) {
+    // CV classify-and-cache now happens once per frame in _onFrame (shared
+    // with transition arrival checks) -- just read the cached prediction.
     final cvPrediction = _lastCvPrediction;
     final cvConfirms = cvPrediction != null &&
         cvPrediction.angleName == step.label.toLowerCase() &&
@@ -737,7 +761,22 @@ class OscillatingCaptureController extends ChangeNotifier {
     }
 
     final target = step.waypoints[_currentWaypointIndex];
-    final dist = (angle - target).abs();
+    final rawDist = (angle - target).abs();
+    // CV assist only applies to the final waypoint -- the actual named
+    // destination (step.label), which is the only point along a transition
+    // the trained classifier can meaningfully recognize (it only knows the
+    // 4 discrete positions, not intermediate waypoint angles). This is what
+    // fixes "moving from RIGHT to FRONT doesn't register" -- IMU-only
+    // arrival detection had no fallback if pitch had drifted by then,
+    // unlike burst holds which already had this hybrid gate.
+    var dist = rawDist;
+    if (_currentWaypointIndex == step.waypoints.length - 1) {
+      final cvPrediction = _lastCvPrediction;
+      final cvConfirms = cvPrediction != null &&
+          cvPrediction.angleName == step.label.toLowerCase() &&
+          cvPrediction.confidence >= _cvConfidenceThreshold;
+      if (cvConfirms) dist = 0.0;
+    }
     final tooFast = _angularVelocity > _maxAngularVelocityDegPerSec;
 
     _apply((s) => s.copyWith(
@@ -775,17 +814,38 @@ class OscillatingCaptureController extends ChangeNotifier {
     final preburstFocus = _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null;
     final torchCapable = _flash?.isNeeded ?? false;
 
+    // EV offset range, queried once (not per-shot) -- torch-lit shots dial
+    // exposure down so full-power torch doesn't blow out ridge detail on
+    // close-up skin; ambient shots stay neutral. Same -0.4 EV middle ground
+    // as MultiAngleCaptureController._setAdaptiveExposureOffset's "normal/
+    // bright indoor + torch" bands, just applied per-shot here since this
+    // mode alternates torch within a single burst rather than fixing it for
+    // a whole session.
+    double? minEv;
+    double? maxEv;
+    if (torchCapable) {
+      try {
+        minEv = await cam?.getMinExposureOffset();
+        maxEv = await cam?.getMaxExposureOffset();
+      } catch (_) {}
+    }
+
     // Raw ISP stills at ResolutionPreset.max are 11-29MB each -- verified
-    // against a real capture in Storage. Uploading 24 of those (~400-500MB)
-    // was the dominant driver of both client upload lag and the backend
-    // sitting in `enhancing` for 15+ minutes. Every shot gets downscaled to
+    // against a real capture in Storage. Every shot gets downscaled to
     // ~2048px-wide grayscale before it ever reaches _capturedFrames, via the
     // same decodeStillJpegToLuma/encodeGrayscaleJpeg pair
     // ArcSweepCaptureController already ships for its own checkpoint
     // stills (see packages/mac_capture/lib/src/still_jpeg_downscaler.dart)
     // -- 2048px is ~4x the 500x500 the backend's NFIQ scoring normalizes to
     // anyway, so this is well above the pipeline's actual quality floor.
-    final pendingShots = <_PendingBurstShot>[];
+    //
+    // Decode+encode happen entirely AFTER the shot loop below, not inline
+    // per-shot -- a real-device test showed the burst taking noticeably too
+    // long with inline decode. Capturing all raw JPEGs first restores the
+    // original fast shot-to-shot cadence (just takePicture() + delays);
+    // the decode/encode cost moves into the post-burst pause, which already
+    // has cover (haptic + confirmation banner + _confirmationDisplayMs).
+    final rawShots = <_RawBurstShot>[];
 
     try {
       if (cam == null) return;
@@ -806,6 +866,10 @@ class OscillatingCaptureController extends ChangeNotifier {
             } else {
               await _flash!.deactivate();
             }
+            if (minEv != null && maxEv != null) {
+              final target = wantTorch ? -0.4 : 0.0;
+              await cam.setExposureOffset(target.clamp(minEv, maxEv));
+            }
             await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
           } catch (_) {}
         }
@@ -821,28 +885,14 @@ class OscillatingCaptureController extends ChangeNotifier {
           // doesn't reflect the actual tilt, corrupting the backend's
           // per-frame geometry for that phase.
           final freshOrient = _orientation.relativeOrientation();
-          final angleDeg = step.axis == _AngleAxis.roll ? freshOrient.roll : freshOrient.pitch;
-          final flashOn = _flash?.isFlashOn ?? false;
-          final shotTimestamp = DateTime.now();
-          // dart:ui decode must stay on this isolate (Flutter-engine API,
-          // unavailable inside compute()) -- but it's a single hardware-
-          // accelerated decode-at-reduced-size, not the continuous 30fps
-          // loop that made transition-frame *encoding* worth backgrounding.
-          // Only the CPU-bound JPEG re-encode below is deferred to compute().
-          final decoded = await decodeStillJpegToLuma(jpeg, _sensorOrientation);
-          if (decoded != null) {
-            pendingShots.add(_PendingBurstShot(
-              phaseNumber: _state.stepIndex + 1,
-              angleDeg: angleDeg,
-              timestamp: shotTimestamp,
-              flashOn: flashOn,
-              laplacianScore: preburstFocus,
-              encodedBytes: compute(
-                _encodeBurstStillIsolate,
-                _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
-              ),
-            ));
-          }
+          rawShots.add(_RawBurstShot(
+            jpeg: jpeg,
+            phaseNumber: _state.stepIndex + 1,
+            angleDeg: step.axis == _AngleAxis.roll ? freshOrient.roll : freshOrient.pitch,
+            timestamp: DateTime.now(),
+            flashOn: _flash?.isFlashOn ?? false,
+            laplacianScore: preburstFocus,
+          ));
         } catch (e) {
           debugPrint('[osc] burst shot $i failed (non-fatal): $e');
         }
@@ -853,9 +903,38 @@ class OscillatingCaptureController extends ChangeNotifier {
       if (torchCapable) {
         try {
           await _flash!.deactivate();
+          if (minEv != null && maxEv != null) {
+            await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
+          }
         } catch (_) {}
       }
 
+      // dart:ui decode must stay on this isolate (Flutter-engine API,
+      // unavailable inside compute()) -- but it's a hardware-accelerated
+      // decode-at-reduced-size done once per shot here, not the continuous
+      // 30fps loop that made transition-frame *encoding* worth
+      // backgrounding. Only the CPU-bound JPEG re-encode is deferred to
+      // compute(), collected via Future.wait below.
+      final pendingShots = <_PendingBurstShot>[];
+      for (final raw in rawShots) {
+        try {
+          final decoded = await decodeStillJpegToLuma(raw.jpeg, _sensorOrientation);
+          if (decoded == null) continue;
+          pendingShots.add(_PendingBurstShot(
+            phaseNumber: raw.phaseNumber,
+            angleDeg: raw.angleDeg,
+            timestamp: raw.timestamp,
+            flashOn: raw.flashOn,
+            laplacianScore: raw.laplacianScore,
+            encodedBytes: compute(
+              _encodeBurstStillIsolate,
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+            ),
+          ));
+        } catch (e) {
+          debugPrint('[osc] burst shot decode failed (non-fatal): $e');
+        }
+      }
       if (pendingShots.isNotEmpty) {
         final encoded = await Future.wait(pendingShots.map((p) => p.encodedBytes));
         for (var i = 0; i < pendingShots.length; i++) {
