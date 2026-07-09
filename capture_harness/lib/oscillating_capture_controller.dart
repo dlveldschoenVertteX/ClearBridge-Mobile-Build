@@ -15,6 +15,31 @@ import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
 
+/// Cropped single-channel (luma) frame ready for JPEG encoding in a
+/// background isolate -- see [_encodeGrayJpegIsolate].
+class _GrayCrop {
+  final Uint8List bytes;
+  final int width;
+  final int height;
+  const _GrayCrop(this.bytes, this.width, this.height);
+}
+
+/// Top-level so it can run in a `compute()` isolate -- JPEG encoding is CPU-
+/// heavy enough (called up to ~30x/sec during transitions) that doing it
+/// synchronously on the UI isolate inside the camera frame callback caused
+/// visible preview lag/jank. Only the crop step (a cheap memcpy, done by
+/// OscillatingCaptureController._cropFrameGray) stays on the UI isolate;
+/// the actual encode moves off it via compute() in _handleTransitionFrame.
+Uint8List _encodeGrayJpegIsolate(_GrayCrop crop) {
+  final imgObj = imglib.Image.fromBytes(
+    width: crop.width,
+    height: crop.height,
+    bytes: crop.bytes.buffer,
+    numChannels: 1,
+  );
+  return Uint8List.fromList(imglib.encodeJpg(imgObj, quality: 88));
+}
+
 /// One of the 8 fixed positions the user holds still at while the ISP fires
 /// a burst of real [CameraController.takePicture] stills.
 class _BurstStep {
@@ -61,39 +86,39 @@ final List<Object> oscillatingSteps = [
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: -45,
-    waypoints: [-15, -30, -45],
+    toDeg: -41,
+    waypoints: [-14, -27, -41],
     label: 'LEFT',
     instruction: 'Move SLOWLY to the LEFT.',
   ),
   const _BurstStep(
-    targetDeg: -45,
+    targetDeg: -41,
     label: 'LEFT',
-    instruction: 'Hold STEADY at LEFT (-45°). Capturing…',
+    instruction: 'Hold STEADY at LEFT (-41°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: -45,
+    fromDeg: -41,
     toDeg: 0,
-    waypoints: [-30, -15, 0],
+    waypoints: [-27, -14, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: 45,
-    waypoints: [15, 30, 45],
+    toDeg: 41,
+    waypoints: [14, 27, 41],
     label: 'RIGHT',
     instruction: 'Move SLOWLY to the RIGHT.',
   ),
   const _BurstStep(
-    targetDeg: 45,
+    targetDeg: 41,
     label: 'RIGHT',
-    instruction: 'Hold STEADY at RIGHT (+45°). Capturing…',
+    instruction: 'Hold STEADY at RIGHT (+41°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: 45,
+    fromDeg: 41,
     toDeg: 0,
-    waypoints: [30, 15, 0],
+    waypoints: [27, 14, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
@@ -247,11 +272,14 @@ class _CapturedFrame {
 /// most reliable segmentation tier on every other capture mode — has real
 /// pairs to work with, not just single ambient frames).
 ///
-/// Deliberately lean compared to the package's other capture controllers
-/// (no ML thumb-coverage gate, brightness-only calibration instead of a
-/// focus-stability tracker) — this mode is purely angle-and-timing driven
-/// per its spec, and staying minimal keeps it fast to retune while the
-/// geometry itself is still being worked out.
+/// Brightness-only calibration instead of a focus-stability tracker (unlike
+/// the package's other controllers) — this mode is otherwise purely
+/// angle-and-timing driven per its spec, and staying minimal keeps it fast
+/// to retune while the geometry itself is still being worked out. It does
+/// use the same hybrid CV+IMU gate as [MultiAngleCaptureController] though
+/// (see [_cvClassifier]) — the trained thumb-orientation model directly
+/// supports this mode's four burst positions (front/left/right/top), so
+/// there was no reason to leave this mode IMU-only.
 class OscillatingCaptureController extends ChangeNotifier {
   static const double _holdToleranceDeg = 5.0;
   static const double _waypointToleranceDeg = 5.0;
@@ -266,6 +294,12 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const int _confirmationDisplayMs = 700;
   static const int _calibDurationMs = 500; // brightness sampling for AdaptiveFlashController
   static const int _torchAlternateMs = 500; // transition-phase torch toggle cadence
+  // Hybrid CV+IMU gate, same threshold as MultiAngleCaptureController: a
+  // confident, correct CV prediction can bring the effective distance to 0
+  // (locked) even if the raw IMU angle hasn't quite settled there -- it
+  // never blocks a capture the IMU alone would already allow.
+  static const double _cvConfidenceThreshold = 0.45;
+  static const int _cvClassifyMinIntervalMs = 150; // ~6-7Hz cap, not full frame-rate
 
   // Loose centre crop for transition frames — cuts background while leaving
   // margin for a wandering thumb during the move (unlike a burst hold, the
@@ -275,6 +309,11 @@ class OscillatingCaptureController extends ChangeNotifier {
   CameraController? _camera;
   String? _userId;
   AdaptiveFlashController? _flash;
+  ThumbOrientationClassifier? _cvClassifier;
+  int _sensorOrientation = 0;
+  DateTime? _lastCvClassifyAt;
+  OrientationPrediction? _lastCvPrediction;
+  bool _encodeInFlight = false;
 
   OscillatingCaptureState _state = const OscillatingCaptureState();
   OscillatingCaptureState get state => _state;
@@ -321,6 +360,11 @@ class OscillatingCaptureController extends ChangeNotifier {
     _disposed = false;
     _camera = camera;
     _userId = userId;
+    _sensorOrientation = camera.description.sensorOrientation;
+    // Lazy-init, same pattern as MultiAngleCaptureController._ensurePlugin --
+    // loading the tflite model takes real time, so it's created once and
+    // reused across repeated start()/"capture again" calls, not per-session.
+    _cvClassifier ??= ThumbOrientationClassifier()..initialize();
 
     _capturedFrames.clear();
     _holdStart = null;
@@ -331,6 +375,9 @@ class OscillatingCaptureController extends ChangeNotifier {
     _angularVelocity = 0;
     _lastVideoFrameAt = null;
     _lastTorchToggleAt = null;
+    _lastCvClassifyAt = null;
+    _lastCvPrediction = null;
+    _encodeInFlight = false;
     _focusPeak = 1.0;
     _hybrid.reset();
     _flash = AdaptiveFlashController(camera);
@@ -346,7 +393,13 @@ class OscillatingCaptureController extends ChangeNotifier {
     } catch (_) {}
 
     _orientation.start();
-    await Future<void>.delayed(const Duration(milliseconds: 50));
+    // 500ms settle before zeroing the reference, matching
+    // MultiAngleCaptureController's proven calibration delay -- the previous
+    // 50ms was too short for the orientation sensor to settle after the
+    // phone is first raised into position, biasing the whole session's "0°
+    // = FRONT" zero point by several degrees (symptom: the dial insists
+    // FRONT isn't reached even when the thumb is visibly dead-centre).
+    await Future<void>.delayed(const Duration(milliseconds: 500));
     if (_disposed) return;
     _orientation.captureReference();
 
@@ -473,7 +526,7 @@ class OscillatingCaptureController extends ChangeNotifier {
 
     final step = oscillatingSteps[_state.stepIndex];
     if (step is _BurstStep) {
-      _handleBurstFrame(angle, step);
+      _handleBurstFrame(image, angle, step);
     } else if (step is _TransitionStep) {
       _maybeToggleTorchForTransition();
       _handleTransitionFrame(image, angle, rawFocus, step);
@@ -511,8 +564,25 @@ class OscillatingCaptureController extends ChangeNotifier {
     }
   }
 
-  void _handleBurstFrame(double angle, _BurstStep step) {
-    final dist = (angle - step.targetDeg).abs();
+  void _handleBurstFrame(CameraImage image, double angle, _BurstStep step) {
+    // Throttled to ~6-7Hz rather than full camera frame-rate: the hold
+    // window is 1.5s, so a few classifications a second is plenty to
+    // confirm a held-steady position, and running tflite inference on
+    // every single frame risked reintroducing the exact preview lag the
+    // async JPEG-encode change (see _cropFrameGray) was fixing.
+    final classifyNow = DateTime.now();
+    if (_lastCvClassifyAt == null ||
+        classifyNow.difference(_lastCvClassifyAt!).inMilliseconds >= _cvClassifyMinIntervalMs) {
+      _lastCvClassifyAt = classifyNow;
+      _lastCvPrediction = _cvClassifier?.classify(image, _sensorOrientation);
+    }
+    final cvPrediction = _lastCvPrediction;
+    final cvConfirms = cvPrediction != null &&
+        cvPrediction.angleName == step.label.toLowerCase() &&
+        cvPrediction.confidence >= _cvConfidenceThreshold;
+
+    final rawDist = (angle - step.targetDeg).abs();
+    final dist = cvConfirms ? 0.0 : rawDist;
     final tooFast = _angularVelocity > _maxAngularVelocityDegPerSec;
 
     if (dist <= _holdToleranceDeg && !tooFast) {
@@ -551,27 +621,44 @@ class OscillatingCaptureController extends ChangeNotifier {
     _TransitionStep step,
   ) {
     // Video-frame extraction, throttled to ~30fps and capped defensively.
+    // The crop (cheap memcpy) stays synchronous; the JPEG encode -- CPU-heavy
+    // enough at this rate to have caused visible preview lag when it ran
+    // synchronously on the UI isolate -- moves to a compute() isolate.
+    // _encodeInFlight provides natural backpressure: if an encode is still
+    // running when the next eligible frame arrives, that frame is skipped
+    // rather than piling up more isolates than the device can keep up with.
     final now = DateTime.now();
     if ((_lastVideoFrameAt == null ||
             now.difference(_lastVideoFrameAt!).inMilliseconds >= _videoFrameMinIntervalMs) &&
-        _capturedFrames.length < _maxVideoFramesPerTransition * 4) {
+        _capturedFrames.length < _maxVideoFramesPerTransition * 4 &&
+        !_encodeInFlight) {
       final transitionFrameCount = _capturedFrames
           .where((f) => !f.isBurst && f.phaseNumber == _state.stepIndex + 1)
           .length;
       if (transitionFrameCount < _maxVideoFramesPerTransition) {
-        final jpeg = _extractFrameJpeg(image);
-        if (jpeg != null) {
-          _capturedFrames.add(_CapturedFrame(
-            bytes: jpeg,
-            phaseNumber: _state.stepIndex + 1,
-            angleDeg: angle,
-            velocityDegPerSec: _angularVelocity,
-            timestamp: now,
-            isBurst: false,
-            flashOn: _flash?.isFlashOn ?? false,
-            laplacianScore: rawFocus,
-          ));
+        final crop = _cropFrameGray(image);
+        if (crop != null) {
+          _encodeInFlight = true;
           _lastVideoFrameAt = now;
+          final phaseNumber = _state.stepIndex + 1;
+          final flashOn = _flash?.isFlashOn ?? false;
+          compute(_encodeGrayJpegIsolate, crop).then((jpeg) {
+            _encodeInFlight = false;
+            if (_disposed) return;
+            _capturedFrames.add(_CapturedFrame(
+              bytes: jpeg,
+              phaseNumber: phaseNumber,
+              angleDeg: angle,
+              velocityDegPerSec: _angularVelocity,
+              timestamp: now,
+              isBurst: false,
+              flashOn: flashOn,
+              laplacianScore: rawFocus,
+            ));
+          }).catchError((Object e) {
+            _encodeInFlight = false;
+            debugPrint('[osc] video-frame encode failed (non-fatal): $e');
+          });
         }
       }
     }
@@ -697,8 +784,13 @@ class OscillatingCaptureController extends ChangeNotifier {
   }
 
   // ── Video-frame extraction ────────────────────────────────────────────
+  //
+  // Split into a synchronous crop (cheap memcpy, must run on the UI isolate
+  // since CameraImage's native buffer isn't valid once _onFrame returns) and
+  // an isolate-run encode (see _encodeGrayJpegIsolate below) -- see the
+  // compute() call in _handleTransitionFrame for why.
 
-  Uint8List? _extractFrameJpeg(CameraImage image) {
+  _GrayCrop? _cropFrameGray(CameraImage image) {
     if (image.planes.isEmpty) return null;
     try {
       final plane = image.planes[0];
@@ -721,17 +813,11 @@ class OscillatingCaptureController extends ChangeNotifier {
         final srcStart = (y0 + y) * stride + x0;
         out.setRange(y * cw, (y + 1) * cw, bytes, srcStart);
       }
-      final imgObj = imglib.Image.fromBytes(
-        width: cw,
-        height: ch,
-        bytes: out.buffer,
-        numChannels: 1,
-      );
-      return Uint8List.fromList(imglib.encodeJpg(imgObj, quality: 88));
+      return _GrayCrop(out, cw, ch);
     } on RangeError {
       return null;
     } catch (e) {
-      debugPrint('[osc] video-frame encode failed (non-fatal): $e');
+      debugPrint('[osc] video-frame crop failed (non-fatal): $e');
       return null;
     }
   }
@@ -898,6 +984,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     unawaited(_flash?.deactivate());
     _orientation.dispose();
     unawaited(_stopStream());
+    _cvClassifier?.dispose();
     super.dispose();
   }
 }
