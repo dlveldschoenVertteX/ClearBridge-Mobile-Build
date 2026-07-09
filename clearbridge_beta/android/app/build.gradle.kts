@@ -4,6 +4,29 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
+// AGP only auto-generates ~/.android/debug.keystore when a build variant
+// uses the literal built-in "debug" SigningConfig object -- the "release"
+// config below borrows its storeFile path as a fallback (when no real
+// release keystore secret is configured), which does NOT trigger that
+// auto-generation. On a fresh CI runner with no pre-existing debug
+// keystore (confirmed on GitLab; GitHub Actions runners happen to ship
+// with one already) that leaves the fallback pointing at a file that's
+// never created, so validateSigningRelease fails outright. Generate it
+// ourselves if missing, matching AGP's own default debug key parameters.
+val debugKeystore = file(System.getProperty("user.home") + "/.android/debug.keystore")
+if (!debugKeystore.exists()) {
+    debugKeystore.parentFile.mkdirs()
+    exec {
+        commandLine(
+            "keytool", "-genkeypair", "-v",
+            "-keystore", debugKeystore.absolutePath,
+            "-storepass", "android", "-alias", "androiddebugkey", "-keypass", "android",
+            "-keyalg", "RSA", "-keysize", "2048", "-validity", "10000",
+            "-dname", "CN=Android Debug,O=Android,C=US",
+        )
+    }
+}
+
 android {
     namespace = "com.clearbridge.beta"
     // See the main ClearBridge app's android/app/build.gradle.kts: several
