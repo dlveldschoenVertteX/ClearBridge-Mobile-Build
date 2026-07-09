@@ -189,9 +189,12 @@ final List<Object> oscillatingSteps = [
     instruction: 'Move SLOWLY back to FRONT.',
   ),
   const _BurstStep(
-    targetDeg: 30,
+    targetDeg: -30,
     label: 'TOP',
-    instruction: 'Tilt thumb UP slightly. Keep thumb centered.',
+    // Positive roll tilts the camera's aim upward (see _AngleAxis) -- to
+    // see over the top of the thumb tip the phone needs to tilt DOWN
+    // instead, so the target and this instruction are both negative-roll.
+    instruction: 'Tilt phone DOWN, looking over the top of your thumb.',
     axis: _AngleAxis.roll,
   ),
 ];
@@ -353,8 +356,8 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const double _waypointToleranceDeg = 5.0;
   static const int _holdDurationMs = 1500;
   static const int _burstFrameCount = 5; // spec floor -- see plan for why
-  static const int _burstShotDelayMs = 90;
-  static const int _burstFlashSettleMs = 120; // AE settle after toggling torch mid-burst
+  static const int _burstShotDelayMs = 50;
+  static const int _burstFlashSettleMs = 70; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
   // ~12fps: still comfortably oversampled for the backend's 5deg angle bins
   // (41deg-ish sweep / 5deg ~= 8-9 bins) but roughly a third of the frame
@@ -681,7 +684,6 @@ class OscillatingCaptureController extends ChangeNotifier {
     final tooFast = _angularVelocity > _maxAngularVelocityDegPerSec;
 
     if (dist <= _holdToleranceDeg && !tooFast) {
-      _audio.updateGuidanceTone(null); // silence proximity beep while holding
       _holdStart ??= DateTime.now();
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
@@ -699,7 +701,6 @@ class OscillatingCaptureController extends ChangeNotifier {
       }
     } else {
       _holdStart = null;
-      _audio.updateGuidanceTone(dist);
       _apply((s) => s.copyWith(
             currentAngleDeg: angle,
             deltaDeg: angle - step.targetDeg,
