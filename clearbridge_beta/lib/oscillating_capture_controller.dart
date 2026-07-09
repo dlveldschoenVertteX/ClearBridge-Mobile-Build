@@ -40,16 +40,27 @@ Uint8List _encodeGrayJpegIsolate(_GrayCrop crop) {
   return Uint8List.fromList(imglib.encodeJpg(imgObj, quality: 88));
 }
 
+/// Which Euler component of [RelativeOrientation] a burst step's targetDeg
+/// is measured against. LEFT/RIGHT are a left-right pan (device Y axis =
+/// pitch, per DeviceOrientationService's naming); TOP is a nose-up/down tilt
+/// (device X axis = roll) -- a physically different motion that was
+/// previously (incorrectly) also read off pitch, which is why the TOP hold
+/// never felt calibrated: the sensor value driving its dial didn't actually
+/// track the "tilt thumb up" motion the user was asked to perform.
+enum _AngleAxis { pitch, roll }
+
 /// One of the 8 fixed positions the user holds still at while the ISP fires
 /// a burst of real [CameraController.takePicture] stills.
 class _BurstStep {
   final double targetDeg;
   final String label;
   final String instruction;
+  final _AngleAxis axis;
   const _BurstStep({
     required this.targetDeg,
     required this.label,
     required this.instruction,
+    this.axis = _AngleAxis.pitch,
   });
 }
 
@@ -73,11 +84,10 @@ class _TransitionStep {
 }
 
 /// The 8-phase oscillating sequence: front → left → front → right → front →
-/// top, alternating burst holds with guided transitions. All 8 phases are
-/// driven off a single signed angle (the device's relative pitch — the same
-/// axis [ThumbAngleService] uses for the left/right orbit in the 4-angle
-/// flow), so phase 8's "+30°" target sits on that same scale rather than
-/// introducing a second physical axis.
+/// top, alternating burst holds with guided transitions. FRONT/LEFT/RIGHT
+/// share a single signed angle (the device's relative pitch — the same axis
+/// [ThumbAngleService] uses for the left/right orbit in the 4-angle flow);
+/// TOP is measured on roll instead -- see [_AngleAxis].
 final List<Object> oscillatingSteps = [
   const _BurstStep(
     targetDeg: 0,
@@ -86,39 +96,39 @@ final List<Object> oscillatingSteps = [
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: -41,
-    waypoints: [-14, -27, -41],
+    toDeg: -36,
+    waypoints: [-12, -24, -36],
     label: 'LEFT',
     instruction: 'Move SLOWLY to the LEFT.',
   ),
   const _BurstStep(
-    targetDeg: -41,
+    targetDeg: -36,
     label: 'LEFT',
-    instruction: 'Hold STEADY at LEFT (-41°). Capturing…',
+    instruction: 'Hold STEADY at LEFT (-36°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: -41,
+    fromDeg: -36,
     toDeg: 0,
-    waypoints: [-27, -14, 0],
+    waypoints: [-24, -12, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
   const _TransitionStep(
     fromDeg: 0,
-    toDeg: 41,
-    waypoints: [14, 27, 41],
+    toDeg: 36,
+    waypoints: [12, 24, 36],
     label: 'RIGHT',
     instruction: 'Move SLOWLY to the RIGHT.',
   ),
   const _BurstStep(
-    targetDeg: 41,
+    targetDeg: 36,
     label: 'RIGHT',
-    instruction: 'Hold STEADY at RIGHT (+41°). Capturing…',
+    instruction: 'Hold STEADY at RIGHT (+36°). Capturing…',
   ),
   const _TransitionStep(
-    fromDeg: 41,
+    fromDeg: 36,
     toDeg: 0,
-    waypoints: [27, 14, 0],
+    waypoints: [24, 12, 0],
     label: 'FRONT',
     instruction: 'Move SLOWLY back to FRONT.',
   ),
@@ -126,6 +136,7 @@ final List<Object> oscillatingSteps = [
     targetDeg: 30,
     label: 'TOP',
     instruction: 'Tilt thumb UP slightly. Keep thumb centered.',
+    axis: _AngleAxis.roll,
   ),
 ];
 
@@ -266,7 +277,8 @@ class _CapturedFrame {
 /// — see the backend's `_download_oscillating_frames` for how the dense
 /// frame stream this controller produces gets binned down into a
 /// cylindrical-projection input. To reconstruct well it tracks, per frame:
-/// the exact device angle (pitch axis, via [DeviceOrientationService]),
+/// the exact device angle (pitch axis for FRONT/LEFT/RIGHT, roll axis for
+/// TOP -- see [_AngleAxis] -- via [DeviceOrientationService]),
 /// raw Laplacian sharpness (so the backend can pick the best frame per
 /// angle bin), and ambient/torch pairing (so flash-diff segmentation — the
 /// most reliable segmentation tier on every other capture mode — has real
@@ -288,12 +300,18 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const int _burstShotDelayMs = 90;
   static const int _burstFlashSettleMs = 120; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
-  static const int _videoFrameMinIntervalMs = 33; // caps extraction at ~30fps
+  // ~12fps: still comfortably oversampled for the backend's 5deg angle bins
+  // (41deg-ish sweep / 5deg ~= 8-9 bins) but roughly a third of the frame
+  // count -- and upload requests -- that ~30fps produced, which was the
+  // main driver of "upload takes extremely long" (each frame is its own
+  // Storage upload; see _uploadConcurrency below).
+  static const int _videoFrameMinIntervalMs = 80;
   static const int _maxVideoFramesPerTransition = 150; // safety cap
   static const int _emitThrottleMs = 80;
   static const int _confirmationDisplayMs = 700;
   static const int _calibDurationMs = 500; // brightness sampling for AdaptiveFlashController
   static const int _torchAlternateMs = 500; // transition-phase torch toggle cadence
+  static const int _uploadConcurrency = 16; // was 6 -- see _videoFrameMinIntervalMs
   // Hybrid CV+IMU gate, same threshold as MultiAngleCaptureController: a
   // confident, correct CV prediction can bring the effective distance to 0
   // (locked) even if the raw IMU angle hasn't quite settled there -- it
@@ -314,12 +332,14 @@ class OscillatingCaptureController extends ChangeNotifier {
   DateTime? _lastCvClassifyAt;
   OrientationPrediction? _lastCvPrediction;
   bool _encodeInFlight = false;
+  _AngleAxis? _lastAxis;
 
   OscillatingCaptureState _state = const OscillatingCaptureState();
   OscillatingCaptureState get state => _state;
 
   final _orientation = DeviceOrientationService();
   final _hybrid = HybridCaptureService(); // live focus meter + per-frame sharpness tag
+  final _audio = CaptureAudioService(); // success chime + proximity tone
 
   bool _disposed = false;
   bool _starting = false;
@@ -378,11 +398,13 @@ class OscillatingCaptureController extends ChangeNotifier {
     _lastCvClassifyAt = null;
     _lastCvPrediction = null;
     _encodeInFlight = false;
+    _lastAxis = null;
     _focusPeak = 1.0;
     _hybrid.reset();
     _flash = AdaptiveFlashController(camera);
     _brightnessSamples.clear();
     _calibDone = false;
+    unawaited(_audio.init());
 
     _state = const OscillatingCaptureState(phase: OscillatingPhase.calibrating);
     notifyListeners();
@@ -512,8 +534,22 @@ class OscillatingCaptureController extends ChangeNotifier {
       );
     } catch (_) {}
 
-    final angle = _orientation.relativeOrientation().pitch;
+    final step = oscillatingSteps[_state.stepIndex];
+    // TOP is the only step measured on roll rather than pitch -- see
+    // _AngleAxis. All transitions and every other burst stay on pitch.
+    final axis = step is _BurstStep ? step.axis : _AngleAxis.pitch;
+    final orient = _orientation.relativeOrientation();
+    final angle = axis == _AngleAxis.roll ? orient.roll : orient.pitch;
+
     final now = DateTime.now();
+    if (_lastAxis != axis) {
+      // Crossing from a pitch-driven step to the roll-driven TOP step (or
+      // back) is a discontinuity in the underlying signal, not real device
+      // motion -- drop the stale sample so it can't register as a bogus
+      // angular-velocity spike and falsely trip the "too fast" guard.
+      _lastAngleAt = null;
+    }
+    _lastAxis = axis;
     if (_lastAngleAt != null) {
       final dt = now.difference(_lastAngleAt!).inMicroseconds / 1e6;
       if (dt > 0.001) {
@@ -524,7 +560,6 @@ class OscillatingCaptureController extends ChangeNotifier {
     _lastAngle = angle;
     _lastAngleAt = now;
 
-    final step = oscillatingSteps[_state.stepIndex];
     if (step is _BurstStep) {
       _handleBurstFrame(image, angle, step);
     } else if (step is _TransitionStep) {
@@ -586,6 +621,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     final tooFast = _angularVelocity > _maxAngularVelocityDegPerSec;
 
     if (dist <= _holdToleranceDeg && !tooFast) {
+      _audio.updateGuidanceTone(null); // silence proximity beep while holding
       _holdStart ??= DateTime.now();
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
@@ -603,6 +639,7 @@ class OscillatingCaptureController extends ChangeNotifier {
       }
     } else {
       _holdStart = null;
+      _audio.updateGuidanceTone(dist);
       _apply((s) => s.copyWith(
             currentAngleDeg: angle,
             deltaDeg: angle - step.targetDeg,
@@ -730,11 +767,16 @@ class OscillatingCaptureController extends ChangeNotifier {
           // DeviceOrientationService reads a native EventChannel independent
           // of the camera image stream, so it keeps updating even while the
           // stream is stopped for takePicture() — read fresh per shot rather
-          // than reusing the pre-burst angle.
+          // than reusing the pre-burst angle. Must read the same axis this
+          // step is gated on (see _AngleAxis) -- TOP frames tagged with
+          // pitch instead of roll would carry a near-zero angleDeg that
+          // doesn't reflect the actual tilt, corrupting the backend's
+          // per-frame geometry for that phase.
+          final freshOrient = _orientation.relativeOrientation();
           _capturedFrames.add(_CapturedFrame(
             bytes: bytes,
             phaseNumber: _state.stepIndex + 1,
-            angleDeg: _orientation.relativeOrientation().pitch,
+            angleDeg: step.axis == _AngleAxis.roll ? freshOrient.roll : freshOrient.pitch,
             velocityDegPerSec: 0,
             timestamp: DateTime.now(),
             isBurst: true,
@@ -755,6 +797,9 @@ class OscillatingCaptureController extends ChangeNotifier {
       }
 
       HapticFeedback.heavyImpact();
+      unawaited(_audio.playAngleSuccess(
+        isFinal: _state.stepIndex == oscillatingSteps.length - 1,
+      ));
       _apply(
         (s) => s.copyWith(
           confirmationText: '✓ ${step.label} captured',
@@ -831,6 +876,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   // cylindrical-projection input.
 
   Future<void> _finishAndUpload() async {
+    _audio.silence();
     _apply((s) => s.copyWith(phase: OscillatingPhase.uploading, uploadProgress: 0), force: true);
     await _stopStream();
     _orientation.dispose();
@@ -901,8 +947,8 @@ class OscillatingCaptureController extends ChangeNotifier {
 
       var completed = 0;
       final total = uploadTasks.isEmpty ? 1 : uploadTasks.length;
-      for (var i = 0; i < uploadTasks.length; i += 6) {
-        final end = math.min(i + 6, uploadTasks.length);
+      for (var i = 0; i < uploadTasks.length; i += _uploadConcurrency) {
+        final end = math.min(i + _uploadConcurrency, uploadTasks.length);
         await Future.wait([
           for (var j = i; j < end; j++)
             FirebaseStorage.instance
@@ -961,6 +1007,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   }
 
   void _fail(String message) {
+    _audio.silence();
     unawaited(_flash?.deactivate());
     unawaited(_stopStream());
     _apply((s) => s.copyWith(phase: OscillatingPhase.error, error: message), force: true);
@@ -985,6 +1032,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     _orientation.dispose();
     unawaited(_stopStream());
     _cvClassifier?.dispose();
+    _audio.dispose();
     super.dispose();
   }
 }

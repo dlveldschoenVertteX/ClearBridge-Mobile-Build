@@ -294,7 +294,7 @@ class _GuidancePanel extends StatelessWidget {
 
   // Phase 8 (index 7) is the only step with a different dial range — see
   // the plan's axis-decision note in oscillating_capture_controller.dart.
-  static const _defaultRange = (min: -41.0, max: 41.0);
+  static const _defaultRange = (min: -36.0, max: 36.0);
   static const _topRange = (min: 0.0, max: 40.0);
 
   @override
@@ -306,7 +306,13 @@ class _GuidancePanel extends StatelessWidget {
     if (state.onTarget) {
       deltaText = state.isBurstStep ? 'On target' : 'On target ✓';
     } else {
-      final dir = state.deltaDeg > 0 ? 'right' : 'left';
+      // deltaDeg = currentAngleDeg - targetAngleDeg. The dial maps higher
+      // angle values to the right (_AngleDialPainter: positive phi sweeps
+      // toward 3 o'clock), so deltaDeg > 0 means the current reading is
+      // already to the right of the target -- the correction needed is
+      // therefore LEFT, not right. (Previously inverted: the dial and the
+      // text disagreed on which way to move.)
+      final dir = state.deltaDeg > 0 ? 'left' : 'right';
       // Phase 8 has no left/right meaning — just show the raw delta.
       deltaText = isTopPhase
           ? '${state.deltaDeg.abs().round()}° to go'
