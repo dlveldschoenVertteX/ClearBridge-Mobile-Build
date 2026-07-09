@@ -14,13 +14,20 @@ import 'package:clearbridge_beta/user_details_popia_screen.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-  // Anonymous auth so Firestore/Storage security rules (which require
-  // request.auth.uid == userId) are satisfied without a full login flow.
-  // See user_details_popia_screen.dart for the phone-number field collected
-  // so a future production migration can link this profile without losing
-  // ClearCoin progress.
-  await FirebaseAuth.instance.signInAnonymously();
+  // Firebase/auth failures (e.g. network-less first launch, API key
+  // restrictions) must not stop the UI from ever appearing — anything
+  // thrown here previously crashed the app before runApp() ran.
+  try {
+    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+    // Anonymous auth so Firestore/Storage security rules (which require
+    // request.auth.uid == userId) are satisfied without a full login flow.
+    // See user_details_popia_screen.dart for the phone-number field collected
+    // so a future production migration can link this profile without losing
+    // ClearCoin progress.
+    await FirebaseAuth.instance.signInAnonymously();
+  } catch (e, st) {
+    debugPrint('Firebase init/auth failed: $e\n$st');
+  }
   runApp(const ClearBridgeBetaApp());
 }
 
