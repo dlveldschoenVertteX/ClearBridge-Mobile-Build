@@ -168,7 +168,12 @@ def _upright_rotate(binimg: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, n
         return binimg, mask
     pts = np.column_stack([xs, ys]).astype(np.float64)
     mean = pts.mean(axis=0)
-    _, _, vt = np.linalg.svd(pts - mean, full_matrices=False)
+    _, s, vt = np.linalg.svd(pts - mean, full_matrices=False)
+    # Only rotate when the pad has a CLEAR long axis. A near-circular mask (or a
+    # failed whole-frame mask) has s[0]≈s[1] → the principal axis is noise, and
+    # rotating by it spun the square output into a diamond. Leave those upright.
+    if s[1] < 1e-6 or (s[0] / s[1]) < 1.25:
+        return binimg, mask
     principal = vt[0]  # (dx, dy) of the long axis
     angle_deg = np.degrees(np.arctan2(principal[1], principal[0])) - 90.0
 
@@ -263,6 +268,14 @@ def generate(
         mask = _coherence_hull_mask(g8)
     if mask is None or (mask > 0).mean() < 0.03:
         logger.warning('AFIS print: no usable thumb mask — skipping')
+        return None, params
+    # A mask covering most of the frame means segmentation failed to isolate
+    # the thumb (the whole photo, background included, would be Gabor-noised).
+    # Better to emit nothing than a full-frame ridge-noise field.
+    if (mask > 0).mean() > 0.55:
+        logger.warning('AFIS print: mask covers %.0f%% of frame — segmentation '
+                       'failed, skipping', 100 * (mask > 0).mean())
+        params['afisMask'] = params['afisMask'] + '_rejected'
         return None, params
 
     binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white

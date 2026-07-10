@@ -440,6 +440,14 @@ class OscillatingCaptureController extends ChangeNotifier {
   bool _focusLocked = false;     // true once AF has been acquired and locked
   bool _refocusing = false;      // an auto→settle→lock cycle is in flight
   bool _refocusedThisStep = false; // fresh AF acquired at the current burst pose
+  // Still-sharpness gate: reject a burst whose sharpest still is anomalously
+  // soft vs the sharpest burst seen this session (self-calibrating across
+  // devices/lighting), refocus and re-fire once before accepting. Directly
+  // targets "RIGHT captures blurry and the capture still gets taken".
+  double _bestBurstSharpness = 0.0;  // session max still Laplacian-variance
+  bool _burstRefired = false;        // one re-fire already spent at this pose
+  bool _burstNeedsRefire = false;    // set when the current burst was rejected
+  static const double _burstAcceptFrac = 0.5;   // accept if ≥ this × session best
   double _appliedEvOffset = 0.0; // current EV offset applied to the camera
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0; // ambient thumb-ROI luma (torch-off)
@@ -520,6 +528,9 @@ class OscillatingCaptureController extends ChangeNotifier {
     _lastAxis = null;
     _focusLocked = false;
     _refocusing = false;
+    _bestBurstSharpness = 0.0;
+    _burstRefired = false;
+    _burstNeedsRefire = false;
     _appliedEvOffset = 0.0;
     _evChangeInFlight = false;
     _lastStableBrightness = 128.0;
@@ -756,6 +767,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     _waypointFired = false;
     _lastVideoFrameAt = null;
     _refocusedThisStep = false;
+    _burstRefired = false;
 
     final step = oscillatingSteps[index];
     if (step is _BurstStep) {
@@ -1097,6 +1109,36 @@ class OscillatingCaptureController extends ChangeNotifier {
 
   // ── Burst capture (real ISP stills) ───────────────────────────────────
 
+  /// Laplacian-variance sharpness over the central ROI of a decoded luma
+  /// still — the standard focus/blur metric, subsampled for speed. Measured
+  /// on the actual captured still (ground truth), not a preview-stream proxy.
+  static double _lumaSharpness(Uint8List luma, int w, int h) {
+    if (w < 8 || h < 8 || luma.length < w * h) return 0.0;
+    final x0 = w ~/ 4, x1 = 3 * w ~/ 4;
+    final y0 = h ~/ 4, y1 = 3 * h ~/ 4;
+    const stepPx = 3;
+    double sum = 0.0, sumSq = 0.0;
+    int n = 0;
+    for (var y = y0 + 1; y < y1 - 1; y += stepPx) {
+      final row = y * w;
+      for (var x = x0 + 1; x < x1 - 1; x += stepPx) {
+        final c = luma[row + x];
+        final lap = (4 * c -
+                luma[row + x - 1] -
+                luma[row + x + 1] -
+                luma[row - w + x] -
+                luma[row + w + x])
+            .toDouble();
+        sum += lap;
+        sumSq += lap * lap;
+        n++;
+      }
+    }
+    if (n == 0) return 0.0;
+    final mean = sum / n;
+    return sumSq / n - mean * mean; // variance of the Laplacian
+  }
+
   Future<void> _fireBurst(_BurstStep step) async {
     if (_burstInFlight) return;
     _burstInFlight = true;
@@ -1216,16 +1258,20 @@ class OscillatingCaptureController extends ChangeNotifier {
       // backgrounding. Only the CPU-bound JPEG re-encode is deferred to
       // compute(), collected via Future.wait below.
       final pendingShots = <_PendingBurstShot>[];
+      var burstMaxSharpness = 0.0;
       for (final raw in rawShots) {
         try {
           final decoded = await decodeStillJpegToLuma(raw.jpeg, _sensorOrientation);
           if (decoded == null) continue;
+          final sharp =
+              _lumaSharpness(decoded.luma, decoded.width, decoded.height);
+          if (sharp > burstMaxSharpness) burstMaxSharpness = sharp;
           pendingShots.add(_PendingBurstShot(
             phaseNumber: raw.phaseNumber,
             angleDeg: raw.angleDeg,
             timestamp: raw.timestamp,
             flashOn: raw.flashOn,
-            laplacianScore: raw.laplacianScore,
+            laplacianScore: sharp, // real measured still sharpness
             encodedBytes: compute(
               _encodeBurstStillIsolate,
               _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
@@ -1234,6 +1280,30 @@ class OscillatingCaptureController extends ChangeNotifier {
         } catch (e) {
           debugPrint('[osc] burst shot decode failed (non-fatal): $e');
         }
+      }
+
+      // Still-sharpness gate. If this burst's sharpest still is well below the
+      // sharpest burst captured so far this session, the lens didn't actually
+      // resolve the ridges (the RIGHT-hold blur): drop it, refocus and re-fire
+      // once. FRONT (captured first, usually in focus) sets the reference. We
+      // never loop forever — after one re-fire we keep the best effort so a
+      // genuinely unfocusable pose can't stall the session.
+      final softBurst = _bestBurstSharpness > 0 &&
+          burstMaxSharpness < _burstAcceptFrac * _bestBurstSharpness;
+      if (softBurst && !_burstRefired && pendingShots.isNotEmpty) {
+        _burstRefired = true;
+        _burstNeedsRefire = true;
+        // Discard: don't collect encode futures into _capturedFrames.
+        for (final p in pendingShots) {
+          unawaited(p.encodedBytes.catchError((_) => Uint8List(0)));
+        }
+        debugPrint('[osc] burst rejected as soft '
+            '(${burstMaxSharpness.toStringAsFixed(0)} < '
+            '${(_burstAcceptFrac * _bestBurstSharpness).toStringAsFixed(0)}) — refiring');
+        return; // finally-block handles the refocus + re-fire, no advance
+      }
+      if (burstMaxSharpness > _bestBurstSharpness) {
+        _bestBurstSharpness = burstMaxSharpness;
       }
       if (pendingShots.isNotEmpty) {
         final encoded = await Future.wait(pendingShots.map((p) => p.encodedBytes));
@@ -1280,7 +1350,16 @@ class OscillatingCaptureController extends ChangeNotifier {
           debugPrint('[osc] failed to resume stream after burst: $e');
         }
       }
-      _advanceStep();
+      if (_burstNeedsRefire && !_disposed) {
+        // Soft burst was rejected: re-run this same pose (fresh focus + hold +
+        // fire) instead of advancing. _handleBurstFrame sees the thumb still
+        // on-target, re-acquires focus (_refocusedThisStep reset), then fires.
+        _burstNeedsRefire = false;
+        _refocusedThisStep = false;
+        _holdStart = null;
+      } else {
+        _advanceStep();
+      }
     }
   }
 
