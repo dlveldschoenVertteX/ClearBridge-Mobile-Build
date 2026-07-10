@@ -402,19 +402,12 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const Rect _scoreRoi = Rect.fromLTRB(0.30, 0.30, 0.70, 0.70);
 
   // Exposure guard bands, measured on the ambient thumb ROI (torch-off frames
-  // only). Field captures came back at ~38/255 luma — badly underexposed, so
-  // ridge contrast was buried in sensor noise. Push EV up when the thumb is
-  // dark, pull back down toward neutral once it recovers, and clamp glare at
-  // the top so a torch hotspot can't blow out ridges either.
-  static const double _darkLowLuma  = 95.0;   // below this → brighten
-  static const double _darkOkLuma   = 120.0;  // above this → stop brightening
+  // only). Glare-only guard: a torch hotspot on close-up skin blows out ridge
+  // detail, so pull EV down above this luma. We intentionally do NOT brighten
+  // a dark thumb — see _maybeAdjustExposure — because +EV in dim light just
+  // lengthens the shutter and motion-blurs the ridges.
   static const double _glareHighLuma = 205.0; // above this → darken
-  static const double _brightenEvStep = 1.5;  // +EV applied when underexposed
   static const double _glareEvStep    = -0.7; // −EV applied on glare
-  // Burst sharpness gate: a hold whose thumb-ROI focus is below this fraction
-  // of the running focus peak is treated as out-of-focus — the burst is held
-  // off and a refocus is kicked instead of banking a blurry set of stills.
-  static const double _burstFocusGateFrac = 0.55;
 
   // On-device thumb detection (MediaPipe hand landmarker) drives a DYNAMIC
   // ROI: focus/exposure/sharpness all target the actual thumb pixels instead
@@ -446,7 +439,7 @@ class OscillatingCaptureController extends ChangeNotifier {
   // Focus/exposure control state (ported from ArcSweepCaptureController).
   bool _focusLocked = false;     // true once AF has been acquired and locked
   bool _refocusing = false;      // an auto→settle→lock cycle is in flight
-  int _burstRefocusAttempts = 0; // sharpness-gate retries at the current hold
+  bool _refocusedThisStep = false; // fresh AF acquired at the current burst pose
   double _appliedEvOffset = 0.0; // current EV offset applied to the camera
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0; // ambient thumb-ROI luma (torch-off)
@@ -712,7 +705,10 @@ class OscillatingCaptureController extends ChangeNotifier {
     () async {
       try {
         await _beginAutofocus();
-        await Future<void>.delayed(const Duration(milliseconds: 350));
+        // Android CAF needs longer than a couple hundred ms to converge on a
+        // close macro subject; 350ms was re-locking mid-hunt (banking soft
+        // stills). 600ms is a safer settle before freezing focus.
+        await Future<void>.delayed(const Duration(milliseconds: 600));
         await _lockFocusOnly();
       } catch (_) {
       } finally {
@@ -721,21 +717,19 @@ class OscillatingCaptureController extends ChangeNotifier {
     }();
   }
 
-  /// Nudges EV to keep the thumb ROI properly exposed: brighten when it's dark
-  /// (the underexposure that buried ridge contrast in noise), pull back toward
-  /// neutral once it recovers, and clamp glare at the top. Uses only torch-off
-  /// readings so torch light can't trigger a spurious change.
+  /// Glare-only exposure guard: pull EV down when the thumb ROI approaches
+  /// blow-out, restore to neutral once it recovers. We deliberately do NOT
+  /// brighten a dark thumb with +EV — in dim light that just lengthens the
+  /// shutter, and a real capture came back uniformly motion-blurred from
+  /// exactly that. Light for the thumb comes from the torch (fast shutter),
+  /// not from stretching exposure time. Uses torch-off readings only.
   void _maybeAdjustExposure() {
     if (_evChangeInFlight) return;
     final c = _camera;
     if (c == null || !c.value.isInitialized) return;
     double? target;
-    if (_lastStableBrightness < _darkLowLuma && _appliedEvOffset < _brightenEvStep) {
-      target = _brightenEvStep;
-    } else if (_lastStableBrightness > _glareHighLuma && _appliedEvOffset >= 0.0) {
+    if (_lastStableBrightness > _glareHighLuma && _appliedEvOffset >= 0.0) {
       target = _glareEvStep;
-    } else if (_appliedEvOffset > 0.0 && _lastStableBrightness > _darkOkLuma) {
-      target = 0.0; // recovered from dark — relax back to neutral
     } else if (_appliedEvOffset < 0.0 && _lastStableBrightness < _glareHighLuma - 20) {
       target = 0.0; // glare gone — relax back to neutral
     }
@@ -761,7 +755,7 @@ class OscillatingCaptureController extends ChangeNotifier {
     _currentWaypointIndex = 0;
     _waypointFired = false;
     _lastVideoFrameAt = null;
-    _burstRefocusAttempts = 0;
+    _refocusedThisStep = false;
 
     final step = oscillatingSteps[index];
     if (step is _BurstStep) {
@@ -950,6 +944,38 @@ class OscillatingCaptureController extends ChangeNotifier {
     final tooFast = _angularVelocity > _maxAngularVelocityDegPerSec;
 
     if (dist <= _holdToleranceDeg && !tooFast) {
+      // Re-acquire focus FRESH at this pose the first time it's reached. Focus
+      // was locked at the FRONT calibration distance/angle; by the time RIGHT
+      // (the last burst) is held, that lock is stale — the dominant cause of
+      // "right angle always blurs". A per-pose re-lock also gives LEFT/TOP a
+      // focus matched to their actual viewing distance.
+      if (!_refocusedThisStep) {
+        _refocusedThisStep = true;
+        _holdStart = null;
+        _refocus();
+        _apply((s) => s.copyWith(
+              currentAngleDeg: angle,
+              deltaDeg: angle - step.targetDeg,
+              onTarget: true,
+              holdProgress: 0,
+              angularVelocityDegPerSec: _angularVelocity,
+              tooFast: false,
+            ));
+        return;
+      }
+      if (_refocusing) {
+        // Hold the user steady while the lens converges; don't start the hold
+        // timer or fire a burst on a mid-hunt frame.
+        _apply((s) => s.copyWith(
+              currentAngleDeg: angle,
+              deltaDeg: angle - step.targetDeg,
+              onTarget: true,
+              holdProgress: 0,
+              angularVelocityDegPerSec: _angularVelocity,
+              tooFast: false,
+            ));
+        return;
+      }
       _holdStart ??= DateTime.now();
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
@@ -962,27 +988,7 @@ class OscillatingCaptureController extends ChangeNotifier {
             tooFast: false,
           ));
       if (heldMs >= _holdDurationMs) {
-        // Sharpness gate: don't bank a burst of soft stills. If the thumb ROI
-        // is out of focus, kick one refocus and keep holding; only after the
-        // refocus (or a couple of attempts) do we fire, so we never stall
-        // forever if the lens simply can't do better at this distance.
-        final soft = _focusLocked && _focusValue < _burstFocusGateFrac;
-        if (soft && !_refocusing && _burstRefocusAttempts < 2) {
-          _burstRefocusAttempts++;
-          _holdStart = DateTime.now(); // re-accumulate the hold during refocus
-          _refocus();
-          _apply((s) => s.copyWith(
-                currentAngleDeg: angle,
-                deltaDeg: angle - step.targetDeg,
-                onTarget: true,
-                holdProgress: 0,
-                angularVelocityDegPerSec: _angularVelocity,
-                tooFast: false,
-              ));
-          return;
-        }
         _holdStart = null;
-        _burstRefocusAttempts = 0;
         unawaited(_fireBurst(step));
       }
     } else {
@@ -1146,31 +1152,19 @@ class OscillatingCaptureController extends ChangeNotifier {
       if (wasStreaming) await _stopStream();
 
       for (var i = 0; i < _burstFrameCount; i++) {
-        // Alternate ambient/torch across the burst so this hold position
-        // also yields a real ambient/flash pair for segmentation, same as
-        // every other frame in the session — not just single ambient shots.
-        // Pitch-dark mode leaves torch on for every shot (deactivate() is a
-        // documented no-op there), which is the correct behaviour: there's
-        // no usable "ambient" variant when the torch is the only light.
-        final wantTorch = torchCapable && i.isOdd;
+        // Torch policy for the burst. `torchCapable` is true only when the
+        // scene is dim (AdaptiveFlashController.isNeeded) — and in dim light a
+        // torch-OFF still is a long-exposure, motion-blurred frame with no
+        // usable ridges (measured on a real capture: uniformly soft, ~40/255).
+        // So when the torch is needed we keep it ON for the WHOLE burst: sharp
+        // torch-lit stills beat blurry dark ones, and the segmentation flash/
+        // ambient pairing still comes from the torch-alternating transitions.
+        // A small −EV keeps close-up torch from blowing out ridge detail.
         if (torchCapable) {
           try {
-            if (wantTorch) {
-              await _flash!.activate();
-            } else {
-              await _flash!.deactivate();
-            }
+            await _flash!.activate();
             if (minEv != null && maxEv != null) {
-              // Baseline on the live guard's current offset (which brightens a
-              // dark thumb / tames glare) rather than forcing 0. Only trim a
-              // little extra for a torch shot when the scene is already bright
-              // enough that the torch would blow out ridges; in a dim scene
-              // (where the guard has pushed EV up) keep that brightening so
-              // torch-lit stills aren't left darker than the ambient ones.
-              final extra = (wantTorch && _lastStableBrightness > _darkOkLuma)
-                  ? -0.4
-                  : 0.0;
-              final target = _appliedEvOffset + extra;
+              final target = _appliedEvOffset - 0.4; // anti-blowout on torch
               await cam.setExposureOffset(target.clamp(minEv, maxEv));
             }
             await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));

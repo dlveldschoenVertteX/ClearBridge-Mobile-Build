@@ -306,12 +306,10 @@ class _GuidancePanel extends StatelessWidget {
     if (state.onTarget) {
       deltaText = state.isBurstStep ? 'On target' : 'On target ✓';
     } else {
-      // deltaDeg = currentAngleDeg - targetAngleDeg. The dial maps higher
-      // angle values to the right (_AngleDialPainter: positive phi sweeps
-      // toward 3 o'clock), so deltaDeg > 0 means the current reading is
-      // already to the right of the target -- the correction needed is
-      // therefore LEFT, not right. (Previously inverted: the dial and the
-      // text disagreed on which way to move.)
+      // deltaDeg = currentAngleDeg - targetAngleDeg. The ring maps higher
+      // angle values clockwise/right (_BiometricGuidePainter), so deltaDeg > 0
+      // means the current reading is already to the right of the target — the
+      // correction needed is therefore LEFT, not right.
       final dir = state.deltaDeg > 0 ? 'left' : 'right';
       // Phase 8 has no left/right meaning — just show the raw delta.
       deltaText = isTopPhase
@@ -319,23 +317,62 @@ class _GuidancePanel extends StatelessWidget {
           : '${state.deltaDeg.abs().round()}° more $dir';
     }
 
+    // Scan-fill fraction: burst shot progress while capturing, else hold time.
+    final progress = state.isCapturingBurst
+        ? (state.burstShotTotal > 0
+            ? state.burstShotIndex / state.burstShotTotal
+            : 0.0)
+        : (state.isBurstStep ? state.holdProgress : 0.0);
+    final accent = state.onTarget ? CaptureColors.success : CaptureColors.cyan;
+    final String centreLabel;
+    if (state.isCapturingBurst) {
+      centreLabel = 'SCAN';
+    } else if (state.onTarget) {
+      centreLabel = 'LOCKED';
+    } else {
+      centreLabel = '${state.deltaDeg.abs().round()}°';
+    }
+
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
-          width: 220,
-          height: 150,
-          child: CustomPaint(
-            painter: _AngleDialPainter(
-              currentDeg: state.currentAngleDeg,
-              targetDeg: state.targetAngleDeg,
-              rangeMin: range.min,
-              rangeMax: range.max,
-              onTarget: state.onTarget,
-            ),
+          width: 208,
+          height: 208,
+          child: Stack(
+            alignment: Alignment.center,
+            children: [
+              CustomPaint(
+                size: const Size(208, 208),
+                painter: _BiometricGuidePainter(
+                  currentDeg: state.currentAngleDeg,
+                  targetDeg: state.targetAngleDeg,
+                  rangeMin: range.min,
+                  rangeMax: range.max,
+                  onTarget: state.onTarget,
+                  progress: progress,
+                  capturing: state.isCapturingBurst,
+                ),
+              ),
+              Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.fingerprint, size: 46, color: accent),
+                  const SizedBox(height: 2),
+                  Text(
+                    centreLabel,
+                    style: CaptureTypography.label.copyWith(
+                      fontSize: 13,
+                      color: accent,
+                      letterSpacing: 1.5,
+                    ),
+                  ),
+                ],
+              ),
+            ],
           ),
         ),
-        const SizedBox(height: 6),
+        const SizedBox(height: 10),
         Text(
           deltaText,
           style: CaptureTypography.h3.copyWith(
@@ -343,33 +380,22 @@ class _GuidancePanel extends StatelessWidget {
             color: state.onTarget ? CaptureColors.success : CaptureColors.silverBright,
           ),
         ),
-        if (state.isBurstStep && state.holdProgress > 0) ...[
-          const SizedBox(height: 8),
-          SizedBox(
-            width: 160,
-            child: ClipRRect(
-              borderRadius: BorderRadius.circular(3),
-              child: LinearProgressIndicator(
-                value: state.isCapturingBurst
-                    ? (state.burstShotTotal > 0
-                        ? state.burstShotIndex / state.burstShotTotal
-                        : 0)
-                    : state.holdProgress,
-                minHeight: 5,
-                backgroundColor: CaptureColors.silverDim.withValues(alpha: 0.25),
-                color: state.isCapturingBurst ? CaptureColors.gold : CaptureColors.success,
-              ),
-            ),
-          ),
+        if (state.isCapturingBurst) ...[
           const SizedBox(height: 4),
           Text(
-            state.isCapturingBurst
-                ? 'Capturing… ${state.burstShotIndex}/${state.burstShotTotal}'
-                : 'Holding steady…',
+            'Capturing ${state.burstShotIndex}/${state.burstShotTotal}',
+            style: CaptureTypography.label.copyWith(
+              fontSize: 11,
+              color: CaptureColors.gold,
+            ),
+          ),
+        ] else if (state.isBurstStep && state.onTarget) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Hold steady…',
             style: CaptureTypography.label.copyWith(fontSize: 11),
           ),
-        ],
-        if (!state.isBurstStep) ...[
+        ] else if (!state.isBurstStep) ...[
           const SizedBox(height: 4),
           Text(
             'Waypoint ${state.waypointIndex + 1}/${state.waypointTotal}',
@@ -410,24 +436,22 @@ class _GuidancePanel extends StatelessWidget {
   }
 }
 
-/// Half-circle gauge: 9 o'clock → 12 o'clock → 3 o'clock, mapping
-/// [rangeMin, rangeMax] linearly onto that sweep. `0`/mid points straight
-/// up; positive angles sweep toward 3 o'clock.
-///
-/// Canvas angle convention: for physical angle φ, the on-screen unit vector
-/// is (dx, dy) = (sin(a), -cos(a)) where a = (φ-mid)/halfRange * (π/2) — a
-/// standard "clock hand" parametrisation (a=0 → straight up). The equivalent
-/// `Canvas.drawArc` angle is θ(φ) = a − π/2, which increases continuously
-/// from −π (φ=min) through −π/2 (φ=mid, straight up) to 0 (φ=max) — verified
-/// algebraically so the background arc and needle never disagree about
-/// which side of the dial is which.
-class _AngleDialPainter extends CustomPainter {
-  const _AngleDialPainter({
+/// Biometric alignment ring — a full circular scanner rather than an
+/// automotive gauge. The upper 270° arc is the "alignment track": the
+/// physical range [rangeMin, rangeMax] maps onto it, a cyan-muted lock zone
+/// marks the target ±tolerance, and a glowing marker rides the track at the
+/// current angle (cyan → green on lock). The remaining sweep is a scan-fill
+/// ring that fills green with [progress] while holding / capturing, giving the
+/// "fingerprint scan" feel. All colours are ClearBridge brand tokens.
+class _BiometricGuidePainter extends CustomPainter {
+  const _BiometricGuidePainter({
     required this.currentDeg,
     required this.targetDeg,
     required this.rangeMin,
     required this.rangeMax,
     required this.onTarget,
+    required this.progress,
+    required this.capturing,
   });
 
   final double currentDeg;
@@ -435,97 +459,113 @@ class _AngleDialPainter extends CustomPainter {
   final double rangeMin;
   final double rangeMax;
   final bool onTarget;
+  final double progress; // 0..1 scan fill
+  final bool capturing;
 
   static const double _toleranceDeg = 5.0;
+  // Alignment track spans 270° centred on straight-up: from 135° left of top
+  // to 135° right of top. In canvas radians (0 = 3 o'clock, +CW), that is
+  // −225° (=−1.25π) sweeping +270° (=1.5π).
+  static const double _trackStart = -1.25 * math.pi;
+  static const double _trackSweep = 1.5 * math.pi;
 
   double _canvasAngle(double phi) {
-    final mid = (rangeMin + rangeMax) / 2;
-    final halfRange = (rangeMax - rangeMin) / 2;
-    final a = (phi - mid) / halfRange * (math.pi / 2);
-    return a - math.pi / 2;
+    final t = ((phi - rangeMin) / (rangeMax - rangeMin)).clamp(0.0, 1.0);
+    return _trackStart + t * _trackSweep;
   }
 
-  Offset _pointAt(Offset center, double radius, double phi) {
-    final theta = _canvasAngle(phi);
-    return center + Offset(math.cos(theta), math.sin(theta)) * radius;
+  Offset _pointAt(Offset c, double r, double phi) {
+    final a = _canvasAngle(phi);
+    return c + Offset(math.cos(a), math.sin(a)) * r;
   }
 
   @override
   void paint(Canvas canvas, Size size) {
-    final center = Offset(size.width / 2, size.height - 8);
-    final radius = math.min(size.width / 2, size.height) - 16;
+    final center = Offset(size.width / 2, size.height / 2);
+    final radius = math.min(size.width, size.height) / 2 - 14;
     final rect = Rect.fromCircle(center: center, radius: radius);
+    final lock = CaptureColors.success;
+    final live = onTarget ? lock : CaptureColors.cyan;
 
-    // Background track.
+    // Full faint base ring.
+    canvas.drawCircle(
+      center,
+      radius,
+      Paint()
+        ..color = CaptureColors.steelMuted.withValues(alpha: 0.55)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3,
+    );
+
+    // Alignment track (the 270° arc the angle maps onto).
     canvas.drawArc(
       rect,
-      -math.pi,
-      math.pi,
+      _trackStart,
+      _trackSweep,
       false,
       Paint()
-        ..color = CaptureColors.steelMuted.withValues(alpha: 0.6)
+        ..color = CaptureColors.silverDim.withValues(alpha: 0.35)
         ..style = PaintingStyle.stroke
-        ..strokeWidth = 8
+        ..strokeWidth = 6
         ..strokeCap = StrokeCap.round,
     );
 
-    // Tolerance wedge, filled pie-slice from centre.
-    final loTheta = _canvasAngle((targetDeg - _toleranceDeg).clamp(rangeMin, rangeMax));
-    final hiTheta = _canvasAngle((targetDeg + _toleranceDeg).clamp(rangeMin, rangeMax));
+    // Target lock zone: a thick cyan-muted arc segment around target±tol.
+    final loA = _canvasAngle((targetDeg - _toleranceDeg).clamp(rangeMin, rangeMax));
+    final hiA = _canvasAngle((targetDeg + _toleranceDeg).clamp(rangeMin, rangeMax));
     canvas.drawArc(
       rect,
-      loTheta,
-      hiTheta - loTheta,
-      true,
+      loA,
+      hiA - loA,
+      false,
       Paint()
-        ..color = CaptureColors.success.withValues(alpha: 0.16)
-        ..style = PaintingStyle.fill,
+        ..color = live.withValues(alpha: onTarget ? 0.9 : 0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 10
+        ..strokeCap = StrokeCap.round,
     );
 
-    // Reference ticks at quarter points.
-    final tickPaint = Paint()
-      ..color = CaptureColors.silverDim.withValues(alpha: 0.5)
-      ..strokeWidth = 2;
-    for (final f in [0.0, 0.25, 0.5, 0.75, 1.0]) {
-      final phi = rangeMin + f * (rangeMax - rangeMin);
-      final p0 = _pointAt(center, radius - 6, phi);
-      final p1 = _pointAt(center, radius + 6, phi);
-      canvas.drawLine(p0, p1, tickPaint);
+    // Scan-fill: green arc growing from the top as the hold/burst progresses.
+    if (progress > 0) {
+      canvas.drawArc(
+        rect,
+        -math.pi / 2,
+        2 * math.pi * progress.clamp(0.0, 1.0),
+        false,
+        Paint()
+          ..color = (capturing ? CaptureColors.gold : lock)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 4
+          ..strokeCap = StrokeCap.round,
+      );
     }
 
-    // Target tick — emphasised.
-    canvas.drawLine(
-      _pointAt(center, radius - 10, targetDeg),
-      _pointAt(center, radius + 10, targetDeg),
+    // Current-angle marker riding the track (glow + core), clamped just past
+    // the range so an overshoot parks at the edge instead of wrapping.
+    final overshoot = (rangeMax - rangeMin) * 0.15;
+    final markDeg = currentDeg.clamp(rangeMin - overshoot, rangeMax + overshoot);
+    final markPt = _pointAt(center, radius, markDeg);
+    canvas.drawCircle(markPt, 11, Paint()..color = live.withValues(alpha: 0.28));
+    canvas.drawCircle(markPt, 6, Paint()..color = live);
+    canvas.drawCircle(
+      markPt,
+      6,
       Paint()
-        ..color = CaptureColors.success
-        ..strokeWidth = 4
-        ..strokeCap = StrokeCap.round,
+        ..color = CaptureColors.void_
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
     );
-
-    // Needle — clamp the display angle a little past the range so an
-    // overshoot doesn't send it swinging around to the opposite side.
-    final overshoot = (rangeMax - rangeMin) * 0.2;
-    final needleDeg = currentDeg.clamp(rangeMin - overshoot, rangeMax + overshoot);
-    final needleTip = _pointAt(center, radius - 4, needleDeg);
-    canvas.drawLine(
-      center,
-      needleTip,
-      Paint()
-        ..color = onTarget ? CaptureColors.success : Colors.white
-        ..strokeWidth = 4
-        ..strokeCap = StrokeCap.round,
-    );
-    canvas.drawCircle(center, 6, Paint()..color = onTarget ? CaptureColors.success : Colors.white);
   }
 
   @override
-  bool shouldRepaint(_AngleDialPainter old) =>
+  bool shouldRepaint(_BiometricGuidePainter old) =>
       old.currentDeg != currentDeg ||
       old.targetDeg != targetDeg ||
       old.rangeMin != rangeMin ||
       old.rangeMax != rangeMax ||
-      old.onTarget != onTarget;
+      old.onTarget != onTarget ||
+      old.progress != progress ||
+      old.capturing != capturing;
 }
 
 // ── Confirmation banner ────────────────────────────────────────────────────
@@ -562,7 +602,7 @@ class _StatusPanel extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Container(
-      color: Colors.black.withValues(alpha: 0.72),
+      color: CaptureColors.void_.withValues(alpha: 0.82),
       padding: const EdgeInsets.fromLTRB(24, 12, 24, 24),
       child: Column(
         mainAxisSize: MainAxisSize.min,

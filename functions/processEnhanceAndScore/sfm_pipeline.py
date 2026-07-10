@@ -259,15 +259,30 @@ def reconstruct_and_unwrap(
             f"Max internal angle gap {max_gap:.0f}° > {gap_limit:.0f}° — too few views."
         )
 
-    # ── Prepare: centre-crop to square at native resolution ───────────────────
-    frames = [_prepare(f) for f in frames]
+    # ── Prepare: centre-crop to square, then normalise all frames to ONE size ──
+    # The projection intrinsics (fx, fy) are derived from a single out_size, so
+    # every frame MUST share that size or it projects at the wrong scale and
+    # lands misaligned in the cylindrical texture (a real defect for the
+    # oscillating/arc flows, which mix full-res burst stills with smaller
+    # preview-stream transition frames — previously only frame[0]'s size was
+    # honoured). Square-crop first, take out_size from the largest frame, then
+    # resize every frame (and its ambient/flash pair) to it.
+    frames   = [_prepare(f) for f in frames]
+    out_size = max(f.shape[0] for f in frames)
+    frames   = [
+        f if f.shape[0] == out_size else cv2.resize(f, (out_size, out_size))
+        for f in frames
+    ]
     grays  = [cv2.cvtColor(f, cv2.COLOR_BGR2GRAY) for f in frames]
 
     def _prep_gray(img: Optional[np.ndarray]) -> Optional[np.ndarray]:
         if img is None:
             return None
         prepped = _prepare(img if img.ndim == 3 else cv2.cvtColor(img, cv2.COLOR_GRAY2BGR))
-        return cv2.cvtColor(prepped, cv2.COLOR_BGR2GRAY)
+        g = cv2.cvtColor(prepped, cv2.COLOR_BGR2GRAY)
+        if g.shape[0] != out_size:
+            g = cv2.resize(g, (out_size, out_size))
+        return g
 
     n_frames  = len(frames)
     amb_grays = [_prep_gray(ambient_frames[i]) for i in range(n_frames)] if ambient_frames else [None] * n_frames
@@ -1105,15 +1120,22 @@ def _accumulate_frame(
     px = np.where(valid, fx * Px / safe_Pz + tx, -1.0)
     py = np.where(valid, fy * Py / safe_Pz + ty, -1.0)
 
+    # Bounds and mask lookup are into the INPUT frame (gray/mask), whose size
+    # is not necessarily out_size: the oscillating/arc flows mix frames from
+    # different sources (full-res ISP burst stills vs smaller preview-stream
+    # transition frames), so a single out_size derived from frame[0] would be
+    # wrong here — using out_size-1 to index a smaller frame's mask crashed
+    # with "index N out of bounds for axis 0 with size N" on real captures.
+    in_h, in_w = gray.shape[:2]
     in_b = (
         valid
-        & (px >= 0.0) & (px <= out_size - 2.0)
-        & (py >= 0.0) & (py <= out_size - 2.0)
+        & (px >= 0.0) & (px <= in_w - 2.0)
+        & (py >= 0.0) & (py <= in_h - 2.0)
     )
 
     if mask is not None:
-        ix   = np.clip(px.astype(np.int32), 0, out_size - 1)
-        iy   = np.clip(py.astype(np.int32), 0, out_size - 1)
+        ix   = np.clip(px.astype(np.int32), 0, mask.shape[1] - 1)
+        iy   = np.clip(py.astype(np.int32), 0, mask.shape[0] - 1)
         in_b = in_b & (mask[iy, ix] > 0)
 
     if not in_b.any():
