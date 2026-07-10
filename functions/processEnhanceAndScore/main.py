@@ -27,22 +27,25 @@ cv2 = None              # type: ignore[assignment]
 np  = None              # type: ignore[assignment]
 enhancement_pipeline = None   # type: ignore[assignment]
 sfm_pipeline         = None   # type: ignore[assignment]
+afis_print           = None   # type: ignore[assignment]
 CaptureQualityError  = Exception  # placeholder; replaced by _init_heavy_deps()
 
 def _init_heavy_deps() -> None:
     """Import scientific libraries on first call. No-op on subsequent calls."""
-    global cv2, np, enhancement_pipeline, sfm_pipeline, CaptureQualityError
+    global cv2, np, enhancement_pipeline, sfm_pipeline, afis_print, CaptureQualityError
     if cv2 is not None:
         return
     import cv2 as _cv2
     import numpy as _np
     import enhancement_pipeline as _ep
     import sfm_pipeline as _sfm
+    import afis_print as _afis
     from sfm_pipeline import CaptureQualityError as _CQE
     cv2 = _cv2
     np  = _np
     enhancement_pipeline = _ep
     sfm_pipeline         = _sfm
+    afis_print           = _afis
     CaptureQualityError  = _CQE
 
 logging.basicConfig(level=logging.INFO)
@@ -557,6 +560,23 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         display_image = enhancement_pipeline.ink_scanner_style(best_enhanced)
         enhanced_path = _save_enhanced_flat(display_image, user_id, capture_id)
 
+        # ── 4c. AFIS-style binary superprint ──────────────────────────────────
+        # Independent of the cylindrical unwrap: the sharpest face-on frame is
+        # Gabor-enhanced and binarised into the classic rolled-print look (see
+        # afis_print.py). Additive artefact — failures never block scoring.
+        afis_path = None
+        afis_params: dict = {}
+        try:
+            _laps = [
+                (m.get('laplacianScore') if isinstance(m, dict) else None)
+                for m in frame_meta
+            ]
+            afis_img, afis_params = afis_print.generate(frames, angles_for_sfm, _laps)
+            if afis_img is not None:
+                afis_path = _save_afis_print(afis_img, user_id, capture_id)
+        except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline
+            logger.warning('AFIS superprint failed (non-critical): %s', afis_exc)
+
         # ── 5. Henry classification ────────────────────────────────────────────
         # Use best TTA variant image — same preprocessing that scored highest.
         henry_class = _classify_henry(best_enhanced)
@@ -590,6 +610,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             'nfiqTtaScores':     nfiq_result.get('tta_scores'),
             'enhancementParams': enhancement_params,
             'enhancedImagePath': enhanced_path,
+            'superprintPath':    afis_path,
+            'superprintParams':  afis_params or None,
         }, critical=True)
 
         # POPIA data minimization: raw frames served their purpose (pipeline input).
@@ -1630,6 +1652,24 @@ def _save_enhanced_flat(image: np.ndarray, user_id: str, capture_id: str) -> str
         return path
     except Exception as exc:
         logger.warning('Failed to save enhanced_flat.jpg (non-critical): %s', exc)
+        return None
+
+
+def _save_afis_print(image: np.ndarray, user_id: str, capture_id: str) -> str | None:
+    """PNG-encode the AFIS-style binary superprint and upload to Storage.
+    PNG (not JPEG): the image is bilevel, PNG is lossless and far smaller here."""
+    try:
+        _, bucket = _get_firebase()
+        ok, buf = cv2.imencode('.png', image)
+        if not ok:
+            logger.warning('cv2.imencode failed for superprint_afis.png')
+            return None
+        path = f'captures/{user_id}/{capture_id}/superprint_afis.png'
+        bucket.blob(path).upload_from_string(buf.tobytes(), content_type='image/png')
+        logger.info('AFIS superprint saved → %s', path)
+        return path
+    except Exception as exc:
+        logger.warning('Failed to save superprint_afis.png (non-critical): %s', exc)
         return None
 
 

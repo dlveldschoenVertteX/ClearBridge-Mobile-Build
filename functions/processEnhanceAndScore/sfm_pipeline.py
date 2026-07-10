@@ -223,6 +223,11 @@ def reconstruct_and_unwrap(
     _phase_conf_thr     = float(cfg.get('phase_conf_threshold', 0.15))  # optimised: 0.30→0.15
     _prior_weight       = float(cfg.get('seg_prior_weight',     0.35))
     _out_theta_deg      = float(cfg.get('out_theta_deg',        120.0))
+    # Prototype/diagnostic switch -- see _multiband_combine's docstring.
+    # Default 'weighted' is the existing, unmodified accumulator; production
+    # behaviour is byte-identical unless a caller explicitly opts into
+    # 'multiband' for A/B comparison.
+    _blend_mode         = str(cfg.get('blend_mode',             'weighted'))
     # Adaptive output span: real capture protocols orbit far less than the
     # nominal ±120° texture span (four-angle targets are ±32°; arc sweeps
     # ±90°). A fixed ±120° span leaves the wings empty by construction,
@@ -390,18 +395,40 @@ def reconstruct_and_unwrap(
         for i, (mask, tx, ty, method) in enumerate(seg_results)
     ]
 
-    for (mask, tx, ty, seg_method), eq_gray, phi_deg, f_w in zip(seg_results, eq_grays, refined_deg, fw):
-        conf = seg_conf_map.get(seg_method, 1.0) * f_w
-        logger.info(
-            f"  phi={phi_deg:6.1f}°  axis=({tx:.0f},{ty:.0f})"
-            f"  mask={np.mean(mask>0):.1%}  seg={seg_method}  conf={conf:.2f}"
-        )
-        _accumulate_frame(
-            eq_gray, np.radians(phi_deg), R, D,
-            fx, fy, tx, ty, out_size,
-            texture, weight, mask, seg_confidence=conf,
-            out_theta_min=_out_theta_min, out_theta_max=_out_theta_max,
-        )
+    if _blend_mode == 'multiband':
+        # Project each frame independently (rather than accumulating into one
+        # shared buffer) so _multiband_combine can blend per-band across the
+        # full per-frame stack -- see its docstring.
+        per_frame_tex:    List[np.ndarray] = []
+        per_frame_weight: List[np.ndarray] = []
+        for (mask, tx, ty, seg_method), eq_gray, phi_deg, f_w in zip(
+            seg_results, eq_grays, refined_deg, fw
+        ):
+            conf = seg_conf_map.get(seg_method, 1.0) * f_w
+            logger.info(
+                f"  phi={phi_deg:6.1f}°  axis=({tx:.0f},{ty:.0f})"
+                f"  mask={np.mean(mask>0):.1%}  seg={seg_method}  conf={conf:.2f}  [multiband]"
+            )
+            f_tex, f_wt = _project_single_frame(
+                eq_gray, np.radians(phi_deg), R, D, fx, fy, tx, ty, out_size,
+                mask, out_theta_min=_out_theta_min, out_theta_max=_out_theta_max,
+            )
+            per_frame_tex.append(f_tex)
+            per_frame_weight.append(f_wt * conf)
+        texture, weight = _multiband_combine(per_frame_tex, per_frame_weight)
+    else:
+        for (mask, tx, ty, seg_method), eq_gray, phi_deg, f_w in zip(seg_results, eq_grays, refined_deg, fw):
+            conf = seg_conf_map.get(seg_method, 1.0) * f_w
+            logger.info(
+                f"  phi={phi_deg:6.1f}°  axis=({tx:.0f},{ty:.0f})"
+                f"  mask={np.mean(mask>0):.1%}  seg={seg_method}  conf={conf:.2f}"
+            )
+            _accumulate_frame(
+                eq_gray, np.radians(phi_deg), R, D,
+                fx, fy, tx, ty, out_size,
+                texture, weight, mask, seg_confidence=conf,
+                out_theta_min=_out_theta_min, out_theta_max=_out_theta_max,
+            )
 
     covered = float(np.mean(weight > 0))
     logger.info(f"Texture coverage: {covered:.1%}")
@@ -1157,6 +1184,103 @@ def _accumulate_frame(
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase-correlation angle refinement
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _multiband_combine(
+    tex_list:    List[np.ndarray],
+    weight_list: List[np.ndarray],
+    num_bands:   int = 5,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Laplacian-pyramid (Burt-Adelson) blend of per-frame cylindrical
+    projections, as an alternative to _accumulate_frame's running weighted
+    average.
+
+    Rationale: the weighted-average accumulator blends ALL frequency content
+    (fine ridge detail and coarse exposure/brightness alike) with the same
+    per-texel alpha. Where two frames' contribution weights cross over --
+    every seam between adjacent orbit angles -- that single-band blend either
+    ghosts (averaging slightly-misaligned high-frequency ridge lines) or shows
+    a visible photometric step (torch-lit vs ambient frames differ in overall
+    brightness even after CLAHE). Multi-band blending fixes this the standard
+    way: blend LOW frequencies over a wide region (hides brightness jumps) but
+    blend HIGH frequencies only right at the seam (avoids smearing ridge
+    lines across it) -- by blending each Laplacian-pyramid band with its own
+    (increasingly blurred) copy of the per-frame weight mask.
+
+    Prototype / diagnostic only -- not wired into the default
+    reconstruct_and_unwrap() path. See sfm_config['blend_mode'] == 'multiband'
+    to opt in for A/B comparison against the existing 'weighted' behaviour.
+
+    Parameters
+    ----------
+    tex_list, weight_list : per-frame (texture, weight) arrays from
+        _project_single_frame, all the same (out_size, out_size) shape.
+    num_bands : pyramid depth. 5 halves the resolution 4 times (e.g.
+        912 -> 456 -> 228 -> 114 -> 57), enough to separate ridge-frequency
+        detail (finest 1-2 bands) from broad exposure gradients (coarsest).
+
+    Returns
+    -------
+    (blended_texture, total_weight) -- total_weight > 0 marks texels any
+    frame actually contributed to (same semantics as the accumulator's
+    `weight` array, for the caller's existing coverage/gap-fill logic).
+    """
+    n = len(tex_list)
+    if n == 0:
+        raise ValueError("_multiband_combine: no frames to blend")
+    out_size = tex_list[0].shape[0]
+
+    # Effective pyramid depth: each level needs a valid (>=4px) size.
+    max_levels = int(np.log2(max(out_size, 4) / 4)) + 1
+    levels = max(1, min(num_bands, max_levels))
+
+    total_weight = np.sum(weight_list, axis=0)
+
+    # Per-frame normalised blend weight (sums to 1 across frames wherever any
+    # frame contributes; 0 where none do -- those texels stay unfilled, same
+    # as the weighted-average path, and get the same _fill_gaps treatment).
+    safe_total = np.where(total_weight > 0, total_weight, 1.0)
+    norm_weights = [w / safe_total for w in weight_list]
+
+    def _gauss_pyr(img: np.ndarray) -> List[np.ndarray]:
+        pyr = [img.astype(np.float64)]
+        for _ in range(levels - 1):
+            pyr.append(cv2.pyrDown(pyr[-1]))
+        return pyr
+
+    def _laplacian_pyr(img: np.ndarray) -> List[np.ndarray]:
+        gp = _gauss_pyr(img)
+        lp = []
+        for i in range(levels - 1):
+            size = (gp[i].shape[1], gp[i].shape[0])
+            up = cv2.pyrUp(gp[i + 1], dstsize=size)
+            lp.append(gp[i] - up)
+        lp.append(gp[-1])  # coarsest residual (the "DC" band)
+        return lp
+
+    # Build each frame's Laplacian pyramid (texture) and Gaussian pyramid
+    # (its normalised blend weight -- deliberately smoothed at every level,
+    # which is what lets low frequencies blend over a WIDE region while high
+    # frequencies stay confined near the seam once weighted by the same
+    # mask at a finer pyramid level).
+    lap_pyrs    = [_laplacian_pyr(t) for t in tex_list]
+    weight_pyrs = [_gauss_pyr(w) for w in norm_weights]
+
+    blended_pyr: List[np.ndarray] = []
+    for level in range(levels):
+        acc = np.zeros_like(lap_pyrs[0][level])
+        for i in range(n):
+            acc += lap_pyrs[i][level] * weight_pyrs[i][level]
+        blended_pyr.append(acc)
+
+    # Collapse: start from the coarsest band, upsample + add finer bands.
+    result = blended_pyr[-1]
+    for level in range(levels - 2, -1, -1):
+        size = (blended_pyr[level].shape[1], blended_pyr[level].shape[0])
+        result = cv2.pyrUp(result, dstsize=size) + blended_pyr[level]
+
+    return result, total_weight
+
 
 def _project_single_frame(
     gray:     np.ndarray,
