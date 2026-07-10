@@ -144,6 +144,67 @@ def _coherence_hull_mask(g8: np.ndarray, bsize: int = _BLOCK) -> Optional[np.nda
     return cv2.erode(out, np.ones((15, 15), np.uint8))
 
 
+def _upright_rotate(binimg: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rotate so the thumb pad's long axis is VERTICAL, tip-up.
+
+    The source frame's orientation depends on how the phone was held during
+    capture (the burst still is sensor-rotation-corrected on-device, but
+    nothing constrains portrait-vs-landscape hold or which way the thumb
+    points within frame) -- so the pad can land in the output at any angle.
+    A rolled/AFIS print is always presented upright, so this is a real
+    correction, not cosmetic.
+
+    Method: PCA on the mask's pixel coordinates gives the pad's principal
+    (long) axis; rotate that to vertical. Up/down is then resolved by mask
+    width profile -- the fingertip end is consistently the narrower, more
+    tightly-curved end (the pad's widest point is roughly at the DIP crease
+    it curves in from, the tip itself tapers), so the narrower half goes on
+    top. This is a heuristic (no true anatomical landmark available from a
+    single 2D silhouette) but is a firm improvement over a random angle.
+    """
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 50:
+        return binimg, mask
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    mean = pts.mean(axis=0)
+    _, _, vt = np.linalg.svd(pts - mean, full_matrices=False)
+    principal = vt[0]  # (dx, dy) of the long axis
+    angle_deg = np.degrees(np.arctan2(principal[1], principal[0])) - 90.0
+
+    h, w = mask.shape
+    center = (w / 2.0, h / 2.0)
+    # Expand canvas so rotation doesn't clip corners of an elongated mask.
+    diag = int(np.ceil(np.hypot(h, w)))
+    pad_y, pad_x = (diag - h) // 2 + 5, (diag - w) // 2 + 5
+    bin_p = cv2.copyMakeBorder(binimg, pad_y, pad_y, pad_x, pad_x,
+                               cv2.BORDER_CONSTANT, value=255)
+    mask_p = cv2.copyMakeBorder(mask, pad_y, pad_y, pad_x, pad_x,
+                                cv2.BORDER_CONSTANT, value=0)
+    center_p = (center[0] + pad_x, center[1] + pad_y)
+    M = cv2.getRotationMatrix2D(center_p, angle_deg, 1.0)
+    size_p = (bin_p.shape[1], bin_p.shape[0])
+    bin_r = cv2.warpAffine(bin_p, M, size_p, borderValue=255)
+    mask_r = cv2.warpAffine(mask_p, M, size_p, borderValue=0)
+
+    # Tip-up: compare mask width in the top vs bottom third; the narrower
+    # third is the tip and belongs on top.
+    ry, rx = np.where(mask_r > 0)
+    if len(ry):
+        y0, y1 = ry.min(), ry.max()
+        third = max(1, (y1 - y0) // 3)
+        def _width(y_lo, y_hi):
+            band = mask_r[y_lo:y_hi, :]
+            widths = [np.count_nonzero(row) for row in band if np.any(row)]
+            return float(np.mean(widths)) if widths else 0.0
+        top_w = _width(y0, y0 + third)
+        bot_w = _width(y1 - third, y1)
+        if top_w > bot_w:  # wider end currently on top -- flip 180
+            bin_r = cv2.rotate(bin_r, cv2.ROTATE_180)
+            mask_r = cv2.rotate(mask_r, cv2.ROTATE_180)
+    return bin_r, mask_r
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -206,6 +267,8 @@ def generate(
 
     binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
     binimg[mask == 0] = 255
+    binimg, mask = _upright_rotate(binimg, mask)
+    params['afisRotated'] = True
     ys, xs = np.where(mask > 0)
     m = 30
     y0, x0 = max(0, ys.min() - m), max(0, xs.min() - m)
