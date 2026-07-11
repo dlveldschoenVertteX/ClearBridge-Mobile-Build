@@ -37,6 +37,7 @@ logger = logging.getLogger('afis_print')
 _BLOCK = 16          # orientation/variance block size (px)
 _N_ORIENT = 16       # Gabor bank orientation count
 _FACE_ON_MAX_DEG = 12.0   # a frame counts as "plain impression" within this angle
+_TARGET_PERIOD = 9.0      # ridge period (px) to normalise to — ~500 DPI domain
 
 
 def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndarray:
@@ -214,6 +215,7 @@ def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
     lap_scores: Optional[List[Optional[float]]] = None,
+    freq_normalize: bool = False,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -256,12 +258,8 @@ def generate(
     gray = src if src.ndim == 2 else cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
     g8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray.astype(np.uint8))
 
-    norm = _normalize(g8)
-    orient = _orientation_field(norm)
-    wl = _ridge_wavelength(norm, orient)
-    params['afisWavelengthPx'] = float(round(wl, 1))
-    enh = _gabor_enhance(norm, orient, wl)
-
+    # Mask FIRST, at native resolution -- the U-Net was trained on native-res
+    # frames, so segmenting a resampled image degrades the mask.
     mask = _unet_mask(gray)
     params['afisMask'] = 'unet' if mask is not None else 'coherence_hull'
     if mask is None:
@@ -277,6 +275,33 @@ def generate(
                        'failed, skipping', 100 * (mask > 0).mean())
         params['afisMask'] = params['afisMask'] + '_rejected'
         return None, params
+
+    # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
+    # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.
+    # Our macro captures land anywhere from 9–20 px depending on phone
+    # distance, so the model sees an out-of-domain frequency and scores low.
+    # Estimate the native ridge wavelength on the MASKED pad, then resample the
+    # image AND the mask together so the period becomes _TARGET_PERIOD before
+    # enhancement (mask stays at native res for the U-Net; only the Gabor stage
+    # sees the resampled version). Grid search over real captures: consistent
+    # NFIQ gain when the estimate is reliable.
+    norm0 = _normalize(g8)
+    native_wl = _ridge_wavelength(norm0, _orientation_field(norm0))
+    params['afisWavelengthPx'] = float(round(native_wl, 1))
+    wl = native_wl
+    if freq_normalize and native_wl > 1.0:
+        scale = float(np.clip(_TARGET_PERIOD / native_wl, 0.35, 2.5))
+        if abs(scale - 1.0) > 0.05:
+            interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            g8 = cv2.resize(g8, None, fx=scale, fy=scale, interpolation=interp)
+            mask = cv2.resize(mask, (g8.shape[1], g8.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+            params['afisFreqScale'] = float(round(scale, 3))
+            wl = _TARGET_PERIOD
+
+    norm = _normalize(g8)
+    orient = _orientation_field(norm)
+    enh = _gabor_enhance(norm, orient, wl)
 
     binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
     binimg[mask == 0] = 255

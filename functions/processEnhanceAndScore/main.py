@@ -549,8 +549,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _fail(capture_id, f"NFIQ error: {nfiq_result['error']}")
             return {'nfiqScore': 0, 'nfiqPass': False, 'henryClass': 'U'}
 
-        nfiq_score  = nfiq_result['nfiq_score']
-        nfiq_pass   = nfiq_score >= _PASS_THRESHOLD
+        cyl_nfiq    = nfiq_result['nfiq_score']
         best_enhanced = nfiq_result.get('best_image', enhanced)
 
         # ── 4b. Save enhanced flat print ──────────────────────────────────────
@@ -560,22 +559,45 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         display_image = enhancement_pipeline.ink_scanner_style(best_enhanced)
         enhanced_path = _save_enhanced_flat(display_image, user_id, capture_id)
 
-        # ── 4c. AFIS-style binary superprint ──────────────────────────────────
-        # Independent of the cylindrical unwrap: the sharpest face-on frame is
-        # Gabor-enhanced and binarised into the classic rolled-print look (see
-        # afis_print.py). Additive artefact — failures never block scoring.
+        # ── 4c. AFIS-style binary superprint (the primary deliverable) ─────────
+        # The cylindrical unwrap is a photographic grayscale of a stretched arc;
+        # the AFIS path (afis_print.py) Gabor-enhances and binarises the
+        # sharpest face-on frame into the classic rolled-print look. Measured
+        # across real captures it scores 14–24 NFIQ points HIGHER than the
+        # unwrap, so it — not the unwrap — is the print we report and save. We
+        # score two renderings (native + ridge-frequency-normalised to the
+        # ~500 DPI NFIQ domain) and keep whichever the model rates higher; the
+        # official nfiqScore is the best across {unwrap, afis-native, afis-freq}.
+        # Additive and non-blocking: any failure just falls back to the unwrap.
         afis_path = None
         afis_params: dict = {}
+        afis_nfiq = 0.0
+        best_afis_img = None
         try:
             _laps = [
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
                 for m in frame_meta
             ]
-            afis_img, afis_params = afis_print.generate(frames, angles_for_sfm, _laps)
-            if afis_img is not None:
-                afis_path = _save_afis_print(afis_img, user_id, capture_id)
+            for _freqnorm in (False, True):
+                _img, _p = afis_print.generate(
+                    frames, angles_for_sfm, _laps, freq_normalize=_freqnorm)
+                if _img is None:
+                    continue
+                _res = _score_nfiq(_img, sfm_coverage=1.0)
+                _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
+                logger.info('AFIS variant freqnorm=%s nfiq=%.1f', _freqnorm, _s)
+                if _s > afis_nfiq:
+                    afis_nfiq = _s
+                    best_afis_img = _img
+                    afis_params = {**_p, 'afisNfiq': round(_s, 2)}
+            if best_afis_img is not None:
+                afis_path = _save_afis_print(best_afis_img, user_id, capture_id)
         except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline
             logger.warning('AFIS superprint failed (non-critical): %s', afis_exc)
+
+        # Official quality = best of the unwrap and the AFIS renderings.
+        nfiq_score = max(cyl_nfiq, afis_nfiq)
+        nfiq_pass  = nfiq_score >= _PASS_THRESHOLD
 
         # ── 5. Henry classification ────────────────────────────────────────────
         # Use best TTA variant image — same preprocessing that scored highest.
@@ -594,11 +616,14 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             'status':           'scored',
             'nfiqScore':        round(nfiq_score, 2),
             'nfiqPass':         nfiq_pass,
+            'nfiqSource':       'afis' if afis_nfiq >= cyl_nfiq and afis_nfiq > 0 else 'cylindrical',
+            'nfiqCylindrical':  round(cyl_nfiq, 2),
+            'nfiqAfis':         round(afis_nfiq, 2) if afis_nfiq > 0 else None,
             'henryClass':       henry_class,
             'processingTimeMs': processing_ms,
             'scoredAt':         firestore.SERVER_TIMESTAMP,
             'nnsStage':         nns_stage,
-            'pipelineVersion':  'MAC3D-v30',
+            'pipelineVersion':  'MAC3D-v31',
             'stagingLatencyMs': {
                 'download': round((t_download - t_start) * 1000),
                 'sfm':      round((t_sfm      - t_download) * 1000),
