@@ -38,6 +38,8 @@ _BLOCK = 16          # orientation/variance block size (px)
 _N_ORIENT = 16       # Gabor bank orientation count
 _FACE_ON_MAX_DEG = 12.0   # a frame counts as "plain impression" within this angle
 _TARGET_PERIOD = 9.0      # ridge period (px) to normalise to — ~500 DPI domain
+_STACK_MAX = 4            # max same-pose frames to align+average (denoise)
+_STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
 
 
 def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndarray:
@@ -95,6 +97,53 @@ def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np
     idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
     yy, xx = np.mgrid[0:h, 0:w]
     return outs[idx, yy, xx]
+
+
+_STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
+
+
+def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Align (ECC affine) and average near-identical same-pose frames -> a
+    denoised full-resolution grayscale. cand[0] is the sharpest (reference).
+
+    The alignment warp is estimated on downscaled (_STACK_ALIGN_PX) copies for
+    speed, then scaled up and applied at full resolution -- ECC on full-res
+    burst stills is far too slow for the Cloud Function budget. Returns None if
+    fewer than 2 usable frames survive the correlation guard, so the caller
+    keeps the single sharpest frame (stacking must never degrade the print)."""
+    grays = [c if c is None or c.ndim == 2 else cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
+             for c in cand]
+    grays = [g for g in grays if g is not None]
+    if len(grays) < 2:
+        return None
+    ref = grays[0]
+    h, w = ref.shape[:2]
+    s = _STACK_ALIGN_PX / max(h, w)
+    small = (max(1, int(w * s)), max(1, int(h * s)))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    ref_small = cl.apply(cv2.resize(ref, small))
+    # Scale matrix mapping small-space warp to full-res.
+    up = np.array([[1 / s, 0, 0], [0, 1 / s, 0]], dtype=np.float32)
+    dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
+    stack = [ref.astype(np.float32)]
+    for g in grays[1:]:
+        gg = g if g.shape[:2] == (h, w) else cv2.resize(g, (w, h))
+        try:
+            warp = np.eye(2, 3, dtype=np.float32)
+            _, warp = cv2.findTransformECC(
+                ref_small, cl.apply(cv2.resize(gg, small)), warp,
+                cv2.MOTION_AFFINE, crit, None, 5)
+            # full-res warp = up · [warp;0 0 1] · dn
+            warp_full = (up @ np.vstack([warp, [0, 0, 1]]) @ dn).astype(np.float32)
+            aligned = cv2.warpAffine(gg, warp_full, (w, h), flags=cv2.INTER_LINEAR)
+            if float(np.corrcoef(aligned.ravel(), ref.ravel())[0, 1]) > 0.5:
+                stack.append(aligned.astype(np.float32))
+        except cv2.error:
+            continue
+    if len(stack) < 2:
+        return None
+    return np.mean(np.stack(stack), axis=0).astype(np.uint8)
 
 
 def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
@@ -216,6 +265,7 @@ def generate(
     angles_deg: List[float],
     lap_scores: Optional[List[Optional[float]]] = None,
     freq_normalize: bool = False,
+    stack: bool = False,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -256,6 +306,31 @@ def generate(
     }
 
     gray = src if src.ndim == 2 else cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+
+    # Same-pose multi-shot stacking. Aligning and averaging near-identical
+    # views is PURE denoising with no geometric distortion -- unlike
+    # multi-ANGLE reconstruction, which unrolls oblique deformable-skin views
+    # and measurably HURTS NFIQ (tested: whole-print unwrap scored 15-18pts
+    # below the single frame). Restrict to a TIGHT window around the sharpest
+    # frame's angle (±_STACK_ANGLE_DEG) so only genuinely same-pose stills are
+    # averaged -- a wider set blends slightly-different views and blurs ridges.
+    # Lifts NFIQ ~+3 by cutting sensor/rolling-shutter noise; falls back to the
+    # single sharpest frame if <2 same-pose frames or alignment fails.
+    #
+    # Gated behind `stack` because it can REGRESS a good capture: when the
+    # binned frame list carries only ~2 near-face-on stills, or when the
+    # "same-pose" frames are actually mild-different views, averaging softens
+    # ridges (observed -3.3 NFIQ on the sunlight capture). main.py scores the
+    # stacked rendering as an ADDITIONAL max-variant alongside the unstacked
+    # ones and keeps the higher NFIQ, so stacking can only ever help.
+    if stack:
+        src_ang = float(angles_deg[order[0]])
+        same_pose = [i for i in order
+                     if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
+        stacked = _stack_face_on([frames[i] for i in same_pose[:_STACK_MAX]])
+        if stacked is not None:
+            gray = stacked
+            params['afisStacked'] = len([i for i in same_pose[:_STACK_MAX]])
     g8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray.astype(np.uint8))
 
     # Mask FIRST, at native resolution -- the U-Net was trained on native-res

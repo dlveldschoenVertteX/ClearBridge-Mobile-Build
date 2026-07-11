@@ -578,14 +578,22 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
                 for m in frame_meta
             ]
-            for _freqnorm in (False, True):
+            # Score each rendering variant and keep the single best NFIQ. Every
+            # variant is ADDITIVE — same-pose stacking and ridge-freq
+            # normalisation each help some captures and hurt others, so they are
+            # scored side-by-side rather than applied unconditionally. Taking the
+            # max guarantees a variant can only raise the final score, never
+            # regress a good capture.
+            for _freqnorm, _stack in ((False, False), (True, False), (False, True)):
                 _img, _p = afis_print.generate(
-                    frames, angles_for_sfm, _laps, freq_normalize=_freqnorm)
+                    frames, angles_for_sfm, _laps,
+                    freq_normalize=_freqnorm, stack=_stack)
                 if _img is None:
                     continue
                 _res = _score_nfiq(_img, sfm_coverage=1.0)
                 _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
-                logger.info('AFIS variant freqnorm=%s nfiq=%.1f', _freqnorm, _s)
+                logger.info('AFIS variant freqnorm=%s stack=%s nfiq=%.1f',
+                            _freqnorm, _stack, _s)
                 if _s > afis_nfiq:
                     afis_nfiq = _s
                     best_afis_img = _img
