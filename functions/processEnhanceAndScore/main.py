@@ -247,6 +247,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         logger.info('stage=download_start elapsed=%.1fs', time.monotonic() - t_start)
         ambient_frames = None
         flash_frames   = None
+        ambient_burst  = None
+        flash_burst    = None
         arc_frame_wts  = None
         osc_theta_deg  = None
         if is_arc:
@@ -277,6 +279,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # swept.
             _range_half   = (max(osc_angles) - min(osc_angles)) / 2.0
             osc_theta_deg = min(120.0, max(40.0, _range_half + 15.0))
+            # Preserve the raw near-face-on front burst (in addition to the
+            # binned frames) for the deep-fusion superprint variant.
+            ambient_burst, flash_burst = _download_front_burst(capture_id)
             _update_firestore(capture_id, {
                 'captureMode':    'oscillating_8phase',
                 'oscAnglesDeg':   [round(a, 1) for a in osc_angles],
@@ -596,17 +601,23 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             #               distorting the front centre (+~1.5 on some captures)
             # fuse/mosaic self-skip (return None) when the flow lacks the inputs
             # (arc, or no ambient/flash pair / no side frame), costing nothing.
+            #   deepFuse  — deep-stack the whole preserved front burst per
+            #               illumination then fuse, freq-normalised (+2.5 on the
+            #               burst-rich indoor capture; self-skips when the raw
+            #               burst wasn't preserved, e.g. non-osc flows).
             _afis_variants = (
                 ('native',     dict()),
                 ('freqNorm',   dict(freq_normalize=True)),
                 ('stack',      dict(stack=True)),
                 ('fuseAvg',    dict(fuse='avg')),
                 ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
+                ('deepFuse',   dict(fuse='deep', freq_normalize=True)),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(
                     frames, angles_for_sfm, _laps,
                     ambient_frames=ambient_frames, flash_frames=flash_frames,
+                    ambient_burst=ambient_burst, flash_burst=flash_burst,
                     **_vkw)
                 if _img is None:
                     continue
@@ -1297,6 +1308,59 @@ def _download_oscillating_frames(capture_id: str, base_path: str):
         sweep_bins_downloaded, lo, hi, osc_stats['oscTopIncluded'], osc_stats['oscBurstAnchors'],
     )
     return bgr_frames, meta_out, angles_for_sfm, osc_stats, frame_weights, ambient_frames, flash_frames
+
+
+def _download_front_burst(capture_id: str, face_yaw_deg: float = 8.0,
+                          top_k: int = 6):
+    """Preserve the RAW near-face-on front burst for deep-fusion.
+
+    The oscillating downloader bins the ~400 captured frames down to one still
+    per (angle-bin, illumination) — great for SfM, but it throws away the rest
+    of the front burst (5–11 shots per hold are uploaded to Storage). Deep
+    fusion wants ALL of them: aligning+averaging every same-pose ambient shot,
+    and every same-pose flash shot, denoises each illumination before they're
+    fused, worth +2.5–8.5 NFIQ over the single sharpest shot.
+
+    Returns (ambient_shots, flash_shots): two flat lists of centre-cropped
+    grayscale arrays for the sharpest `top_k` near-face-on shots per
+    illumination (burst-anchor stills preferred, then client laplacianScore).
+    Returns ([], []) on any error — the deep-fuse variant then self-skips."""
+    try:
+        db, _ = _get_firebase()
+        doc = db.collection('captures').document(capture_id).get()
+        doc_dict = doc.to_dict() or {}
+        frames_meta = doc_dict.get('frames', [])
+        phases_meta = doc_dict.get('phases', [])
+        top_pn = {int(p.get('phaseNumber', 0)) for p in phases_meta
+                  if p.get('label') == 'TOP'}
+        face = [e for e in frames_meta
+                if int(e.get('phaseNumber', 0)) not in top_pn
+                and abs(float(e.get('angleDeg', 0.0))) <= face_yaw_deg]
+        if not face:
+            return [], []
+
+        def _rank(e):
+            return (e.get('type') == 'burst', float(e.get('laplacianScore') or 0.0))
+
+        def _collect(flash_on: bool):
+            cell = sorted([e for e in face if bool(e.get('flashOn', False)) == flash_on],
+                          key=_rank, reverse=True)[:top_k]
+            out = []
+            for e in cell:
+                try:
+                    arr = _decode_image(_download_storage_file(e['path']))
+                    h, w = arr.shape[:2]
+                    side = min(h, w)
+                    out.append(arr[(h - side) // 2:(h - side) // 2 + side,
+                                   (w - side) // 2:(w - side) // 2 + side])
+                except Exception as e2:                       # noqa: BLE001
+                    logger.warning('front-burst shot download failed: %s', e2)
+            return out
+
+        return _collect(False), _collect(True)
+    except Exception as exc:                                  # noqa: BLE001
+        logger.warning('front-burst preservation skipped: %s', exc)
+        return [], []
 
 
 def _extract_orbit_angles(capture_id: str) -> dict:
