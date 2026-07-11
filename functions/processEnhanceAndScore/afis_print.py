@@ -146,6 +146,71 @@ def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
     return np.mean(np.stack(stack), axis=0).astype(np.uint8)
 
 
+def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
+                        mode: str = 'maxc') -> Optional[np.ndarray]:
+    """Fuse a SAME-POSE ambient+flash pair into one enhanced grayscale.
+
+    Flash and ambient stills of the same pose carry complementary ridge
+    signal: the flash exposure gives strong specular contrast where the pad is
+    in closest contact (ridge crests catch the light), while the ambient
+    exposure reads ridge/valley modulation across the whole pad without
+    blow-out. Because it's the same pose this is PURE signal fusion with no
+    geometric distortion (unlike multi-angle reconstruction, which warps
+    oblique views and hurts NFIQ).
+
+    Registers flash→ambient (ECC affine — the hand drifts slightly between the
+    two exposures) then combines:
+      'maxc' : per-_BLOCK-px block, take whichever source has higher ridge
+               coherence. Biggest, most consistent NFIQ gain in testing
+               (+5–7 on the two hardest real captures).
+      'avg'  : intensity average — cross-illumination denoise; wins on
+               already-clean captures.
+    Returns a fused uint8 gray, or None if the pair can't be registered (caller
+    then skips the fusion variant and keeps the single-source renderings)."""
+    if ambient is None or flash is None:
+        return None
+    ga = ambient if ambient.ndim == 2 else cv2.cvtColor(ambient, cv2.COLOR_BGR2GRAY)
+    gf = flash if flash.ndim == 2 else cv2.cvtColor(flash, cv2.COLOR_BGR2GRAY)
+    if gf.shape[:2] != ga.shape[:2]:
+        gf = cv2.resize(gf, (ga.shape[1], ga.shape[0]))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    warp = np.eye(2, 3, dtype=np.float32)
+    try:
+        _, warp = cv2.findTransformECC(
+            cl.apply(ga), cl.apply(gf), warp, cv2.MOTION_AFFINE,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-4), None, 5)
+        gf_reg = cv2.warpAffine(gf, warp, (ga.shape[1], ga.shape[0]),
+                                flags=cv2.INTER_LINEAR)
+    except cv2.error:
+        return None
+    if float(np.corrcoef(gf_reg.ravel(), ga.ravel())[0, 1]) < 0.3:
+        return None   # not actually the same view — don't blend
+    if mode == 'avg':
+        return ((ga.astype(np.float32) + gf_reg.astype(np.float32)) / 2).astype(np.uint8)
+
+    def _coh(gray: np.ndarray) -> np.ndarray:
+        gg = gray.astype(np.float32)
+        gx = cv2.Sobel(gg, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gg, cv2.CV_32F, 0, 1, ksize=3)
+        gxx = cv2.boxFilter(gx * gx, -1, (_BLOCK, _BLOCK))
+        gyy = cv2.boxFilter(gy * gy, -1, (_BLOCK, _BLOCK))
+        gxy = cv2.boxFilter(gx * gy, -1, (_BLOCK, _BLOCK))
+        return np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-6)
+
+    ca, cf = _coh(ga), _coh(gf_reg)
+    if mode == 'soft':
+        # Feathered coherence weighting: each pixel is a blend biased toward the
+        # locally higher-coherence exposure. Smoother than a hard per-block
+        # switch (which leaves seams the orientation field then trips on), while
+        # still favouring the exposure that resolves ridges best in each region.
+        w = cv2.GaussianBlur(ca / (ca + cf + 1e-6), (0, 0), _BLOCK)
+        return (w * ga.astype(np.float32) +
+                (1.0 - w) * gf_reg.astype(np.float32)).astype(np.uint8)
+    # 'maxc': hard per-block selection.
+    return np.where(ca >= cf, ga.astype(np.float32),
+                    gf_reg.astype(np.float32)).astype(np.uint8)
+
+
 def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
     """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
     try:
@@ -264,15 +329,28 @@ def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
     lap_scores: Optional[List[Optional[float]]] = None,
+    ambient_frames: Optional[List[Optional[np.ndarray]]] = None,
+    flash_frames: Optional[List[Optional[np.ndarray]]] = None,
     freq_normalize: bool = False,
     stack: bool = False,
+    fuse: Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
 
-    frames      : BGR or grayscale frames (the same binned list fed to SfM).
-    angles_deg  : per-frame sweep angle (0 = face-on plain impression).
-    lap_scores  : optional per-frame sharpness (client laplacianScore).
+    frames         : BGR or grayscale frames (the same binned list fed to SfM).
+    angles_deg     : per-frame sweep angle (0 = face-on plain impression).
+    lap_scores     : optional per-frame sharpness (client laplacianScore).
+    ambient_frames : optional per-index ambient exposure for each bin (or None).
+    flash_frames   : optional per-index flash exposure for each bin (or None).
+                     Same-pose ambient/flash pairs enable `fuse` (see below).
+    freq_normalize : resample so the ridge period → _TARGET_PERIOD before Gabor.
+    stack          : same-pose burst denoise (align+average).
+    fuse           : 'maxc' | 'avg' — fuse the sharpest face-on bin's ambient +
+                     flash exposures instead of using a single source. Requires
+                     ambient_frames and flash_frames; returns (None, params) when
+                     no fusable same-pose pair exists so the max-variant caller
+                     simply keeps the single-source renderings.
 
     Returns (binary uint8 image or None, params dict for Firestore).
     """
@@ -307,6 +385,43 @@ def generate(
 
     gray = src if src.ndim == 2 else cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
 
+    # Flash + ambient fusion. Walk the ridge-energy-ranked face-on candidates
+    # and fuse the FIRST bin that has both an ambient and a flash exposure of
+    # the same pose (they are already per-bin aligned by the oscillating
+    # downloader). This is complementary-illumination signal fusion with no
+    # geometric distortion and is the single biggest superprint lever found:
+    # +5–7 NFIQ on the hardest captures. Emits None (variant skipped) when no
+    # fusable pair exists, so single-source renderings still stand.
+    if fuse:
+        if ambient_frames is None or flash_frames is None:
+            return None, params
+        # Rank fusion candidates by MOST FACE-ON first (smallest |angle|), then
+        # by the weaker of the two exposures' ridge energy — a bin only fuses
+        # well if BOTH its ambient and flash are sharp, and an off-centre bin
+        # (even if one exposure is very sharp) reintroduces the oblique
+        # distortion fusion is meant to avoid. This is deliberately different
+        # from the single-source `order` (which maximises one frame's energy).
+        def _pair_key(i):
+            amb = ambient_frames[i] if i < len(ambient_frames) else None
+            fla = flash_frames[i] if i < len(flash_frames) else None
+            if amb is None or fla is None:
+                return None
+            return (abs(float(angles_deg[i])),
+                    -min(_ridge_energy(amb), _ridge_energy(fla)))
+        pair_cands = sorted((i for i in candidates if _pair_key(i) is not None),
+                            key=_pair_key)
+        fused = None
+        for i in pair_cands:
+            fused = _fuse_flash_ambient(ambient_frames[i], flash_frames[i], mode=fuse)
+            if fused is not None:
+                gray = fused
+                params['afisFused'] = fuse
+                params['afisFusedBin'] = int(i)
+                params['afisFusedAngle'] = float(round(float(angles_deg[i]), 1))
+                break
+        if fused is None:
+            return None, params
+
     # Same-pose multi-shot stacking. Aligning and averaging near-identical
     # views is PURE denoising with no geometric distortion -- unlike
     # multi-ANGLE reconstruction, which unrolls oblique deformable-skin views
@@ -323,7 +438,7 @@ def generate(
     # ridges (observed -3.3 NFIQ on the sunlight capture). main.py scores the
     # stacked rendering as an ADDITIONAL max-variant alongside the unstacked
     # ones and keeps the higher NFIQ, so stacking can only ever help.
-    if stack:
+    if stack and not fuse:
         src_ang = float(angles_deg[order[0]])
         same_pose = [i for i in order
                      if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]

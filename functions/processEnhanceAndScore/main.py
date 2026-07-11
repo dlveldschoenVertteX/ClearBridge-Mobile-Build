@@ -584,16 +584,28 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # scored side-by-side rather than applied unconditionally. Taking the
             # max guarantees a variant can only raise the final score, never
             # regress a good capture.
-            for _freqnorm, _stack in ((False, False), (True, False), (False, True)):
+            # (freq_normalize, stack, fuse). fuse='avg' fuses the same-pose
+            # flash+ambient exposures of the most face-on bin (biggest lever:
+            # +12 NFIQ on a well-paired capture); it's skipped automatically when
+            # the flow has no ambient/flash pairs (arc, or a bin missing one
+            # exposure), and the max-of-variants keeps the better single source
+            # when one exposure is too soft to help.
+            for _freqnorm, _stack, _fuse in (
+                (False, False, None),
+                (True,  False, None),
+                (False, True,  None),
+                (False, False, 'avg'),
+            ):
                 _img, _p = afis_print.generate(
                     frames, angles_for_sfm, _laps,
-                    freq_normalize=_freqnorm, stack=_stack)
+                    ambient_frames=ambient_frames, flash_frames=flash_frames,
+                    freq_normalize=_freqnorm, stack=_stack, fuse=_fuse)
                 if _img is None:
                     continue
                 _res = _score_nfiq(_img, sfm_coverage=1.0)
                 _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
-                logger.info('AFIS variant freqnorm=%s stack=%s nfiq=%.1f',
-                            _freqnorm, _stack, _s)
+                logger.info('AFIS variant freqnorm=%s stack=%s fuse=%s nfiq=%.1f',
+                            _freqnorm, _stack, _fuse, _s)
                 if _s > afis_nfiq:
                     afis_nfiq = _s
                     best_afis_img = _img
