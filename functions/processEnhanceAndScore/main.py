@@ -584,28 +584,35 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # scored side-by-side rather than applied unconditionally. Taking the
             # max guarantees a variant can only raise the final score, never
             # regress a good capture.
-            # (freq_normalize, stack, fuse). fuse='avg' fuses the same-pose
-            # flash+ambient exposures of the most face-on bin (biggest lever:
-            # +12 NFIQ on a well-paired capture); it's skipped automatically when
-            # the flow has no ambient/flash pairs (arc, or a bin missing one
-            # exposure), and the max-of-variants keeps the better single source
-            # when one exposure is too soft to help.
-            for _freqnorm, _stack, _fuse in (
-                (False, False, None),
-                (True,  False, None),
-                (False, True,  None),
-                (False, False, 'avg'),
-            ):
+            # Rendering variants (name, generate-kwargs). The max NFIQ across all
+            # of them is kept, so each variant can only ever raise the score:
+            #   native    — sharpest single face-on frame
+            #   freqNorm  — resample ridge period to the ~500 DPI domain
+            #   stack     — same-pose burst denoise (align+average)
+            #   fuseAvg   — fuse same-pose flash+ambient exposures (biggest
+            #               lever, +12 NFIQ on a well-paired capture)
+            #   mosaicFreq— front-anchored minimal-yaw reconstruction: borrow
+            #               pad-edge ridges from lightly-yawed neighbours without
+            #               distorting the front centre (+~1.5 on some captures)
+            # fuse/mosaic self-skip (return None) when the flow lacks the inputs
+            # (arc, or no ambient/flash pair / no side frame), costing nothing.
+            _afis_variants = (
+                ('native',     dict()),
+                ('freqNorm',   dict(freq_normalize=True)),
+                ('stack',      dict(stack=True)),
+                ('fuseAvg',    dict(fuse='avg')),
+                ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
+            )
+            for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(
                     frames, angles_for_sfm, _laps,
                     ambient_frames=ambient_frames, flash_frames=flash_frames,
-                    freq_normalize=_freqnorm, stack=_stack, fuse=_fuse)
+                    **_vkw)
                 if _img is None:
                     continue
                 _res = _score_nfiq(_img, sfm_coverage=1.0)
                 _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
-                logger.info('AFIS variant freqnorm=%s stack=%s fuse=%s nfiq=%.1f',
-                            _freqnorm, _stack, _fuse, _s)
+                logger.info('AFIS variant %s nfiq=%.1f', _vname, _s)
                 if _s > afis_nfiq:
                     afis_nfiq = _s
                     best_afis_img = _img

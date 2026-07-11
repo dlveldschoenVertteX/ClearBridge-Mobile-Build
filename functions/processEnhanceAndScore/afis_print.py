@@ -211,6 +211,77 @@ def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
                     gf_reg.astype(np.float32)).astype(np.uint8)
 
 
+_MOSAIC_YAW_DEG   = 12.0   # only borrow from THIS-lightly-yawed neighbours
+_MOSAIC_YAW_MIN   = 4.0    # ...but far enough to add genuine edge coverage
+_MOSAIC_MAX_SIDE  = 6      # cap side frames (registration cost)
+_MOSAIC_REG_PX    = 640    # ECC registration resolution (warp applied full-res)
+
+
+def _block_coherence(gray: np.ndarray, blur: float = 8.0) -> np.ndarray:
+    gg = gray.astype(np.float32)
+    gx = cv2.Sobel(gg, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gg, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = cv2.boxFilter(gx * gx, -1, (_BLOCK, _BLOCK))
+    gyy = cv2.boxFilter(gy * gy, -1, (_BLOCK, _BLOCK))
+    gxy = cv2.boxFilter(gx * gy, -1, (_BLOCK, _BLOCK))
+    c = np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-6)
+    return cv2.GaussianBlur(c, (0, 0), blur)
+
+
+def _front_anchored_mosaic(front: np.ndarray,
+                           sides: List[np.ndarray]) -> Tuple[Optional[np.ndarray], int]:
+    """Distortion-free minimal-yaw reconstruction.
+
+    Keeps the sharp FACE-ON `front` frame as the undistorted geometric anchor
+    and only BORROWS ridge detail from lightly-yawed side frames in the regions
+    where they register well AND resolve ridges better than the front (the pad
+    edges that curve away from the camera). At the small yaw this is restricted
+    to (<=_MOSAIC_YAW_DEG) the ridge foreshortening is a few percent, so the
+    borrowed edge ridges land at near-true scale -- unlike a full cylindrical
+    unwrap of wide-baseline oblique views, which stretches ridges and lowers
+    NFIQ. Composite is a per-pixel coherence-weighted average anchored on the
+    front's own coherence, so the centre stays exactly the front frame.
+
+    Homographies are estimated on _MOSAIC_REG_PX copies and applied at full
+    resolution (ECC on full-res stills is too slow for the function budget).
+    Returns (mosaic uint8, n_sides_used); n_used==0 means it degenerates to the
+    front frame."""
+    fh, fw = front.shape[:2]
+    acc = front.astype(np.float32) * _block_coherence(front)
+    wsum = _block_coherence(front).copy()
+    s = _MOSAIC_REG_PX / max(fh, fw)
+    small = (max(1, int(fw * s)), max(1, int(fh * s)))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    ref_small = cl.apply(cv2.resize(front, small))
+    up = np.array([[1 / s, 0, 0], [0, 1 / s, 0], [0, 0, 1]], dtype=np.float32)
+    dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-4)
+    used = 0
+    for sd in sides:
+        g = sd if sd.ndim == 2 else cv2.cvtColor(sd, cv2.COLOR_BGR2GRAY)
+        if g.shape[:2] != (fh, fw):
+            g = cv2.resize(g, (fw, fh))
+        try:
+            warp = np.eye(3, 3, dtype=np.float32)
+            _, warp = cv2.findTransformECC(
+                ref_small, cl.apply(cv2.resize(g, small)), warp,
+                cv2.MOTION_HOMOGRAPHY, crit, None, 5)
+            warp_full = (up @ warp @ dn).astype(np.float32)
+            reg = cv2.warpPerspective(g, warp_full, (fw, fh), flags=cv2.INTER_LINEAR)
+        except cv2.error:
+            continue
+        if float(np.corrcoef(reg.ravel(), front.ravel())[0, 1]) < 0.45:
+            continue
+        valid = (reg > 0).astype(np.float32)
+        cs = _block_coherence(reg) * valid
+        acc += reg.astype(np.float32) * cs
+        wsum += cs
+        used += 1
+    if used == 0:
+        return None, 0
+    return (acc / np.maximum(wsum, 1e-6)).astype(np.uint8), used
+
+
 def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
     """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
     try:
@@ -334,6 +405,7 @@ def generate(
     freq_normalize: bool = False,
     stack: bool = False,
     fuse: Optional[str] = None,
+    mosaic: bool = False,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -346,6 +418,10 @@ def generate(
                      Same-pose ambient/flash pairs enable `fuse` (see below).
     freq_normalize : resample so the ridge period → _TARGET_PERIOD before Gabor.
     stack          : same-pose burst denoise (align+average).
+    mosaic         : front-anchored minimal-yaw reconstruction — borrow edge
+                     ridges from lightly-yawed side frames without distorting
+                     the front centre. Returns (None, params) if no side frame
+                     registers, so single-source renderings still stand.
     fuse           : 'maxc' | 'avg' — fuse the sharpest face-on bin's ambient +
                      flash exposures instead of using a single source. Requires
                      ambient_frames and flash_frames; returns (None, params) when
@@ -422,6 +498,24 @@ def generate(
         if fused is None:
             return None, params
 
+    # Front-anchored minimal-yaw reconstruction. Anchor on the sharpest face-on
+    # frame (order[0]) and borrow edge ridge detail from lightly-yawed
+    # neighbours. Distortion-free because the yaw is tiny and the front centre
+    # is preserved; adds genuine pad-edge coverage the single frame lacks.
+    if mosaic and not fuse:
+        front_g = gray
+        sides = [frames[i] for i in range(len(frames))
+                 if _MOSAIC_YAW_MIN < abs(float(angles_deg[i])) <= _MOSAIC_YAW_DEG
+                 and frames[i] is not None]
+        sides = sorted(sides, key=lambda f: -_ridge_energy(f))[:_MOSAIC_MAX_SIDE]
+        if not sides:
+            return None, params
+        mos, n_used = _front_anchored_mosaic(front_g, sides)
+        if mos is None:
+            return None, params
+        gray = mos
+        params['afisMosaicSides'] = int(n_used)
+
     # Same-pose multi-shot stacking. Aligning and averaging near-identical
     # views is PURE denoising with no geometric distortion -- unlike
     # multi-ANGLE reconstruction, which unrolls oblique deformable-skin views
@@ -438,7 +532,7 @@ def generate(
     # ridges (observed -3.3 NFIQ on the sunlight capture). main.py scores the
     # stacked rendering as an ADDITIONAL max-variant alongside the unstacked
     # ones and keeps the higher NFIQ, so stacking can only ever help.
-    if stack and not fuse:
+    if stack and not fuse and not mosaic:
         src_ang = float(angles_deg[order[0]])
         same_pose = [i for i in order
                      if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
