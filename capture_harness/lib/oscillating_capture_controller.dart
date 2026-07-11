@@ -387,6 +387,20 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const int _calibDurationMs = 500; // brightness sampling for AdaptiveFlashController
   static const int _torchAlternateMs = 500; // transition-phase torch toggle cadence
   static const int _uploadConcurrency = 16; // was 6 -- see _videoFrameMinIntervalMs
+  // A session uploads up to ~400 individual Storage objects (burst stills +
+  // preview-stream transition frames); with no retry, a single transient
+  // network blip on any one of them aborted the whole capture
+  // ([firebase_storage/unknown] observed on real devices mid-upload).
+  static const List<int> _uploadRetryDelaysMs = [500, 1500, 4000];
+  static const Set<String> _uploadNonRetryableCodes = {
+    'unauthorized',
+    'unauthenticated',
+    'no-default-bucket',
+    'invalid-argument',
+    'invalid-url',
+    'object-not-found',
+    'quota-exceeded',
+  };
   // Hybrid CV+IMU gate, same threshold as MultiAngleCaptureController: a
   // confident, correct CV prediction can bring the effective distance to 0
   // (locked) even if the raw IMU angle hasn't quite settled there -- it
@@ -1422,6 +1436,29 @@ class OscillatingCaptureController extends ChangeNotifier {
   // that function for how the dense frame stream gets binned down into a
   // cylindrical-projection input.
 
+  /// Uploads one frame, retrying with backoff on transient Storage failures
+  /// (network blips, timeouts -- the generic `firebase_storage/unknown` seen
+  /// on real devices mid-session). Permanent errors (auth, quota, bad ref)
+  /// are rethrown immediately since retrying them can't help.
+  Future<void> _uploadWithRetry(Uint8List bytes, String path) async {
+    for (var attempt = 0; ; attempt++) {
+      try {
+        await FirebaseStorage.instance
+            .ref()
+            .child(path)
+            .putData(bytes, SettableMetadata(contentType: 'image/jpeg'));
+        return;
+      } catch (e) {
+        final code = e is FirebaseException ? e.code : null;
+        final retryable = code == null || !_uploadNonRetryableCodes.contains(code);
+        if (!retryable || attempt >= _uploadRetryDelaysMs.length) rethrow;
+        debugPrint('[osc] upload retry ${attempt + 1}/${_uploadRetryDelaysMs.length} '
+            'for $path after error: $e');
+        await Future.delayed(Duration(milliseconds: _uploadRetryDelaysMs[attempt]));
+      }
+    }
+  }
+
   Future<void> _finishAndUpload() async {
     _audio.silence();
     _apply((s) => s.copyWith(phase: OscillatingPhase.uploading, uploadProgress: 0), force: true);
@@ -1498,11 +1535,7 @@ class OscillatingCaptureController extends ChangeNotifier {
         final end = math.min(i + _uploadConcurrency, uploadTasks.length);
         await Future.wait([
           for (var j = i; j < end; j++)
-            FirebaseStorage.instance
-                .ref()
-                .child(uploadTasks[j].$2)
-                .putData(uploadTasks[j].$1, SettableMetadata(contentType: 'image/jpeg'))
-                .then((_) {
+            _uploadWithRetry(uploadTasks[j].$1, uploadTasks[j].$2).then((_) {
               completed++;
               _apply((s) => s.copyWith(uploadProgress: completed / total));
             }),
