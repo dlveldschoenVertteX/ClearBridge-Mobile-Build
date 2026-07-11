@@ -101,13 +101,36 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
 
     final s = _ctrl.state;
     final showDial = s.phase == OscillatingPhase.running;
+    // Spotlight reticle: shown while framing/capturing so the user fills the
+    // thumb-pad oval (which is exactly the focus/exposure/scoring ROI). Hidden
+    // once uploading/complete/error.
+    final showReticle = s.phase == OscillatingPhase.idle ||
+        s.phase == OscillatingPhase.calibrating ||
+        s.phase == OscillatingPhase.running;
+    final reticleState = s.isCapturingBurst
+        ? ReticleState.capturing
+        : (s.onTarget ? ReticleState.locked : ReticleState.aligning);
+    final reticleHint = s.phase == OscillatingPhase.idle
+        ? 'Fill the oval with your thumb pad'
+        : null;
 
     return Scaffold(
       backgroundColor: CaptureColors.void_,
       body: Stack(
         children: [
           Positioned.fill(child: RepaintBoundary(child: _cameraLayer())),
-          const Positioned.fill(child: RepaintBoundary(child: CaptureVignetteOverlay())),
+          if (showReticle)
+            Positioned.fill(
+              child: RepaintBoundary(
+                child: CaptureReticleOverlay(
+                  state: reticleState,
+                  hint: reticleHint,
+                ),
+              ),
+            )
+          else
+            const Positioned.fill(
+                child: RepaintBoundary(child: CaptureVignetteOverlay())),
 
           // Right: live focus readout — diagnostic only, doesn't gate capture.
           if (showDial)
@@ -419,6 +442,16 @@ class _GuidancePanel extends StatelessWidget {
             style: CaptureTypography.label.copyWith(
               fontSize: 12,
               color: CaptureColors.warning,
+            ),
+          ),
+        ],
+        if (state.lowLight) ...[
+          const SizedBox(height: 6),
+          Text(
+            '☀ Brighter light = sharper print',
+            style: CaptureTypography.label.copyWith(
+              fontSize: 12,
+              color: CaptureColors.gold,
             ),
           ),
         ],

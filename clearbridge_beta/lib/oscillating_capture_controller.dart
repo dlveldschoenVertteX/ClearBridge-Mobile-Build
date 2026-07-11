@@ -217,6 +217,7 @@ class OscillatingCaptureState {
   final double angularVelocityDegPerSec;
   final bool tooFast;
   final int distanceHint; // -1 too far (move closer), +1 too close (back off), 0 ok
+  final bool lowLight; // scene needs the torch — nudge user to brighter light
   final bool isCapturingBurst;
   final int burstShotIndex; // shots fired so far this burst, for the UI countdown
   final int burstShotTotal;
@@ -242,6 +243,7 @@ class OscillatingCaptureState {
     this.angularVelocityDegPerSec = 0,
     this.tooFast = false,
     this.distanceHint = 0,
+    this.lowLight = false,
     this.isCapturingBurst = false,
     this.burstShotIndex = 0,
     this.burstShotTotal = 0,
@@ -268,6 +270,7 @@ class OscillatingCaptureState {
     double? angularVelocityDegPerSec,
     bool? tooFast,
     int? distanceHint,
+    bool? lowLight,
     bool? isCapturingBurst,
     int? burstShotIndex,
     int? burstShotTotal,
@@ -294,6 +297,7 @@ class OscillatingCaptureState {
             angularVelocityDegPerSec ?? this.angularVelocityDegPerSec,
         tooFast: tooFast ?? this.tooFast,
         distanceHint: distanceHint ?? this.distanceHint,
+        lowLight: lowLight ?? this.lowLight,
         isCapturingBurst: isCapturingBurst ?? this.isCapturingBurst,
         burstShotIndex: burstShotIndex ?? this.burstShotIndex,
         burstShotTotal: burstShotTotal ?? this.burstShotTotal,
@@ -398,8 +402,10 @@ class OscillatingCaptureController extends ChangeNotifier {
   // Centre ROI the focus meter, brightness meter and exposure guard all score
   // on — the thumb sits here, so a crisp/bright background can't outscore a
   // soft/dark thumb (the exact failure that left production captures a blurry
-  // back-focused lozenge). Same window ArcSweepCaptureController scores on.
-  static const Rect _scoreRoi = Rect.fromLTRB(0.30, 0.30, 0.70, 0.70);
+  // back-focused lozenge). Aligned 1:1 with CaptureReticleOverlay.reticleRect:
+  // the oval the user visually fills IS the region we focus/expose/score, so
+  // framing, metering, masking and the superprint crop all agree.
+  static const Rect _scoreRoi = Rect.fromLTRB(0.28, 0.22, 0.72, 0.78);
 
   // Exposure guard bands, measured on the ambient thumb ROI (torch-off frames
   // only). Glare-only guard: a torch hotspot on close-up skin blows out ridge
@@ -604,6 +610,12 @@ class OscillatingCaptureController extends ChangeNotifier {
         : _brightnessSamples.reduce((a, b) => a + b) / _brightnessSamples.length;
     await _flash?.calibrate(avg);
     if (_disposed) return;
+    // Nudge toward brighter light. Empirically the single biggest quality
+    // differentiator: a bright, directional (sun/window) capture scored ~2x
+    // NFIQ vs a dim, torch-lit one — the torch is on-axis and flattens the
+    // ridge shadows that carry contrast. isNeeded == true means ambient was
+    // too dark and the torch is compensating (flat ridges + motion-blur risk).
+    _apply((s) => s.copyWith(lowLight: _flash?.isNeeded ?? false), force: true);
     // Lock focus so it holds the thumb through the whole orbit instead of
     // hunting to the background. AE stays in auto (exposure must adapt as the
     // view goes face-on → side-on), guarded by _maybeAdjustExposure below.
