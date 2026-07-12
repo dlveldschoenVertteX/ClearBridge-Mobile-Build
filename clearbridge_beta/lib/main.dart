@@ -5,6 +5,7 @@ import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:shared_preferences/shared_preferences.dart';
 
 import 'package:clearbridge_beta/beta_thank_you_screen.dart';
+import 'package:clearbridge_beta/camera_probe_screen.dart';
 import 'package:clearbridge_beta/clearbridge_colors.dart';
 import 'package:clearbridge_beta/clearcoin_screen.dart';
 import 'package:clearbridge_beta/firebase_options.dart';
@@ -43,6 +44,13 @@ class ClearBridgeBetaApp extends StatelessWidget {
       navigatorKey: _navigatorKey,
       theme: ThemeData(useMaterial3: true, colorSchemeSeed: ClearBridgeColors.cyan),
       home: SplashScreen(
+        onDiagnostics: () => _navigatorKey.currentState?.push(
+          MaterialPageRoute(
+            builder: (_) => CameraProbeScreen(
+              getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+            ),
+          ),
+        ),
         onDone: () async {
           final prefs = await SharedPreferences.getInstance();
           final done = prefs.getBool('popia_completed') ?? false;

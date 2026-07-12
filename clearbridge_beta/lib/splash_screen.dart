@@ -8,9 +8,14 @@ import 'package:clearbridge_beta/clearbridge_colors.dart';
 /// Branded splash shown for a beat on cold start, then hands off into the
 /// user-details/POPIA screen. Tap anywhere to skip.
 class SplashScreen extends StatefulWidget {
-  const SplashScreen({super.key, required this.onDone});
+  const SplashScreen({super.key, required this.onDone, this.onDiagnostics});
 
   final VoidCallback onDone;
+
+  /// Hidden entry point: long-press the logo to open the device camera probe
+  /// (Phase-0 diagnostic; see docs/CAPTURE_OPTIMIZATION_SCOPE.md). Optional so
+  /// production builds can leave it unset.
+  final VoidCallback? onDiagnostics;
 
   @override
   State<SplashScreen> createState() => _SplashScreenState();
@@ -44,6 +49,15 @@ class _SplashScreenState extends State<SplashScreen> {
       backgroundColor: ClearBridgeColors.void_,
       body: GestureDetector(
         onTap: _go,
+        onLongPress: widget.onDiagnostics == null
+            ? null
+            : () {
+                // Cancel auto-advance so the splash doesn't navigate away from
+                // under the probe; leave _done false so a tap still continues
+                // into the normal flow after the probe is popped.
+                _timer?.cancel();
+                widget.onDiagnostics!();
+              },
         behavior: HitTestBehavior.opaque,
         child: Center(
           child: Column(
