@@ -5,7 +5,8 @@ import 'dart:typed_data';
 import 'package:camera/camera.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
-import 'package:mac_capture/mac_capture.dart' show decodeStillJpegToLuma, DecodedStillLuma;
+import 'package:mac_capture/mac_capture.dart'
+    show CameraService, decodeStillJpegToLuma, DecodedStillLuma;
 
 import 'package:clearbridge_beta/clearbridge_colors.dart';
 
@@ -19,12 +20,21 @@ import 'package:clearbridge_beta/clearbridge_colors.dart';
 ///   3. whether torch/flash helps each, and whether the IR night-vision camera
 ///      is worth pursuing as an ambient-independent source.
 ///
-/// For each accessible back camera it captures a torch-off and a torch-on still
-/// of whatever is framed (present a thumb pad), uploads both plus a `probe.json`
-/// capability manifest under `captures/<uid>/camera_probe_<id>/` (the Storage
-/// path the owner is already allowed to write — no rules change, and the
-/// callable pipeline never runs on it). Reachable via a long-press on the
-/// splash logo; never touches the normal capture flow.
+/// Uses [CameraService] (the SAME camera-lifecycle helper the real capture
+/// flow uses) instead of a raw CameraController, specifically for its
+/// documented two-attempt retry (12s then 20s) around cold-HAL-start
+/// negotiation on budget devices — a raw single-timeout init was the bug in
+/// the first cut of this screen (camera index 0 hung with no visible
+/// progress). A live preview is shown per camera so it's visually obvious
+/// when a camera has actually opened, and a "Skip camera" button lets you
+/// bail out of a slow one without waiting the full retry budget.
+///
+/// For each accessible back camera it captures a torch-off and a torch-on
+/// still, uploads both plus a `probe.json` capability manifest under
+/// `captures/<uid>/camera_probe_<id>/` (the Storage path the owner is already
+/// allowed to write — no rules change, and the callable pipeline never runs on
+/// it). Reachable via a long-press on the splash logo; never touches the
+/// normal capture flow.
 class CameraProbeScreen extends StatefulWidget {
   const CameraProbeScreen({super.key, required this.getUserId});
 
@@ -33,6 +43,8 @@ class CameraProbeScreen extends StatefulWidget {
   @override
   State<CameraProbeScreen> createState() => _CameraProbeScreenState();
 }
+
+class _SkipRequested implements Exception {}
 
 class _CamResult {
   final Map<String, dynamic> caps = {};
@@ -44,9 +56,13 @@ class _CamResult {
 class _CameraProbeScreenState extends State<CameraProbeScreen> {
   final List<String> _log = [];
   final List<_CamResult> _results = [];
+  final CameraService _cameraService = CameraService();
   bool _running = false;
   bool _done = false;
+  bool _skipRequested = false;
+  VoidCallback? _skipListener;
   String? _probeId;
+  String? _currentCameraLabel;
 
   @override
   void initState() {
@@ -54,9 +70,19 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     WidgetsBinding.instance.addPostFrameCallback((_) { _runProbe(); });
   }
 
+  @override
+  void dispose() {
+    _cameraService.disposeCamera();
+    super.dispose();
+  }
+
   void _say(String s) {
     debugPrint('[probe] $s');
     if (mounted) setState(() => _log.add(s));
+  }
+
+  void _checkSkip() {
+    if (_skipRequested) throw _SkipRequested();
   }
 
   Future<void> _runProbe() async {
@@ -85,28 +111,68 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     final docCams = <Map<String, dynamic>>[];
     for (final desc in back) {
       final r = _CamResult();
+      // Recorded upfront so even a skip/failure before init completes still
+      // leaves an identifiable entry in probe.json.
+      r.caps['name'] = desc.name;
+      r.caps['lensType'] = desc.lensType.name;
+      r.caps['lensDirection'] = desc.lensDirection.name;
+      r.caps['sensorOrientation'] = desc.sensorOrientation;
       _results.add(r);
+      _skipRequested = false;
+      setState(() => _currentCameraLabel = '${desc.name} (${desc.lensType.name})');
       _say('── probing ${desc.name} (${desc.lensType.name}) ──');
-      CameraController? ctrl;
       try {
-        ctrl = CameraController(desc, ResolutionPreset.max, enableAudio: false);
-        await ctrl.initialize().timeout(const Duration(seconds: 15));
-        await Future<void>.delayed(const Duration(milliseconds: 400));
+        _checkSkip();
+        // CameraService.initializeCamera has its own bounded 12s+20s retry
+        // for exactly this device class's cold-HAL-start negotiation — that
+        // resilience is the whole point of using it instead of a raw
+        // CameraController, so every camera gets a bounded (not unbounded)
+        // wait even in the worst case. It can still take up to ~32s though,
+        // so race it against the Skip button rather than only checking after
+        // it returns — otherwise Skip does nothing while a camera is stuck
+        // mid-init, exactly the case that motivated this rewrite.
+        final skipDuringInit = Completer<void>();
+        void onSkipDuringInit() {
+          if (!skipDuringInit.isCompleted) skipDuringInit.complete();
+        }
+        _skipListener = onSkipDuringInit;
+        final initFuture = _cameraService.initializeCamera(
+          cameraDescription: desc,
+          resolution: ResolutionPreset.max,
+        );
+        final raced = await Future.any<String>([
+          initFuture.then((_) => 'done'),
+          skipDuringInit.future.then((_) => 'skipped'),
+        ]);
+        _skipListener = null;
+        if (raced == 'skipped') {
+          r.status = 'skipped-by-user';
+          _say('  ⏭ skipped while opening (finishing in background)');
+          // Don't await the real init here — let it settle on its own and
+          // clean up afterwards, so we don't block the next camera on it.
+          unawaited(initFuture
+              .then((_) => _cameraService.disposeCamera())
+              .catchError((_) {}));
+          r.caps['status'] = r.status;
+          docCams.add(r.caps);
+          if (mounted) setState(() {});
+          continue;
+        }
+        setState(() {}); // let the preview widget pick up the new controller
+        final ctrl = _cameraService.controller!;
+        _checkSkip();
 
-        r.caps['name'] = desc.name;
-        r.caps['lensType'] = desc.lensType.name;
-        r.caps['lensDirection'] = desc.lensDirection.name;
-        r.caps['sensorOrientation'] = desc.sensorOrientation;
         final ps = ctrl.value.previewSize;
         r.caps['previewSize'] = ps == null ? null : '${ps.width.toInt()}x${ps.height.toInt()}';
-        r.caps['minExposureOffset'] = await _tryD(() => ctrl!.getMinExposureOffset());
-        r.caps['maxExposureOffset'] = await _tryD(() => ctrl!.getMaxExposureOffset());
-        r.caps['minZoom'] = await _tryD(() => ctrl!.getMinZoomLevel());
-        r.caps['maxZoom'] = await _tryD(() => ctrl!.getMaxZoomLevel());
+        r.caps['minExposureOffset'] = await _tryD(() => ctrl.getMinExposureOffset());
+        r.caps['maxExposureOffset'] = await _tryD(() => ctrl.getMaxExposureOffset());
+        r.caps['minZoom'] = await _tryD(() => ctrl.getMinZoomLevel());
+        r.caps['maxZoom'] = await _tryD(() => ctrl.getMaxZoomLevel());
+        _say('  opened: preview=${r.caps['previewSize']} '
+            'zoom=${r.caps['minZoom']}-${r.caps['maxZoom']}');
 
-        await ctrl.setFocusMode(FocusMode.auto).catchError((_) {});
-        await ctrl.setFocusPoint(const Offset(0.5, 0.5)).catchError((_) {});
         await Future<void>.delayed(const Duration(milliseconds: 700)); // let AF settle
+        _checkSkip();
 
         // Torch OFF still.
         try {
@@ -119,8 +185,10 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
           _say('  torch-off: ${(off.length / 1024).toStringAsFixed(0)}KB '
               '${r.caps['imgOff'] ?? ''} sharp=${r.sharpOff.toStringAsFixed(0)}');
         } catch (e) {
+          if (e is _SkipRequested) rethrow;
           _say('  torch-off capture failed: $e');
         }
+        _checkSkip();
         // Torch ON still (main flash LED; night-vision camera auto-uses its IR).
         try {
           await ctrl.setFlashMode(FlashMode.torch);
@@ -132,15 +200,19 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
           await ctrl.setFlashMode(FlashMode.off);
           _say('  torch-on:  sharp=${r.sharpOn.toStringAsFixed(0)}');
         } catch (e) {
+          if (e is _SkipRequested) rethrow;
           _say('  torch-on capture failed: $e');
         }
         r.status = 'ok';
+      } on _SkipRequested {
+        r.status = 'skipped-by-user';
+        _say('  ⏭ skipped by user');
       } catch (e) {
         r.status = 'init-failed';
         r.caps['error'] = e.toString();
-        _say('  ${desc.name} init failed: $e');
+        _say('  ${desc.name} failed: $e');
       } finally {
-        try { await ctrl?.dispose(); } catch (_) {}
+        await _cameraService.disposeCamera();
         await Future<void>.delayed(const Duration(milliseconds: 300));
       }
       r.caps['sharpnessOff'] = r.sharpOff;
@@ -150,6 +222,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
       if (mounted) setState(() {});
     }
 
+    setState(() => _currentCameraLabel = null);
     try {
       final meta = {
         'probeId': probeId,
@@ -249,6 +322,8 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
 
   @override
   Widget build(BuildContext context) {
+    final ctrl = _cameraService.controller;
+    final showPreview = ctrl != null && ctrl.value.isInitialized;
     return Scaffold(
       backgroundColor: ClearBridgeColors.void_,
       appBar: AppBar(
@@ -261,14 +336,43 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            Text(
-              _running
-                  ? 'Probing… hold a thumb pad in frame'
-                  : _done
-                      ? 'Done — uploaded (probe $_probeId)'
-                      : 'Starting…',
-              style: const TextStyle(color: ClearBridgeColors.cyan, fontWeight: FontWeight.bold),
+            Row(
+              children: [
+                Expanded(
+                  child: Text(
+                    _running
+                        ? 'Probing ${_currentCameraLabel ?? '…'} — hold a thumb pad in frame'
+                        : _done
+                            ? 'Done — uploaded (probe $_probeId)'
+                            : 'Starting…',
+                    style: const TextStyle(
+                        color: ClearBridgeColors.cyan, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                if (_running && !_skipRequested)
+                  TextButton(
+                    onPressed: () {
+                      setState(() => _skipRequested = true);
+                      _skipListener?.call(); // interrupts an in-flight init immediately
+                    },
+                    child: const Text('Skip camera →',
+                        style: TextStyle(color: ClearBridgeColors.silverBright)),
+                  ),
+              ],
             ),
+            if (showPreview) ...[
+              const SizedBox(height: 8),
+              SizedBox(
+                height: 160,
+                child: ClipRRect(
+                  borderRadius: BorderRadius.circular(8),
+                  child: AspectRatio(
+                    aspectRatio: ctrl.value.aspectRatio,
+                    child: CameraPreview(ctrl),
+                  ),
+                ),
+              ),
+            ],
             const SizedBox(height: 8),
             if (_results.isNotEmpty) _rankCard(),
             const SizedBox(height: 8),
@@ -316,7 +420,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
               child: Text(
                 '${r.status == 'ok' ? '✓' : '✗'} $lensType  '
                 'off=${r.sharpOff.toStringAsFixed(0)} torch=${r.sharpOn.toStringAsFixed(0)}  '
-                '→ ${best(r).toStringAsFixed(0)}',
+                '→ ${best(r).toStringAsFixed(0)}  [${r.status}]',
                 style: const TextStyle(color: ClearBridgeColors.silverDim, fontSize: 13),
               ),
             );
