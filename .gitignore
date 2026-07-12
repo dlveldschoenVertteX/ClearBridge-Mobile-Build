@@ -26,3 +26,7 @@ functions/processEnhanceAndScore/venv/
 functions/processEnhanceAndScore/__pycache__/
 **/__pycache__/
 *.pyc
+
+# Firebase CLI deploy logs
+firebase-debug.log
+*firebase-debug*.log
