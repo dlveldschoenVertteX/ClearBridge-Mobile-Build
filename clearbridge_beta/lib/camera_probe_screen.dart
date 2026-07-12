@@ -6,7 +6,8 @@ import 'package:camera/camera.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/material.dart';
 import 'package:mac_capture/mac_capture.dart'
-    show CameraService, decodeStillJpegToLuma, DecodedStillLuma;
+    show CameraService, CaptureReticleOverlay, ReticleState,
+        decodeStillJpegToLuma, DecodedStillLuma;
 
 import 'package:clearbridge_beta/clearbridge_colors.dart';
 
@@ -63,6 +64,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
   VoidCallback? _skipListener;
   String? _probeId;
   String? _currentCameraLabel;
+  int? _countdown;
 
   @override
   void initState() {
@@ -83,6 +85,21 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
 
   void _checkSkip() {
     if (_skipRequested) throw _SkipRequested();
+  }
+
+  /// Visible "get ready" countdown before a shot fires. The whole point is
+  /// giving the user time to see the live preview (now large, with the same
+  /// reticle the real capture flow uses) and place their thumb pad ON TARGET
+  /// before the shutter — the prior cut fired instantly on camera open, which
+  /// is why the very first shot caught an empty desk.
+  Future<void> _countdownThen(int seconds) async {
+    for (var s = seconds; s >= 1; s--) {
+      if (!mounted) return;
+      _checkSkip();
+      setState(() => _countdown = s);
+      await Future<void>.delayed(const Duration(seconds: 1));
+    }
+    if (mounted) setState(() => _countdown = null);
   }
 
   Future<void> _runProbe() async {
@@ -174,16 +191,22 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
         await Future<void>.delayed(const Duration(milliseconds: 700)); // let AF settle
         _checkSkip();
 
+        // Give the user time to see the (now large) live preview and place
+        // their thumb pad on target before anything fires.
+        await ctrl.setFlashMode(FlashMode.off);
+        await _countdownThen(4);
+        _checkSkip();
+
         // Torch OFF still.
         try {
-          await ctrl.setFlashMode(FlashMode.off);
           final off = await _capture(ctrl);
           r.sharpOff = await _sharpness(off, desc.sensorOrientation);
           r.caps['imgOff'] = _jpegDims(off);
           r.caps['bytesOff'] = off.length;
-          await _upload('$base/${_safe(desc.name)}_off.jpg', off);
+          final uploaded = await _upload('$base/${_safe(desc.name)}_off.jpg', off);
           _say('  torch-off: ${(off.length / 1024).toStringAsFixed(0)}KB '
-              '${r.caps['imgOff'] ?? ''} sharp=${r.sharpOff.toStringAsFixed(0)}');
+              '${r.caps['imgOff'] ?? ''} sharp=${r.sharpOff.toStringAsFixed(0)} '
+              '${uploaded ? '' : '(upload FAILED)'}');
         } catch (e) {
           if (e is _SkipRequested) rethrow;
           _say('  torch-off capture failed: $e');
@@ -192,13 +215,14 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
         // Torch ON still (main flash LED; night-vision camera auto-uses its IR).
         try {
           await ctrl.setFlashMode(FlashMode.torch);
-          await Future<void>.delayed(const Duration(milliseconds: 500));
+          await _countdownThen(2); // hold steady while AE re-settles for torch
           final on = await _capture(ctrl);
           r.sharpOn = await _sharpness(on, desc.sensorOrientation);
           r.caps['imgOn'] = _jpegDims(on);
-          await _upload('$base/${_safe(desc.name)}_torch.jpg', on);
+          final uploaded = await _upload('$base/${_safe(desc.name)}_torch.jpg', on);
           await ctrl.setFlashMode(FlashMode.off);
-          _say('  torch-on:  sharp=${r.sharpOn.toStringAsFixed(0)}');
+          _say('  torch-on:  sharp=${r.sharpOn.toStringAsFixed(0)} '
+              '${uploaded ? '' : '(upload FAILED)'}');
         } catch (e) {
           if (e is _SkipRequested) rethrow;
           _say('  torch-on capture failed: $e');
@@ -233,10 +257,20 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
         'rearCameraCount': back.length,
         'cameras': docCams,
       };
-      await _upload('$base/probe.json',
+      final ok = await _upload('$base/probe.json',
           Uint8List.fromList(utf8.encode(const JsonEncoder.withIndent('  ').convert(meta))),
           contentType: 'application/json');
-      _say('✓ wrote $base/probe.json');
+      if (ok) {
+        _say('✓ wrote $base/probe.json');
+      } else {
+        // Storage rules on captures/ likely only allow image content-types --
+        // fall back to logging the full manifest on-screen so nothing is lost
+        // (a screenshot captures it, same as the sharpness ranking above).
+        _say('✗ probe.json upload rejected -- full manifest below:');
+        for (final line in const JsonEncoder.withIndent('  ').convert(meta).split('\n')) {
+          _say('  $line');
+        }
+      }
     } catch (e) {
       _say('metadata upload failed: $e');
     }
@@ -307,14 +341,18 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
 
   String _safe(String s) => s.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
 
-  Future<void> _upload(String path, Uint8List bytes, {String contentType = 'image/jpeg'}) async {
+  /// Returns whether the upload actually succeeded — callers must check this
+  /// rather than assume success, since a prior cut logged "✓ wrote" even when
+  /// every retry had failed (probe.json silently never landed in Storage,
+  /// likely a content-type restriction on the captures/ path).
+  Future<bool> _upload(String path, Uint8List bytes, {String contentType = 'image/jpeg'}) async {
     for (var attempt = 0; ; attempt++) {
       try {
         await FirebaseStorage.instance.ref().child(path).putData(
             bytes, SettableMetadata(contentType: contentType));
-        return;
+        return true;
       } catch (e) {
-        if (attempt >= 2) { _say('  upload failed ($path): $e'); return; }
+        if (attempt >= 2) { _say('  upload failed ($path): $e'); return false; }
         await Future<void>.delayed(Duration(milliseconds: 800 * (attempt + 1)));
       }
     }
@@ -362,13 +400,34 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
             ),
             if (showPreview) ...[
               const SizedBox(height: 8),
+              // Large and prominent — the whole point is you can SEE the
+              // camera has opened and where to place your thumb, instead of
+              // placing it blind. Same reticle oval the real capture flow
+              // uses, so the framing target is familiar.
               SizedBox(
-                height: 160,
+                height: MediaQuery.of(context).size.height * 0.42,
                 child: ClipRRect(
                   borderRadius: BorderRadius.circular(8),
-                  child: AspectRatio(
-                    aspectRatio: ctrl.value.aspectRatio,
-                    child: CameraPreview(ctrl),
+                  child: Stack(
+                    fit: StackFit.expand,
+                    children: [
+                      FittedBox(
+                        fit: BoxFit.cover,
+                        child: SizedBox(
+                          width: ctrl.value.previewSize?.height ?? 100,
+                          height: ctrl.value.previewSize?.width ?? 100,
+                          child: CameraPreview(ctrl),
+                        ),
+                      ),
+                      CaptureReticleOverlay(
+                        state: _countdown != null
+                            ? ReticleState.capturing
+                            : ReticleState.aligning,
+                        hint: _countdown != null
+                            ? 'Hold steady — capturing in $_countdown…'
+                            : 'Place thumb pad in the oval',
+                      ),
+                    ],
                   ),
                 ),
               ),
