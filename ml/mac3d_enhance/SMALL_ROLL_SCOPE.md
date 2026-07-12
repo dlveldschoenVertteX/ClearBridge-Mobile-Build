@@ -1,5 +1,33 @@
 # Scope: small-roll pad-flattening for NFIQ (continuous small-baseline chaining)
 
+> ## ⛔ Phase-0 RESULT: NO-GO (validated 2026-07-12)
+>
+> Phase-0 ran two ways. A simplified scorer suggested a big win (+2 to +14 NFIQ
+> from per-region max-coherence compositing of <=15° frames). **But re-run
+> through the real production pipeline (U-Net segmentation + guards), the gain
+> vanished:** on one capture the composite's seams even made segmentation grab
+> 100% of the frame (rejected); on the others it matched or *underperformed* the
+> single frame. The simplified number was a harness artifact.
+>
+> **Root cause (fundamental, not tuning):** compositing differently-warped views
+> of deformable skin introduces sub-pixel ridge *discontinuities* at the joins.
+> Those break exactly what the pipeline needs — clean segmentation and ridge
+> *continuity* (which NFIQ and any minutiae matcher reward). A denser continuous
+> roll makes each warp step smaller but still stitches across views, so it
+> wouldn't fix the continuity break. The edge-coherence mechanism is real
+> (+45–69%), but it does not translate to NFIQ through a continuity-sensitive
+> pipeline.
+>
+> **Verdict:** do not build the small-roll capture mode for NFIQ. The lever that
+> works — improving ridge quality *without* cross-view stitching — is the
+> **learned restoration model** (single-view in, clean-ridge out; no joins to
+> break). Redirect effort there. The shipped weighted-average mosaic
+> (`mosaicFreq`, +1.5 on one capture) stays as the harmless max-variant it
+> already is. Original scoping below kept for the record.
+
+---
+
+
 **Goal:** sharpen the thumb pad's LEFT/RIGHT edges — which curve away from a
 face-on camera and are always soft in a single shot — by compositing views from
 a *small* continuous roll, WITHOUT extending coverage beyond the pad (which
