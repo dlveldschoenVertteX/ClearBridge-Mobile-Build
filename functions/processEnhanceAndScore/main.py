@@ -629,6 +629,38 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     afis_nfiq = _s
                     best_afis_img = _img
                     afis_params = {**_p, 'afisNfiq': round(_s, 2)}
+
+            # Secondary-camera candidates: independent single-frame renderings
+            # from any OTHER back camera the device captured alongside the main
+            # sweep (see OscillatingCaptureController's best-effort secondary
+            # capture -- e.g. this Doogee S118's IR/night-vision sensor,
+            # validated at +3 NFIQ over the main camera on a real capture).
+            # Each is scored as its own single-frame candidate, same pattern as
+            # the 'native' variant above, and only replaces best_afis_img if it
+            # scores higher -- purely additive, same max-variant guarantee.
+            _db, _ = _get_firebase()
+            _cap_doc = _db.collection('captures').document(capture_id).get().to_dict() or {}
+            for _cam in _cap_doc.get('secondaryCameras', []) or []:
+                _spath = _cam.get('path')
+                if not _spath:
+                    continue
+                try:
+                    _sbytes = _download_storage_file(_spath)
+                    _simg = _decode_image(_sbytes)
+                    _sname = f"secondary_{_cam.get('name', 'cam')}"
+                    _simg_res, _sp = afis_print.generate([_simg], [0.0], [None])
+                    if _simg_res is None:
+                        continue
+                    _sres = _score_nfiq(_simg_res, sfm_coverage=1.0)
+                    _ss = _sres.get('nfiq_score', 0.0) if not _sres.get('error') else 0.0
+                    logger.info('AFIS variant %s nfiq=%.1f', _sname, _ss)
+                    if _ss > afis_nfiq:
+                        afis_nfiq = _ss
+                        best_afis_img = _simg_res
+                        afis_params = {**_sp, 'afisNfiq': round(_ss, 2), 'afisSource': _sname}
+                except Exception as _sec_exc:   # noqa: BLE001 — never block the pipeline
+                    logger.warning('secondary camera %s scoring failed (non-critical): %s', _spath, _sec_exc)
+
             if best_afis_img is not None:
                 afis_path = _save_afis_print(best_afis_img, user_id, capture_id)
         except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline

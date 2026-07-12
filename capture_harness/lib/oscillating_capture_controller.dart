@@ -1548,6 +1548,58 @@ class OscillatingCaptureController extends ChangeNotifier {
       }
       await firestoreFuture;
 
+      // Best-effort secondary-camera capture: try any OTHER back cameras this
+      // device exposes (e.g. this Doogee S118's IR/night-vision + ultrawide
+      // sensors) for one extra torch-lit still each, purely additive to the
+      // main flow above. Validated server-side through the real production
+      // pipeline: on this device the IR camera's torch shot alone scored
+      // competitively with (and here, above) the main camera's best single
+      // frame -- see docs/CAPTURE_OPTIMIZATION_SCOPE.md. This can never
+      // block or risk the primary capture: it runs AFTER the main camera's
+      // stream is stopped and the main frames + Firestore doc are already
+      // committed, so there is nothing left for a failure here to jeopardise.
+      // Many devices can only hold one camera session open at a time --
+      // opening a second physical camera here may simply fail, which is
+      // caught and skipped silently per-camera, same as every other
+      // best-effort step in this controller.
+      final secondaryMeta = <Map<String, dynamic>>[];
+      try {
+        final allCams = await availableCameras();
+        final mainName = _camera?.description.name;
+        final others = allCams.where((c) =>
+            c.lensDirection == CameraLensDirection.back && c.name != mainName);
+        for (final desc in others) {
+          CameraController? tmp;
+          try {
+            tmp = CameraController(desc, ResolutionPreset.max, enableAudio: false);
+            await tmp.initialize().timeout(const Duration(seconds: 8));
+            await tmp.setFlashMode(FlashMode.torch);
+            await Future<void>.delayed(const Duration(milliseconds: 600));
+            final shot = await tmp.takePicture();
+            final bytes = await shot.readAsBytes();
+            await tmp.setFlashMode(FlashMode.off);
+            final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+            final path = '$basePath/secondary_${safeName}_torch.jpg';
+            await _uploadWithRetry(bytes, path);
+            secondaryMeta.add({'name': desc.name, 'path': path});
+          } catch (e) {
+            debugPrint('[osc] secondary camera ${desc.name} skipped: $e');
+          } finally {
+            try {
+              await tmp?.dispose();
+            } catch (_) {}
+          }
+        }
+        if (secondaryMeta.isNotEmpty) {
+          await FirebaseFirestore.instance
+              .collection('captures')
+              .doc(id)
+              .update({'secondaryCameras': secondaryMeta});
+        }
+      } catch (e) {
+        debugPrint('[osc] secondary camera capture skipped entirely: $e');
+      }
+
       // Fire-and-forget, matching every other capture mode's uploader
       // (BackendCaptureUploader.uploadAndProcess /
       // ArcCaptureUploader.uploadArcAndProcess) — the callable's own
