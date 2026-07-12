@@ -16,10 +16,15 @@ import 'package:clearbridge_beta/clearbridge_colors.dart';
 /// Turns three guesses into measured facts, on THIS device:
 ///   1. which rear cameras Flutter can actually open (main / night-vision+IR /
 ///      ultrawide on the Doogee S118), with their capabilities;
-///   2. which one resolves thumb ridges the sharpest — a blur-then-Laplacian
-///      estimate on a centre crop (raw Laplacian was found to be fooled by
-///      sensor noise: a grainy shot outscored a genuinely cleaner one in
-///      testing, hence the pre-smoothing);
+///   2. which one resolves thumb ridges the sharpest — a Laplacian-variance
+///      estimate on a centre crop. Rough on-device TRIAGE only, not the
+///      scoring authority (the pipeline's real NFIQ score is) — it can be
+///      fooled by sensor noise (a grainy shot can outscore a genuinely
+///      cleaner one), and a pre-smoothing fix for that was tried and
+///      reverted after it over-blurred away the ridge structure itself
+///      (~9-20px period) along with the noise, crushing every score toward
+///      zero. Worth another attempt with local Flutter testing to calibrate
+///      safely, not attempted blind again;
 ///   3. whether torch/flash helps each, and whether a forced negative EV
 ///      offset recovers ridge detail on cameras whose metered still comes
 ///      back blown out (motivated by a field observation: ridges visible in
@@ -360,24 +365,22 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
   /// Decodes via the hardware-accelerated downscaler (targetWidth 1024) so a
   /// 50MP still never gets fully decoded in pure Dart.
   ///
-  /// Pre-smooths before measuring: a raw Laplacian on the untouched still is
-  /// fooled by sensor noise, since grain reads as high-frequency energy just
-  /// like real ridges do. Confirmed on real captures during testing — a
-  /// grainy low-light shot scored HIGHER than a genuinely cleaner one. A
-  /// mild blur first removes single-pixel grain while ridge-scale structure
-  /// (many pixels wide) survives, so the score tracks true detail again —
-  /// same principle as the server-side ridge-energy probe, just implemented
-  /// as blur-then-Laplacian here instead of a difference-of-Gaussians.
+  /// A pre-smoothing pass was tried here to fix a real accuracy issue (raw
+  /// Laplacian is fooled by sensor noise — a grainy low-light shot scored
+  /// higher than a genuinely cleaner one in earlier testing) but a 3-pass
+  /// box blur turned out to blur away the ridge structure itself (~9-20px
+  /// period in these captures), not just single-pixel grain — every shot in
+  /// the next test came back reading ~0. Reverted to the plain, proven
+  /// metric: this is explicitly a rough on-device TRIAGE tool, not the
+  /// scoring authority (the pipeline's real NFIQ score is), so reliability
+  /// matters more here than a refinement that needs local Flutter testing to
+  /// calibrate safely, which isn't available in this environment.
   Future<double> _sharpness(Uint8List jpeg, int sensorOrientation) async {
     final DecodedStillLuma? d =
         await decodeStillJpegToLuma(jpeg, sensorOrientation, targetWidth: 1024);
     if (d == null) return 0;
+    final lum = d.luma;
     final w = d.width, h = d.height;
-    final raw = Float32List(w * h);
-    for (var i = 0; i < raw.length; i++) {
-      raw[i] = d.luma[i].toDouble();
-    }
-    final smoothed = _boxBlur3x(raw, w, h, 2);
     final s = w < h ? w : h;
     final x0 = (w - s) ~/ 2 + s ~/ 4;
     final y0 = (h - s) ~/ 2 + s ~/ 4;
@@ -388,8 +391,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     for (var y = y0 + 1; y < y0 + cs - 1; y += 2) {
       for (var x = x0 + 1; x < x0 + cs - 1; x += 2) {
         final i = y * w + x;
-        final lap = 4.0 * smoothed[i] - smoothed[i - 1] - smoothed[i + 1] -
-            smoothed[i - w] - smoothed[i + w];
+        final lap = 4.0 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
         vals.add(lap);
         mean += lap;
         n++;
@@ -400,56 +402,6 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     double v = 0;
     for (final x in vals) { final dd = x - mean; v += dd * dd; }
     return v / n;
-  }
-
-  /// 3-pass box blur (horizontal + vertical each pass) — a standard, cheap
-  /// approximation of a Gaussian blur (each pass narrows the result toward a
-  /// normal distribution per the Central Limit Theorem). Precision doesn't
-  /// matter here, only that it meaningfully suppresses single-pixel noise.
-  Float32List _boxBlur3x(Float32List src, int w, int h, int radius) {
-    var buf = src;
-    for (var pass = 0; pass < 3; pass++) {
-      buf = _boxBlurH(buf, w, h, radius);
-      buf = _boxBlurV(buf, w, h, radius);
-    }
-    return buf;
-  }
-
-  Float32List _boxBlurH(Float32List src, int w, int h, int r) {
-    final out = Float32List(w * h);
-    for (var y = 0; y < h; y++) {
-      final rowBase = y * w;
-      double sum = 0;
-      for (var k = -r; k <= r; k++) {
-        sum += src[rowBase + k.clamp(0, w - 1)];
-      }
-      out[rowBase] = sum / (2 * r + 1);
-      for (var x = 1; x < w; x++) {
-        final addIdx = (x + r).clamp(0, w - 1);
-        final subIdx = (x - r - 1).clamp(0, w - 1);
-        sum += src[rowBase + addIdx] - src[rowBase + subIdx];
-        out[rowBase + x] = sum / (2 * r + 1);
-      }
-    }
-    return out;
-  }
-
-  Float32List _boxBlurV(Float32List src, int w, int h, int r) {
-    final out = Float32List(w * h);
-    for (var x = 0; x < w; x++) {
-      double sum = 0;
-      for (var k = -r; k <= r; k++) {
-        sum += src[k.clamp(0, h - 1) * w + x];
-      }
-      out[x] = sum / (2 * r + 1);
-      for (var y = 1; y < h; y++) {
-        final addIdx = (y + r).clamp(0, h - 1);
-        final subIdx = (y - r - 1).clamp(0, h - 1);
-        sum += src[addIdx * w + x] - src[subIdx * w + x];
-        out[y * w + x] = sum / (2 * r + 1);
-      }
-    }
-    return out;
   }
 
   String _safe(String s) => s.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
