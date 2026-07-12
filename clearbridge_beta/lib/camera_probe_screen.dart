@@ -84,7 +84,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
 
     final docCams = <Map<String, dynamic>>[];
     for (final desc in back) {
-      final r = _CamResult(desc.name);
+      final r = _CamResult();
       _results.add(r);
       _say('── probing ${desc.name} (${desc.lensType.name}) ──');
       CameraController? ctrl;
