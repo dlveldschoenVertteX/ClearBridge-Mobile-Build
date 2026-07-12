@@ -371,7 +371,12 @@ class OscillatingCaptureController extends ChangeNotifier {
   static const double _holdToleranceDeg = 5.0;
   static const double _waypointToleranceDeg = 5.0;
   static const int _holdDurationMs = 1500;
-  static const int _burstFrameCount = 3; // reduced from 5 per field-test feedback on burst duration
+  // 3 (reduced from 5 per field-test feedback on burst duration) undershot
+  // the raw material the backend's deep-fuse denoise variant needs -- a real
+  // capture with only 3/hold produced just 9 total near-face-on raw shots
+  // for it to work with. 4 is a middle ground: modest hold-time cost, more
+  // room for deepFuse without reverting all the way to the original length.
+  static const int _burstFrameCount = 4;
   static const int _burstShotDelayMs = 50;
   static const int _burstFlashSettleMs = 70; // AE settle after toggling torch mid-burst
   static const double _maxAngularVelocityDegPerSec = 30.0;
