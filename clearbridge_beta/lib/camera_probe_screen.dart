@@ -16,10 +16,16 @@ import 'package:clearbridge_beta/clearbridge_colors.dart';
 /// Turns three guesses into measured facts, on THIS device:
 ///   1. which rear cameras Flutter can actually open (main / night-vision+IR /
 ///      ultrawide on the Doogee S118), with their capabilities;
-///   2. which one resolves thumb ridges the sharpest (on-device Laplacian-
-///      variance of a centre crop, so you get an instant ranking);
-///   3. whether torch/flash helps each, and whether the IR night-vision camera
-///      is worth pursuing as an ambient-independent source.
+///   2. which one resolves thumb ridges the sharpest — a blur-then-Laplacian
+///      estimate on a centre crop (raw Laplacian was found to be fooled by
+///      sensor noise: a grainy shot outscored a genuinely cleaner one in
+///      testing, hence the pre-smoothing);
+///   3. whether torch/flash helps each, and whether a forced negative EV
+///      offset recovers ridge detail on cameras whose metered still comes
+///      back blown out (motivated by a field observation: ridges visible in
+///      the IR/night-vision camera's LIVE preview, but every metered still
+///      overexposed white — that split points at the still-capture exposure
+///      being wrong, not the sensor being incapable).
 ///
 /// Uses [CameraService] (the SAME camera-lifecycle helper the real capture
 /// flow uses) instead of a raw CameraController, specifically for its
@@ -51,7 +57,21 @@ class _CamResult {
   final Map<String, dynamic> caps = {};
   double sharpOff = 0;
   double sharpOn = 0;
+  double sharpEvLow = 0;
   String status = 'pending';
+
+  double get best {
+    var m = sharpOff;
+    if (sharpOn > m) m = sharpOn;
+    if (sharpEvLow > m) m = sharpEvLow;
+    return m;
+  }
+
+  String get bestLabel {
+    if (best == sharpEvLow && sharpEvLow > 0) return 'ev-low';
+    if (best == sharpOn && sharpOn > 0) return 'torch';
+    return 'ambient';
+  }
 }
 
 class _CameraProbeScreenState extends State<CameraProbeScreen> {
@@ -227,6 +247,34 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
           if (e is _SkipRequested) rethrow;
           _say('  torch-on capture failed: $e');
         }
+        _checkSkip();
+        // EV-compensated still. Motivated by a direct field observation: on
+        // the IR/night-vision camera, ridges were visible in the LIVE preview
+        // but every still (torch off AND on) came back fully blown out white.
+        // That split points at the metered STILL exposure being wrong, not
+        // the sensor being incapable -- Camera2/CameraX can meter a still
+        // differently than the live preview, especially with a dedicated IR
+        // illuminator that isn't driven by the visible-light torch API at
+        // all. Force exposure down to the camera's own reported minimum and
+        // shoot again with torch off to test whether that recovers detail.
+        try {
+          await ctrl.setFlashMode(FlashMode.off);
+          final minEv = await _tryD(() => ctrl.getMinExposureOffset()) ?? -2.0;
+          await ctrl.setExposureOffset(minEv);
+          await _countdownThen(2);
+          final evShot = await _capture(ctrl);
+          r.sharpEvLow = await _sharpness(evShot, desc.sensorOrientation);
+          r.caps['imgEvLow'] = _jpegDims(evShot);
+          final uploaded =
+              await _upload('$base/${_safe(desc.name)}_evlow.jpg', evShot);
+          await ctrl.setExposureOffset(0.0);
+          _say('  ev-low (${minEv.toStringAsFixed(1)}): '
+              'sharp=${r.sharpEvLow.toStringAsFixed(0)} '
+              '${uploaded ? '' : '(upload FAILED)'}');
+        } catch (e) {
+          if (e is _SkipRequested) rethrow;
+          _say('  ev-low capture failed: $e');
+        }
         r.status = 'ok';
       } on _SkipRequested {
         r.status = 'skipped-by-user';
@@ -241,6 +289,7 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
       }
       r.caps['sharpnessOff'] = r.sharpOff;
       r.caps['sharpnessTorch'] = r.sharpOn;
+      r.caps['sharpnessEvLow'] = r.sharpEvLow;
       r.caps['status'] = r.status;
       docCams.add(r.caps);
       if (mounted) setState(() {});
@@ -310,12 +359,25 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
   /// Laplacian-variance sharpness on the central ROI — higher = crisper ridges.
   /// Decodes via the hardware-accelerated downscaler (targetWidth 1024) so a
   /// 50MP still never gets fully decoded in pure Dart.
+  ///
+  /// Pre-smooths before measuring: a raw Laplacian on the untouched still is
+  /// fooled by sensor noise, since grain reads as high-frequency energy just
+  /// like real ridges do. Confirmed on real captures during testing — a
+  /// grainy low-light shot scored HIGHER than a genuinely cleaner one. A
+  /// mild blur first removes single-pixel grain while ridge-scale structure
+  /// (many pixels wide) survives, so the score tracks true detail again —
+  /// same principle as the server-side ridge-energy probe, just implemented
+  /// as blur-then-Laplacian here instead of a difference-of-Gaussians.
   Future<double> _sharpness(Uint8List jpeg, int sensorOrientation) async {
     final DecodedStillLuma? d =
         await decodeStillJpegToLuma(jpeg, sensorOrientation, targetWidth: 1024);
     if (d == null) return 0;
-    final lum = d.luma;
     final w = d.width, h = d.height;
+    final raw = Float32List(w * h);
+    for (var i = 0; i < raw.length; i++) {
+      raw[i] = d.luma[i].toDouble();
+    }
+    final smoothed = _boxBlur3x(raw, w, h, 2);
     final s = w < h ? w : h;
     final x0 = (w - s) ~/ 2 + s ~/ 4;
     final y0 = (h - s) ~/ 2 + s ~/ 4;
@@ -326,7 +388,8 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     for (var y = y0 + 1; y < y0 + cs - 1; y += 2) {
       for (var x = x0 + 1; x < x0 + cs - 1; x += 2) {
         final i = y * w + x;
-        final lap = 4.0 * lum[i] - lum[i - 1] - lum[i + 1] - lum[i - w] - lum[i + w];
+        final lap = 4.0 * smoothed[i] - smoothed[i - 1] - smoothed[i + 1] -
+            smoothed[i - w] - smoothed[i + w];
         vals.add(lap);
         mean += lap;
         n++;
@@ -337,6 +400,56 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
     double v = 0;
     for (final x in vals) { final dd = x - mean; v += dd * dd; }
     return v / n;
+  }
+
+  /// 3-pass box blur (horizontal + vertical each pass) — a standard, cheap
+  /// approximation of a Gaussian blur (each pass narrows the result toward a
+  /// normal distribution per the Central Limit Theorem). Precision doesn't
+  /// matter here, only that it meaningfully suppresses single-pixel noise.
+  Float32List _boxBlur3x(Float32List src, int w, int h, int radius) {
+    var buf = src;
+    for (var pass = 0; pass < 3; pass++) {
+      buf = _boxBlurH(buf, w, h, radius);
+      buf = _boxBlurV(buf, w, h, radius);
+    }
+    return buf;
+  }
+
+  Float32List _boxBlurH(Float32List src, int w, int h, int r) {
+    final out = Float32List(w * h);
+    for (var y = 0; y < h; y++) {
+      final rowBase = y * w;
+      double sum = 0;
+      for (var k = -r; k <= r; k++) {
+        sum += src[rowBase + k.clamp(0, w - 1)];
+      }
+      out[rowBase] = sum / (2 * r + 1);
+      for (var x = 1; x < w; x++) {
+        final addIdx = (x + r).clamp(0, w - 1);
+        final subIdx = (x - r - 1).clamp(0, w - 1);
+        sum += src[rowBase + addIdx] - src[rowBase + subIdx];
+        out[rowBase + x] = sum / (2 * r + 1);
+      }
+    }
+    return out;
+  }
+
+  Float32List _boxBlurV(Float32List src, int w, int h, int r) {
+    final out = Float32List(w * h);
+    for (var x = 0; x < w; x++) {
+      double sum = 0;
+      for (var k = -r; k <= r; k++) {
+        sum += src[k.clamp(0, h - 1) * w + x];
+      }
+      out[x] = sum / (2 * r + 1);
+      for (var y = 1; y < h; y++) {
+        final addIdx = (y + r).clamp(0, h - 1);
+        final subIdx = (y - r - 1).clamp(0, h - 1);
+        sum += src[addIdx * w + x] - src[subIdx * w + x];
+        out[y * w + x] = sum / (2 * r + 1);
+      }
+    }
+    return out;
   }
 
   String _safe(String s) => s.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
@@ -460,8 +573,10 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
   }
 
   Widget _rankCard() {
-    double best(_CamResult r) => r.sharpOff > r.sharpOn ? r.sharpOff : r.sharpOn;
-    final ranked = [..._results]..sort((a, b) => best(b).compareTo(best(a)));
+    final ranked = [..._results]..sort((a, b) => b.best.compareTo(a.best));
+    final overall = ranked.where((r) => r.status == 'ok').isEmpty
+        ? null
+        : ranked.firstWhere((r) => r.status == 'ok');
     return Container(
       padding: const EdgeInsets.all(10),
       decoration: BoxDecoration(
@@ -469,21 +584,37 @@ class _CameraProbeScreenState extends State<CameraProbeScreen> {
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          const Text('Sharpness ranking (higher = crisper ridges)',
+          const Text('Sharpness ranking (higher = crisper ridges; on-device '
+              'estimate only — the pipeline\'s real NFIQ score is the '
+              'authority, this is triage)',
               style: TextStyle(color: ClearBridgeColors.silverBright, fontWeight: FontWeight.bold)),
           const SizedBox(height: 6),
           ...ranked.map((r) {
-            final lensType = (r.caps['lensType'] ?? '?').toString();
+            final name = (r.caps['name'] ?? '?').toString();
             return Padding(
               padding: const EdgeInsets.symmetric(vertical: 2),
               child: Text(
-                '${r.status == 'ok' ? '✓' : '✗'} $lensType  '
-                'off=${r.sharpOff.toStringAsFixed(0)} torch=${r.sharpOn.toStringAsFixed(0)}  '
-                '→ ${best(r).toStringAsFixed(0)}  [${r.status}]',
+                '${r.status == 'ok' ? '✓' : '✗'} cam$name  '
+                'ambient=${r.sharpOff.toStringAsFixed(0)} '
+                'torch=${r.sharpOn.toStringAsFixed(0)} '
+                'evLow=${r.sharpEvLow.toStringAsFixed(0)}  '
+                '→ ${r.best.toStringAsFixed(0)} (${r.bestLabel})  [${r.status}]',
                 style: const TextStyle(color: ClearBridgeColors.silverDim, fontSize: 13),
               ),
             );
           }),
+          if (overall != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              'Best pick so far: camera ${overall.caps['name']} · '
+              '${overall.bestLabel} (score ${overall.best.toStringAsFixed(0)}) — '
+              'multi-camera capture should let this kind of comparison pick '
+              'the source per capture, same as the backend already does '
+              'across renderings.',
+              style: const TextStyle(
+                  color: ClearBridgeColors.cyan, fontSize: 12, fontWeight: FontWeight.bold),
+            ),
+          ],
         ],
       ),
     );
