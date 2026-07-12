@@ -3,6 +3,11 @@ name: Deploy Python Pipeline Function
 # Manually triggered only -- this deploys the production
 # processEnhanceAndScore Cloud Function (africa-south1) and must never fire
 # automatically on push, unlike the APK/hosting jobs in build.yml.
+#
+# NOTE: workflow_dispatch can only be triggered via the GitHub API/UI once
+# this file exists on the repo's default branch -- until then, run it via
+# the Actions tab's "Run workflow" button after merging, or trigger from a
+# branch that already has it merged in.
 on:
   workflow_dispatch: {}
 
