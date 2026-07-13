@@ -7,3 +7,5 @@ torch>=2.0,<2.5
 torchvision>=0.15,<0.20
 opencv-contrib-python-headless>=4.8,<4.11
 scipy>=1.11,<2.0
+requests>=2.31,<3.0
+google-auth>=2.23,<3.0

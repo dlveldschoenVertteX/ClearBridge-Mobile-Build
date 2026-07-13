@@ -20,6 +20,8 @@ import firebase_admin
 from firebase_admin import firestore, storage
 from firebase_functions import https_fn, options
 
+import nfiq2_client
+
 # cv2 / numpy / sfm_pipeline / enhancement_pipeline are heavy (DLL load on Windows).
 # Deferring them to first function invocation keeps module import <1 s so that the
 # Firebase CLI local analysis server (10 s timeout) can return functions.yaml.
@@ -670,6 +672,17 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         nfiq_score = max(cyl_nfiq, afis_nfiq)
         nfiq_pass  = nfiq_score >= _PASS_THRESHOLD
 
+        # ── 4d. Real NFIQ2 ground-truth score (additive, non-blocking) ─────────
+        # nfiqScore above is the ResNet18 proxy -- fast, used as the training/
+        # ranking signal throughout this pipeline, but a learned proxy, not the
+        # NIST ground-truth algorithm. Score the SAME image that won nfiqScore
+        # (mirrors the nfiqSource selection below) through the real NFIQ2
+        # binary via the sidecar service. Never blocks or fails the pipeline:
+        # score_nfiq2() itself never raises, and nfiq2Score is simply null in
+        # Firestore if the sidecar is unreachable, unconfigured, or times out.
+        winning_image = best_afis_img if (afis_nfiq >= cyl_nfiq and afis_nfiq > 0) else best_enhanced
+        nfiq2_score = nfiq2_client.score_nfiq2(winning_image)
+
         # ── 5. Henry classification ────────────────────────────────────────────
         # Use best TTA variant image — same preprocessing that scored highest.
         henry_class = _classify_henry(best_enhanced)
@@ -687,6 +700,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             'status':           'scored',
             'nfiqScore':        round(nfiq_score, 2),
             'nfiqPass':         nfiq_pass,
+            'nfiq2Score':       nfiq2_score,
             'nfiqSource':       'afis' if afis_nfiq >= cyl_nfiq and afis_nfiq > 0 else 'cylindrical',
             'nfiqCylindrical':  round(cyl_nfiq, 2),
             'nfiqAfis':         round(afis_nfiq, 2) if afis_nfiq > 0 else None,
