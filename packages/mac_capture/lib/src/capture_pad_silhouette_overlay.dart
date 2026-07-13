@@ -12,10 +12,11 @@ import 'capture_typography.dart';
 /// reconstructs the exact same superellipse as the (feathered) crop mask.
 /// Keep [n] in sync with afis_print._superellipse_mask's default exponent.
 ///
-/// Superellipse: |(x-cx)/rx|^n + |(y-cy)/ry|^n <= 1. n≈2.5 reads as a rounded
-/// thumb pad (fuller than an ellipse, softer than a rectangle). Drawn tip-up:
-/// the pad's tip points toward the TOP of the portrait screen, which is what
-/// lets the backend upright the print deterministically.
+/// Shape: tapered superellipse |(x-cx)/rx(t)|^n + |(y-cy)/ry|^n <= 1 where
+/// rx(t) = rx*(1+taper*sin(t)). sin(t)>0 = bottom half (base, wider),
+/// sin(t)<0 = top half (tip, narrower) — matches a real thumbprint silhouette.
+/// Drawn tip-up: the pad's tip points toward the TOP of the portrait screen,
+/// which is what lets the backend upright the print deterministically.
 class PadSilhouetteShape {
   const PadSilhouetteShape({
     required this.cx,
@@ -23,40 +24,43 @@ class PadSilhouetteShape {
     required this.rx,
     required this.ry,
     this.n = 2.5,
+    this.taper = 0.0,
   });
 
   final double cx;
   final double cy;
+  /// Nominal half-width (average across tip and base).
   final double rx;
   final double ry;
   final double n;
+  /// Taper amount [0,1]: how much wider the base is vs the tip.
+  /// At taper=0.20: base is rx*1.20 wide, tip is rx*0.80 wide.
+  final double taper;
 
-  /// Default pad shape — bounding box matches
-  /// OscillatingCaptureController._scoreRoi so framing, metering, masking and
-  /// the superprint crop all agree.
-  ///
-  /// Sized from real device feedback: an annotated screenshot showed the
-  /// prior guide (rx=0.184, ry=0.201) excluding real pad area a user marked
-  /// as should-be-included (rx=0.190, ry=0.263) -- same width, ~30% taller.
-  /// Grown symmetrically about the same centre (rather than shifting it)
-  /// since a taller guide already captures more both toward the tip and the
-  /// base without an unverified position change.
+  /// Default pad shape — a thumbprint oval: fatter base, narrower rounded tip.
+  /// Smaller than the prior symmetric superellipse based on CTO feedback.
+  /// Bounding box kept in sync with FrontCaptureController._scoreRoi so
+  /// framing, metering and the superprint crop all agree.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.5,
-    rx: 0.23,
-    ry: 0.36,
+    rx: 0.17,
+    ry: 0.26,
+    taper: 0.20,
   );
 
-  /// Normalized bounding rect (for driving focus/exposure ROI).
-  Rect get boundingRect =>
-      Rect.fromLTRB(cx - rx, cy - ry, cx + rx, cy + ry);
+  /// Max half-width (at the base).
+  double get rxMax => rx * (1.0 + taper);
 
-  /// Build the closed superellipse path in pixel space for a given canvas size.
+  /// Normalized bounding rect (uses max width for conservative metering).
+  Rect get boundingRect =>
+      Rect.fromLTRB(cx - rxMax, cy - ry, cx + rxMax, cy + ry);
+
+  /// Build the closed tapered-superellipse path in pixel space.
+  /// rx varies with sin(t): wider at the bottom (base), narrower at the top (tip).
   Path toPath(Size size, {double inflate = 0.0}) {
     final pcx = cx * size.width;
     final pcy = cy * size.height;
-    final a = rx * size.width + inflate;
     final b = ry * size.height + inflate;
     final e = 2.0 / n;
     final path = Path();
@@ -65,6 +69,8 @@ class PadSilhouetteShape {
       final t = (i / steps) * 2 * math.pi;
       final ct = math.cos(t);
       final st = math.sin(t);
+      // Taper: rx scales with sin(t) — positive at bottom, negative at top.
+      final a = (rx * (1.0 + taper * st)) * size.width + inflate;
       final x = pcx + a * _signPow(ct, e);
       final y = pcy + b * _signPow(st, e);
       if (i == 0) {

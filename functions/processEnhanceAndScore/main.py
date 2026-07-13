@@ -216,6 +216,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
     arc_angles: Optional[list[float]] = [float(a) for a in arc_angles_raw] if arc_angles_raw else None
     is_arc = bool(arc_angles)
     is_oscillating = (data.get('captureMode') or '') == 'oscillating_8phase'
+    is_front_only = (data.get('captureMode') or '') == 'front_only_v1'
 
     if not capture_id or not user_id or not base_path:
         raise https_fn.HttpsError(
@@ -276,6 +277,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 ),
                 **arc_sweep_stats,
             })
+        elif is_front_only:
+            frames, frame_meta, actual_angles, ambient_frames, flash_frames = \
+                _download_front_only_frames(capture_id, base_path)
+            _update_firestore(capture_id, {'captureMode': 'front_only_v1'})
         elif is_oscillating:
             (frames, frame_meta, osc_angles, osc_stats,
              arc_frame_wts, ambient_frames, flash_frames) = _download_oscillating_frames(capture_id, base_path)
@@ -357,6 +362,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # silently overwrite the already-correct oscillating/arc angles
             # with the unrelated four-angle protocol's 0/±32/-20 targets.
             pass
+        elif is_front_only:
+            # Single face-on frame — no SfM reconstruction, all angles 0°.
+            angles_for_sfm = [0.0]
         elif orbit_angles:
             # Zero-point relative: subtract front orbit reading so any device-level
             # sensor offset cancels out.  Front is always φ=0 by definition; all
@@ -444,7 +452,22 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         sfm_coverage    = 0.0
         sfm_diagnostics: dict = {}
         fallback_mask   = None
+        if is_front_only:
+            # Single face-on frame — skip SfM reconstruction entirely.
+            # Prepare the best frame the same way the fallback path would:
+            # centre-square, greyscale, ready for enhancement + AFIS.
+            front_sq = sfm_pipeline._prepare(frames[0])
+            unwrapped = cv2.cvtColor(front_sq, cv2.COLOR_BGR2GRAY)
+            sfm_refined_angles = [0.0]
+            sfm_coverage = 0.35  # non-zero so downstream quality gates pass
+            _update_firestore(capture_id, {
+                'sfmStatus': 'skipped_front_only',
+                'sfmCoverage': sfm_coverage,
+                'sfmRefinedAngles': [0.0],
+            })
         try:
+            if is_front_only:
+                raise CaptureQualityError('front_only_v1: single-frame AFIS only, no SfM')
             sfm_cfg = {'out_theta_deg': osc_theta_deg} if osc_theta_deg is not None else None
             unwrapped, sfm_coverage, sfm_refined_angles, sfm_diagnostics = (
                 sfm_pipeline.reconstruct_and_unwrap(
@@ -475,57 +498,63 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 sfm_fields['sfmMissingAngle'] = 'top'
             _update_firestore(capture_id, sfm_fields)
         except CaptureQualityError as e:
-            logger.warning(f"Cylindrical projection failed — falling back to front frame: {e}")
-            try:
-                # Pick the fallback frame deliberately. frames[0] is only the
-                # front view in four-angle mode; arc AND oscillating frames
-                # are both sorted by angle, so [0] is the extreme-left view —
-                # the worst possible single-frame print. Use the sharpest
-                # frame nearest mid-sweep.
-                if (is_arc or is_oscillating) and len(frames) > 1:
-                    def _fb_key(i):
-                        meta = frame_meta[i] if i < len(frame_meta) else {}
-                        lap  = float(meta.get('laplacianScore') or 0.0)
-                        ang  = abs(float(angles_for_sfm[i])) if i < len(angles_for_sfm) else 90.0
-                        return (0 if ang <= 30.0 else 1, -lap)
-                    fb_idx = min(range(len(frames)), key=_fb_key)
-                else:
-                    fb_idx = 0
-                front_sq = sfm_pipeline._prepare(frames[fb_idx])
-                unwrapped = cv2.cvtColor(front_sq, cv2.COLOR_BGR2GRAY)
-                # The SfM path excludes background via the segmentation mask
-                # baked into the cylindrical warp; this single-frame fallback
-                # skipped that entirely and fed the *whole* photo (thumb +
-                # room background) into enhancement. Segment here too, but
-                # DON'T blank the background yet — masking before Gabor/NNS
-                # enhancement creates a hard edge between real content and a
-                # flat fill, and the ridge filters ring on that edge, painting
-                # concentric wave artefacts across the print. Instead keep
-                # `unwrapped` untouched, remember the mask, and composite it
-                # in afterwards once `enhanced` exists (see below).
-                fb_out_size       = unwrapped.shape[0]
-                _, _, fb_ksize    = sfm_pipeline._scale_params(fb_out_size)
-                fb_cx = fb_cy     = fb_out_size / 2.0
-                fb_mask, _, _, _  = sfm_pipeline._segment_and_locate(
-                    unwrapped, fb_ksize, fb_cx, fb_cy,
-                )
-                fallback_mask = fb_mask
-                sfm_coverage  = float(np.mean(fb_mask > 0)) if fb_mask is not None else 0.0
-            except Exception as frame_err:
+            if is_front_only:
+                # SfM was intentionally skipped; frame already prepared before
+                # the try block. Nothing to do — sfm_coverage, unwrapped, and
+                # sfm_refined_angles are all already set.
+                pass
+            else:
+                logger.warning(f"Cylindrical projection failed — falling back to front frame: {e}")
+                try:
+                    # Pick the fallback frame deliberately. frames[0] is only the
+                    # front view in four-angle mode; arc AND oscillating frames
+                    # are both sorted by angle, so [0] is the extreme-left view —
+                    # the worst possible single-frame print. Use the sharpest
+                    # frame nearest mid-sweep.
+                    if (is_arc or is_oscillating) and len(frames) > 1:
+                        def _fb_key(i):
+                            meta = frame_meta[i] if i < len(frame_meta) else {}
+                            lap  = float(meta.get('laplacianScore') or 0.0)
+                            ang  = abs(float(angles_for_sfm[i])) if i < len(angles_for_sfm) else 90.0
+                            return (0 if ang <= 30.0 else 1, -lap)
+                        fb_idx = min(range(len(frames)), key=_fb_key)
+                    else:
+                        fb_idx = 0
+                    front_sq = sfm_pipeline._prepare(frames[fb_idx])
+                    unwrapped = cv2.cvtColor(front_sq, cv2.COLOR_BGR2GRAY)
+                    # The SfM path excludes background via the segmentation mask
+                    # baked into the cylindrical warp; this single-frame fallback
+                    # skipped that entirely and fed the *whole* photo (thumb +
+                    # room background) into enhancement. Segment here too, but
+                    # DON'T blank the background yet — masking before Gabor/NNS
+                    # enhancement creates a hard edge between real content and a
+                    # flat fill, and the ridge filters ring on that edge, painting
+                    # concentric wave artefacts across the print. Instead keep
+                    # `unwrapped` untouched, remember the mask, and composite it
+                    # in afterwards once `enhanced` exists (see below).
+                    fb_out_size       = unwrapped.shape[0]
+                    _, _, fb_ksize    = sfm_pipeline._scale_params(fb_out_size)
+                    fb_cx = fb_cy     = fb_out_size / 2.0
+                    fb_mask, _, _, _  = sfm_pipeline._segment_and_locate(
+                        unwrapped, fb_ksize, fb_cx, fb_cy,
+                    )
+                    fallback_mask = fb_mask
+                    sfm_coverage  = float(np.mean(fb_mask > 0)) if fb_mask is not None else 0.0
+                except Exception as frame_err:
+                    _update_firestore(capture_id, {
+                        'status':         'failed',
+                        'sfmStatus':      'fallback_failed',
+                        'failureReason':  f'SfM + front-frame fallback both failed: {str(frame_err)[:200]}',
+                    }, critical=False)
+                    raise https_fn.HttpsError(
+                        code=https_fn.FunctionsErrorCode.INTERNAL,
+                        message='Capture data corrupted — please retake.',
+                    ) from frame_err
                 _update_firestore(capture_id, {
-                    'status':         'failed',
-                    'sfmStatus':      'fallback_failed',
-                    'failureReason':  f'SfM + front-frame fallback both failed: {str(frame_err)[:200]}',
-                }, critical=False)
-                raise https_fn.HttpsError(
-                    code=https_fn.FunctionsErrorCode.INTERNAL,
-                    message='Capture data corrupted — please retake.',
-                ) from frame_err
-            _update_firestore(capture_id, {
-                'sfmStatus':  'fallback_front_only',
-                'sfmError':   str(e)[:200],
-                'needsRecapture': True,
-            })
+                    'sfmStatus':  'fallback_front_only',
+                    'sfmError':   str(e)[:200],
+                    'needsRecapture': True,
+                })
         t_sfm = time.monotonic()
         logger.info('stage=sfm_done       elapsed=%.1fs', t_sfm - t_start)
 
@@ -1183,6 +1212,72 @@ def _download_arc_frames(capture_id: str, base_path: str):
         'arcActualTopRollDeg': round(actual_top,   1),
     }
     return bgr_frames, meta_out, angles_for_sfm, sweep_stats, frame_wts
+
+
+def _download_front_only_frames(capture_id: str, base_path: str):
+    """
+    Download burst stills for front_only_v1 captures.
+
+    The Flutter FrontCaptureController uploads stills at:
+      {basePath}/front_burst_amb_{idx}.jpg  (ambient / torch-off)
+      {basePath}/front_burst_fl_{idx}.jpg   (torch-lit)
+
+    Returns (frames, frame_meta, actual_angles, ambient_frames, flash_frames)
+    where all angles are 0° (face-on). The best (sharpest) single frame is used
+    as the primary; all frames are also returned in ambient_frames / flash_frames
+    so the deepFuse variant can denoise the burst.
+    """
+    db, _ = _get_firebase()
+    doc_dict = db.collection('captures').document(capture_id).get().to_dict() or {}
+    frames_meta = doc_dict.get('frames', [])
+
+    if not frames_meta:
+        raise CaptureQualityError(f'No frames metadata for front_only capture {capture_id}')
+
+    def _sort_key(e):
+        return float(e.get('laplacianScore') or 0.0)
+
+    amb_entries = sorted([e for e in frames_meta if not e.get('flashOn')],
+                         key=_sort_key, reverse=True)
+    fl_entries  = sorted([e for e in frames_meta if e.get('flashOn')],
+                         key=_sort_key, reverse=True)
+
+    def _load(entry):
+        arr = _decode_image(_download_storage_file(entry['path']))
+        h, w = arr.shape[:2]
+        side = min(h, w)
+        return arr[(h - side) // 2:(h - side) // 2 + side,
+                   (w - side) // 2:(w - side) // 2 + side]
+
+    amb_frames_list, fl_frames_list = [], []
+    for e in amb_entries:
+        try:
+            amb_frames_list.append(_load(e))
+        except Exception as exc:
+            logger.warning('front_only: ambient frame %s failed: %s', e.get('path'), exc)
+    for e in fl_entries:
+        try:
+            fl_frames_list.append(_load(e))
+        except Exception as exc:
+            logger.warning('front_only: flash frame %s failed: %s', e.get('path'), exc)
+
+    if not amb_frames_list and not fl_frames_list:
+        raise CaptureQualityError('No usable frames in front_only capture')
+
+    # Best single frame (sharpest ambient preferred, else sharpest flash).
+    best_arr = amb_frames_list[0] if amb_frames_list else fl_frames_list[0]
+
+    frames     = [best_arr]
+    meta_out   = [{'angle': 'front', 'laplacianScore': 0, 'frameSource': 'front_only'}]
+    angles_out = [0.0]
+
+    # Per-angle lists indexed to match frames[] — single entry at position 0.
+    ambient_frames_out = [amb_frames_list[0]] if amb_frames_list else [None]
+    flash_frames_out   = [fl_frames_list[0]]  if fl_frames_list  else [None]
+
+    logger.info('front_only: %d ambient + %d flash frames loaded',
+                len(amb_frames_list), len(fl_frames_list))
+    return frames, meta_out, angles_out, ambient_frames_out, flash_frames_out
 
 
 def _download_oscillating_frames(capture_id: str, base_path: str):

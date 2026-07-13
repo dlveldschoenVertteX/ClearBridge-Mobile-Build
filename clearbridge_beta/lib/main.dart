@@ -9,7 +9,7 @@ import 'package:clearbridge_beta/camera_probe_screen.dart';
 import 'package:clearbridge_beta/clearbridge_colors.dart';
 import 'package:clearbridge_beta/clearcoin_screen.dart';
 import 'package:clearbridge_beta/firebase_options.dart';
-import 'package:clearbridge_beta/oscillating_capture_screen.dart';
+import 'package:clearbridge_beta/front_capture_screen.dart';
 import 'package:clearbridge_beta/splash_screen.dart';
 import 'package:clearbridge_beta/user_details_popia_screen.dart';
 
@@ -80,12 +80,11 @@ class _CaptureRoute extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return OscillatingCaptureScreen(
+    return FrontCaptureScreen(
       getUserId: () => FirebaseAuth.instance.currentUser?.uid,
       // No login screen in this single-flow app -- anonymous sign-in already
       // ran in main() before runApp(). This only fires if that sign-in
-      // failed (see main.dart's try/catch), so retry it silently; the user
-      // can press "Start Sequence" again once it succeeds.
+      // failed (see main.dart's try/catch), so retry it silently.
       onRequireLogin: () => FirebaseAuth.instance.signInAnonymously(),
       onComplete: (captureId) => _navigatorKey.currentState?.pushReplacement(
         MaterialPageRoute(
@@ -99,8 +98,6 @@ class _CaptureRoute extends StatelessWidget {
           ),
         ),
       ),
-      // No dashboard to fall back to in this single-flow app — closing the
-      // capture screen exits, matching BetaThankYouScreen's Exit button.
       onClose: () => SystemNavigator.pop(),
     );
   }
