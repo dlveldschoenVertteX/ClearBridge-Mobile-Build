@@ -330,6 +330,153 @@ def _coherence_hull_mask(g8: np.ndarray, bsize: int = _BLOCK) -> Optional[np.nda
     return cv2.erode(out, np.ones((15, 15), np.uint8))
 
 
+def _ridge_texture_strength(img: np.ndarray, orient: np.ndarray, bsize: int = 48, stride: int = 16) -> np.ndarray:
+    """
+    Per-PIXEL continuous ridge-periodicity strength (not a thresholded
+    block mask). A crease has a strong local gradient just like a ridge
+    does -- gradient coherence alone can't tell them apart. A crease does
+    NOT repeat at a short, consistent period the way a bank of parallel
+    ridges does, though -- autocorrelating each window along its own local
+    orientation (same technique as _ridge_wavelength) and reading off the
+    first peak's strength is a specific "is this actually fingerprint
+    ridge" signal (checked against a real capture: true pad windows median
+    0.254, background median 0.023 -- real separation). Overlapping windows
+    (stride < bsize) rather than a coarser upsampled grid: each window has
+    enough samples for a stable estimate, and the dense overlap makes the
+    field smooth by construction.
+    """
+    h, w = img.shape
+    ys = list(range(0, max(1, h - bsize), stride)) or [0]
+    xs = list(range(0, max(1, w - bsize), stride)) or [0]
+    grid = np.zeros((len(ys), len(xs)), dtype=np.float32)
+    for iy, y in enumerate(ys):
+        for ix, x in enumerate(xs):
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.shape != (bsize, bsize) or blk.std() < 8:
+                continue
+            ang = orient[min(y + bsize // 2, h - 1), min(x + bsize // 2, w - 1)]
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            if sig.std() < 1e-6:
+                continue
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            ac = ac / max(ac[0], 1e-6)
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]   # no upper bound -- native-res ridge period
+            # varies with capture distance/resolution (matches _ridge_wavelength,
+            # which clamps only its final aggregate, not each candidate peak)
+            if len(peaks):
+                grid[iy, ix] = max(0.0, float(ac[peaks[0]]))
+    return cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _crop_to_pad_mask(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Tighten a thumb-silhouette mask down to just the ridge-bearing pad,
+    dropping the DIP crease and everything beyond it (lower thumb segment,
+    palm). The U-Net/hull masks segment "thumb-shaped skin" -- on a close,
+    wide-framed capture that's far more than the pad.
+
+    Earlier attempts classified individual 2D blocks/windows as ridge-like
+    or not (first by gradient coherence, then by ridge periodicity) and
+    tried to consolidate the result into one connected region. Both failed:
+    coherence can't tell a crease from a ridge (a crease's strong local
+    gradient reads as "coherent" too), and periodicity -- though a real,
+    measurably discriminating signal -- turned out too spatially sparse at
+    any single block scale to consolidate without either falling back to
+    the unchanged mask or fragmenting into unusable islands, even after
+    several rounds of tuning window size, stride, and threshold.
+
+    This instead collapses the problem to 1D: project every mask pixel
+    onto the mask's own principal (long) axis -- the same axis
+    _upright_rotate independently computes for tip-up orientation -- and
+    average ridge-texture strength across each thin cross-section
+    perpendicular to that axis. A whole cross-section's average is far
+    more stable than any single block (the pad's dense parallel ridges
+    keep the average high; the crease's one sparse line plus the flat skin
+    around it drag it down), so finding where the profile falls off from
+    the pad's core is a single robust threshold crossing in each
+    direction, not a fragile 2D consolidation problem.
+    """
+    orient = _orientation_field(_normalize(gray))
+    strength = _ridge_texture_strength(gray, orient)
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return mask
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    center = pts.mean(axis=0)
+    _, s, vt = np.linalg.svd(pts - center, full_matrices=False)
+    if s[1] < 1e-6 or (s[0] / s[1]) < 1.15:
+        return mask   # no clear long axis -- leave alone, same guard as _upright_rotate
+    axis = vt[0]
+
+    proj = (pts - center) @ axis   # every mask pixel's 1D position along the long axis
+    vals = strength[ys, xs]
+
+    lo, hi = float(proj.min()), float(proj.max())
+    if hi - lo < 20:
+        return mask
+    n_bins = max(10, int((hi - lo) / 8))
+    bin_idx = np.clip(((proj - lo) / (hi - lo) * (n_bins - 1)).astype(int), 0, n_bins - 1)
+    bin_sum = np.bincount(bin_idx, weights=vals, minlength=n_bins)
+    bin_cnt = np.bincount(bin_idx, minlength=n_bins)
+    profile = np.where(bin_cnt > 0, bin_sum / np.maximum(bin_cnt, 1), 0.0).astype(np.float32)
+    profile = cv2.GaussianBlur(profile.reshape(-1, 1), (0, 0), 1.5).flatten()
+
+    # Pick the widest sustained band of periodicity, not simply the single
+    # tallest bin. A narrow, spurious high-periodicity spot (a stray
+    # reflection, a sharp-edged object at the frame's border) can outscore
+    # the real ridge band on peak height alone while covering only a
+    # handful of bins -- verified on a real capture where a 4-bin edge
+    # spike (0.223) beat a genuine ~35-bin ridge plateau (peak 0.104) and
+    # collapsed the kept region to nothing. Scoring contiguous above-floor
+    # runs by total area (width x strength) favours the sustained plateau
+    # a real print pad produces over a thin artifact spike.
+    floor_val = 0.05
+    above = profile >= floor_val
+    runs = []
+    start = None
+    for i in range(n_bins):
+        if above[i] and start is None:
+            start = i
+        elif not above[i] and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, n_bins - 1))
+
+    candidates = [(float(profile[a:b + 1].sum()), a, b)
+                  for a, b in runs if float(profile[a:b + 1].max()) >= 0.10]
+    if not candidates:
+        return mask   # no confident, sustained ridge core found -- keep the original mask
+    _, lo_bin, hi_bin = max(candidates, key=lambda c: c[0])
+
+    bin_width = (hi - lo) / (n_bins - 1)
+    keep_lo = lo - 0.5 * bin_width + lo_bin * bin_width
+    keep_hi = lo - 0.5 * bin_width + (hi_bin + 1) * bin_width
+    keep = (proj >= keep_lo) & (proj <= keep_hi)
+
+    pad_mask = np.zeros_like(mask)
+    pad_mask[ys[keep], xs[keep]] = 255
+    pad_mask = cv2.morphologyEx(pad_mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    # Fraction of the ORIGINAL mask kept, not of the whole frame -- the
+    # whole point of this function is to keep a genuine SUBSET of the mask
+    # (excluding the crease/hand), so a correct result is naturally a small
+    # fraction of the full image whenever the mask itself is. An earlier
+    # version checked (pad_mask > 0).mean() against the whole image, which
+    # rejected every real result as "too aggressive" purely because the
+    # mask itself was a minority of the frame -- not because the crop was
+    # actually wrong.
+    kept_frac_of_mask = (pad_mask > 0).sum() / max((mask > 0).sum(), 1)
+    if kept_frac_of_mask < 0.05:
+        return mask   # too aggressive -- keep the original rather than emit nothing
+    return pad_mask
+
+
 def _upright_rotate(binimg: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Rotate so the thumb pad's long axis is VERTICAL, tip-up.
@@ -592,16 +739,12 @@ def generate(
         params['afisMask'] = params['afisMask'] + '_rejected'
         return None, params
 
-    # NOTE: the mask above segments the whole visible thumb -- on a close,
-    # wide-framed capture that includes the DIP crease and lower thumb
-    # segment, not just the ridge-bearing pad, which shows up as a visible
-    # crease/hand in the rendered print and confuses _upright_rotate's
-    # tip-detection heuristic. Tried isolating the pad via ridge-coherence
-    # and ridge-periodicity block classification + region-growing (several
-    # iterations, real signal confirmed -- true pad windows measurably
-    # differ from crease/background) but couldn't get it to converge on a
-    # usable contiguous region in the time available. Left unfixed rather
-    # than shipping something unverified; worth a dedicated follow-up.
+    # Tighten to just the ridge-bearing pad -- the mask above segments the
+    # whole visible thumb (creases, lower segment, palm on a close/wide
+    # framing), not only the print-worthy area. See _crop_to_pad_mask. Uses
+    # g8 (CLAHE-boosted): raw contrast is too low across most of the frame
+    # for the block-std gate to pass at all.
+    mask = _crop_to_pad_mask(g8, mask)
 
     # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
     # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.
