@@ -594,6 +594,16 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
                 for m in frame_meta
             ]
+            # Guided capture: the user seated the pad in the on-screen
+            # silhouette, so the app wrote its region to the capture doc. The
+            # backend uses that region AS the (feathered) crop mask -- no
+            # free-range segmentation, no fragile ridge-periodicity crop. The
+            # region is already in the center-square-cropped frame's normalized
+            # coords (the space generate() receives), so it passes straight
+            # through. Absent (legacy captures) -> None -> segmentation path.
+            _guide_db, _ = _get_firebase()
+            _guide_doc = _guide_db.collection('captures').document(capture_id).get().to_dict() or {}
+            _guide_region = _guide_doc.get('guideRegion') or None
             # Score each rendering variant and keep the single best NFIQ. Every
             # variant is ADDITIVE — same-pose stacking and ridge-freq
             # normalisation each help some captures and hurt others, so they are
@@ -616,10 +626,16 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             #               illumination then fuse, freq-normalised (+2.5 on the
             #               burst-rich indoor capture; self-skips when the raw
             #               burst wasn't preserved, e.g. non-osc flows).
+            #   focusStack— same-pose burst combined by LOCAL sharpness (keep
+            #               the best-focused region of each shot) rather than a
+            #               flat mean: targets the pad's curved edges going soft
+            #               under shallow macro depth-of-field. Self-skips (falls
+            #               back to single frame) when <2 same-pose frames align.
             _afis_variants = (
                 ('native',     dict()),
                 ('freqNorm',   dict(freq_normalize=True)),
                 ('stack',      dict(stack=True)),
+                ('focusStack', dict(focus_stack=True)),
                 ('fuseAvg',    dict(fuse='avg')),
                 ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
                 ('deepFuse',   dict(fuse='deep', freq_normalize=True)),
@@ -629,6 +645,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     frames, angles_for_sfm, _laps,
                     ambient_frames=ambient_frames, flash_frames=flash_frames,
                     ambient_burst=ambient_burst, flash_burst=flash_burst,
+                    guide_region=_guide_region,
                     **_vkw)
                 if _img is None:
                     continue
@@ -648,8 +665,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # Each is scored as its own single-frame candidate, same pattern as
             # the 'native' variant above, and only replaces best_afis_img if it
             # scores higher -- purely additive, same max-variant guarantee.
-            _db, _ = _get_firebase()
-            _cap_doc = _db.collection('captures').document(capture_id).get().to_dict() or {}
+            # Reuse the capture doc already fetched above for guideRegion.
+            # Secondary cameras stay on the segmentation path (no guide_region):
+            # they're different physical sensors, not center-square-cropped, and
+            # don't share the main preview's framing the silhouette was shown in.
+            _cap_doc = _guide_doc
             for _cam in _cap_doc.get('secondaryCameras', []) or []:
                 _spath = _cam.get('path')
                 if not _spath:

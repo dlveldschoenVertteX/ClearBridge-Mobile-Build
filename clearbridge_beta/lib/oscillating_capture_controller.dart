@@ -426,6 +426,23 @@ class OscillatingCaptureController extends ChangeNotifier {
   // framing, metering, masking and the superprint crop all agree.
   static const Rect _scoreRoi = Rect.fromLTRB(0.28, 0.22, 0.72, 0.78);
 
+  // Guide region written to Firestore so the backend uses the pad silhouette
+  // the user visually filled AS the (feathered) crop mask -- no free-range
+  // segmentation, no fragile ridge-periodicity crop. Expressed in the
+  // CENTER-SQUARE-CROPPED landscape frame's normalized coords (the exact space
+  // afis_print.generate() receives), so main.py passes it straight through.
+  //
+  // Center is (0.5, 0.5): the user seats the pad in the centered on-screen
+  // silhouette, so the pad lands centered in the still, and a center-square
+  // crop keeps the centre centred. rx/ry are the pad half-extents in that
+  // frame; n matches PadSilhouetteShape / afis_print._superellipse_mask.
+  // These radii are a first estimate to be dialled in against the on-device
+  // debug overlay (they depend on the preview->still cover mapping, which is
+  // verified empirically, not derived). See task: end-to-end device verify.
+  static const double _guideRegionRx = 0.17;
+  static const double _guideRegionRy = 0.14;
+  static const double _guideRegionN = 2.5;
+
   // Exposure guard bands, measured on the ambient thumb ROI (torch-off frames
   // only). Glare-only guard: a torch hotspot on close-up skin blows out ridge
   // detail, so pull EV down above this luma. We intentionally do NOT brighten
@@ -1510,6 +1527,14 @@ class OscillatingCaptureController extends ChangeNotifier {
         });
       }
 
+      // Tip direction in the landscape frame the backend receives, in the
+      // superellipse's pixel space (0° = +x/right, 90° = +y/up). The on-screen
+      // silhouette is drawn tip-up; decodeStillJpegToLuma rotates 90° CW into
+      // landscape for 90°/270° sensors (so tip-up -> tip points +x -> 0°); for
+      // 0°/180° sensors no rotation is applied, so the tip stays up (90°).
+      final tipAngleDeg =
+          (_sensorOrientation == 90 || _sensorOrientation == 270) ? 0.0 : 90.0;
+
       final firestoreFuture = FirebaseFirestore.instance.collection('captures').doc(id).set({
         'captureId': id,
         'userId': userId,
@@ -1518,6 +1543,14 @@ class OscillatingCaptureController extends ChangeNotifier {
         'source': 'clearbridge_beta',
         'captureMode': 'oscillating_8phase',
         'captureMethod': 'oscillating_8phase_v1',
+        'guideRegion': {
+          'cx': 0.5,
+          'cy': 0.5,
+          'rx': _guideRegionRx,
+          'ry': _guideRegionRy,
+          'n': _guideRegionN,
+          'tipAngleDeg': tipAngleDeg,
+        },
         'frameCount': _capturedFrames.length,
         'burstFrameCount': _capturedFrames.where((f) => f.isBurst).length,
         'transitionFrameCount': _capturedFrames.where((f) => !f.isBurst).length,

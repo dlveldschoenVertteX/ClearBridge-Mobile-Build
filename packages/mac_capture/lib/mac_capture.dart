@@ -63,6 +63,8 @@ export 'src/capture_intro_animation.dart' show CaptureIntroAnimation;
 export 'src/capture_vignette_overlay.dart' show CaptureVignetteOverlay;
 export 'src/capture_reticle_overlay.dart'
     show CaptureReticleOverlay, ReticleState;
+export 'src/capture_pad_silhouette_overlay.dart'
+    show CapturePadSilhouetteOverlay, PadSilhouetteState, PadSilhouetteShape;
 export 'src/distance_guidance_widget.dart' show DistanceGuidanceWidget;
 export 'src/focus_meter_widget.dart' show FocusMeterWidget;
 export 'src/haptic_guidance_circle.dart';

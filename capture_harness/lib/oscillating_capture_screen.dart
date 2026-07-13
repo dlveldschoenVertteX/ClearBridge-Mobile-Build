@@ -107,11 +107,11 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
     final showReticle = s.phase == OscillatingPhase.idle ||
         s.phase == OscillatingPhase.calibrating ||
         s.phase == OscillatingPhase.running;
-    final reticleState = s.isCapturingBurst
-        ? ReticleState.capturing
-        : (s.onTarget ? ReticleState.locked : ReticleState.aligning);
-    final reticleHint = s.phase == OscillatingPhase.idle
-        ? 'Fill the oval with your thumb pad'
+    final silhouetteState = s.isCapturingBurst
+        ? PadSilhouetteState.capturing
+        : (s.onTarget ? PadSilhouetteState.locked : PadSilhouetteState.aligning);
+    final silhouetteHint = s.phase == OscillatingPhase.idle
+        ? 'Seat your thumb pad in the outline'
         : null;
 
     return Scaffold(
@@ -122,9 +122,9 @@ class _OscillatingCaptureScreenState extends State<OscillatingCaptureScreen> {
           if (showReticle)
             Positioned.fill(
               child: RepaintBoundary(
-                child: CaptureReticleOverlay(
-                  state: reticleState,
-                  hint: reticleHint,
+                child: CapturePadSilhouetteOverlay(
+                  state: silhouetteState,
+                  hint: silhouetteHint,
                 ),
               ),
             )

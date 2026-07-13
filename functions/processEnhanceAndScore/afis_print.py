@@ -102,9 +102,9 @@ def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np
 _STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
 
 
-def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
-    """Align (ECC affine) and average near-identical same-pose frames -> a
-    denoised full-resolution grayscale. cand[0] is the sharpest (reference).
+def _align_face_on_stack(cand: List[Optional[np.ndarray]]) -> Optional[List[np.ndarray]]:
+    """ECC-affine align near-identical same-pose frames to the sharpest
+    (cand[0]) reference and return the aligned float32 stack (reference first).
 
     The alignment warp is estimated on downscaled (_STACK_ALIGN_PX) copies for
     speed, then scaled up and applied at full resolution -- ECC on full-res
@@ -143,7 +143,44 @@ def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
             continue
     if len(stack) < 2:
         return None
+    return stack
+
+
+def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Align (ECC affine) and AVERAGE near-identical same-pose frames -> a
+    denoised full-resolution grayscale (pure noise reduction). Returns None if
+    fewer than 2 usable frames survive."""
+    stack = _align_face_on_stack(cand)
+    if stack is None:
+        return None
     return np.mean(np.stack(stack), axis=0).astype(np.uint8)
+
+
+def _focus_stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Align (ECC affine) same-pose frames, then combine by LOCAL SHARPNESS
+    rather than a flat mean -- classic focus stacking. Each output pixel is a
+    sharpness-weighted blend across the aligned frames, so the region that was
+    best-focused in ANY frame dominates there. This targets the pad's curved
+    edges going soft under a single frame's shallow macro depth-of-field:
+    different frames (slightly different hand distance across the burst) hold
+    focus at different radii, and this keeps the sharpest of each.
+
+    Weighted blend (not hard per-pixel argmax) to avoid seam artifacts where
+    the sharpest-frame index would flip abruptly. Returns None if fewer than 2
+    frames align, so the caller falls back to the single sharpest frame."""
+    stack = _align_face_on_stack(cand)
+    if stack is None:
+        return None
+    # Local sharpness energy per frame: |Laplacian| smoothed to a small window
+    # so the weight reflects neighbourhood focus, not single-pixel noise.
+    weights = []
+    for g in stack:
+        lap = np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3))
+        weights.append(cv2.GaussianBlur(lap, (0, 0), 4.0) + 1e-3)
+    w = np.stack(weights)                      # (N, H, W)
+    w /= w.sum(axis=0, keepdims=True)
+    out = (w * np.stack(stack)).sum(axis=0)
+    return np.clip(out, 0, 255).astype(np.uint8)
 
 
 def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
@@ -543,6 +580,65 @@ def _upright_rotate(binimg: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, n
     return bin_r, mask_r
 
 
+def _superellipse_mask(shape: Tuple[int, int], region: dict) -> Optional[np.ndarray]:
+    """
+    Rasterize the app's guide silhouette into a binary pad mask.
+
+    `region` is in the SAME normalized (0-1) coordinate space as the frame
+    `generate()` receives (the center-square-cropped frame — main.py does the
+    full-still → cropped-frame remap before calling us, so here we only scale
+    by the frame's own dimensions). Shape is a superellipse
+    |x/rx|^n + |y/ry|^n <= 1 (n≈2.5 reads as a rounded thumb pad, not a plain
+    oval), matching what capture_pad_silhouette_overlay.dart draws so the
+    region the user visually fills IS the mask.
+    """
+    h, w = shape
+    cx = float(region['cx']) * w
+    cy = float(region['cy']) * h
+    rx = max(1.0, float(region['rx']) * w)
+    ry = max(1.0, float(region['ry']) * h)
+    n = float(region.get('n', 2.5))
+    ys, xs = np.mgrid[0:h, 0:w]
+    d = (np.abs((xs - cx) / rx) ** n) + (np.abs((ys - cy) / ry) ** n)
+    mask = (d <= 1.0).astype(np.uint8) * 255
+    if (mask > 0).sum() < 200:
+        return None
+    return mask
+
+
+def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
+                      tip_angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Deterministic tip-up rotation for guided captures.
+
+    The app draws the silhouette tip-up on the portrait screen, so it knows
+    exactly which way the tip points once the still is rotated into landscape.
+    `tip_angle_deg` is that direction in the frame's own pixel space (standard
+    math convention: 0° = +x/right, 90° = +y/up). We rotate the content so the
+    tip ends up pointing UP -- no PCA guess (which is unstable on a near-
+    symmetric pad) and no width heuristic. A rolled/AFIS print is always
+    presented upright, so this is a real correction.
+    """
+    # Image y runs downward, so "up" on screen is -y. To send a vector at
+    # math-angle `tip_angle_deg` to screen-up, rotate the image by this much
+    # (getRotationMatrix2D's positive angle is CCW in math space).
+    rot_deg = 90.0 - tip_angle_deg
+    h, w = mask.shape
+    center = (w / 2.0, h / 2.0)
+    diag = int(np.ceil(np.hypot(h, w)))
+    pad_y, pad_x = (diag - h) // 2 + 5, (diag - w) // 2 + 5
+    bin_p = cv2.copyMakeBorder(binimg, pad_y, pad_y, pad_x, pad_x,
+                               cv2.BORDER_CONSTANT, value=255)
+    mask_p = cv2.copyMakeBorder(mask, pad_y, pad_y, pad_x, pad_x,
+                                cv2.BORDER_CONSTANT, value=0)
+    center_p = (center[0] + pad_x, center[1] + pad_y)
+    M = cv2.getRotationMatrix2D(center_p, rot_deg, 1.0)
+    size_p = (bin_p.shape[1], bin_p.shape[0])
+    bin_r = cv2.warpAffine(bin_p, M, size_p, borderValue=255)
+    mask_r = cv2.warpAffine(mask_p, M, size_p, borderValue=0)
+    return bin_r, mask_r
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -553,8 +649,10 @@ def generate(
     flash_burst: Optional[List[np.ndarray]] = None,
     freq_normalize: bool = False,
     stack: bool = False,
+    focus_stack: bool = False,
     fuse: Optional[str] = None,
     mosaic: bool = False,
+    guide_region: Optional[dict] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -711,40 +809,56 @@ def generate(
     # ridges (observed -3.3 NFIQ on the sunlight capture). main.py scores the
     # stacked rendering as an ADDITIONAL max-variant alongside the unstacked
     # ones and keeps the higher NFIQ, so stacking can only ever help.
-    if stack and not fuse and not mosaic:
+    if (stack or focus_stack) and not fuse and not mosaic:
         src_ang = float(angles_deg[order[0]])
         same_pose = [i for i in order
                      if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
-        stacked = _stack_face_on([frames[i] for i in same_pose[:_STACK_MAX]])
+        same_frames = [frames[i] for i in same_pose[:_STACK_MAX]]
+        # focus_stack: sharpness-weighted combine (keep the best-focused region
+        # of each frame -- targets soft pad edges); stack: flat average (denoise).
+        stacked = (_focus_stack_face_on(same_frames) if focus_stack
+                   else _stack_face_on(same_frames))
         if stacked is not None:
             gray = stacked
-            params['afisStacked'] = len([i for i in same_pose[:_STACK_MAX]])
+            params['afisStacked'] = len(same_frames)
+            params['afisStackMode'] = 'focus' if focus_stack else 'mean'
     g8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray.astype(np.uint8))
 
-    # Mask FIRST, at native resolution -- the U-Net was trained on native-res
-    # frames, so segmenting a resampled image degrades the mask.
-    mask = _unet_mask(gray)
-    params['afisMask'] = 'unet' if mask is not None else 'coherence_hull'
-    if mask is None:
-        mask = _coherence_hull_mask(g8)
-    if mask is None or (mask > 0).mean() < 0.03:
-        logger.warning('AFIS print: no usable thumb mask — skipping')
-        return None, params
-    # A mask covering most of the frame means segmentation failed to isolate
-    # the thumb (the whole photo, background included, would be Gabor-noised).
-    # Better to emit nothing than a full-frame ridge-noise field.
-    if (mask > 0).mean() > 0.55:
-        logger.warning('AFIS print: mask covers %.0f%% of frame — segmentation '
-                       'failed, skipping', 100 * (mask > 0).mean())
-        params['afisMask'] = params['afisMask'] + '_rejected'
-        return None, params
+    # Guided path: the user visually seated the pad inside the on-screen
+    # silhouette, so that region IS the mask -- no free-range segmentation to
+    # bleed onto creases/hand/background, and no fragile ridge-periodicity crop
+    # (which selected a crease-side sliver on real captures). See
+    # _superellipse_mask. Falls through to segmentation only if the region
+    # rasterizes to nothing (degenerate params).
+    guide_mask = _superellipse_mask(gray.shape[:2], guide_region) if guide_region else None
+    if guide_mask is not None:
+        mask = guide_mask
+        params['afisMask'] = 'guide'
+    else:
+        # Mask FIRST, at native resolution -- the U-Net was trained on native-res
+        # frames, so segmenting a resampled image degrades the mask.
+        mask = _unet_mask(gray)
+        params['afisMask'] = 'unet' if mask is not None else 'coherence_hull'
+        if mask is None:
+            mask = _coherence_hull_mask(g8)
+        if mask is None or (mask > 0).mean() < 0.03:
+            logger.warning('AFIS print: no usable thumb mask — skipping')
+            return None, params
+        # A mask covering most of the frame means segmentation failed to isolate
+        # the thumb (the whole photo, background included, would be Gabor-noised).
+        # Better to emit nothing than a full-frame ridge-noise field.
+        if (mask > 0).mean() > 0.55:
+            logger.warning('AFIS print: mask covers %.0f%% of frame — segmentation '
+                           'failed, skipping', 100 * (mask > 0).mean())
+            params['afisMask'] = params['afisMask'] + '_rejected'
+            return None, params
 
-    # Tighten to just the ridge-bearing pad -- the mask above segments the
-    # whole visible thumb (creases, lower segment, palm on a close/wide
-    # framing), not only the print-worthy area. See _crop_to_pad_mask. Uses
-    # g8 (CLAHE-boosted): raw contrast is too low across most of the frame
-    # for the block-std gate to pass at all.
-    mask = _crop_to_pad_mask(g8, mask)
+        # Tighten to just the ridge-bearing pad -- the mask above segments the
+        # whole visible thumb (creases, lower segment, palm on a close/wide
+        # framing), not only the print-worthy area. See _crop_to_pad_mask. Uses
+        # g8 (CLAHE-boosted): raw contrast is too low across most of the frame
+        # for the block-std gate to pass at all.
+        mask = _crop_to_pad_mask(g8, mask)
 
     # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
     # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.
@@ -792,7 +906,13 @@ def generate(
     edge_weight = 1.0 - np.abs(2.0 * mask_soft - 1.0)   # peaks at the boundary, ~0 elsewhere
     binimg = (blurred.astype(np.float32) * edge_weight +
               binimg.astype(np.float32) * (1.0 - edge_weight)).astype(np.uint8)
-    binimg, mask = _upright_rotate(binimg, mask)
+    if guide_region is not None and guide_mask is not None and 'tipAngleDeg' in guide_region:
+        # Deterministic upright from the guide's known tip direction -- the pad
+        # silhouette is near-symmetric, so PCA (_upright_rotate) can pick the
+        # wrong axis; the app tells us exactly which way the tip points.
+        binimg, mask = _upright_from_tip(binimg, mask, float(guide_region['tipAngleDeg']))
+    else:
+        binimg, mask = _upright_rotate(binimg, mask)
     params['afisRotated'] = True
     ys, xs = np.where(mask > 0)
     m = 30
