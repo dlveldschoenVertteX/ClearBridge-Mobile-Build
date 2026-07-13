@@ -137,7 +137,7 @@ class _PadSilhouettePainter extends CustomPainter {
     const layers = 5;
     for (var i = layers; i >= 1; i--) {
       final inflate = i * 26.0;
-      final alpha = (0.16 * (layers - i + 1)).clamp(0.0, 0.7);
+      final alpha = (0.16 * (layers - i + 1)).clamp(0.0, 0.7).toDouble();
       final band = Path()
         ..addRect(Offset.zero & size)
         ..addPath(shape.toPath(size, inflate: inflate), Offset.zero)
