@@ -592,6 +592,17 @@ def generate(
         params['afisMask'] = params['afisMask'] + '_rejected'
         return None, params
 
+    # NOTE: the mask above segments the whole visible thumb -- on a close,
+    # wide-framed capture that includes the DIP crease and lower thumb
+    # segment, not just the ridge-bearing pad, which shows up as a visible
+    # crease/hand in the rendered print and confuses _upright_rotate's
+    # tip-detection heuristic. Tried isolating the pad via ridge-coherence
+    # and ridge-periodicity block classification + region-growing (several
+    # iterations, real signal confirmed -- true pad windows measurably
+    # differ from crease/background) but couldn't get it to converge on a
+    # usable contiguous region in the time available. Left unfixed rather
+    # than shipping something unverified; worth a dedicated follow-up.
+
     # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
     # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.
     # Our macro captures land anywhere from 9–20 px depending on phone
@@ -620,18 +631,24 @@ def generate(
     enh = _gabor_enhance(norm, orient, wl)
 
     binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
-    # Feather the mask edge instead of a hard cutoff. A real digital scanner
-    # print has no thumb-silhouette outline -- ridges simply fade out at the
-    # contact edge. The U-Net mask here is a crisp binary shape (thresholded,
-    # resized with nearest-neighbour), so blending it straight in leaves a
-    # visible geometric contour around the pad. Blur the mask before blending
-    # so the ridge pattern tapers into white over a few pixels, matching how
-    # an actual scanner print looks. `mask` itself stays hard-edged below
-    # (crop bounding box, _upright_rotate's PCA) -- only the pixel blend of
-    # the print image is softened.
-    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
-    binimg = (binimg.astype(np.float32) * mask_soft +
-              255.0 * (1.0 - mask_soft)).astype(np.uint8)
+    binimg[mask == 0] = 255   # hard mask FIRST -- background is genuinely
+    # pure white here, zero Gabor-noise content, before any blur touches it.
+    # Feather the mask edge instead of leaving a hard cutoff. A real digital
+    # scanner print has no thumb-silhouette outline -- ridges simply fade
+    # out at the contact edge. Blurring `binimg` directly (already masked to
+    # solid white outside the pad) and blending that blur in ONLY near the
+    # boundary softens the transition without ever revealing the unmasked
+    # Gabor response outside the pad -- an earlier version of this blurred
+    # the mask and blended it against the UNMASKED binimg, which leaked a
+    # faint version of the background's own Gabor "ridges" through the fade
+    # (visible as a ghosted second boundary/texture past the real edge).
+    # `mask` itself stays hard-edged below (crop bounding box,
+    # _upright_rotate's PCA) -- only the pixel blend is softened.
+    blurred = cv2.GaussianBlur(binimg, (0, 0), sigmaX=4.0)
+    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=4.0).astype(np.float32) / 255.0
+    edge_weight = 1.0 - np.abs(2.0 * mask_soft - 1.0)   # peaks at the boundary, ~0 elsewhere
+    binimg = (blurred.astype(np.float32) * edge_weight +
+              binimg.astype(np.float32) * (1.0 - edge_weight)).astype(np.uint8)
     binimg, mask = _upright_rotate(binimg, mask)
     params['afisRotated'] = True
     ys, xs = np.where(mask > 0)
