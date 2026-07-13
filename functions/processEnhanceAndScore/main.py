@@ -50,7 +50,15 @@ def _init_heavy_deps() -> None:
     afis_print           = _afis
     CaptureQualityError  = _CQE
 
-logging.basicConfig(level=logging.INFO)
+# force=True: the Functions Framework/firebase_functions runtime configures the
+# root logger before this module imports, so a plain basicConfig() call here is
+# documented to be a silent no-op (it only acts if the root logger has no
+# handlers yet). Confirmed in production: none of this module's logger.info/
+# logger.warning calls -- including the ones that would explain an AFIS
+# failure -- were reaching Cloud Logging, only infra-level entries were.
+# force=True tears down whatever handler got installed first and replaces it
+# with a plain synchronous StreamHandler, so our own log calls actually emit.
+logging.basicConfig(level=logging.INFO, force=True)
 logger = logging.getLogger(__name__)
 
 # ── Constants ─────────────────────────────────────────────────────────────────
