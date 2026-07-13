@@ -421,10 +421,11 @@ class OscillatingCaptureController extends ChangeNotifier {
   // Centre ROI the focus meter, brightness meter and exposure guard all score
   // on — the thumb sits here, so a crisp/bright background can't outscore a
   // soft/dark thumb (the exact failure that left production captures a blurry
-  // back-focused lozenge). Aligned 1:1 with CaptureReticleOverlay.reticleRect:
-  // the oval the user visually fills IS the region we focus/expose/score, so
-  // framing, metering, masking and the superprint crop all agree.
-  static const Rect _scoreRoi = Rect.fromLTRB(0.28, 0.22, 0.72, 0.78);
+  // back-focused lozenge). Aligned 1:1 with
+  // CapturePadSilhouetteOverlay.PadSilhouetteShape.defaultShape's bounding
+  // box: the pad shape the user visually fills IS the region we focus/expose/
+  // score, so framing, metering, masking and the superprint crop all agree.
+  static const Rect _scoreRoi = Rect.fromLTRB(0.27, 0.14, 0.73, 0.86);
 
   // Guide region written to Firestore so the backend uses the pad silhouette
   // the user visually filled AS the (feathered) crop mask -- no free-range
@@ -436,11 +437,16 @@ class OscillatingCaptureController extends ChangeNotifier {
   // silhouette, so the pad lands centered in the still, and a center-square
   // crop keeps the centre centred. rx/ry are the pad half-extents in that
   // frame; n matches PadSilhouetteShape / afis_print._superellipse_mask.
-  // These radii are a first estimate to be dialled in against the on-device
-  // debug overlay (they depend on the preview->still cover mapping, which is
-  // verified empirically, not derived). See task: end-to-end device verify.
-  static const double _guideRegionRx = 0.17;
-  static const double _guideRegionRy = 0.14;
+  // These radii are informed by real device feedback (an annotated screenshot
+  // showed the on-screen guide undersized by the same shape: same width,
+  // ~30% short on height) -- scaled here by that same relative growth rather
+  // than the raw screenshot fractions, since this coordinate space (still,
+  // post-crop) isn't the same as the screenshot's (preview, pre-cover-fit).
+  // Still a first estimate to confirm against the on-device debug overlay
+  // (depends on the preview->still cover mapping, verified empirically, not
+  // derived). See task: end-to-end device verify.
+  static const double _guideRegionRx = 0.18;
+  static const double _guideRegionRy = 0.18;
   static const double _guideRegionN = 2.5;
 
   // Exposure guard bands, measured on the ambient thumb ROI (torch-off frames

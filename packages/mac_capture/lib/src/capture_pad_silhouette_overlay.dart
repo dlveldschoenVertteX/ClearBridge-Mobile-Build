@@ -32,13 +32,20 @@ class PadSilhouetteShape {
   final double n;
 
   /// Default pad shape — bounding box matches
-  /// OscillatingCaptureController._scoreRoi (0.28,0.22,0.72,0.78) so framing,
-  /// metering, masking and the superprint crop all agree.
+  /// OscillatingCaptureController._scoreRoi so framing, metering, masking and
+  /// the superprint crop all agree.
+  ///
+  /// Sized from real device feedback: an annotated screenshot showed the
+  /// prior guide (rx=0.184, ry=0.201) excluding real pad area a user marked
+  /// as should-be-included (rx=0.190, ry=0.263) -- same width, ~30% taller.
+  /// Grown symmetrically about the same centre (rather than shifting it)
+  /// since a taller guide already captures more both toward the tip and the
+  /// base without an unverified position change.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.5,
-    rx: 0.22,
-    ry: 0.28,
+    rx: 0.23,
+    ry: 0.36,
   );
 
   /// Normalized bounding rect (for driving focus/exposure ROI).
