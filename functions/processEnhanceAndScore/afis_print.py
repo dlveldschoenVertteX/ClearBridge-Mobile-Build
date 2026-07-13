@@ -620,7 +620,18 @@ def generate(
     enh = _gabor_enhance(norm, orient, wl)
 
     binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
-    binimg[mask == 0] = 255
+    # Feather the mask edge instead of a hard cutoff. A real digital scanner
+    # print has no thumb-silhouette outline -- ridges simply fade out at the
+    # contact edge. The U-Net mask here is a crisp binary shape (thresholded,
+    # resized with nearest-neighbour), so blending it straight in leaves a
+    # visible geometric contour around the pad. Blur the mask before blending
+    # so the ridge pattern tapers into white over a few pixels, matching how
+    # an actual scanner print looks. `mask` itself stays hard-edged below
+    # (crop bounding box, _upright_rotate's PCA) -- only the pixel blend of
+    # the print image is softened.
+    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=5.0).astype(np.float32) / 255.0
+    binimg = (binimg.astype(np.float32) * mask_soft +
+              255.0 * (1.0 - mask_soft)).astype(np.uint8)
     binimg, mask = _upright_rotate(binimg, mask)
     params['afisRotated'] = True
     ys, xs = np.where(mask > 0)
