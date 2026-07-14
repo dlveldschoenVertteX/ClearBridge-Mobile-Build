@@ -48,6 +48,15 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
+        // Plugin native libs (camerax, TFLite, etc.) land in both arm64-v8a
+        // and armeabi-v7a, but --target-platform android-arm64 only compiles
+        // libapp.so for arm64. The resulting partial armeabi-v7a directory
+        // confuses Android's ABI selector and causes INSTALL_PARSE_FAILED /
+        // "can't unzip" on sideloaded installs. Restrict to arm64 only so
+        // the APK is consistent end-to-end.
+        ndk {
+            abiFilters += "arm64-v8a"
+        }
     }
 
     signingConfigs {
