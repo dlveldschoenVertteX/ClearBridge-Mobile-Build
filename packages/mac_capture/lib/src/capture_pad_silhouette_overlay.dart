@@ -43,9 +43,9 @@ class PadSilhouetteShape {
   /// framing, metering and the superprint crop all agree.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
-    cy: 0.5,
+    cy: 0.37,
     rx: 0.17,
-    ry: 0.26,
+    ry: 0.13,
     taper: 0.20,
   );
 

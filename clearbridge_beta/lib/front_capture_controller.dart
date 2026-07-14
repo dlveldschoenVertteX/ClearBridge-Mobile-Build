@@ -118,22 +118,30 @@ class FrontCaptureController extends ChangeNotifier {
   // ROI the focus/exposure meters score on — aligned to the pad silhouette
   // bounding box so framing, metering and the superprint crop all agree.
   // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper:
-  //   cx=0.5, cy=0.5, rx=0.17*(1+0.20)=0.204, ry=0.26 → [0.30,0.24,0.70,0.76]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.30, 0.24, 0.70, 0.76);
+  //   cx=0.5, cy=0.37, rx=0.17*(1+0.20)=0.204, ry=0.13 → [0.30,0.24,0.70,0.50]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.30, 0.24, 0.70, 0.50);
 
-  // Guide region in center-square-cropped landscape still coords (the space
-  // afis_print.generate() receives). rx/ry cover the thumb pad's extents in
-  // that frame. For sensor orientation 90°/270°, decodeStillJpegToLuma rotates
-  // 90° CW so the thumb's long axis becomes horizontal:
-  //   rx ≈ 0.40 (long axis, horizontal in landscape still)
-  //   ry ≈ 0.15 (short axis, vertical in landscape still)
-  // These are calibrated estimates — verify empirically against real stills.
-  static const double _guideRx = 0.40;
-  static const double _guideRy = 0.15;
+  // Guide region in landscape-still coords (the space afis_print.generate()
+  // receives after decodeStillJpegToLuma's 90°-CW rotation).
+  // Portrait (cx=0.5,cy=0.37,rx=0.17,ry=0.13) maps under (px,py)→(1-py,px):
+  //   landscape cx = 1-0.37 = 0.63  (thumb is right-of-centre in landscape)
+  //   landscape cy = 0.50
+  //   landscape rx = portrait ry = 0.13  (thumb's long axis is now horizontal)
+  //   landscape ry = portrait rx = 0.17  (thumb's short axis is now vertical)
+  // cx/cy verified empirically against front_burst_fl_0.jpg: thumb pad centre
+  // sits ~63% from the left in the landscape still, vertically centred.
+  static const double _guideCx = 0.63;
+  static const double _guideCy = 0.50;
+  static const double _guideRx = 0.13;
+  static const double _guideRy = 0.17;
   static const double _guideN = 2.5;
 
   static const double _glareHighLuma = 205.0;
   static const double _glareEvStep = -0.7;
+  // Extra EV reduction applied when the torch fires at close range (~10 cm).
+  // Flash overexposure killed NFIQ on the first real capture — the pad centre
+  // blew out completely. -1.0 EV at close range keeps ridges in the histogram.
+  static const double _flashEvStep = -1.0;
   static const double _coverageMin = 0.35;
   static const double _coverageMax = 0.85;
 
@@ -393,17 +401,29 @@ class FrontCaptureController extends ChangeNotifier {
       if (cam == null) return;
       await _stopStream();
 
+      // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
+      // flash (torch ON with negative EV). At 10cm the torch at full ambient EV
+      // blows out the pad centre completely (confirmed on first real capture:
+      // NFIQ2=9). Alternating gives the backend both lighting conditions;
+      // _download_front_only_frames already splits frames into ambient_frames
+      // and flash_frames so AFIS can pick the best-exposed set.
       for (var i = 0; i < _burstFrameCount; i++) {
-        if (torchCapable) {
-          try {
+        final wantFlash = torchCapable && i.isOdd;
+        try {
+          if (wantFlash) {
             await _flash!.activate();
             if (minEv != null && maxEv != null) {
-              final target = _appliedEvOffset - 0.4;
+              final target = _appliedEvOffset + _flashEvStep;
               await cam.setExposureOffset(target.clamp(minEv, maxEv));
             }
             await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
-          } catch (_) {}
-        }
+          } else {
+            await _flash?.deactivate();
+            if (minEv != null && maxEv != null) {
+              await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+            }
+          }
+        } catch (_) {}
         try {
           final xfile = await cam.takePicture();
           final jpeg = await xfile.readAsBytes();
@@ -420,14 +440,13 @@ class FrontCaptureController extends ChangeNotifier {
           await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
         }
       }
-      if (torchCapable) {
-        try {
-          await _flash!.deactivate();
-          if (minEv != null && maxEv != null) {
-            await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
-          }
-        } catch (_) {}
-      }
+      // Always restore torch-off and base EV when done.
+      try {
+        await _flash?.deactivate();
+        if (minEv != null && maxEv != null) {
+          await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+        }
+      } catch (_) {}
 
       // Decode + re-encode off the UI isolate.
       final futures = <Future<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})>>[];
@@ -518,8 +537,8 @@ class FrontCaptureController extends ChangeNotifier {
         'captureMode': 'front_only_v1',
         'captureMethod': 'front_only_v1',
         'guideRegion': {
-          'cx': 0.5,
-          'cy': 0.5,
+          'cx': _guideCx,
+          'cy': _guideCy,
           'rx': _guideRx,
           'ry': _guideRy,
           'n': _guideN,
