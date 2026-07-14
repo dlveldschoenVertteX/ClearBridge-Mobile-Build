@@ -6,6 +6,8 @@ import 'package:camera/camera.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_storage/firebase_storage.dart';
+import 'dart:ui' show Offset, Rect;
+
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:mac_capture/mac_capture.dart';
@@ -189,12 +191,7 @@ class FrontCaptureController extends ChangeNotifier {
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
 
-    try {
-      _flash = AdaptiveFlashController(camera);
-      await _flash!.initialize();
-    } catch (e) {
-      debugPrint('[front] flash init failed (non-fatal): $e');
-    }
+    _flash = AdaptiveFlashController(camera);
 
     _apply((s) => s.copyWith(phase: FrontCapturePhase.calibrating), force: true);
 
@@ -237,9 +234,10 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(distanceHint: hint));
     }
 
-    // Focus tracking.
+    // Focus tracking: offerFrame returns raw Laplacian variance; normalise by
+    // running peak so the meter reads 0→1 relative to the sharpest frame seen.
     try {
-      final rawFocus = _hybrid.laplacianScore(image, roi: roi);
+      final rawFocus = _hybrid.offerFrame(image, thumbRoi: roi);
       if (rawFocus > _focusPeak) _focusPeak = rawFocus;
       _focusValue = HybridCaptureService.ema(
         _focusValue,
@@ -294,7 +292,7 @@ class FrontCaptureController extends ChangeNotifier {
     if (_brightnessSamples.isNotEmpty) {
       final avg = _brightnessSamples.reduce((a, b) => a + b) / _brightnessSamples.length;
       try {
-        await _flash?.calibrate(averageLuma: avg);
+        await _flash?.calibrate(avg);
       } catch (_) {}
     }
     _apply((s) => s.copyWith(phase: FrontCapturePhase.holding), force: true);
