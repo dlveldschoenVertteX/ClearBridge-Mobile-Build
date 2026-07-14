@@ -48,14 +48,24 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // Plugin native libs (camerax, TFLite, etc.) land in both arm64-v8a
-        // and armeabi-v7a, but --target-platform android-arm64 only compiles
-        // libapp.so for arm64. The resulting partial armeabi-v7a directory
-        // confuses Android's ABI selector and causes INSTALL_PARSE_FAILED /
-        // "can't unzip" on sideloaded installs. Restrict to arm64 only so
-        // the APK is consistent end-to-end.
-        ndk {
-            abiFilters += "arm64-v8a"
+    }
+
+    // Plugin AARs (camerax, TFLite, datastore) bundle pre-compiled .so files
+    // for arm64-v8a, armeabi-v7a, AND x86_64. But --target-platform android-arm64
+    // only compiles libapp.so + libflutter.so for arm64, leaving the other ABI
+    // directories partially populated (no libapp.so / libflutter.so). Android's
+    // ABI selector sees multiple lib directories, picks the "best" one for the
+    // device, then fails when core Flutter libs are missing there.
+    // ndk.abiFilters only controls JNI compilation — it does NOT strip
+    // pre-built .so files from plugin AARs. packaging.jniLibs.excludes
+    // operates at the final APK packaging step and actually removes them.
+    packaging {
+        jniLibs {
+            excludes += setOf(
+                "lib/armeabi-v7a/**",
+                "lib/x86_64/**",
+                "lib/x86/**",
+            )
         }
     }
 
