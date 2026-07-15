@@ -108,17 +108,40 @@ from the repo — only the CI build step was dropped, in case revisited later.
     Storage/Cloud Run Admin API (`run.googleapis.com`, to look up the service URL) all work
     fine — it's specifically the deployed service's own generated hostname that's blocked.
 
-## Current focus (as of 2026-07-15, post-guideRegion-fix): enhancement model tuning
-CTO directive after the guideRegion fix's 72-score breakthrough: **the AFIS enhancement
+## Enhancement model tuning (started 2026-07-15, post-guideRegion-fix)
+CTO directive after the guideRegion fix's 72-score breakthrough: tune the AFIS enhancement
 pipeline itself (`functions/processEnhanceAndScore/afis_print.py` — Gabor filtering, ridge
-frequency normalization, morphological ops, binarization) has never been manually tuned.**
-Use the real captured burst frames/superprints from the 2026-07-15 test captures (and
-broader Firestore history) as a concrete tuning dataset and start iterating on its
-parameters directly. Verify every change against real `nfiq2Score` (the sidecar), never
-the ResNet18 proxy alone — same discipline as everywhere else in this project. The sidecar
-itself can't be called from this sandbox (see above) — tuning experiments need to go
-through a real deploy + real device capture cycle, or a Cloud Build job that can reach the
-sidecar, to get real NFIQ2 feedback.
+frequency normalization, feather blur), which had never been manually tuned. Verify every
+change against real `nfiq2Score` (the sidecar), never the ResNet18 proxy alone — same
+discipline as everywhere else in this project. The sidecar itself can't be called from this
+sandbox (see above) — real validation needs a deploy + real device capture cycle.
+
+**First tuning pass done, committed `abbb7b8`, NOT YET DEPLOYED.** Method: built a local
+harness (`nfiq_resnet18.onnx` downloaded once from Storage, run fully offline; scratchpad
+`enh_tune/afis_print_tunable.py` + `sweep.py`) that reproduces `main.py`'s exact proxy
+scoring closely enough to match its recorded values almost exactly on 5 real captures with
+known ground-truth `nfiq2Score`. Used it to sweep Gabor/CLAHE/feather/frequency-clamp
+parameters. Findings:
+- **Broad correlation across all 24 scored captures**: every capture whose winning variant
+  ended with native ridge wavelength ≥15px scored catastrophically on real NFIQ2 (single
+  digits), *regardless* of whether/how aggressively frequency-normalization resampling was
+  applied. Only 9-11px native wavelength captures scored well (62, 72, 72) — though 9px
+  alone wasn't sufficient in one case (`3edf5455`: wl=9, still scored 1, unexplained). This
+  points at native capture distance as a bigger lever than post-processing, but the
+  enhancement side was still worth tuning within that constraint.
+- Changed: `_GABOR_SIGMA_RATIO` 0.56→0.65, `_GABOR_GAMMA` 0.6→0.85 (both broadly positive
+  across every real test case, good and bad alike, visually confirmed as finer/more
+  continuous ridge lines — no regressions), `_FEATHER_SIGMA` 4.0→2.5 (small, uniformly
+  non-negative), `_FREQ_SCALE_MIN` 0.35→0.7 (caps how aggressively the ridge-period resample
+  can shrink the image — directly targets the correlation above; improved the local proxy
+  +7.2 on the real bad case that had used an 0.5x rescale in production, zero effect on
+  captures that didn't need rescaling).
+- Final combined check: 4 of 5 real test cases improved or held flat; only the most extreme
+  (native wl=20px) dipped slightly — likely beyond what enhancement alone can fix.
+- **Not yet confirmed against real NFIQ2** — proxy + visual evidence only so far (except the
+  frequency-floor change, which also has real, non-proxy Firestore support). Needs a deploy
+  + real device captures to confirm before trusting the gain. Notion session log:
+  https://app.notion.com/p/39ea03ed9e7e81ad9beac33f717445b7
 
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
