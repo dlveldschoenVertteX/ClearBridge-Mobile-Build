@@ -4,16 +4,21 @@ plugins {
     id("dev.flutter.flutter-gradle-plugin")
 }
 
-// AGP only auto-generates ~/.android/debug.keystore when a build variant
-// uses the literal built-in "debug" SigningConfig object -- the "release"
-// config below borrows its storeFile path as a fallback (when no real
-// release keystore secret is configured), which does NOT trigger that
+// AGP only auto-generates the debug keystore when a build variant uses the
+// literal built-in "debug" SigningConfig object -- the "release" config
+// below borrows its storeFile path as a fallback (when no real release
+// keystore secret is configured), which does NOT trigger that
 // auto-generation. On a fresh CI runner with no pre-existing debug
-// keystore (confirmed on GitLab; GitHub Actions runners happen to ship
-// with one already) that leaves the fallback pointing at a file that's
-// never created, so validateSigningRelease fails outright. Generate it
-// ourselves if missing, matching AGP's own default debug key parameters.
-val debugKeystore = file(System.getProperty("user.home") + "/.android/debug.keystore")
+// keystore that leaves the fallback pointing at a file that's never
+// created, so validateSigningRelease fails outright. Generate it ourselves
+// if missing, matching AGP's own default debug key parameters.
+// Read the path from AGP's own "debug" SigningConfig rather than
+// hardcoding ~/.android/debug.keystore -- newer Android tooling resolves
+// this to the XDG location (~/.config/.android/debug.keystore) on runners
+// where XDG_CONFIG_HOME is set, and a hardcoded path silently generated a
+// keystore nobody looked at while validateSigningRelease still failed
+// "not found" against the real (XDG) path.
+val debugKeystore = android.signingConfigs.getByName("debug").storeFile!!
 if (!debugKeystore.exists()) {
     debugKeystore.parentFile.mkdirs()
     // Plain ProcessBuilder rather than Gradle's exec {} DSL -- the latter
