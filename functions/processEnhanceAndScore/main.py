@@ -737,6 +737,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # binary via the sidecar service. Never blocks or fails the pipeline:
         # score_nfiq2() itself never raises, and nfiq2Score is simply null in
         # Firestore if the sidecar is unreachable, unconfigured, or times out.
+        #
+        # Do NOT "fix" this to always score best_enhanced instead -- a real
+        # production oscillating capture has scored 70% NFIQ2 via the
+        # binarized AFIS superprint (nfiqSource=afis), so the binarized
+        # rendering is not inherently out-of-distribution for NFIQ2. A
+        # previous session incorrectly assumed otherwise (catastrophic
+        # nfiq2Score of 4-6 on two front_only_v1 captures, both
+        # nfiqSource=afis) and swapped this to always score best_enhanced;
+        # that was reverted once the 70% counter-example surfaced. The 4-6
+        # scores traced to real capture-quality problems on those two
+        # captures (AF-lock timing, camera shake, red ambient-light cast) --
+        # not to which image type NFIQ2 was scoring.
         winning_image = best_afis_img if (afis_nfiq >= cyl_nfiq and afis_nfiq > 0) else best_enhanced
         nfiq2_score = nfiq2_client.score_nfiq2(winning_image)
 
