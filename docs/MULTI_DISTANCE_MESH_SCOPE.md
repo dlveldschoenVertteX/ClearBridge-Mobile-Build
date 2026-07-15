@@ -107,6 +107,17 @@ third hold+burst.
   check (already used for the "move closer"/"move back" hints) can detect
   when the user has moved to a meaningfully different distance zone — no new
   sensor/hardware capability needed.
+- **Guide-size-as-distance-control (CTO note, 2026-07-15)**: the pad
+  silhouette guide's own on-screen SIZE can be the distance-transition
+  mechanism, not just a passive framing target. Concretely: the guide should
+  actively SHRINK between capture stages, so the user is prompted to move
+  the thumb back to make it fit the now-smaller opening again — turning the
+  guide into an active "move to this distance" control rather than a fixed
+  window. Directly related to the same-day guide-enlargement fix
+  (`defaultShape` rx/ry bumped 0.17/0.13 -> 0.21/0.17, commit `36dc2f7`) —
+  that fix was needed because the guide was static and sized for one
+  distance only; a multi-distance capture needs the guide to be dynamic
+  (parameterized by capture stage), not a single constant.
 - **Schema**: tag each burst's `frames[]` entries with a `distanceZone`
   field (`'near'|'mid'|'far'`), parallel to the existing `flashOn` tagging —
   additive, no redesign.
