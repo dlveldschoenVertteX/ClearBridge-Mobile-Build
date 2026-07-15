@@ -38,14 +38,26 @@ class PadSilhouetteShape {
   final double taper;
 
   /// Default pad shape — a thumbprint oval: fatter base, narrower rounded tip.
-  /// Smaller than the prior symmetric superellipse based on CTO feedback.
   /// Bounding box kept in sync with FrontCaptureController._scoreRoi so
   /// framing, metering and the superprint crop all agree.
+  ///
+  /// Enlarged 2026-07-15 (rx 0.17->0.21, ry 0.13->0.17) per CTO request: the
+  /// guide opening was constraining how close the user could bring the thumb
+  /// -- a closer capture appears larger on screen and no longer fit inside
+  /// the previous, smaller opening. This directly targets the dominant real
+  /// nfiq2Score lever found this session (native ridge wavelength / working
+  /// distance -- see CLAUDE.md), so the guide needs to accommodate a bigger
+  /// on-screen thumb, not just a fixed framing. Now that the BoxFit.cover
+  /// guideRegion mapping bug is fixed, the on-screen guide and the backend
+  /// mask are guaranteed to match, so this is a deliberate size choice, not
+  /// a mask-position bug -- re-test visually if creases start showing up in
+  /// superprints again, since a bigger opening does extend closer to the DIP
+  /// crease than the previous top-half-only shrink.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.17,
-    ry: 0.13,
+    rx: 0.21,
+    ry: 0.17,
     taper: 0.20,
   );
 
