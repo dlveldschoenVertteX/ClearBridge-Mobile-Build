@@ -55,11 +55,32 @@ from the repo — only the CI build step was dropped, in case revisited later.
   tapered superellipse guide, shrunk to **top-half of the pad only** per CTO annotation
   (cy=0.37, ry=0.13 — was cy=0.5, ry=0.26). Kept 1:1 with `_scoreRoi` in the controller.
 - `guideRegion` is written to Firestore and used **directly as the AFIS mask** on the
-  backend (no U-Net segmentation, no fragile ridge-periodicity crop) — current values
-  cx=0.63, cy=0.50, rx=0.13, ry=0.17, derived from the portrait→landscape display transform.
-  These were corrected once already (first attempt used rough estimates); if NFIQ looks
-  systematically off-center again, re-derive from the actual preview→still transform rather
-  than re-guessing.
+  backend (no U-Net segmentation, no fragile ridge-periodicity crop). **Now computed at
+  runtime** (`_computeGuideRegion` in `front_capture_controller.dart`), not hardcoded —
+  see the BoxFit.cover fix below. If NFIQ looks systematically off-center again, re-derive
+  from the actual preview→still transform rather than re-guessing constants.
+- **BoxFit.cover guideRegion bug, found + fixed 2026-07-15 (commit `a20e009`) — real
+  breakthrough, NFIQ2 jumped from single digits to 72.** The old hardcoded guideRegion
+  constants (cx=0.63, cy=0.50, rx=0.13, ry=0.17) were derived by rotating the on-screen
+  pad silhouette's raw screen-normalized fraction directly into still-space, silently
+  ignoring the `BoxFit.cover` crop+scale that `front_capture_screen.dart`'s
+  `_cameraLayer()` applies (`FittedBox(fit: BoxFit.cover, clipBehavior: Clip.hardEdge)`
+  around a `SizedBox` sized to the swapped preview dimensions) whenever the preview's
+  aspect ratio differs from the screen's. Net effect: the backend mask used as the AFIS
+  ROI **did not match what the user actually saw on the live capture screen** — it caught
+  lower-pad skin creases the on-screen guide never covered. Found only because the user
+  sent two annotated screenshots (live on-screen guide vs. a rendered mask overlay with a
+  hand-drawn "correct ROI") after explicitly rejecting an incorrect "skin-crease
+  contamination" theory floated first — **don't re-derive "why is the print bad" from
+  theory when the user says the mask doesn't match what they see; ask for/inspect the
+  actual on-screen visual before theorizing.** Fix: `_computeGuideRegion({screenSize,
+  previewSize})` now maps the pad silhouette through the same BoxFit.cover math at
+  runtime (screen size + preview size both vary by device), then applies the existing
+  correct `(u,v) -> (1-v,u)` rotation into still-space. Validated on 3 real post-fix
+  captures: 2 of 3 scored real `nfiq2Score` **72** (previous project-wide best was 62;
+  previous `front_only_v1` baseline was single digits) — visually confirmed via
+  `superprint_afis.png` as a genuinely clean, dense, natural whorl print. Notion session
+  log: https://app.notion.com/p/39ea03ed9e7e818bbab5e12207af6570
 - NFIQ scores are backend-only, never surfaced to end users (see Notion "NFIQ Visibility
   Policy — Backend Only").
 - **NFIQ2 sidecar exists and is live** (`functions/nfiq2_service/`, deployed to Cloud Run
@@ -86,6 +107,18 @@ from the repo — only the CI build step was dropped, in case revisited later.
     reachable); same class of restriction as the GHCR/dl.google.com blocks below. Firestore/
     Storage/Cloud Run Admin API (`run.googleapis.com`, to look up the service URL) all work
     fine — it's specifically the deployed service's own generated hostname that's blocked.
+
+## Current focus (as of 2026-07-15, post-guideRegion-fix): enhancement model tuning
+CTO directive after the guideRegion fix's 72-score breakthrough: **the AFIS enhancement
+pipeline itself (`functions/processEnhanceAndScore/afis_print.py` — Gabor filtering, ridge
+frequency normalization, morphological ops, binarization) has never been manually tuned.**
+Use the real captured burst frames/superprints from the 2026-07-15 test captures (and
+broader Firestore history) as a concrete tuning dataset and start iterating on its
+parameters directly. Verify every change against real `nfiq2Score` (the sidecar), never
+the ResNet18 proxy alone — same discipline as everywhere else in this project. The sidecar
+itself can't be called from this sandbox (see above) — tuning experiments need to go
+through a real deploy + real device capture cycle, or a Cloud Build job that can reach the
+sidecar, to get real NFIQ2 feedback.
 
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
