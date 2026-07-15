@@ -280,6 +280,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         elif is_front_only:
             frames, frame_meta, actual_angles, ambient_frames, flash_frames = \
                 _download_front_only_frames(capture_id, base_path)
+            # Preserve the raw burst for the deepFuse variant -- same schema
+            # _download_front_burst already expects (frames[] entries with
+            # angleDeg/flashOn/type/laplacianScore/path), just never wired in
+            # for this capture mode. Without this, deepFuse always self-skips
+            # for front_only_v1 despite being worth +2.5-8.5 NFIQ elsewhere.
+            ambient_burst, flash_burst = _download_front_burst(capture_id)
             _update_firestore(capture_id, {'captureMode': 'front_only_v1'})
         elif is_oscillating:
             (frames, frame_meta, osc_angles, osc_stats,
