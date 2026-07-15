@@ -154,6 +154,50 @@ parameters. Findings:
   + real device captures to confirm before trusting the gain. Notion session log:
   https://app.notion.com/p/39ea03ed9e7e81ad9beac33f717445b7
 
+## Fidelity/matching axis (added 2026-07-15) — ground-truth minutiae matching sidecar
+CTO elevated **fidelity** (does the print structurally/minutiae-match the real finger,
+not just score well on NFIQ2) to co-equal status with `nfiq2Score` after comparing our
+best real capture (`ccb9c85a`, nfiq2Score 72) against a real inked print and finding ours
+visibly noisier despite the good score. Full plan in
+`docs/GROUND_TRUTH_MATCHING_SCOPE.md`; CTO decisions: keep capture single-front-pad-only
+(NFIQ's fixed 500×500 scoring and real AFIS matching value pull in opposite directions on
+capture coverage — don't reopen this), try pretrained enhancement models before collecting
+a training dataset from scratch.
+
+**Stream A built and deployed-pending: mindtct/bozorth3 ground-truth matching sidecar.**
+Extended `functions/nfiq2_service/` (the existing NFIQ2 Cloud Run service) with `/minutiae`
+and `/match` endpoints wrapping NIST NBIS's `mindtct` (minutiae extraction) and `bozorth3`
+(minutiae matching, partial-print-capable, no fixed universal pass/fail threshold) — this
+is the actual measurement tool for the fidelity axis, separate from and complementary to
+NFIQ2's quality axis. New `functions/processEnhanceAndScore/mindtct_client.py` mirrors
+`nfiq2_client.py`'s ID-token auth pattern (`extract_minutiae()`, `match_prints()`).
+
+- **NBIS source is vendored into the repo** (`functions/nfiq2_service/vendor/nbis/`, ~9MB,
+  see `vendor/nbis/PROVENANCE.md`) rather than fetched from an external URL at Docker build
+  time. A first attempt at fetching `lessandro/nbis` (a community mirror — no single
+  official NIST-hosted git repo for NBIS exists, unlike NFIQ2's `usnistgov/NFIQ2`; NIST's
+  own distribution page 403s automated fetches) directly in the Dockerfile was correctly
+  blocked by the session's own safety tooling as an unvetted third-party build dependency.
+  Verified the mirror's content is genuine NBIS 5.0.0 (license header, changelog, and every
+  file's NIST/ITL project metadata all match NIST's real release) before vendoring, then got
+  the user's explicit sign-off on this specific source. Vendored copy trimmed from ~102MB to
+  ~9MB (just the packages `mindtct`/`bozorth3` actually link against, traced via their own
+  Makefiles) and required one real fix: `-fcommon` added to `CFLAGS` (this 2015-era C89 code
+  needs it on GCC 10+, which Ubuntu 22.04 ships — without it, several packages fail to link
+  with "multiple definition" errors).
+- **Build-verified locally before vendoring** (not yet build-tested in the real Cloud Build/
+  Ubuntu-22.04 environment — watch the first real deploy's log, same caveat the Dockerfile
+  already carries for the NFIQ2 `.deb` install step): `setup.sh && make config && make it`
+  exits 0, produces real `mindtct`/`bozorth3` binaries whose usage output matches NBIS's own
+  man pages, and a synthetic end-to-end smoke test (mindtct on a test image → `.xyt` minutiae
+  file → bozorth3 on two `.xyt` files → numeric match score) ran without error.
+- **Not yet deployed.** Next steps per the approved plan: deploy (separate explicit go-ahead
+  needed, same as every backend change), then get a real baseline match score between the
+  CTO's ink scan (`ground_truth/cto_thumb_ink_scan_2026-07-15.jpg` in Firebase Storage) and
+  the best real captures (`ccb9c85a`, `3e54236a`, `c34911b5`), then the CTO-chosen "try
+  pretrained enhancement models first" experiment (FpEnhancer / FingerFlow's CoarseNet-
+  FineNet, no training) scored against that real match baseline.
+
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
   datastore) bundle prebuilt `.so` for arm64-v8a + armeabi-v7a + x86_64, but
