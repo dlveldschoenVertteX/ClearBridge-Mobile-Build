@@ -732,18 +732,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # ── 4d. Real NFIQ2 ground-truth score (additive, non-blocking) ─────────
         # nfiqScore above is the ResNet18 proxy -- fast, used as the training/
         # ranking signal throughout this pipeline, but a learned proxy, not the
-        # NIST ground-truth algorithm. Deliberately always score best_enhanced
-        # (continuous-tone) here, NOT whichever image won the proxy comparison
-        # (afis vs cylindrical): NFIQ2 is calibrated on natural grayscale
-        # ridge-valley scanner images, and the AFIS "superprint" is a
-        # posterized/binarized rendering built for matching/display, not a
-        # natural image -- feeding it to NFIQ2 is out-of-distribution for the
-        # algorithm and was producing single-digit scores (real captures
-        # fc619fe8/7d7d0162, both nfiqSource=afis, nfiq2Score 6 and 4) even
-        # when the proxy scored them 60+. Never blocks or fails the pipeline:
+        # NIST ground-truth algorithm. Score the SAME image that won nfiqScore
+        # (mirrors the nfiqSource selection below) through the real NFIQ2
+        # binary via the sidecar service. Never blocks or fails the pipeline:
         # score_nfiq2() itself never raises, and nfiq2Score is simply null in
         # Firestore if the sidecar is unreachable, unconfigured, or times out.
-        nfiq2_score = nfiq2_client.score_nfiq2(best_enhanced)
+        winning_image = best_afis_img if (afis_nfiq >= cyl_nfiq and afis_nfiq > 0) else best_enhanced
+        nfiq2_score = nfiq2_client.score_nfiq2(winning_image)
 
         # ── 5. Henry classification ────────────────────────────────────────────
         # Use best TTA variant image — same preprocessing that scored highest.
