@@ -729,6 +729,59 @@ class FrontCaptureController extends ChangeNotifier {
       }
       await firestoreFuture;
 
+      // Best-effort secondary-camera capture: try any OTHER back cameras this
+      // device exposes (e.g. IR/night-vision + ultrawide sensors) for one
+      // extra torch-lit still each, purely additive to the main flow above.
+      // Ported from OscillatingCaptureController (built + validated there,
+      // proven server-side: the IR camera's torch shot alone scored
+      // competitively with -- and on one device, above -- the main camera's
+      // best single frame; see docs/CAPTURE_OPTIMIZATION_SCOPE.md). Was never
+      // wired into front_only_v1 before now since that flow didn't exist yet
+      // when this was built. Runs AFTER the main frames + Firestore doc are
+      // already committed, so there is nothing left for a failure here to
+      // jeopardise, and BEFORE the processEnhanceAndScore trigger below so
+      // the backend's one-time doc read sees secondaryCameras already
+      // present. Many devices can only hold one camera session open at a
+      // time -- opening a second physical camera here may simply fail, which
+      // is caught and skipped silently per-camera.
+      final secondaryMeta = <Map<String, dynamic>>[];
+      try {
+        final allCams = await availableCameras();
+        final mainName = _camera?.description.name;
+        final others = allCams.where((c) =>
+            c.lensDirection == CameraLensDirection.back && c.name != mainName);
+        for (final desc in others) {
+          CameraController? tmp;
+          try {
+            tmp = CameraController(desc, ResolutionPreset.max, enableAudio: false);
+            await tmp.initialize().timeout(const Duration(seconds: 8));
+            await tmp.setFlashMode(FlashMode.torch);
+            await Future<void>.delayed(const Duration(milliseconds: 600));
+            final shot = await tmp.takePicture();
+            final bytes = await shot.readAsBytes();
+            await tmp.setFlashMode(FlashMode.off);
+            final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+            final path = '$basePath/secondary_${safeName}_torch.jpg';
+            await _uploadWithRetry(bytes, path);
+            secondaryMeta.add({'name': desc.name, 'path': path});
+          } catch (e) {
+            debugPrint('[front] secondary camera ${desc.name} skipped: $e');
+          } finally {
+            try {
+              await tmp?.dispose();
+            } catch (_) {}
+          }
+        }
+        if (secondaryMeta.isNotEmpty) {
+          await FirebaseFirestore.instance
+              .collection('captures')
+              .doc(id)
+              .update({'secondaryCameras': secondaryMeta});
+        }
+      } catch (e) {
+        debugPrint('[front] secondary camera capture skipped entirely: $e');
+      }
+
       () async {
         try {
           await FirebaseFunctions.instanceFor(region: 'africa-south1')
