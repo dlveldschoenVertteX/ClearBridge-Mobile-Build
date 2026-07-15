@@ -624,6 +624,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         afis_params: dict = {}
         afis_nfiq = 0.0
         best_afis_img = None
+        freqnorm_img = None
         try:
             _laps = [
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
@@ -684,6 +685,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     **_vkw)
                 if _img is None:
                     continue
+                if _vname == 'freqNorm':
+                    freqnorm_img = _img
                 _res = _score_nfiq(_img, sfm_coverage=1.0)
                 _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
                 logger.info('AFIS variant %s nfiq=%.1f', _vname, _s)
@@ -757,6 +760,24 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # not to which image type NFIQ2 was scoring.
         winning_image = best_afis_img if (afis_nfiq >= cyl_nfiq and afis_nfiq > 0) else best_enhanced
         nfiq2_score = nfiq2_client.score_nfiq2(winning_image)
+        nfiq2_source = 'winner'
+
+        # Additive experiment: the ResNet18 proxy above doesn't appear to
+        # penalise an out-of-domain ridge period the way real NFIQ2 does (a
+        # real front_only_v1 capture won its proxy vote at afisWavelengthPx
+        # 15.5-20px -- over 2x afis_print's own _TARGET_PERIOD=9.0 -- while
+        # the frequency-normalised variant, which would correct that, scored
+        # lower on the proxy and lost; the one real capture that hit exactly
+        # 9.0px scored 62 NFIQ2, the best clean result on record). If the
+        # freqNorm rendering differs from the proxy-selected winner, score it
+        # too and keep whichever real NFIQ2 is higher -- same non-regressing
+        # "keep the max" pattern as the proxy variants above, just applied to
+        # the ground-truth score directly since the two models disagree here.
+        if freqnorm_img is not None and freqnorm_img is not winning_image:
+            _freqnorm_nfiq2 = nfiq2_client.score_nfiq2(freqnorm_img)
+            if _freqnorm_nfiq2 is not None and (nfiq2_score is None or _freqnorm_nfiq2 > nfiq2_score):
+                nfiq2_score = _freqnorm_nfiq2
+                nfiq2_source = 'freqNorm'
 
         # ── 5. Henry classification ────────────────────────────────────────────
         # Use best TTA variant image — same preprocessing that scored highest.
@@ -776,6 +797,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             'nfiqScore':        round(nfiq_score, 2),
             'nfiqPass':         nfiq_pass,
             'nfiq2Score':       nfiq2_score,
+            # Which image nfiq2Score actually came from: 'winner' (the proxy's
+            # own pick, same as nfiqSource) or 'freqNorm' (the frequency-
+            # normalised rendering, when it beat the proxy's pick on real
+            # NFIQ2 specifically) -- diagnostic for the prime-directive
+            # frequency-mismatch experiment, see main.py's NFIQ2-scoring step.
+            'nfiq2Source':      nfiq2_source,
             'nfiqSource':       'afis' if afis_nfiq >= cyl_nfiq and afis_nfiq > 0 else 'cylindrical',
             'nfiqCylindrical':  round(cyl_nfiq, 2),
             'nfiqAfis':         round(afis_nfiq, 2) if afis_nfiq > 0 else None,
