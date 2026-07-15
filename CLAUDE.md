@@ -24,13 +24,23 @@ me manually invoking it. Flag this to the user before pushing non-trivial commit
 matters in the moment.
 
 ## Three apps in this monorepo
-1. **Main app** (`android/`, root) — four-angle + arc-sweep SfM capture flavors. GitHub
-   Actions job `build`.
+1. **Main app** (`android/`, root) — four-angle + arc-sweep SfM capture flavors.
+   **Discontinued 2026-07-15** (see below); the `build` CI job that built it was removed
+   from `.github/workflows/build.yml`. App code/flavors left in place, not deleted.
 2. **`capture_harness/`** — standalone camera-only test build (mac_capture package only, no
    Firebase/Paystack/MLKit). GitHub Actions job `build-capture-harness`.
 3. **`clearbridge_beta/`** — consumer-facing beta app, **front-only single-capture flow**
    (no SfM/oscillation). GitHub Actions job `build-clearbridge-beta`; also mirrored in
-   `.gitlab-ci.yml`.
+   `.gitlab-ci.yml`. This is the active development focus.
+
+## Four-angle / arc-sweep: discontinued (2026-07-15)
+User decision: **not moving forward with the four-angle/arc-sweep SfM reconstruction
+model.** Same root cause as the beta app's earlier oscillating-capture drop — wider
+angular coverage dilutes ridge density in NFIQ's fixed 500×500 model input rather than
+adding usable detail. The CI `build` job (built `fourAngle`/`arcSweep` flavors, published
+to GitHub Release + Firebase Storage) was removed from `build.yml`; `build-capture-harness`,
+`build-clearbridge-beta`, and `deploy-web` remain. App code/flavors were **not** deleted
+from the repo — only the CI build step was dropped, in case revisited later.
 
 ## Capture pipeline decisions (front-only, current)
 - **8-phase oscillating / SfM reconstruction is deliberately dropped for the beta app.**
