@@ -116,7 +116,14 @@ class _RawShot {
 /// picks it up (no SfM reconstruction, no oscillation, pure AFIS single-frame
 /// + deep-fuse variants).
 class FrontCaptureController extends ChangeNotifier {
-  static const int _burstFrameCount = 4;
+  // 4 ambient + 4 flash. Bumped from 4 (2+2): a bigger candidate pool raises
+  // the odds afis_print's ridge-energy single-frame selection lands on a
+  // genuinely sharp shot -- the real-data pattern behind this project's best
+  // scores (four-angle/oscillating captures with 12-24 total frames vastly
+  // outscored front-only's fixed 4) -- and gives the deepFuse variant (now
+  // wired in for front_only_v1) a real multi-frame stack per illumination
+  // instead of the bare 2-frame minimum.
+  static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 50;
   static const int _burstFlashSettleMs = 70;
   static const int _holdDurationMs = 1500;
