@@ -41,6 +41,27 @@ _TARGET_PERIOD = 9.0      # ridge period (px) to normalise to — ~500 DPI domai
 _STACK_MAX = 4            # max same-pose frames to align+average (denoise)
 _STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
 
+# Gabor/CLAHE tuning (2026-07-15): swept against the local ResNet18 proxy on 5
+# real captures whose actual nfiq2Score is known (2 good/72, 2 bad/7, 1
+# worst-case/1 — see Notion session log), reproducing main.py's scoring
+# exactly enough to match its recorded proxy values to within ~0.1. Gamma and
+# sigma-ratio moves were broadly positive (or flat) on EVERY case tested,
+# good and bad alike, so they're low-risk. Not yet confirmed against real
+# NFIQ2 (the sidecar can't be reached from this sandbox) — validate on the
+# next real device captures before trusting the absolute gain.
+_GABOR_SIGMA_RATIO = 0.65   # was 0.56 -- slightly wider envelope, helped coarser-ridge (larger native wavelength) captures without hurting clean ones
+_GABOR_GAMMA = 0.85         # was 0.60 -- monotonically improved every one of the 5 real test cases as it rose toward 1.0; kept <1.0 to preserve some orientation-selectivity rather than going fully isotropic
+_FEATHER_SIGMA = 2.5        # was 4.0 -- small, uniformly-nonnegative gain across all 5 cases
+_FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
+# shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
+# native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
+# regardless of variant (722ae3b0: scale 0.5 -> real 7; d7dd0c68: scale 0.9 -> real 5),
+# while captures needing little/no rescale did well (c34911b5, 3e54236a: both real 72).
+# Capping how aggressive the resample is allowed to get also improved the LOCAL proxy
+# score substantially on the same real bad case (722ae3b0: 65.3 -> 72.6). Left as a
+# floor rather than disabling freq_normalize entirely -- a mild correction still helps
+# (d7dd0c68's 0.9 scale case, while bad, wasn't as bad as the 0.5/0.45 cases).
+
 
 def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndarray:
     img = img.astype(np.float32)
@@ -85,13 +106,13 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
 
 def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np.ndarray:
     h, w = img.shape
-    sigma = 0.56 * wavelength
+    sigma = _GABOR_SIGMA_RATIO * wavelength
     ksize = int(2 * np.ceil(3 * sigma) + 1)
     outs = np.zeros((_N_ORIENT, h, w), np.float32)
     for i in range(_N_ORIENT):
         th = np.pi * i / _N_ORIENT
         k = cv2.getGaborKernel((ksize, ksize), sigma, th + np.pi / 2,
-                               wavelength, 0.6, 0, cv2.CV_32F)
+                               wavelength, _GABOR_GAMMA, 0, cv2.CV_32F)
         k -= k.mean()
         outs[i] = cv2.filter2D(img, cv2.CV_32F, k)
     idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
@@ -874,7 +895,7 @@ def generate(
     params['afisWavelengthPx'] = float(round(native_wl, 1))
     wl = native_wl
     if freq_normalize and native_wl > 1.0:
-        scale = float(np.clip(_TARGET_PERIOD / native_wl, 0.35, 2.5))
+        scale = float(np.clip(_TARGET_PERIOD / native_wl, _FREQ_SCALE_MIN, 2.5))
         if abs(scale - 1.0) > 0.05:
             interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
             g8 = cv2.resize(g8, None, fx=scale, fy=scale, interpolation=interp)
@@ -901,8 +922,8 @@ def generate(
     # (visible as a ghosted second boundary/texture past the real edge).
     # `mask` itself stays hard-edged below (crop bounding box,
     # _upright_rotate's PCA) -- only the pixel blend is softened.
-    blurred = cv2.GaussianBlur(binimg, (0, 0), sigmaX=4.0)
-    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=4.0).astype(np.float32) / 255.0
+    blurred = cv2.GaussianBlur(binimg, (0, 0), sigmaX=_FEATHER_SIGMA)
+    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=_FEATHER_SIGMA).astype(np.float32) / 255.0
     edge_weight = 1.0 - np.abs(2.0 * mask_soft - 1.0)   # peaks at the boundary, ~0 elsewhere
     binimg = (blurred.astype(np.float32) * edge_weight +
               binimg.astype(np.float32) * (1.0 - edge_weight)).astype(np.uint8)
