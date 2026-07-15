@@ -207,11 +207,68 @@ NFIQ2's quality axis. New `functions/processEnhanceAndScore/mindtct_client.py` m
   (this sandbox's egress reaches `*.googleapis.com` but not the deployed service's own
   `*.run.app` hostname). Real validation happens the same way NFIQ2 itself gets validated:
   through `processEnhanceAndScore` calling it during an actual capture, not from here.
-- **Next steps per the approved plan**: get a real baseline match score between the CTO's
-  ink scan (`ground_truth/cto_thumb_ink_scan_2026-07-15.jpg` in Firebase Storage) and the
-  best real captures (`ccb9c85a`, `3e54236a`, `c34911b5`), then the CTO-chosen "try
-  pretrained enhancement models first" experiment (FpEnhancer / FingerFlow's CoarseNet-
-  FineNet, no training) scored against that real match baseline.
+- **First real baseline match test run, 2026-07-15** (in-sandbox, using the vendored
+  `mindtct`/`bozorth3` binaries directly — not via the live HTTP endpoint, which this
+  sandbox can't reach). Probe = `3e54236a` (nfiq2Score 72; picked over the other two 72-
+  scorers `ccb9c85a`/`c34911b5` by visual ridge-continuity check — `c34911b5` has visibly
+  messier/broken ridges lower-right; `3e54236a` and `ccb9c85a` both clean, `3e54236a`
+  slightly smoother/less "hairy" at the edges). Gallery = the CTO's ink scan.
+  - **Raw score: 3** (essentially a non-match by bozorth3's usual scale). Investigating
+    *why* before treating that as a verdict (same discipline as everywhere else):
+    measured actual ridge wavelength in each image and found a real ~2.75x scale mismatch
+    (mindtct assumes ~500 DPI; nothing was correcting for it). Correcting raised the score
+    to 14 with a quick single-ROI estimate — real evidence scale matters, but that quick
+    estimate itself turned out unreliable (see below).
+  - **CTO directly observed the prints are mirrored** (loop on the wrong side). Checked
+    `packages/mac_capture`'s still-image decode path (`decodeStillJpegToLuma`) for an
+    app-level mirroring bug — found none, it only rotates for sensor orientation, never
+    flips. Swept all 8 rotate/mirror combinations of the (scale-corrected) pair: scores
+    only spread 10-18, too narrow/noisy to trust any single orientation as "the" correct
+    one (genuine matches typically score far higher). No code-traceable bug found, so the
+    mirroring's root cause is still open — the fix that shipped works around the
+    ambiguity rather than resolving it (see below).
+- **Built real DPI normalization + mirror handling into `mindtct_client.py`**
+  (commit `7d359c0`), not a one-off script:
+  - `_estimate_ridge_wavelength_px()`: FFT-based ridge-period estimate. The quick manual
+    estimate used above wasn't actually reliable — sweeping ROI size on the ink scan gave
+    wildly inconsistent results (61px to 163px) because a real photo's lighting/shading
+    gradient can dominate the low frequencies a small `min_r` cutoff doesn't exclude.
+    Shipped defaults (`roi_frac=0.6`, `min_r=15`) were chosen because they're the ones
+    that **converge to a stable answer across a wide range of nearby parameter values on
+    both real images** (~11.7px digital capture, ~21.6px ink scan) — convergence, not a
+    single lucky number, is what makes an estimate trustworthy on a noisy real photo.
+  - `_normalize_dpi()`: rescales toward this project's existing ~9px calibration target
+    (same one `afis_print.py` already uses).
+  - `match_prints()` now tries the probe both as normalized and mirrored, keeps the
+    higher bozorth3 score, and returns a dict (`matchScore`, `mirrorApplied`,
+    `rawScoreOriginal`, `rawScoreMirrored`, `probeDpiScale`, `galleryDpiScale`) instead of
+    a bare int — full transparency, since nothing else calls this yet.
+  - **Honest result with the more rigorous estimate: score 6, mirror did NOT help (5 <
+    6)** — actually lower than the quick pass's 14. Real, not tuned to look good: it means
+    the quick pass's number was closer by chance, and scale/orientation alone isn't the
+    dominant gap for this specific pair. Remaining real candidates, not yet corrected for:
+    the ink scan shows the whole thumb while the digital capture's `guideRegion` only
+    frames the pad's top portion (a coverage mismatch — not fixable by scale/orientation
+    correction alone), and the ink scan photo itself has real quality issues (blur, low
+    contrast — the CTO's own words: "the best I could get"). **Do not treat this single
+    pair's score as a verdict on fidelity either way** — same "need more real data before
+    concluding" discipline as the rest of this project. All test artifacts (probe/gallery
+    images at every processing stage) are in this session's scratchpad, not committed.
+- **Next real steps**: (1) get more paired ink-scan/digital-capture samples before
+  generalizing from one pair; (2) the CTO-chosen "try pretrained enhancement models
+  first" experiment — see the new section below for where that stands.
+
+## Pretrained fingerphoto-enhancement models — where this stands (2026-07-15)
+Per the CTO's "try pretrained first" decision (§ Fidelity/matching axis above), evaluating
+existing pretrained models before any from-scratch training. Two candidates identified in
+earlier web research: **FpEnhancer** (github.com/XiongjunGuan/FpEnhancer) and
+**FingerFlow** (`pip install fingerflow`, packages MinutiaeNet's CoarseNet/FineNet).
+Learned from the NBIS vendoring experience this same session: pulling in external
+pretrained weights is the same class of supply-chain decision as vendoring external
+source, so apply the same diligence (verify the source is real/legitimate/maintained,
+check license compatibility with shipping in a commercial product, confirm it actually
+does image enhancement and not just minutiae extraction) before integrating either —
+in progress, not yet concluded as of this note.
 
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
