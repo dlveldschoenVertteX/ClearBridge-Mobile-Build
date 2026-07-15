@@ -744,12 +744,24 @@ class FrontCaptureController extends ChangeNotifier {
       // present. Many devices can only hold one camera session open at a
       // time -- opening a second physical camera here may simply fail, which
       // is caught and skipped silently per-camera.
+      // Diagnostic trail written unconditionally (unlike secondaryMeta below,
+      // which only ever reflects successes) -- added after a real device
+      // test on the Doogee S118 (previously confirmed to expose separate
+      // IR/ultrawide camera IDs) silently produced zero secondaryCameras
+      // with no way to tell whether that meant "no other camera found" or
+      // "every attempt failed". Written even on total failure so the next
+      // real capture actually explains itself instead of staying silent.
+      final secondaryDebug = <String, dynamic>{'foundBackCams': <String>[]};
       final secondaryMeta = <Map<String, dynamic>>[];
       try {
         final allCams = await availableCameras();
         final mainName = _camera?.description.name;
+        secondaryDebug['allCamsCount'] = allCams.length;
+        secondaryDebug['mainCamName'] = mainName;
         final others = allCams.where((c) =>
             c.lensDirection == CameraLensDirection.back && c.name != mainName);
+        secondaryDebug['foundBackCams'] =
+            others.map((c) => c.name).toList(growable: false);
         for (final desc in others) {
           CameraController? tmp;
           try {
@@ -764,23 +776,25 @@ class FrontCaptureController extends ChangeNotifier {
             final path = '$basePath/secondary_${safeName}_torch.jpg';
             await _uploadWithRetry(bytes, path);
             secondaryMeta.add({'name': desc.name, 'path': path});
+            secondaryDebug['${desc.name}_ok'] = true;
           } catch (e) {
             debugPrint('[front] secondary camera ${desc.name} skipped: $e');
+            secondaryDebug['${desc.name}_error'] = e.toString();
           } finally {
             try {
               await tmp?.dispose();
             } catch (_) {}
           }
         }
-        if (secondaryMeta.isNotEmpty) {
-          await FirebaseFirestore.instance
-              .collection('captures')
-              .doc(id)
-              .update({'secondaryCameras': secondaryMeta});
-        }
       } catch (e) {
         debugPrint('[front] secondary camera capture skipped entirely: $e');
+        secondaryDebug['fatalError'] = e.toString();
       }
+      try {
+        final update = <String, dynamic>{'secondaryCameraDebug': secondaryDebug};
+        if (secondaryMeta.isNotEmpty) update['secondaryCameras'] = secondaryMeta;
+        await FirebaseFirestore.instance.collection('captures').doc(id).update(update);
+      } catch (_) {}
 
       () async {
         try {
