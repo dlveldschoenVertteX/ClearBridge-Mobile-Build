@@ -678,45 +678,6 @@ class FrontCaptureController extends ChangeNotifier {
       }
       await firestoreFuture;
 
-      // Secondary cameras — best-effort, same pattern as oscillating controller.
-      try {
-        final allCams = await availableCameras();
-        final mainName = _camera?.description.name;
-        final others = allCams.where(
-            (c) => c.lensDirection == CameraLensDirection.back && c.name != mainName);
-        final secondaryMeta = <Map<String, dynamic>>[];
-        for (final desc in others) {
-          CameraController? tmp;
-          try {
-            tmp = CameraController(desc, ResolutionPreset.max, enableAudio: false);
-            await tmp.initialize().timeout(const Duration(seconds: 8));
-            await tmp.setFlashMode(FlashMode.torch);
-            await Future<void>.delayed(const Duration(milliseconds: 600));
-            final shot = await tmp.takePicture();
-            final bytes = await shot.readAsBytes();
-            await tmp.setFlashMode(FlashMode.off);
-            final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-            final path = '$basePath/secondary_${safeName}_torch.jpg';
-            await _uploadWithRetry(bytes, path);
-            secondaryMeta.add({'name': desc.name, 'path': path});
-          } catch (e) {
-            debugPrint('[front] secondary camera ${desc.name} skipped: $e');
-          } finally {
-            try {
-              await tmp?.dispose();
-            } catch (_) {}
-          }
-        }
-        if (secondaryMeta.isNotEmpty) {
-          await FirebaseFirestore.instance
-              .collection('captures')
-              .doc(id)
-              .update({'secondaryCameras': secondaryMeta});
-        }
-      } catch (e) {
-        debugPrint('[front] secondary cameras skipped: $e');
-      }
-
       () async {
         try {
           await FirebaseFunctions.instanceFor(region: 'africa-south1')
