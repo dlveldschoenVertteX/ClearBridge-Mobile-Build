@@ -85,9 +85,12 @@ android {
             val keystorePath = System.getenv("KEYSTORE_PATH")
             val keystoreFile = keystorePath?.let { file(it) }?.takeIf { it.exists() }
             storeFile = keystoreFile ?: signingConfigs.getByName("debug").storeFile
-            storePassword = System.getenv("KEYSTORE_PASSWORD") ?: "android"
-            keyAlias = System.getenv("KEY_ALIAS") ?: "androiddebugkey"
-            keyPassword = System.getenv("KEY_PASSWORD") ?: "android"
+            // Secrets not yet configured in GitHub evaluate to "" (empty string), not
+            // null, so `?: "android"` alone doesn't trigger the fallback. Use
+            // takeIf { isNotBlank() } so both null and "" fall through to the defaults.
+            storePassword = System.getenv("KEYSTORE_PASSWORD")?.takeIf { it.isNotBlank() } ?: "android"
+            keyAlias = System.getenv("KEY_ALIAS")?.takeIf { it.isNotBlank() } ?: "androiddebugkey"
+            keyPassword = System.getenv("KEY_PASSWORD")?.takeIf { it.isNotBlank() } ?: "android"
         }
     }
 
