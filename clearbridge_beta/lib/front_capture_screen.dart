@@ -83,7 +83,11 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
     }
     final cam = _camera;
     if (cam == null) return;
-    await _ctrl.start(camera: cam, userId: userId);
+    await _ctrl.start(
+      camera: cam,
+      userId: userId,
+      screenSize: MediaQuery.sizeOf(context),
+    );
   }
 
   @override

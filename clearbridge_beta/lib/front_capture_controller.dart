@@ -6,7 +6,7 @@ import 'package:camera/camera.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_storage/firebase_storage.dart';
-import 'dart:ui' show Offset, Rect;
+import 'dart:ui' show Offset, Rect, Size;
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
@@ -144,18 +144,21 @@ class FrontCaptureController extends ChangeNotifier {
   static const Rect _scoreRoi = Rect.fromLTRB(0.30, 0.24, 0.70, 0.50);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
-  // receives after decodeStillJpegToLuma's 90°-CW rotation).
-  // Portrait (cx=0.5,cy=0.37,rx=0.17,ry=0.13) maps under (px,py)→(1-py,px):
-  //   landscape cx = 1-0.37 = 0.63  (thumb is right-of-centre in landscape)
-  //   landscape cy = 0.50
-  //   landscape rx = portrait ry = 0.13  (thumb's long axis is now horizontal)
-  //   landscape ry = portrait rx = 0.17  (thumb's short axis is now vertical)
-  // cx/cy verified empirically against front_burst_fl_0.jpg: thumb pad centre
-  // sits ~63% from the left in the landscape still, vertically centred.
-  static const double _guideCx = 0.63;
-  static const double _guideCy = 0.50;
-  static const double _guideRx = 0.13;
-  static const double _guideRy = 0.17;
+  // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
+  // runtime in start() from the actual screen size + camera preview size --
+  // NOT a fixed constant. The on-screen silhouette is drawn in
+  // screen-normalized coords, but _cameraLayer() displays the preview via
+  // BoxFit.cover, which CROPS part of the preview frame whenever the
+  // preview's aspect ratio differs from the screen's. A hardcoded rotation-
+  // only formula (the previous approach) ignores that crop entirely, so the
+  // backend mask silently drifts from what the on-screen guide actually
+  // shows on any device where the crop is non-trivial -- confirmed via a
+  // real device screenshot showing the live guide sitting higher/tighter on
+  // the pad than the backend's masked region. See _computeGuideRegion.
+  double _guideCx = 0.63;
+  double _guideCy = 0.50;
+  double _guideRx = 0.13;
+  double _guideRy = 0.17;
   static const double _guideN = 2.5;
 
   static const double _glareHighLuma = 205.0;
@@ -223,6 +226,7 @@ class FrontCaptureController extends ChangeNotifier {
   Future<void> start({
     required CameraController camera,
     required String userId,
+    required Size screenSize,
   }) async {
     if (_starting || _streamRunning) return;
     _starting = true;
@@ -230,6 +234,8 @@ class FrontCaptureController extends ChangeNotifier {
     _camera = camera;
     _userId = userId;
     _sensorOrientation = camera.description.sensorOrientation;
+
+    _computeGuideRegion(screenSize: screenSize, previewSize: camera.value.previewSize);
 
     _holdStart = null;
     _calibDone = false;
@@ -281,6 +287,51 @@ class FrontCaptureController extends ChangeNotifier {
     } finally {
       _starting = false;
     }
+  }
+
+  /// Maps the on-screen pad silhouette (screen-normalized coords) into
+  /// landscape-still-normalized guideRegion coords, accounting for the
+  /// BoxFit.cover crop _cameraLayer() applies (the previous fixed-constant
+  /// approach only rotated the raw on-screen fraction, silently ignoring
+  /// that crop -- confirmed wrong via a real device screenshot comparing
+  /// the live guide against the actual masked backend region).
+  void _computeGuideRegion({required Size screenSize, Size? previewSize}) {
+    if (previewSize == null || screenSize.width <= 0 || screenSize.height <= 0) {
+      return; // keep the existing (last-good or default) values
+    }
+    // _cameraLayer() swaps previewSize's width/height to get the portrait
+    // display aspect ratio before handing it to FittedBox(fit: BoxFit.cover).
+    final wp = previewSize.height;
+    final hp = previewSize.width;
+    final ws = screenSize.width;
+    final hs = screenSize.height;
+    final scale = math.max(ws / wp, hs / hp);
+    final offX = (wp * scale - ws) / 2;
+    final offY = (hp * scale - hs) / 2;
+
+    // Screen-normalized point -> landscape-still-normalized point: undo the
+    // BoxFit.cover crop/scale to recover the true preview-frame fraction,
+    // then apply the same 90°-CW rotation decodeStillJpegToLuma performs
+    // ((u,v) in portrait-preview -> (1-v,u) in landscape-still).
+    Offset toStill(double su, double sv) {
+      final previewU = ((su * ws) + offX) / scale / wp;
+      final previewV = ((sv * hs) + offY) / scale / hp;
+      return Offset(1.0 - previewV, previewU);
+    }
+
+    const shape = PadSilhouetteShape.defaultShape;
+    final center = toStill(shape.cx, shape.cy);
+    final top = toStill(shape.cx, shape.cy - shape.ry);
+    final bottom = toStill(shape.cx, shape.cy + shape.ry);
+    final left = toStill(shape.cx - shape.rx, shape.cy);
+    final right = toStill(shape.cx + shape.rx, shape.cy);
+
+    final xs = [top.dx, bottom.dx, left.dx, right.dx];
+    final ys = [top.dy, bottom.dy, left.dy, right.dy];
+    _guideCx = center.dx;
+    _guideCy = center.dy;
+    _guideRx = (xs.reduce(math.max) - xs.reduce(math.min)) / 2;
+    _guideRy = (ys.reduce(math.max) - ys.reduce(math.min)) / 2;
   }
 
   void _onFrame(CameraImage image) {
