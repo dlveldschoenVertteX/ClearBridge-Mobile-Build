@@ -62,6 +62,30 @@ from the repo — only the CI build step was dropped, in case revisited later.
   than re-guessing.
 - NFIQ scores are backend-only, never surfaced to end users (see Notion "NFIQ Visibility
   Policy — Backend Only").
+- **NFIQ2 sidecar exists and is live** (`functions/nfiq2_service/`, deployed to Cloud Run
+  `nfiq2-service` in `africa-south1`) — the real NIST NFIQ2 binary, called from
+  `main.py`/`nfiq2_client.py` as an additive, non-blocking ground-truth check alongside the
+  ResNet18 proxy (`nfiqScore`). Written to Firestore as `nfiq2Score` (0-100). `main.py`
+  scores whichever image won the internal proxy comparison — either `best_afis_img` (the
+  binarized/posterized AFIS superprint) or `best_enhanced` (continuous-tone) — recorded as
+  `nfiqSource: "afis"` or `"cylindrical"` on the capture doc.
+  - **Do NOT assume the binarized AFIS image is bad input for NFIQ2.** A real production
+    oscillating capture scored **70% NFIQ2 via the binarized AFIS template**
+    (`nfiqSource: afis`) — proof the binarized rendering is not inherently
+    out-of-distribution for NFIQ2, despite NFIQ2 being calibrated on natural scanner
+    images. A session on 2026-07-15 incorrectly derived this "binarized = bad" theory from
+    first principles after seeing two catastrophic front_only_v1 captures (nfiq2Score 4
+    and 6, both `nfiqSource: afis`) and "fixed" `main.py` to always score `best_enhanced` —
+    that change was reverted once the 70% counter-example came up. The real cause of those
+    two low scores was capture quality (motion blur from AF-lock timing + camera shake +
+    a red ambient-light cast in the test environment), not which image type NFIQ2 scored.
+    **Before changing anything about which image NFIQ2 scores, pull real Firestore
+    `nfiq2Score`/`nfiqSource` history first** — don't re-derive this from theory alone.
+  - **NFIQ2 sidecar can't be called directly from this sandbox** — its Cloud Run URL
+    (`*.run.app`) is blocked by the sandbox egress policy (only `*.googleapis.com` is
+    reachable); same class of restriction as the GHCR/dl.google.com blocks below. Firestore/
+    Storage/Cloud Run Admin API (`run.googleapis.com`, to look up the service URL) all work
+    fine — it's specifically the deployed service's own generated hostname that's blocked.
 
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
