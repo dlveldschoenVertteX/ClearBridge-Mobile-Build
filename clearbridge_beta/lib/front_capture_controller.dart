@@ -11,6 +11,7 @@ import 'dart:ui' show Offset, Rect;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:mac_capture/mac_capture.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
@@ -28,6 +29,8 @@ class FrontCaptureState {
     this.error,
     this.confirmationText,
     this.distanceHint,
+    this.isSteady = true,
+    this.lightingValue = 0.5,
   });
 
   final FrontCapturePhase phase;
@@ -39,6 +42,14 @@ class FrontCaptureState {
   final String? error;
   final String? confirmationText;
   final String? distanceHint;
+  // False while the device is being held too unsteadily (gyroscope-derived)
+  // for the hold timer to progress -- surfaced separately from onTarget so
+  // the UI can tell the user specifically to hold the phone still, distinct
+  // from "align your thumb".
+  final bool isSteady;
+  // Normalised 0..1 brightness read from the ROI (torch-off samples only),
+  // for the lighting meter alongside the focus meter.
+  final double lightingValue;
 
   FrontCaptureState copyWith({
     FrontCapturePhase? phase,
@@ -50,6 +61,8 @@ class FrontCaptureState {
     Object? error = _sentinel,
     Object? confirmationText = _sentinel,
     Object? distanceHint = _sentinel,
+    bool? isSteady,
+    double? lightingValue,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -64,6 +77,8 @@ class FrontCaptureState {
             : confirmationText as String?,
         distanceHint:
             identical(distanceHint, _sentinel) ? this.distanceHint : distanceHint as String?,
+        isSteady: isSteady ?? this.isSteady,
+        lightingValue: lightingValue ?? this.lightingValue,
       );
 }
 
@@ -145,6 +160,14 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _coverageMin = 0.35;
   static const double _coverageMax = 0.85;
 
+  // Device must be this still (gyroscope magnitude, deg/s) before the hold
+  // timer counts and the burst can fire. Real captures showed motion-blur
+  // streaking in BOTH ambient and flash frames of the same burst — camera
+  // shake at macro (thumb-pad-filling) distance, independent of focus
+  // distance or exposure. First-cut threshold; tune from real telemetry
+  // (gyroMagnitudeDegPerSec is stored per-frame below).
+  static const double _maxSteadyDegPerSec = 6.0;
+
   CameraController? _camera;
   String? _userId;
   AdaptiveFlashController? _flash;
@@ -157,10 +180,19 @@ class FrontCaptureController extends ChangeNotifier {
 
   bool _focusLocked = false;
   bool _refocusing = false;
+  // True once a fresh auto->lock cycle has run for the CURRENT hold attempt.
+  // Mirrors OscillatingCaptureController's _refocusedThisStep: focus is
+  // deliberately NOT locked at session start (before the thumb is anywhere
+  // near the lens, which was locking onto empty background) -- it's
+  // re-acquired fresh the moment the thumb is first confirmed on-target.
+  bool _refocusedThisHold = false;
 
   double _appliedEvOffset = 0.0;
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0;
+
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _gyroMagnitudeDegPerSec = 0.0;
 
   DateTime? _calibStart;
   bool _calibDone = false;
@@ -198,14 +230,37 @@ class FrontCaptureController extends ChangeNotifier {
     _focusValue = 0;
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
+    _refocusedThisHold = false;
+    _gyroMagnitudeDegPerSec = 0.0;
 
     _flash = AdaptiveFlashController(camera);
 
     _apply((s) => s.copyWith(phase: FrontCapturePhase.calibrating), force: true);
 
+    // Enable continuous autofocus tracking the ROI right away, but DO NOT
+    // lock yet -- locking here (before the thumb is anywhere near the lens)
+    // freezes the AF distance on whatever's in frame at cold-open (empty
+    // background) and it never re-adjusts once locked, which was the root
+    // cause of inconsistent blur: the on-screen "on target" gate is a
+    // software Laplacian score normalised against its own running peak, so
+    // it can read as "locked" even though the underlying AF never actually
+    // pointed at the pad. The real re-acquire+lock now happens in
+    // _onFrame/_refocus, once the thumb is confirmed on-target.
     try {
-      await _refocus();
+      await _beginAutofocus();
     } catch (_) {}
+
+    _gyroSub ??= gyroscopeEventStream().listen((event) {
+      final degPerSec = math.sqrt(
+            event.x * event.x + event.y * event.y + event.z * event.z,
+          ) *
+          (180.0 / math.pi);
+      _gyroMagnitudeDegPerSec = HybridCaptureService.ema(
+        _gyroMagnitudeDegPerSec,
+        degPerSec,
+        alpha: 0.35,
+      );
+    });
 
     _calibStart = DateTime.now();
     _brightnessSamples.clear();
@@ -257,6 +312,9 @@ class FrontCaptureController extends ChangeNotifier {
     if (!(_flash?.isFlashOn ?? false)) {
       try {
         _lastStableBrightness = HybridCaptureService.meanLuma(image, roi: roi);
+        _apply((s) => s.copyWith(
+              lightingValue: (_lastStableBrightness / 255.0).clamp(0.0, 1.0),
+            ));
       } catch (_) {}
     }
     if (!_refocusing) _maybeAdjustExposure();
@@ -277,20 +335,44 @@ class FrontCaptureController extends ChangeNotifier {
     if (_state.phase != FrontCapturePhase.holding) return;
     if (_burstInFlight) return;
 
-    // On-target: focus score crosses threshold.
-    final onTarget = _focusValue > 0.45 && !tooFar && !tooClose;
-    if (onTarget) {
+    // On-target: focus score crosses threshold, distance is right, AND the
+    // device is objectively still (gyroscope-derived). Real captures showed
+    // motion-blur streaking even when the software focus score read "on
+    // target" -- a fixed hold timer alone doesn't catch handshake at macro
+    // distance.
+    final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
+    final rawOnTarget = _focusValue > 0.45 && !tooFar && !tooClose && steady;
+
+    if (rawOnTarget) {
+      // Re-acquire focus FRESH the first time this hold reaches on-target,
+      // instead of trusting whatever the lens converged to before the thumb
+      // arrived. Mirrors OscillatingCaptureController's per-pose re-lock
+      // (the fix for "RIGHT angle always blurs").
+      if (!_refocusedThisHold) {
+        _refocusedThisHold = true;
+        _holdStart = null;
+        unawaited(_refocus());
+        _apply((s) => s.copyWith(onTarget: true, holdProgress: 0, isSteady: steady));
+        return;
+      }
+      if (_refocusing) {
+        // Hold the user steady while the lens converges; don't start the
+        // hold timer or fire on a mid-hunt frame.
+        _apply((s) => s.copyWith(onTarget: true, holdProgress: 0, isSteady: steady));
+        return;
+      }
       _holdStart ??= DateTime.now();
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
-      _apply((s) => s.copyWith(onTarget: true, holdProgress: progress));
+      _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
       if (heldMs >= _holdDurationMs) {
         _holdStart = null;
         unawaited(_fireBurst());
       }
     } else {
       _holdStart = null;
-      _apply((s) => s.copyWith(onTarget: false, holdProgress: 0));
+      _refocusedThisHold = false;
+      _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
     }
   }
 
@@ -306,23 +388,44 @@ class FrontCaptureController extends ChangeNotifier {
     _apply((s) => s.copyWith(phase: FrontCapturePhase.holding), force: true);
   }
 
+  Future<void> _beginAutofocus() async {
+    final cam = _camera;
+    if (cam == null) return;
+    _focusLocked = false;
+    final cx = (_scoreRoi.left + _scoreRoi.right) / 2;
+    final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
+    final pt = Offset(cx, cy);
+    try {
+      await cam.setFocusMode(FocusMode.auto);
+    } catch (_) {}
+    try {
+      await cam.setFocusPoint(pt);
+    } catch (_) {}
+    try {
+      await cam.setExposurePoint(pt);
+    } catch (_) {}
+  }
+
+  Future<void> _lockFocusOnly() async {
+    final cam = _camera;
+    if (cam == null) return;
+    try {
+      await cam.setFocusMode(FocusMode.locked);
+      _focusLocked = true;
+    } catch (_) {}
+  }
+
+  /// Re-acquire then re-lock focus at the pad's actual current distance,
+  /// instead of trusting whatever the lens converged to before the thumb was
+  /// in frame. Same 600ms auto->settle->lock cycle already proven for the
+  /// oscillating flow's RIGHT-angle blur fix (350ms was re-locking mid-hunt).
   Future<void> _refocus() async {
     if (_refocusing) return;
     _refocusing = true;
-    _focusLocked = false;
-    final cam = _camera;
-    if (cam == null) {
-      _refocusing = false;
-      return;
-    }
     try {
-      await cam.setFocusMode(FocusMode.auto);
-      final cx = (_scoreRoi.left + _scoreRoi.right) / 2;
-      final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
-      await cam.setFocusPoint(Offset(cx, cy));
-      await Future<void>.delayed(const Duration(milliseconds: 800));
-      await cam.setFocusMode(FocusMode.locked);
-      _focusLocked = true;
+      await _beginAutofocus();
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      await _lockFocusOnly();
     } catch (e) {
       debugPrint('[front] refocus failed (non-fatal): $e');
     } finally {
@@ -376,6 +479,10 @@ class FrontCaptureController extends ChangeNotifier {
   Future<void> _fireBurst() async {
     if (_burstInFlight || _disposed) return;
     _burstInFlight = true;
+    // Snapshot device stillness at the moment the burst fires -- diagnostic
+    // only (stored alongside laplacianScore below), for tuning
+    // _maxSteadyDegPerSec against real capture outcomes.
+    final gyroAtCapture = _gyroMagnitudeDegPerSec;
     _apply(
       (s) => s.copyWith(
         isCapturingBurst: true,
@@ -477,7 +584,7 @@ class FrontCaptureController extends ChangeNotifier {
       );
       await Future<void>.delayed(const Duration(milliseconds: _confirmationDisplayMs));
 
-      await _finishAndUpload(results);
+      await _finishAndUpload(results, gyroAtCapture);
     } catch (e) {
       _fail('Capture failed: $e');
     } finally {
@@ -490,6 +597,7 @@ class FrontCaptureController extends ChangeNotifier {
 
   Future<void> _finishAndUpload(
     List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})> shots,
+    double gyroAtCapture,
   ) async {
     _audio.silence();
     _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
@@ -545,6 +653,7 @@ class FrontCaptureController extends ChangeNotifier {
           'tipAngleDeg': tipAngleDeg,
         },
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
+        'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
       }, SetOptions(merge: true));
 
@@ -658,6 +767,8 @@ class FrontCaptureController extends ChangeNotifier {
     _audio.silence();
     unawaited(_flash?.deactivate());
     unawaited(_stopStream());
+    unawaited(_gyroSub?.cancel());
+    _gyroSub = null;
     _apply((s) => s.copyWith(phase: FrontCapturePhase.error, error: message), force: true);
   }
 
@@ -678,6 +789,8 @@ class FrontCaptureController extends ChangeNotifier {
     _disposed = true;
     unawaited(_flash?.deactivate());
     unawaited(_stopStream());
+    unawaited(_gyroSub?.cancel());
+    _gyroSub = null;
     _audio.dispose();
     super.dispose();
   }

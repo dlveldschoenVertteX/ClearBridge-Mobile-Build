@@ -111,7 +111,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
     final silhouetteHint = s.phase == FrontCapturePhase.idle
         ? 'Seat your thumb pad in the outline'
         : (s.phase == FrontCapturePhase.holding && !s.onTarget
-            ? 'Align your thumb and hold still'
+            ? (s.isSteady ? 'Align your thumb and hold still' : null)
             : null);
 
     return Scaffold(
@@ -149,6 +149,20 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               ),
             ),
 
+          // Lighting meter (left edge) — mirrors the focus meter so the user
+          // sees both quality signals live, not just focus.
+          if (showGuide)
+            Positioned(
+              left: 12,
+              top: 0,
+              bottom: 0,
+              child: Center(
+                child: RepaintBoundary(
+                  child: LightingMeterWidget(value: s.lightingValue),
+                ),
+              ),
+            ),
+
           // Hold progress ring around the guide centre.
           if (s.phase == FrontCapturePhase.holding && s.holdProgress > 0)
             Positioned.fill(
@@ -171,10 +185,31 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               left: 40,
               right: 40,
               child: Text(
-                s.distanceHint!,
+                s.distanceHint == 'Move closer'
+                    ? '↑ Move phone CLOSER to your thumb'
+                    : '↓ Move phone BACK a little',
                 textAlign: TextAlign.center,
                 style: CaptureTypography.label.copyWith(
                   fontSize: 13,
+                  color: CaptureColors.warning,
+                ),
+              ),
+            ),
+
+          // Low-light hint.
+          if (s.distanceHint == null &&
+              s.lightingValue < 0.18 &&
+              (s.phase == FrontCapturePhase.calibrating ||
+                  s.phase == FrontCapturePhase.holding))
+            Positioned(
+              bottom: 160,
+              left: 40,
+              right: 40,
+              child: Text(
+                '☀ Brighter light = sharper print',
+                textAlign: TextAlign.center,
+                style: CaptureTypography.label.copyWith(
+                  fontSize: 12,
                   color: CaptureColors.gold,
                 ),
               ),
@@ -213,13 +248,10 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               bottom: 100,
               left: 40,
               right: 40,
-              child: Text(
-                'Preparing camera…',
-                textAlign: TextAlign.center,
-                style: CaptureTypography.label.copyWith(
-                  fontSize: 13,
-                  color: CaptureColors.silverBright,
-                ),
+              child: CaptureGuidanceOverlay(
+                message: 'Preparing camera…',
+                isAllGreen: false,
+                greenFraction: 0,
               ),
             ),
 
@@ -229,16 +261,28 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               bottom: 100,
               left: 40,
               right: 40,
-              child: Text(
-                'Hold still…',
-                textAlign: TextAlign.center,
-                style: CaptureTypography.label.copyWith(
-                  fontSize: 14,
-                  color: CaptureColors.success,
-                  fontWeight: FontWeight.bold,
-                ),
+              child: CaptureGuidanceOverlay(
+                message: 'Hold still…',
+                isAllGreen: true,
+                greenFraction: s.holdProgress,
               ),
             ),
+
+          // Unsteady hint while holding but not yet on target — distinct from
+          // the silhouette's "align your thumb" so the user knows WHICH
+          // problem to fix.
+          if (s.phase == FrontCapturePhase.holding && !s.onTarget && !s.isSteady)
+            Positioned(
+              bottom: 100,
+              left: 40,
+              right: 40,
+              child: CaptureGuidanceOverlay(
+                message: 'Hold the phone steady…',
+                isAllGreen: false,
+                greenFraction: 0,
+              ),
+            ),
+
 
           // Uploading overlay.
           if (s.phase == FrontCapturePhase.uploading)
@@ -383,20 +427,17 @@ class _ConfirmationBanner extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
-      decoration: BoxDecoration(
-        color: CaptureColors.success.withValues(alpha: 0.15),
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: CaptureColors.success.withValues(alpha: 0.5)),
-      ),
-      child: Text(
-        text,
-        textAlign: TextAlign.center,
-        style: CaptureTypography.label.copyWith(
-          fontSize: 15,
-          color: CaptureColors.success,
-          fontWeight: FontWeight.bold,
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+        decoration: BoxDecoration(
+          color: CaptureColors.success.withValues(alpha: 0.16),
+          borderRadius: BorderRadius.circular(100),
+          border: Border.all(color: CaptureColors.success.withValues(alpha: 0.5)),
+        ),
+        child: Text(
+          text,
+          style: CaptureTypography.h3.copyWith(color: CaptureColors.success, fontSize: 15),
         ),
       ),
     );
@@ -415,8 +456,11 @@ class _UploadingOverlay extends StatelessWidget {
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            const Icon(Icons.cloud_upload_outlined,
-                color: CaptureColors.cyan, size: 48),
+            SizedBox(
+              width: 160,
+              height: 160,
+              child: CaptureIntroAnimation(onComplete: () {}, loop: true),
+            ),
             const SizedBox(height: 18),
             Text(
               'Uploading capture…',
