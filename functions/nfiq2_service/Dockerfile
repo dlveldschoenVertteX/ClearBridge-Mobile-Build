@@ -56,16 +56,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 COPY vendor/nbis /tmp/nbis-src
 
-# `make it` (not a separate `make install`) builds AND installs into the
-# directory passed to setup.sh -- that's the whole purpose of the argument
-# in NBIS's classic build flow. Deliberately not chaining a `make install`
-# after it: unlike the sanity-check RUNs below (guarded with `|| true`), a
-# nonexistent target here would hard-fail the build rather than degrade
-# gracefully.
+# `make it` only BUILDS (real first-deploy build log correction: `it` and
+# `install` are separate top-level Makefile targets -- `all: config it
+# install catalog` -- contrary to this file's earlier assumption). `make
+# install` is deliberately NOT used here either: its RUNTIME_DATA_PACKAGES
+# list (an2k, nfiq, pcasys, hardcoded in rules.mak.src, not derived from the
+# trimmed PACKAGES list) would `cp` nfiq/pcasys runtime data that isn't
+# vendored and hard-fail. We only need the two compiled binaries on PATH,
+# so copy them directly instead of running the full install machinery.
 RUN cd /tmp/nbis-src \
     && ./setup.sh /usr/local --without-X11 --without-OPENJP2 \
     && make config \
     && make it \
+    && cp mindtct/bin/mindtct bozorth3/bin/bozorth3 /usr/local/bin/ \
     && rm -rf /tmp/nbis-src
 
 # Same build-time sanity check pattern as NFIQ2 above -- fail loudly here,
