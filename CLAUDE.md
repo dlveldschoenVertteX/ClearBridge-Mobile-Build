@@ -51,6 +51,17 @@ from the repo — only the CI build step was dropped, in case revisited later.
   hold → 4-shot burst → upload. Burst **alternates ambient/flash** (even index = torch off,
   odd = torch on with EV step -1.0) — an earlier all-flash burst blew out the pad centre
   completely at ~10cm (NFIQ2=9, confirmed via raw burst frame + enhanced_flat.jpg all-white).
+- **Secondary-camera (IR/wide-lens) capture ported into front_only_v1, 2026-07-15.** This
+  was built + validated on `OscillatingCaptureController` (IR torch shot scored
+  competitively with, and on one real device above, the main camera's best frame — see
+  `docs/CAPTURE_OPTIMIZATION_SCOPE.md`), and the backend's `secondaryCameras` scoring loop
+  in `main.py` is shared/unconditional (not gated to oscillating mode) — but it was never
+  wired into `front_capture_controller.dart` since front_only_v1 didn't exist yet when the
+  feature was built. Ported directly (best-effort, try/catch per camera, non-blocking):
+  after the main burst uploads + Firestore commit, opens each other available back camera,
+  fires one torch-lit still, uploads it, records `secondaryCameras` on the doc — all before
+  the `processEnhanceAndScore` trigger so the backend's one-time doc read sees it. Not yet
+  validated on a real device with this specific app/flow.
 - `PadSilhouetteShape.defaultShape` (`packages/mac_capture/lib/src/capture_pad_silhouette_overlay.dart`):
   tapered superellipse guide, shrunk to **top-half of the pad only** per CTO annotation
   (cy=0.37, ry=0.13 — was cy=0.5, ry=0.26). Kept 1:1 with `_scoreRoi` in the controller.
