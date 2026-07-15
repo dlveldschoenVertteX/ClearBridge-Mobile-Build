@@ -185,16 +185,31 @@ NFIQ2's quality axis. New `functions/processEnhanceAndScore/mindtct_client.py` m
   Makefiles) and required one real fix: `-fcommon` added to `CFLAGS` (this 2015-era C89 code
   needs it on GCC 10+, which Ubuntu 22.04 ships — without it, several packages fail to link
   with "multiple definition" errors).
-- **Build-verified locally before vendoring** (not yet build-tested in the real Cloud Build/
-  Ubuntu-22.04 environment — watch the first real deploy's log, same caveat the Dockerfile
-  already carries for the NFIQ2 `.deb` install step): `setup.sh && make config && make it`
-  exits 0, produces real `mindtct`/`bozorth3` binaries whose usage output matches NBIS's own
-  man pages, and a synthetic end-to-end smoke test (mindtct on a test image → `.xyt` minutiae
-  file → bozorth3 on two `.xyt` files → numeric match score) ran without error.
-- **Not yet deployed.** Next steps per the approved plan: deploy (separate explicit go-ahead
-  needed, same as every backend change), then get a real baseline match score between the
-  CTO's ink scan (`ground_truth/cto_thumb_ink_scan_2026-07-15.jpg` in Firebase Storage) and
-  the best real captures (`ccb9c85a`, `3e54236a`, `c34911b5`), then the CTO-chosen "try
+- **Deployed 2026-07-15 to `nfiq2-service` (Cloud Run, africa-south1), revision
+  `nfiq2-service-00002-kxl`.** Built via Cloud Build directly from Python (`google-cloud-
+  build`/`google-cloud-run`/`google-cloud-storage` client libs) since this sandbox has no
+  `gcloud` CLI — source tarball staged through the existing `clearbridge-dc699-nfiq2-build-
+  src` GCS bucket, then `ServicesClient.update_service()` to roll the new image out.
+  Deploying required a service-account key upload (same pattern as the earlier Firebase
+  deploy this session) since no ADC/credentials are configured in this sandbox by default.
+- **First real Cloud Build run found and fixed a genuine bug the local test missed**:
+  `mindtct`/`bozorth3` compiled fine, but the build-time sanity check (`RUN mindtct ... ||
+  true`) reported "not found" — NBIS's top-level Makefile has `it` and `install` as
+  *separate* targets (`all: config it install catalog`), so `make it` alone never puts the
+  binaries on `PATH`. Chaining `make install` was rejected too: its hardcoded
+  `RUNTIME_DATA_PACKAGES := an2k nfiq pcasys` list would `cp` runtime data from `nfiq`/
+  `pcasys`, which aren't vendored, and hard-fail. Fix (commit `da4ae5b`): copy the two
+  compiled binaries directly to `/usr/local/bin` instead of running `make install` at all.
+  Rebuilt, confirmed via the real build log that both binaries now respond with correct
+  usage text, then deployed. **Lesson for future NBIS-adjacent work**: `make it` builds
+  only; never assume it installs without checking the actual Makefile.
+- **Not yet HTTP-smoke-tested** — same known sandbox limitation as the NFIQ2 sidecar itself
+  (this sandbox's egress reaches `*.googleapis.com` but not the deployed service's own
+  `*.run.app` hostname). Real validation happens the same way NFIQ2 itself gets validated:
+  through `processEnhanceAndScore` calling it during an actual capture, not from here.
+- **Next steps per the approved plan**: get a real baseline match score between the CTO's
+  ink scan (`ground_truth/cto_thumb_ink_scan_2026-07-15.jpg` in Firebase Storage) and the
+  best real captures (`ccb9c85a`, `3e54236a`, `c34911b5`), then the CTO-chosen "try
   pretrained enhancement models first" experiment (FpEnhancer / FingerFlow's CoarseNet-
   FineNet, no training) scored against that real match baseline.
 
