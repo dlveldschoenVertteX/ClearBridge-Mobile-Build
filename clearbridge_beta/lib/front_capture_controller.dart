@@ -140,8 +140,8 @@ class FrontCaptureController extends ChangeNotifier {
   // ROI the focus/exposure meters score on — aligned to the pad silhouette
   // bounding box so framing, metering and the superprint crop all agree.
   // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper:
-  //   cx=0.5, cy=0.37, rx=0.21*(1+0.20)=0.252, ry=0.17 → [0.248,0.20,0.752,0.54]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.248, 0.20, 0.752, 0.54);
+  //   cx=0.5, cy=0.37, rx=0.23*(1+0.20)=0.276, ry=0.19 → [0.224,0.18,0.776,0.56]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.224, 0.18, 0.776, 0.56);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at

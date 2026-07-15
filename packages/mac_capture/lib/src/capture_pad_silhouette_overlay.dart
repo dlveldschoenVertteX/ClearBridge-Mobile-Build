@@ -41,23 +41,25 @@ class PadSilhouetteShape {
   /// Bounding box kept in sync with FrontCaptureController._scoreRoi so
   /// framing, metering and the superprint crop all agree.
   ///
-  /// Enlarged 2026-07-15 (rx 0.17->0.21, ry 0.13->0.17) per CTO request: the
-  /// guide opening was constraining how close the user could bring the thumb
-  /// -- a closer capture appears larger on screen and no longer fit inside
-  /// the previous, smaller opening. This directly targets the dominant real
-  /// nfiq2Score lever found this session (native ridge wavelength / working
-  /// distance -- see CLAUDE.md), so the guide needs to accommodate a bigger
-  /// on-screen thumb, not just a fixed framing. Now that the BoxFit.cover
-  /// guideRegion mapping bug is fixed, the on-screen guide and the backend
-  /// mask are guaranteed to match, so this is a deliberate size choice, not
-  /// a mask-position bug -- re-test visually if creases start showing up in
-  /// superprints again, since a bigger opening does extend closer to the DIP
-  /// crease than the previous top-half-only shrink.
+  /// Enlarged twice 2026-07-15 per CTO request: the guide opening was
+  /// constraining how close the user could bring the thumb -- a closer
+  /// capture appears larger on screen and no longer fit inside a smaller
+  /// opening. This directly targets the dominant real nfiq2Score lever
+  /// found this session (native ridge wavelength / working distance -- see
+  /// CLAUDE.md), so the guide needs to accommodate a bigger on-screen
+  /// thumb, not just a fixed framing. Now that the BoxFit.cover guideRegion
+  /// mapping bug is fixed, the on-screen guide and the backend mask are
+  /// guaranteed to match, so this is a deliberate size choice, not a
+  /// mask-position bug -- re-test visually if creases start showing up in
+  /// superprints again, since a bigger opening extends closer to the DIP
+  /// crease than the original top-half-only shrink.
+  /// History: 0.17/0.13 -> 0.21/0.17 (first bump) -> 0.23/0.19 (this one,
+  /// "slightly more" per CTO follow-up).
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.21,
-    ry: 0.17,
+    rx: 0.23,
+    ry: 0.19,
     taper: 0.20,
   );
 

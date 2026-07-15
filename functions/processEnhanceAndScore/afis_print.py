@@ -62,6 +62,21 @@ _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 sco
 # floor rather than disabling freq_normalize entirely -- a mild correction still helps
 # (d7dd0c68's 0.9 scale case, while bad, wasn't as bad as the 0.5/0.45 cases).
 
+# Ridge-continuity tuning (2026-07-15, round 2): CTO reported ridges not
+# connecting/flowing smoothly on real device captures. Tried morphological
+# closing/opening directly on the binarized print first -- REJECTED, actively
+# harmful: any kernel size large enough to visibly bridge a gap (>=5px) is
+# already comparable to the native ridge spacing itself and collapses
+# adjacent ridges together (proxy score craters from ~70 to ~38 on all 3 real
+# test cases). Orientation-field smoothing was the real fix: swept 5.0 (old
+# default) up to 28.0 against the same 3 real captures (nfiq2Score 72/63/0) --
+# monotonically positive up to ~15, peaking there, mild falloff beyond.
+# Visually confirmed: dramatically smoother, naturally-flowing ridge curves
+# vs. the old choppy/jagged pattern, on both the good and the bad case.
+_ORIENT_SMOOTH = 15.0       # was 5.0 -- fixes the actual "ridges don't flow
+# smoothly" complaint; do NOT try morphological close/open on the binary
+# print for this instead, it was tested and made things worse (see above).
+
 
 def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndarray:
     img = img.astype(np.float32)
@@ -69,7 +84,7 @@ def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndar
     return m0 + np.sqrt(v0 * (img - m) ** 2 / v) * np.sign(img - m)
 
 
-def _orientation_field(img: np.ndarray, bsize: int = _BLOCK, smooth: float = 5.0) -> np.ndarray:
+def _orientation_field(img: np.ndarray, bsize: int = _BLOCK, smooth: float = _ORIENT_SMOOTH) -> np.ndarray:
     gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
     gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
     vx = cv2.boxFilter(2 * gx * gy, -1, (bsize, bsize))
