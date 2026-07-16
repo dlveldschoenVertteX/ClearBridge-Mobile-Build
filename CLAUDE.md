@@ -321,6 +321,44 @@ crop) before deciding whether to integrate as a real `('pyfing', ...)` max-of-va
 candidate. `pyfing_service` itself is committed but **not deployed** — needs its own
 explicit go-ahead like every other backend change.
 
+### pyfing wired in + measured on all 14 real captures — does NOT currently beat the tuned Gabor pipeline
+Wired `enhance='pyfing'` into `afis_print.generate()` (`_pyfing_enhance()`: crops to the
+mask bbox, grey-fills outside it, routes through pyfing's SNFEN) and added
+`('pyfingSnfen', dict(enhance='pyfing'))` to `main.py`'s `_afis_variants` — same
+max-of-variants pattern as every other addition, so it can only ever help, never regress.
+
+**Real bug found in the `pyfing` library itself, not our code**: its `Snfen.run()`
+enhancement stage, when called with `dpi != 500`, resizes `image`/`mask`/`orientation`
+to a scaled size but resizes `ridge_periods` to the *original* unscaled size — a numpy
+`dstack` shape mismatch every time (reproduced standalone: a 465px crop at `dpi=300`
+crashes with "index 0 has size 800 and index 3 has size 465"). Their own examples always
+call it at `dpi=500`, so this path is presumably untested upstream. **Fix**: pre-rescale
+our own crop to the ~500dpi-equivalent domain first (same convention as
+`mindtct_client._normalize_dpi` — resample toward `_TARGET_PERIOD`), then always call
+pyfing with `dpi=500`, sidestepping the buggy internal rescale entirely instead of
+working around a third-party bug with try/except.
+
+**Honest measured result, harness run across all 14 real captures (local pyfing, in-
+process, no HTTP sidecar needed for this test)**: `pyfingSnfen` **never won a single
+capture** by real NFIQ2 — it ran successfully every time (no failures/fallbacks) but
+scored lower than the current tuned-Gabor best variant on all 14, by margins from ~4 to
+~31 points (e.g. `3e54236a`: pyfing 53 vs. winner 81; `847fa2d3`: pyfing 24 vs. winner 55).
+On the fidelity axis (bozorth-vs-ink), pyfing alone averages ~4.8 vs. the full pipeline's
+realized ~5.2 — roughly a wash, with one real exception: `7d7d0162` scored bozorth **8**
+via pyfing vs. **5** for the variant that actually won on NFIQ2 that capture — a genuine
+fidelity edge NFIQ2-only selection missed on that one capture, but not a broad pattern.
+
+**Conclusion**: a generic pretrained SNFEN, with zero fine-tuning on this project's own
+data, does not beat a pipeline that's already been through several real-data-driven
+tuning passes (Gabor gamma/sigma, frequency-scale floor, orientation smoothing, mask
+coverage, coherence fusion) specifically calibrated against these exact captures. This
+tracks — pyfing was trained on its own dataset domain, not fingerphoto captures like
+ours. The variant stays wired in (harmless, additive, and a no-op in production today
+since `pyfing_service` isn't deployed) in case future pyfing versions or fine-tuning
+change this, but **do not expect it to move real scores right now** without either (a)
+fine-tuning pyfing on this project's own captures, or (b) a materially different crop/
+input than what's already been tried here.
+
 ## Background contamination in AFIS masking — real fix, 2026-07-15
 CTO flagged real background contamination degrading scoring, and named the exact prior
 solution: a trained fingerprint segmentation model + flash captures as the finger-vs-

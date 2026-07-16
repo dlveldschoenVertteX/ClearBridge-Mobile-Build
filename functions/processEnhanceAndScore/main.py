@@ -685,6 +685,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
                 ('deepFuse',   dict(fuse='deep', freq_normalize=True)),
                 ('deepMaxc',   dict(fuse='deepMaxc', freq_normalize=True)),
+                # pyfing (SNFEN, pretrained neural enhancement) as an
+                # alternative to the classical Gabor bank -- self-skips
+                # (falls back to Gabor) if the pyfing_service sidecar isn't
+                # configured/reachable. Max-of-variants: can only add a
+                # candidate, never replace the Gabor path's own coverage.
+                ('pyfingSnfen', dict(enhance='pyfing')),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(

@@ -722,6 +722,78 @@ def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
     return bin_r, mask_r
 
 
+def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
+    """Alternative to _gabor_enhance: routes the masked pad through the
+    pyfing sidecar (functions/pyfing_service/, pyfing_client.py) instead of
+    the classical Gabor bank. See CLAUDE.md "Pretrained fingerphoto-
+    enhancement models" -- first real test (SNFEN on a raw single frame,
+    crude crop) scored competitively with this module's own tuned Gabor
+    output (bozorth3 vs the CTO's ink scan: 7 vs 6).
+
+    Crops to the mask's own bounding box and grey-fills outside it before
+    sending (matches the test that produced that result -- pyfing's own
+    internal segmentation doesn't need to re-solve backgrounds we've
+    already excluded via guide+flashdiff/U-Net). Derives pyfing's `dpi`
+    parameter from the measured ridge wavelength (pyfing was trained at
+    ~500 DPI / ~9-11px ridge period, same domain as this project's own
+    _TARGET_PERIOD) rather than hardcoding 500, so an unnormalized native
+    capture still tells pyfing its real effective scale.
+
+    Returns None on any failure (sidecar not configured, network error,
+    degenerate crop) -- caller treats this exactly like a failed fuse
+    pair: skip this variant, single-source renderings still stand. Output
+    is inverted from pyfing's own convention (ridges white-on-black) to
+    this project's (ridges black-on-white) before returning.
+
+    Pre-rescales the crop to the ~500 DPI domain itself (same convention
+    as mindtct_client._normalize_dpi -- resample toward _TARGET_PERIOD)
+    and always calls pyfing with dpi=500, rather than passing our own
+    measured dpi through. Verified in-sandbox: pyfing's own Snfen.run()
+    has a real bug when dpi != its dnn_input_dpi (500) -- it resizes
+    image/mask/orientation to a scaled size but resizes ridge_periods to
+    the ORIGINAL unscaled size, raising a numpy dstack shape-mismatch
+    every time (reproduced standalone: 465px image at dpi=300 -> crash).
+    Pre-normalizing ourselves and always passing dpi=500 sidesteps that
+    internal rescale path entirely instead of working around a third-
+    party bug with try/except."""
+    try:
+        import pyfing_client
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+    y0, x0 = max(0, ys.min() - 10), max(0, xs.min() - 10)
+    y1, x1 = min(g8.shape[0], ys.max() + 10), min(g8.shape[1], xs.max() + 10)
+    crop = g8[y0:y1, x0:x1].copy()
+    crop_mask = mask[y0:y1, x0:x1]
+    crop[crop_mask == 0] = 128   # neutral grey outside the mask, not the raw
+    # background pixels -- avoids handing pyfing's own segmentation a real
+    # background texture to (mis)classify, same as the validated test crop.
+
+    scale = float(np.clip(_TARGET_PERIOD / max(wl, 1.0), 0.3, 3.0))
+    orig_shape = crop.shape
+    if abs(scale - 1.0) > 0.02:
+        new_w = max(32, int(round(crop.shape[1] * scale)))
+        new_h = max(32, int(round(crop.shape[0] * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        crop_scaled = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+    else:
+        crop_scaled = crop
+
+    enhanced_scaled = pyfing_client.enhance_fingerprint(crop_scaled, method='SNFEN', dpi=500)
+    if enhanced_scaled is None or enhanced_scaled.shape != crop_scaled.shape:
+        return None
+    enhanced = cv2.resize(enhanced_scaled, (orig_shape[1], orig_shape[0]),
+                           interpolation=cv2.INTER_CUBIC) if crop_scaled.shape != orig_shape else enhanced_scaled
+
+    binimg_crop = 255 - enhanced   # pyfing: ridges white-on-black -> project: black-on-white
+    binimg = np.full(g8.shape, 255, dtype=np.uint8)
+    binimg[y0:y1, x0:x1] = binimg_crop
+    return binimg
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -736,6 +808,7 @@ def generate(
     fuse: Optional[str] = None,
     mosaic: bool = False,
     guide_region: Optional[dict] = None,
+    enhance: str = 'gabor',
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -763,6 +836,12 @@ def generate(
                      stacks (uses ambient_burst/flash_burst). Returns
                      (None, params) when the required inputs are absent, so the
                      max-variant caller keeps the single-source renderings.
+    enhance        : 'gabor' (default, this module's own tuned Gabor bank) or
+                     'pyfing' (routes the masked pad through the pyfing sidecar's
+                     SNFEN model instead -- see _pyfing_enhance). Returns
+                     (None, params) if the sidecar isn't configured/reachable,
+                     so the caller keeps the gabor-based renderings; this can
+                     only ever add a candidate, never remove one.
 
     Returns (binary uint8 image or None, params dict for Firestore).
     """
@@ -1028,11 +1107,20 @@ def generate(
             params['afisFreqScale'] = float(round(scale, 3))
             wl = _TARGET_PERIOD
 
-    norm = _normalize(g8)
-    orient = _orientation_field(norm)
-    enh = _gabor_enhance(norm, orient, wl)
+    binimg = None
+    if enhance == 'pyfing':
+        binimg = _pyfing_enhance(g8, mask, wl)
+        params['afisEnhance'] = 'pyfing' if binimg is not None else 'pyfing_unavailable'
+    if binimg is None:
+        # Either enhance == 'gabor', or 'pyfing' was requested but the sidecar
+        # wasn't configured/reachable -- same non-blocking contract as every
+        # other optional signal in this module (fall back, don't fail).
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        enh = _gabor_enhance(norm, orient, wl)
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
+        params.setdefault('afisEnhance', 'gabor')
 
-    binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
     binimg[mask == 0] = 255   # hard mask FIRST -- background is genuinely
     # pure white here, zero Gabor-noise content, before any blur touches it.
     # Feather the mask edge instead of leaving a hard cutoff. A real digital
