@@ -702,6 +702,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # does the final black-ridge/white-background conversion,
                 # instead of a raw intensity invert of pyfing's output.
                 ('pyfingHybrid', dict(enhance='pyfingHybrid')),
+                # Coherence-enhancing diffusion (oriented smoothing along
+                # ridge direction, classical, no sidecar dependency) as a
+                # denoise pre-pass ahead of the same Gabor+binarize chain --
+                # see docs/CAPTURE_OPTIMIZATION_SCOPE.md-adjacent scope work
+                # on ridge continuity, 2026-07-16.
+                ('coherenceDiff', dict(enhance='coherenceDiff')),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(

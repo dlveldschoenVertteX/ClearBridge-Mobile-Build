@@ -149,6 +149,45 @@ def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np
     return outs[idx, yy, xx]
 
 
+_COH_DIFF_SIGMA = 1.2        # across-ridge smoothing extent (px) -- narrow, preserves ridge/valley contrast
+_COH_DIFF_ORIENT_RATIO = 2.5  # along-ridge : across-ridge elongation of the smoothing kernel
+
+
+def _coherence_diffusion(img: np.ndarray, orient: np.ndarray) -> np.ndarray:
+    """Oriented smoothing along the local ridge direction -- a directional-
+    kernel approximation of coherence-enhancing diffusion (Weickert-style
+    structure-tensor anisotropic diffusion, well-established in the
+    fingerprint-enhancement literature as a technique complementary to
+    Gabor bandpass filtering: it repairs small ridge discontinuities by
+    smoothing LENGTHWISE along the ridge while barely touching the
+    across-ridge direction, rather than Gabor's frequency-selective
+    response). Not a full iterative PDE solve -- reuses this module's own
+    per-orientation-bank architecture (see _gabor_enhance) for efficiency:
+    precompute elongated anisotropic Gaussian kernels at _N_ORIENT
+    discretized angles, select per pixel by the same orientation index.
+
+    Intended as a denoise PRE-PASS feeding the existing Gabor+binarize
+    chain (same role as _pyfing_denoise in the pyfingHybrid path), not a
+    replacement for it -- see enhance='coherenceDiff' in generate()."""
+    h, w = img.shape
+    sigma_across = _COH_DIFF_SIGMA
+    sigma_along = _COH_DIFF_SIGMA * _COH_DIFF_ORIENT_RATIO
+    half = int(np.ceil(3 * sigma_along))
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float32)
+    outs = np.zeros((_N_ORIENT, h, w), np.float32)
+    for i in range(_N_ORIENT):
+        th = np.pi * i / _N_ORIENT   # ridge direction for this bin
+        c, s = np.cos(th), np.sin(th)
+        xr = xx * c + yy * s   # along-ridge axis
+        yr = -xx * s + yy * c  # across-ridge axis
+        k = np.exp(-(xr ** 2) / (2 * sigma_along ** 2) - (yr ** 2) / (2 * sigma_across ** 2))
+        k /= k.sum()
+        outs[i] = cv2.filter2D(img, cv2.CV_32F, k.astype(np.float32))
+    idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
+    yy2, xx2 = np.mgrid[0:h, 0:w]
+    return outs[idx, yy2, xx2]
+
+
 _STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
 
 
@@ -1146,6 +1185,20 @@ def generate(
             params['afisEnhance'] = 'pyfingHybrid'
         else:
             params['afisEnhance'] = 'pyfingHybrid_unavailable'
+    elif enhance == 'coherenceDiff':
+        # Coherence-enhancing diffusion as a denoise PRE-PASS (same role as
+        # _pyfing_denoise in the hybrid path, but classical, local, and
+        # always available -- no sidecar dependency): smooth lengthwise
+        # along the ridge direction to repair small discontinuities, THEN
+        # run this module's own tuned Gabor bank + binarization on top for
+        # the final black-ridge/white-background conversion.
+        norm = _normalize(g8)
+        orient0 = _orientation_field(norm)
+        denoised = _coherence_diffusion(norm, orient0)
+        orient = _orientation_field(denoised)
+        enh = _gabor_enhance(denoised, orient, wl)
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+        params['afisEnhance'] = 'coherenceDiff'
     if binimg is None:
         # Either enhance == 'gabor', or a pyfing path was requested but the
         # sidecar wasn't configured/reachable -- same non-blocking contract
