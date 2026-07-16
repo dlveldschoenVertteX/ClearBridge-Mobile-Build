@@ -690,7 +690,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # (falls back to Gabor) if the pyfing_service sidecar isn't
                 # configured/reachable. Max-of-variants: can only add a
                 # candidate, never replace the Gabor path's own coverage.
+                # Measured across all 14 real captures: never won (see
+                # CLAUDE.md) -- likely because pyfing's own continuous-
+                # tone, ridges-bright convention doesn't survive a plain
+                # invert the way this pipeline's own Gabor+hard-binarize
+                # step (tuned against these exact captures) does.
                 ('pyfingSnfen', dict(enhance='pyfing')),
+                # Hybrid: pyfing as a denoise pre-pass (its actual trained
+                # job -- clean up ridge continuity from a noisy photo),
+                # then this module's own tuned Gabor bank + binarization
+                # does the final black-ridge/white-background conversion,
+                # instead of a raw intensity invert of pyfing's output.
+                ('pyfingHybrid', dict(enhance='pyfingHybrid')),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(

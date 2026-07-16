@@ -722,40 +722,30 @@ def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
     return bin_r, mask_r
 
 
-def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
-    """Alternative to _gabor_enhance: routes the masked pad through the
-    pyfing sidecar (functions/pyfing_service/, pyfing_client.py) instead of
-    the classical Gabor bank. See CLAUDE.md "Pretrained fingerphoto-
-    enhancement models" -- first real test (SNFEN on a raw single frame,
-    crude crop) scored competitively with this module's own tuned Gabor
-    output (bozorth3 vs the CTO's ink scan: 7 vs 6).
+def _pyfing_denoise(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
+    """Runs the pyfing sidecar's SNFEN model as a denoising pre-pass and
+    returns a full-frame-shaped CONTINUOUS-TONE image in pyfing's OWN
+    convention (ridges bright, background dark) -- not yet inverted,
+    not yet binarized. Feeds `_pyfing_enhance` (pure-pyfing variant) and
+    `enhance='pyfingHybrid'` in generate() (pyfing-then-Gabor hybrid).
 
     Crops to the mask's own bounding box and grey-fills outside it before
-    sending (matches the test that produced that result -- pyfing's own
-    internal segmentation doesn't need to re-solve backgrounds we've
-    already excluded via guide+flashdiff/U-Net). Derives pyfing's `dpi`
-    parameter from the measured ridge wavelength (pyfing was trained at
-    ~500 DPI / ~9-11px ridge period, same domain as this project's own
-    _TARGET_PERIOD) rather than hardcoding 500, so an unnormalized native
-    capture still tells pyfing its real effective scale.
+    sending -- pyfing's own internal segmentation doesn't need to re-solve
+    backgrounds we've already excluded via guide+flashdiff/U-Net. Pre-
+    rescales the crop to the ~500 DPI domain itself (same convention as
+    mindtct_client._normalize_dpi -- resample toward _TARGET_PERIOD) and
+    always calls pyfing with dpi=500, rather than passing our own measured
+    dpi through: pyfing's own Snfen.run() has a real bug when dpi != its
+    dnn_input_dpi (500) -- it resizes image/mask/orientation to a scaled
+    size but resizes ridge_periods to the ORIGINAL unscaled size, raising
+    a numpy dstack shape-mismatch every time (reproduced standalone: a
+    465px crop at dpi=300 crashes). Pre-normalizing ourselves and always
+    passing dpi=500 sidesteps that internal rescale path entirely instead
+    of working around a third-party bug with try/except.
 
     Returns None on any failure (sidecar not configured, network error,
     degenerate crop) -- caller treats this exactly like a failed fuse
-    pair: skip this variant, single-source renderings still stand. Output
-    is inverted from pyfing's own convention (ridges white-on-black) to
-    this project's (ridges black-on-white) before returning.
-
-    Pre-rescales the crop to the ~500 DPI domain itself (same convention
-    as mindtct_client._normalize_dpi -- resample toward _TARGET_PERIOD)
-    and always calls pyfing with dpi=500, rather than passing our own
-    measured dpi through. Verified in-sandbox: pyfing's own Snfen.run()
-    has a real bug when dpi != its dnn_input_dpi (500) -- it resizes
-    image/mask/orientation to a scaled size but resizes ridge_periods to
-    the ORIGINAL unscaled size, raising a numpy dstack shape-mismatch
-    every time (reproduced standalone: 465px image at dpi=300 -> crash).
-    Pre-normalizing ourselves and always passing dpi=500 sidesteps that
-    internal rescale path entirely instead of working around a third-
-    party bug with try/except."""
+    pair: skip this variant, single-source renderings still stand."""
     try:
         import pyfing_client
     except ImportError:
@@ -788,10 +778,38 @@ def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.
     enhanced = cv2.resize(enhanced_scaled, (orig_shape[1], orig_shape[0]),
                            interpolation=cv2.INTER_CUBIC) if crop_scaled.shape != orig_shape else enhanced_scaled
 
-    binimg_crop = 255 - enhanced   # pyfing: ridges white-on-black -> project: black-on-white
-    binimg = np.full(g8.shape, 255, dtype=np.uint8)
-    binimg[y0:y1, x0:x1] = binimg_crop
-    return binimg
+    # Paste back into a full-frame canvas (native g8 outside the crop) so
+    # the result can feed straight into _normalize/_orientation_field --
+    # both only look at content inside `mask`, which is re-applied after
+    # Gabor same as every other enhance path.
+    full = g8.copy()
+    full[y0:y1, x0:x1] = enhanced
+    return full
+
+
+def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
+    """Alternative to _gabor_enhance: routes the masked pad through pyfing's
+    SNFEN model and uses ITS output directly as the final print (inverted
+    from pyfing's ridges-bright convention to this project's ridges-black
+    convention). See CLAUDE.md "Pretrained fingerphoto-enhancement models"
+    -- first real test scored competitively with this module's own tuned
+    Gabor output (bozorth3 vs the CTO's ink scan: 7 vs 6), but measured
+    across all 14 real front_only_v1 captures, never beat the tuned Gabor
+    pipeline on real NFIQ2 (see CLAUDE.md's "pyfing wired in" section).
+    See `enhance='pyfingHybrid'` in generate() for a second way to use
+    pyfing (as a denoise pre-pass feeding this project's own Gabor+
+    binarize chain, rather than as a standalone final image) motivated by
+    the CTO's observation that pyfing's own image convention (continuous-
+    tone, ridges bright) differs from what this pipeline's Gabor tuning
+    (gamma/sigma/freq-scale/orient-smooth) has always been calibrated
+    against (hard-binarized, ridges black) -- a plain invert isn't the
+    same transformation as that binarization."""
+    full = _pyfing_denoise(g8, mask, wl)
+    if full is None:
+        return None
+    return 255 - full   # pyfing: ridges bright -> project: ridges dark (still continuous-tone)
+    # caller (generate()) applies `binimg[mask == 0] = 255` right after,
+    # same as every other enhance path -- no need to duplicate it here.
 
 
 def generate(
@@ -1111,10 +1129,28 @@ def generate(
     if enhance == 'pyfing':
         binimg = _pyfing_enhance(g8, mask, wl)
         params['afisEnhance'] = 'pyfing' if binimg is not None else 'pyfing_unavailable'
+    elif enhance == 'pyfingHybrid':
+        # pyfing as a denoise PRE-PASS, not a standalone final image: run
+        # SNFEN to clean up ridge continuity, then let this module's own
+        # Gabor bank + hard binarization (calibrated against these exact
+        # captures) do the final black-ridge/white-background conversion,
+        # instead of a plain intensity invert of pyfing's own continuous-
+        # tone output. See _pyfing_denoise's docstring for why the two
+        # conventions aren't interchangeable via a simple invert.
+        denoised = _pyfing_denoise(g8, mask, wl)
+        if denoised is not None:
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'pyfingHybrid'
+        else:
+            params['afisEnhance'] = 'pyfingHybrid_unavailable'
     if binimg is None:
-        # Either enhance == 'gabor', or 'pyfing' was requested but the sidecar
-        # wasn't configured/reachable -- same non-blocking contract as every
-        # other optional signal in this module (fall back, don't fail).
+        # Either enhance == 'gabor', or a pyfing path was requested but the
+        # sidecar wasn't configured/reachable -- same non-blocking contract
+        # as every other optional signal in this module (fall back, don't
+        # fail).
         norm = _normalize(g8)
         orient = _orientation_field(norm)
         enh = _gabor_enhance(norm, orient, wl)
