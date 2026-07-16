@@ -359,6 +359,46 @@ change this, but **do not expect it to move real scores right now** without eith
 fine-tuning pyfing on this project's own captures, or (b) a materially different crop/
 input than what's already been tried here.
 
+### pyfing-then-Gabor hybrid (`enhance='pyfingHybrid'`) — CTO's convention-mismatch hypothesis CONFIRMED, real gain
+CTO observation, unprompted and correct: pyfing's own output convention is continuous-
+tone with ridges bright on a dark background (near its own internal binary-ish scale),
+while this project's entire Gabor pipeline (and every real NFIQ2/bozorth result it's
+been tuned against) uses **hard-binarized** black ridges on a white background, gray
+only at the feathered mask edge. The pure-`pyfingSnfen` variant's `_pyfing_enhance` was
+just doing `255 - enhanced` — a plain intensity invert, not the same transformation as
+this pipeline's own binarization. CTO's proposed fix: use pyfing purely to *find ridge
+continuity* (its actual trained job — denoise a noisy photo into cleaner ridge
+structure), then run that through this project's own tuned Gabor+binarize chain for the
+final black/white conversion, rather than inverting pyfing's output directly.
+
+**Built exactly that.** Refactored `_pyfing_enhance` into `_pyfing_denoise()` (returns
+pyfing's raw continuous-tone output, still in pyfing's own convention) + a thin invert
+wrapper for the existing pure-pyfing path, and added `enhance='pyfingHybrid'`: runs
+`_pyfing_denoise()`, then feeds that image through `_normalize` → `_orientation_field`
+→ `_gabor_enhance` → the same hard-binarization line every other variant uses. Wired
+into `main.py`'s `_afis_variants` as `pyfingHybrid`, max-of-variants alongside
+`pyfingSnfen` and everything else.
+
+**Measured on all 14 real captures, hypothesis confirmed real (not just theoretical)**:
+- **Hybrid vs. pure pyfing: mean real NFIQ2 jumped 49.4 -> 61.4 (+12)** purely from
+  fixing the convention handling — the CTO's observation was pointing at a genuine,
+  measurable gap, not a cosmetic one.
+- **Hybrid vs. the current best (tuned-Gabor) pipeline**: still trails on 13 of 14
+  captures by 10-25 points (e.g. `9bdc9f85`: hybrid 66 vs. winner 83) — the classical
+  pipeline's several real-data tuning passes still win on raw quality score. But **it
+  now wins outright on one real capture** (`382cc4b2`: 76 vs. the previous winner's 74)
+  — a small, real, additive gain now live via max-of-variants.
+- **One real fidelity win**: `ccb9c85a` scores bozorth **8** via the hybrid vs. **5**
+  for whichever variant wins there on NFIQ2 — a genuine structural-match edge that
+  pure-NFIQ2 selection misses, the same pattern seen with plain pyfing on a different
+  capture (`7d7d0162`). Reinforces the existing finding that NFIQ2-only selection can
+  leave real fidelity gains on the table on specific captures.
+
+**Conclusion**: the convention-mismatch theory was right and fixing it recovered real
+score, but doesn't (yet) make pyfing-based enhancement beat this project's own tuned
+Gabor chain overall — it's now a genuine, if narrow, additive candidate rather than a
+categorically-losing one. Committed (`e3007ff`), not deployed.
+
 ## Background contamination in AFIS masking — real fix, 2026-07-15
 CTO flagged real background contamination degrading scoring, and named the exact prior
 solution: a trained fingerprint segmentation model + flash captures as the finger-vs-
