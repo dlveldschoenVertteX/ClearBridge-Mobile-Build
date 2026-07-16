@@ -673,8 +673,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 ('stack',      dict(stack=True)),
                 ('focusStack', dict(focus_stack=True)),
                 ('fuseAvg',    dict(fuse='avg')),
+                # Coherence-based flash+ambient fusion: per-region takes whichever
+                # exposure resolves ridges best, recovering the specular-blown
+                # flash centre the flat 'avg' washes out (CTO flash-smudge
+                # feedback). The modes already existed in _fuse_flash_ambient but
+                # were never wired as production variants. Confirmed to beat 'avg'
+                # on real captures (3e54236a maxc: real NFIQ2 57->81, bozorth
+                # 4->6). Max-of-variants, so purely additive.
+                ('fuseMaxc',   dict(fuse='maxc')),
+                ('fuseSoft',   dict(fuse='soft')),
                 ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
                 ('deepFuse',   dict(fuse='deep', freq_normalize=True)),
+                ('deepMaxc',   dict(fuse='deepMaxc', freq_normalize=True)),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(

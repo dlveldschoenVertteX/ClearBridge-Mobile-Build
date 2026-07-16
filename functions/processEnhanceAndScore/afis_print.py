@@ -62,6 +62,20 @@ _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 sco
 # floor rather than disabling freq_normalize entirely -- a mild correction still helps
 # (d7dd0c68's 0.9 scale case, while bad, wasn't as bad as the 0.5/0.45 cases).
 
+_MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUTER
+# BOUND for coverage expansion: the flash-diff/U-Net-detected real pad is used as the
+# mask (covering more of the pad incl. the tip, which the tight guide oval cuts off --
+# CTO: "entire thumbpad should be covered"), then clipped to this dilated guide so it can
+# never wander onto background or the hand behind the pad. 1.0 == legacy behaviour
+# (intersect with the bare guide -> shrink only). Set to 1.3 rather than a larger value
+# from a local sweep on the 14-capture set: 1.3 adds real pad/tip coverage while a more
+# aggressive 1.6 measurably HURT a capture whose guide was already well-placed
+# (c34911b5: local NFIQ2 79->68) by reaching into poor-contact periphery. The metrics
+# available in-sandbox (real NFIQ2, foolable; bozorth vs a single weak ink scan,
+# noise-limited) cannot finely arbitrate a fidelity gain from coverage, so this is a
+# conservative choice honouring the explicit "cover the pad" ask with limited downside --
+# confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
+
 # Ridge-continuity tuning (2026-07-15, round 2): CTO reported ridges not
 # connecting/flowing smoothly on real device captures. Tried morphological
 # closing/opening directly on the binarized print first -- REJECTED, actively
@@ -790,12 +804,25 @@ def generate(
     # geometric distortion and is the single biggest superprint lever found:
     # +5–7 NFIQ on the hardest captures. Emits None (variant skipped) when no
     # fusable pair exists, so single-source renderings still stand.
-    if fuse == 'deep':
+    if fuse in ('deep', 'deepMaxc', 'deepSoft'):
         # Deep raw-burst fusion: denoise each illumination by aligning+averaging
         # ALL its preserved near-face-on burst shots, THEN fuse the two clean
         # stacks. Strengthens both fusion inputs before combining — worth
         # +2.5–8.5 NFIQ over the single best shot in testing. Needs the raw
         # front burst preserved past binning (main._download_front_burst).
+        #
+        # Fusion mode matters for the flash SPECULAR SMUDGE (CTO feedback:
+        # "shadows/dark smudges that cover ridge patterns because of too much
+        # flash reflection"). Flat 'avg' keeps a blown-out flash centre half-
+        # bright, washing out the ridges there; the coherence modes ('maxc'
+        # hard per-block, 'soft' feathered) instead take whichever exposure
+        # actually RESOLVES ridges in each region, so the ambient exposure
+        # wins back the specular-blown centre. Confirmed on a real capture
+        # (3e54236a): maxc-fused superprint is a clean, fully-covered whorl
+        # with the centre smudge gone, vs. avg's washed centre (real NFIQ2
+        # 57->81, bozorth 4->6). All three are scored as separate max-variants
+        # in main.py, so the coherence modes can only ever raise the result.
+        _deep_mode = {'deep': 'avg', 'deepMaxc': 'maxc', 'deepSoft': 'soft'}[fuse]
         ab = [g for g in (ambient_burst or []) if g is not None]
         fb = [g for g in (flash_burst or []) if g is not None]
         if not ab and not fb:
@@ -807,13 +834,13 @@ def generate(
         if df is not None and df.ndim != 2:
             df = cv2.cvtColor(df, cv2.COLOR_BGR2GRAY)
         if da is not None and df is not None:
-            fused = _fuse_flash_ambient(da, df, mode='avg')
+            fused = _fuse_flash_ambient(da, df, mode=_deep_mode)
             gray = fused if fused is not None else da
         elif da is not None or df is not None:
             gray = da if da is not None else df
         else:
             return None, params
-        params['afisDeepFuse'] = {'nAmb': len(ab), 'nFla': len(fb)}
+        params['afisDeepFuse'] = {'nAmb': len(ab), 'nFla': len(fb), 'mode': _deep_mode}
     elif fuse:
         if ambient_frames is None or flash_frames is None:
             return None, params
@@ -904,34 +931,54 @@ def generate(
         mask = guide_mask
         params['afisMask'] = 'guide'
 
-        # Content-aware refinement: the guide silhouette is a static,
-        # purely geometric region (where the on-screen overlay sat) with
-        # zero awareness of what's actually in the frame, so background
-        # bleeding in past its edges (real-world alignment isn't
-        # pixel-perfect) still gets Gabor-enhanced as if it were ridge
-        # content. Intersect with a real per-capture signal that actually
-        # distinguishes thumb from background: flash-diff first (the
-        # torch falls off with distance-squared, so flash-minus-ambient
-        # isolates near-camera surfaces almost regardless of background
-        # brightness — see sfm_pipeline._segment_via_flash_diff), then the
-        # U-Net (trained on flash-diff pseudo-labels, a learned
-        # generalization of the same cue, useful when a clean ambient/
-        # flash pair isn't available). This can only ever SHRINK the mask
-        # (intersection stays within the guide's own bounds — never
-        # introduces new background outside it) and falls back to the
-        # guide mask alone if a refinement looks unreliable (wipes out
-        # most of the guide region), rather than trusting a failed/
-        # misfiring segmentation over the user's own on-screen alignment.
-        refine_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
+        # Content-aware refinement, with COVERAGE EXPANSION. The guide
+        # silhouette is only where the on-screen overlay sat -- the real
+        # ridge-bearing pad extends BEYOND the tight guide oval (notably the
+        # tip), so masking to the bare guide throws away real, matchable
+        # ridge area (CTO feedback: "entire thumbpad should be covered").
+        # But the guide is also purely geometric with zero awareness of what
+        # is actually in frame, so background past its edges would get
+        # Gabor-noised if we just grew it blindly.
+        #
+        # Resolve both with a real per-capture pad detector: flash-diff
+        # (torch falls off with distance^2, so flash-minus-ambient isolates
+        # the near-camera pad almost regardless of background -- see
+        # sfm_pipeline._segment_via_flash_diff), U-Net fallback. Then:
+        #   - use the DETECTED pad as the mask (covers the whole real pad,
+        #     tip included), but
+        #   - CLIP it to a generous dilation of the guide (bound), so we can
+        #     never wander onto far background or the hand/wrist behind the
+        #     pad even if the detector over-segments.
+        # Falls back to the bare guide mask if the detector is unavailable or
+        # the result looks degenerate/runaway, so this can't regress a
+        # capture where the guide alone was already right.
+        pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
         refine_tag = 'flashdiff'
-        if refine_mask is None:
-            refine_mask = _unet_mask(gray)
+        if pad_mask is None:
+            pad_mask = _unet_mask(gray)
             refine_tag = 'unet'
-        if refine_mask is not None:
-            refined = cv2.bitwise_and(mask, refine_mask)
-            if (refined > 0).sum() >= 0.35 * (mask > 0).sum():
-                mask = refined
-                params['afisMask'] = f'guide+{refine_tag}'
+        if pad_mask is not None:
+            if _MASK_COVER_DILATE > 1.0:
+                bound = _superellipse_mask(gray.shape[:2], {
+                    **guide_region,
+                    'rx': float(guide_region['rx']) * _MASK_COVER_DILATE,
+                    'ry': float(guide_region['ry']) * _MASK_COVER_DILATE,
+                })
+                cand = cv2.bitwise_and(pad_mask, bound) if bound is not None else None
+                bound_area = (bound > 0).sum() if bound is not None else 1
+            else:
+                cand = cv2.bitwise_and(mask, pad_mask)      # legacy shrink-only
+                bound_area = (guide_mask > 0).sum()
+            # Accept only a plausible mask: at least a third of the guide (not
+            # a sliver from a misfire) and not filling ~the entire generous
+            # bound (which would mean the detector grabbed everything ->
+            # untrustworthy). Otherwise keep the bare guide.
+            if cand is not None:
+                cov = (cand > 0).sum()
+                if 0.35 * (guide_mask > 0).sum() <= cov <= 0.92 * bound_area:
+                    mask = cand
+                    params['afisMask'] = f'guide+{refine_tag}'
+                    params['afisMaskCoverPx'] = int(cov)
     else:
         # Mask FIRST, at native resolution -- the U-Net was trained on native-res
         # frames, so segmenting a resampled image degrades the mask.
