@@ -258,17 +258,68 @@ NFIQ2's quality axis. New `functions/processEnhanceAndScore/mindtct_client.py` m
   generalizing from one pair; (2) the CTO-chosen "try pretrained enhancement models
   first" experiment — see the new section below for where that stands.
 
-## Pretrained fingerphoto-enhancement models — where this stands (2026-07-15)
-Per the CTO's "try pretrained first" decision (§ Fidelity/matching axis above), evaluating
-existing pretrained models before any from-scratch training. Two candidates identified in
-earlier web research: **FpEnhancer** (github.com/XiongjunGuan/FpEnhancer) and
-**FingerFlow** (`pip install fingerflow`, packages MinutiaeNet's CoarseNet/FineNet).
-Learned from the NBIS vendoring experience this same session: pulling in external
-pretrained weights is the same class of supply-chain decision as vendoring external
-source, so apply the same diligence (verify the source is real/legitimate/maintained,
-check license compatibility with shipping in a commercial product, confirm it actually
-does image enhancement and not just minutiae extraction) before integrating either —
-in progress, not yet concluded as of this note.
+## Pretrained fingerphoto-enhancement models (2026-07-15) — pyfing sidecar built
+Per the CTO's "try pretrained first" decision (§ Fidelity/matching axis above), evaluated
+existing pretrained models before any from-scratch training. Learned from the NBIS
+vendoring experience this same session: pulling in external pretrained weights is the same
+class of supply-chain decision as vendoring external source, so applied the same diligence
+(verify the source is real/legitimate/maintained, check license compatibility with shipping
+in a commercial product, confirm it actually does image enhancement and not just minutiae
+extraction) before integrating anything.
+
+**Two originally-identified candidates both ruled out on closer inspection**:
+- **FpEnhancer** (github.com/XiongjunGuan/FpEnhancer) — real repo, MIT license, legitimate
+  academic author, but trained on ~800 rolled/scanner-quality prints with synthetic noise
+  augmentation; its own README warns it struggles on "highly blurry/incomplete images or
+  complex backgrounds" — exactly the failure mode a raw fingerphoto presents. Weights only
+  distributed via an unverified external Google Drive link.
+- **FingerFlow** (`pip install fingerflow`) — real package, MIT license, but
+  `extract_minutiae()` only returns minutiae coordinates — **no enhanced image output at
+  all**, disqualifying for this use case regardless of quality. Also shows signs of light
+  abandonment (last release ~2022).
+
+**New candidate found and adopted: `pyfing`** (github.com/raffaele-cappelli/pyfing,
+`pip install pyfing`). Verified clean — MIT license (commercial use/redistribution
+explicitly fine), maintainer Raffaele Cappelli is an associate professor at the University
+of Bologna and FVC (Fingerprint Verification Competition) co-organizer, author of the
+widely-used SFinGe synthetic-fingerprint generator. Pretrained weights ship **inside the
+MIT-licensed PyPI package itself** (confirmed via source read — model classes build weight
+paths from `os.path.dirname(__file__)`, no external download calls anywhere; the wheel is
+~85MB, consistent with bundled `.h5` weights) — no separate third-party host to vet at all,
+cleaner than even the NBIS situation. Real peer-reviewed backing: SNFOE/SNFFE (IEEE Access
+2024, same author), LEADER (arXiv:2602.15493, claims cross-domain generalization to latent
+impressions — the closest published claim to our fingerphoto use case of any candidate
+found).
+
+**Built `functions/pyfing_service/`** (Dockerfile + Flask `app.py` running pyfing's
+segmentation→orientation→frequency→enhancement pipeline, `SNFEN`/`GBFEN` method choice) as
+a **separate Cloud Run sidecar** — CTO's explicit choice over embedding directly in
+`processEnhanceAndScore`, since pyfing needs Keras/TensorFlow alongside that function's
+existing PyTorch stack; isolating it keeps the shared function's footprint unchanged and
+makes it trivial to fully remove if the experiment doesn't pan out. New
+`functions/processEnhanceAndScore/pyfing_client.py` mirrors `nfiq2_client.py`'s ID-token
+auth pattern (`enhance_fingerprint()`).
+
+**First real test, in-sandbox** (installed `pyfing`+`keras`+`tensorflow-cpu` directly,
+ran the Flask app via its test client — no deploy needed to validate the code path): took
+a real raw burst frame from `3e54236a` (`front_burst_fl_0.jpg`, red-tinted, needed an
+autocontrast stretch first), a crude manual crop (no real `guideRegion` alignment, no
+multi-frame fusion — everything the production pipeline already does that this quick test
+skipped), and ran both methods:
+- **SNFEN (neural): bozorth3 match score 7** against the CTO's ink scan (via the newly-
+  built `mindtct_client.match_prints()` normalization) — edges out the production
+  pipeline's own tuned output on this exact capture (6), with zero training/tuning and a
+  worse (cruder) input crop.
+- **GBFEN (classical, non-neural): score 4** — worse than both SNFEN and the current
+  pipeline.
+- Visually, SNFEN's enhanced output shows a genuinely clean, continuous whorl in the real
+  pad region — output saved to session scratchpad, not committed.
+
+**Not yet wired into `main.py`'s `_afis_variants`** — the honest next test is running
+SNFEN on the pipeline's own properly `guideRegion`-cropped/aligned image (not a manual
+crop) before deciding whether to integrate as a real `('pyfing', ...)` max-of-variants
+candidate. `pyfing_service` itself is committed but **not deployed** — needs its own
+explicit go-ahead like every other backend change.
 
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
