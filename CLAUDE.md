@@ -376,6 +376,74 @@ orientation JPEGs never passed through the pipeline's own upright-rotation step.
 change needed or made — going forward, rotate raw/diagnostic frames upright before display
 whenever showing them for review.
 
+## Real NFIQ2 + bozorth3 now run LOCALLY in-sandbox (2026-07-16) — major unlock
+Previously all real-NFIQ2 validation needed a deploy + on-device capture (the Cloud Run
+sidecar's `*.run.app` host is unreachable from the sandbox). Both ground-truth tools now
+build and run locally:
+- **Real NIST NFIQ2 2.3.0** built from source: `git clone --recursive
+  https://github.com/usnistgov/NFIQ2` (github.com clone works; only release-asset
+  downloads 403), then the CMake superbuild — needed `apt-get install libdb-dev
+  libdb++-dev libsqlite3-dev libssl-dev libjpeg-dev libpng-dev libtiff-dev
+  libopenjp2-7-dev libhwloc-dev` for its `libbiomeval` dependency (Berkeley DB + OpenJPEG
+  were the two blockers). Binary at `/tmp/NFIQ2/build/install_staging/nfiq2/bin/nfiq2`,
+  model at `.../share/nist_plain_tir-ink.txt`. CLI: `nfiq2 -m MODEL -i IMG.png -F` prints
+  the bare score. **Calibrated**: resize to 500×500 LANCZOS first (exactly as
+  `nfiq2_client` does) → exact match to production's recorded `nfiq2Score=72` on `3e54236a`.
+- **NBIS mindtct/bozorth3**: already vendored (`functions/nfiq2_service/vendor/nbis/`),
+  build copy in scratchpad.
+- The proxy ONNX (`nfiq_resnet18.onnx`) and `thumb_seg_unet.onnx` are both pullable from
+  Storage `models/` (googleapis reachable) → the U-Net mask path and the exact production
+  proxy scorer also run locally.
+- Harness (`scratchpad/harness.py`, not committed): runs the real `afis_print.generate()`
+  variants on all 14 real front captures, scores each with real NFIQ2 + bozorth-vs-ink.
+
+### CRITICAL measurement finding — do NOT optimize blindly to NFIQ2
+- **Real NFIQ2 is FOOLABLE on our prints.** A visually-garbage front capture (`5aa18155`,
+  broken/choppy discontinuous ridges, vertical crease artifacts, no coherent whorl) scored
+  real NFIQ2 **77**. NFIQ2 rewards high-frequency ridge-*like* texture regardless of whether
+  it's a faithful print. So NFIQ2 is a **floor/sanity check, NOT the optimization target** —
+  selecting the "best" variant purely by NFIQ2 will happily pick a high-scoring garbage
+  render. (This also explains the proxy's total unreliability — proxy 76 → real NFIQ2 9 in
+  production history.)
+- **The single ink scan is too weak to be a fidelity target.** bozorth3-vs-ink is only
+  valid on the CTO's OWN captures (same finger: uid `Sgsk0mvnECac` = `3e54236a`,
+  `c34911b5`, `382cc4b2`, `722ae3b0`). On those it sits at **4–5** — and *different* people's
+  captures score bozorth 4–7 against the same ink scan too. So at this quality level bozorth
+  cannot distinguish same-finger from different-finger; absolute values 4–7 are noise floor.
+  The ink scan's own low quality ("best I could get" — blur, low contrast) is the limiter.
+- **Consequence: there is no reliable *numeric* fidelity target yet.** "Optimize until the
+  match score is high" is not honestly achievable with current ground truth. What IS
+  reliable: **visual ridge continuity/coverage**, plus the tools as floors. To unlock real
+  fidelity optimization we need a **better ground-truth reference** — a proper ≥500-DPI
+  scanner/ink-card capture of the CTO's finger (ideally a few fingers), which is exactly the
+  `ml/mac3d_enhance/DATA_SPEC.md` gap.
+- **Root-cause finding (most important):** on the CTO's own captures the static `guideRegion`
+  oval is sometimes **MIS-CENTERED off the ridge-dense pad** — on `3e54236a` the whorl core
+  sits to the *right*, largely outside the guide, while the guide covers the fainter left
+  pad (confirmed via a red=guide/green=detected-pad overlay). This mis-alignment — not just
+  coverage size — is a likely real reason match quality on the CTO's own finger is mediocre.
+  Content-aware pad detection (flash-diff/U-Net) re-centers onto the actual dense-ridge
+  region; longer-term the on-screen capture guide placement itself should be improved so the
+  pad's ridge core lands inside the guide.
+
+### Two CTO-reported print defects fixed (commit `906c0f8`, NOT deployed)
+- **Whole-pad coverage** (`_MASK_COVER_DILATE=1.3` in `afis_print.py`): the mask now expands
+  from the detected real pad (flash-diff/U-Net) toward the pad tip the tight guide oval cut
+  off, clipped to a dilated guide so it can't grab background/hand. Set to 1.3 not higher —
+  a 1.6 sweep measurably hurt a well-placed capture (`c34911b5` local NFIQ2 79→68) by
+  reaching into poor-contact periphery. Note: the "choppy top" seen on some expanded prints
+  is real poor-contact ridge signal at the pad top (a *capture* issue), not a masking bug.
+- **Flash specular smudge** (coherence-fusion variants `fuseMaxc`/`fuseSoft`/`deepMaxc` added
+  to `main.py`'s `_afis_variants`): `deepFuse` hardcoded flat `avg` fusion, which keeps a
+  blown-out flash centre half-bright and washes out the ridges there. The coherence modes
+  (already in `_fuse_flash_ambient`, never wired as variants) per-region take whichever
+  exposure resolves ridges best, winning the specular centre back from the ambient exposure.
+  Confirmed on `3e54236a`: maxc superprint is a clean, fully-covered whorl with the centre
+  smudge gone (real NFIQ2 57→81, visually verified). Coherence-fusion variants win on 6 of
+  14 captures; max-of-variants, so purely additive. **This is the more solid of the two
+  fixes** (verified visually + wins as a real variant), vs. coverage which the noisy metrics
+  can't confirm.
+
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
   datastore) bundle prebuilt `.so` for arm64-v8a + armeabi-v7a + x86_64, but
