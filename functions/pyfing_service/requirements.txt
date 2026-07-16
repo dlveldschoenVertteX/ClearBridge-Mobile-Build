@@ -1,0 +1,7 @@
+flask>=3.0,<4.0
+gunicorn>=21.0,<23.0
+Pillow>=10.0,<13.0
+numpy>=1.24,<2.0
+pyfing==0.6
+keras>=3.0,<4.0
+tensorflow-cpu>=2.18,<2.22
