@@ -436,6 +436,49 @@ technique that's currently the weakest of the three denoise-pre-pass variants
 tried this session (Gabor-only > pyfingHybrid > coherenceDiff > pyfingSnfen on
 mean NFIQ2). Committed (`25b6b44`), not deployed.
 
+## NNS-then-Gabor hybrid variant (`enhance='nnsHybrid'`, 2026-07-16) — CTO's own "combine both pipelines" idea, measured underperforms
+CTO request: after seeing this project's OTHER, older enhancement model side
+by side with the AFIS template on the same real capture (`382cc4b2`:
+`enhancement_pipeline.enhance()`'s NNS output scored real NFIQ2 39, visibly
+smoother/more continuous ridge-wise than the AFIS binarized template's 76),
+asked for a hybrid combining the NNS pipeline's ridge smoothness/continuity
+with the AFIS template's NFIQ2 quality — the same denoise-then-Gabor pattern
+already used for `pyfingHybrid`/`coherenceDiff`, applied to this project's own
+second enhancement model instead of an external one.
+
+**Built exactly that.** `_nns_denoise()` in `afis_print.py` crops to the mask
+bbox, grey-fills outside it, and runs `enhancement_pipeline.enhance()` (CLAHE
++ multi-scale Gabor + trained `FingerprintUNet`) as a denoise pre-pass, then
+feeds the result through this module's own `_normalize` → `_orientation_field`
+→ `_gabor_enhance` → hard-binarization chain — same pattern as the other two
+hybrids. Unlike pyfing, NNS's own output convention already matches this
+project's (ridges dark, background light — confirmed via
+`enhancement_pipeline.ink_scanner_style`'s docstring and `_postprocess`'s
+contrast-stretch), so no invert was needed. Wired into `main.py`'s
+`_afis_variants` as `nnsHybrid`, max-of-variants. Committed (`3a8b3f4`).
+
+**Measured on all 14 real captures**: mean real NFIQ2 **50.1** — never won
+selection on any capture (one near-tie: `847fa2d3` at 55 vs. the winner's own
+55), worse than `coherenceDiff` (55.1) and `pyfingHybrid` (61.4), roughly on
+par with pure `pyfingSnfen` (49.4) — the worst-performing of the three
+denoise-pre-pass hybrids tried this session (Gabor-only > pyfingHybrid >
+coherenceDiff > nnsHybrid ≈ pyfingSnfen on mean NFIQ2). Bozorth-vs-ink mean
+4.57, a wash vs. baseline, no standout fidelity win this time (best deltas
+were only +1: `ccb9c85a` 6 vs. 5, `382cc4b2` 6 vs. 5).
+
+**Conclusion**: the NNS pipeline's smoother continuous-tone output does NOT
+translate into a better post-Gabor-binarized result — likely because its own
+enhancement stages (CLAHE + multi-scale Gabor + `FingerprintUNet`, tuned
+against a completely different objective — the ResNet18 proxy's continuous-
+tone scoring, not real NFIQ2 on a binarized template) already discard or
+reshape ridge information in a way that doesn't compose well with a SECOND
+independent Gabor pass on top. This is the same lesson as `coherenceDiff`: an
+extra denoise/smoothing stage ahead of this project's own tuned Gabor bank
+is not automatically additive just because the pre-pass looks visually
+smoother — it has to be measured, not assumed. Left wired in as a harmless,
+additive, max-of-variants candidate; not prioritized for further tuning over
+the untested capture-side items in `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md`.
+
 ## Background contamination in AFIS masking — real fix, 2026-07-15
 CTO flagged real background contamination degrading scoring, and named the exact prior
 solution: a trained fingerprint segmentation model + flash captures as the finger-vs-
