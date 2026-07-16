@@ -634,13 +634,22 @@ real capture dropped from 15.9s to 4.7s reusing the cache (same real NFIQ2 score
 81); full 14-capture regression sweep afterward matched the pre-fix baseline exactly
 (mean 74.4, same winning variant per capture) — zero regression.
 
-**Still needed, not yet done**: the Cloud Run request timeout itself (2 min) should
-probably be raised too as extra safety margin — an infra change needing its own
-explicit go-ahead, separate from this code fix. Also unresolved: this same capture's
-`secondaryCameras`/`distanceStage2` debug fields were completely absent (not just
-empty) despite the Dart code being structurally correct and the backend trigger
-firing — root cause not pinned down without device-side logs; asked the CTO whether
-an error banner appeared on screen during/after that capture.
+**Also raised the Cloud Run request timeout** 120s → 300s (`main.py`'s
+`@https_fn.on_call(timeout_sec=...)` — the actual source of truth `firebase deploy`
+applies each time, not a raw Cloud Run API edit which would be silently reverted on
+the next deploy) as a safety margin — 120s left almost no headroom even for a normal
+capture once cold model downloads (~15-55s per real logs) are counted, and the 70s
+variant budget already bounds runaway work internally so the higher ceiling costs
+nothing by itself. **Deployed** (both fixes together, `firebase deploy --only
+functions:python-pipeline`).
+
+**Still needed, not yet done**: get a real device to re-test and confirm a capture
+now reaches `status: "scored"` — this fix is deployed but not yet confirmed against
+a real capture. Also unresolved: this same capture's `secondaryCameras`/
+`distanceStage2` debug fields were completely absent (not just empty) despite the
+Dart code being structurally correct and the backend trigger firing — root cause not
+pinned down without device-side logs; asked the CTO whether an error banner appeared
+on screen during/after that capture.
 
 ## Capture-side scope items 2-4 built, NOT YET DEVICE-TESTED (2026-07-16)
 Per `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md` + the CTO's "let's go according

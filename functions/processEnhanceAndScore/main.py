@@ -183,7 +183,15 @@ def _get_nfiq_session():
 
 @https_fn.on_call(
     region='africa-south1',
-    timeout_sec=120,
+    # Raised from 120s 2026-07-16: real capture 9efb7d1e showed the AFIS
+    # variant loop alone taking 15+ minutes on a poorly-correlated burst
+    # (fixed separately via stack_cache + a 70s variant-loop budget), but
+    # 120s left near-zero margin even for a normal capture once cold model
+    # downloads (~15-55s per the real logs) are included. 300s gives real
+    # headroom; the internal 70s variant budget already bounds runaway work,
+    # so this ceiling costs nothing by itself (2nd-gen Functions bill actual
+    # compute time, not the timeout allowance).
+    timeout_sec=300,
     memory=options.MemoryOption.GB_4,
     cpu=4,
     min_instances=0,
