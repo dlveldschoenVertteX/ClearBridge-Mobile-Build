@@ -56,7 +56,7 @@ second film over the lens, rotated 90°, blocks specular reflection at the
 source. **Testable with ~$2 of film and zero engineering** before any code
 change — highest value-per-effort item in this scope.
 
-### 2. Deepen multi-camera testing
+### 2. Deepen multi-camera testing (BUILT 2026-07-16, not device-tested)
 Today: each secondary back camera (IR/night-vision, ultrawide) gets exactly one
 torch-lit still, no burst, no per-camera exposure tuning
 (`clearbridge_beta/lib/front_capture_controller.dart` ~lines 732–797), scored
@@ -66,7 +66,7 @@ honest about that limit). Extend to a short burst per secondary camera + per-
 camera EV tuning; feed each camera's sharpest-of-burst frame in as its own
 candidate (already the pattern, just better raw material).
 
-### 3. Focus/distance capture meshed into one superprint
+### 3. Focus/distance capture meshed into one superprint (Phase 0 BUILT 2026-07-16, not device-tested)
 Build `docs/MULTI_DISTANCE_MESH_SCOPE.md`'s own **Phase 0 first** (fully
 designed, not started): capture at 2 distances, feed each distance's sharpest
 frame in as an independent candidate — no fusion math yet.
@@ -83,7 +83,7 @@ is core to this pipeline's best variants. **Do not pursue Camera2
 distance, relying on continuous AF to re-acquire focus naturally. Zero Camera2
 risk, zero new native code.
 
-### 4. RAW/DNG capture (Lever C — still fully unbuilt)
+### 4. RAW/DNG capture (Lever C — Phase 0 capability check BUILT 2026-07-16, not device-tested)
 No `imageFormatGroup`/quality override exists anywhere in this codebase; the
 `camera` plugin's `takePicture()` stills are always compressed JPEG regardless.
 True RAW needs Camera2's `RAW_SENSOR` + `DngCreator` directly — a native Android

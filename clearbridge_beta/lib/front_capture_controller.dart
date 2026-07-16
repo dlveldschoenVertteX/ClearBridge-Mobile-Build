@@ -9,7 +9,7 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'dart:ui' show Offset, Rect, Size;
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show HapticFeedback;
+import 'package:flutter/services.dart' show HapticFeedback, MethodChannel;
 import 'package:mac_capture/mac_capture.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
@@ -125,6 +125,12 @@ class FrontCaptureController extends ChangeNotifier {
   // instead of the bare 2-frame minimum.
   static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 50;
+  // Secondary-camera (IR/ultrawide) burst depth. Was a single takePicture()
+  // per camera with no sharpness ranking -- a short burst here lets the
+  // backend keep the sharpest shot per camera (same Laplacian-variance
+  // pattern already used for the main burst), same rationale as the main
+  // burst's own frame-count bump above.
+  static const int _secondaryBurstCount = 3;
   static const int _burstFlashSettleMs = 70;
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
@@ -132,6 +138,33 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _emitThrottleMs = 80;
   static const int _uploadConcurrency = 8;
   static const List<int> _uploadRetryDelaysMs = [500, 1500, 4000];
+
+  // docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md item 4, Phase 0: a silent,
+  // read-only query (native MethodChannel -> Camera2 CameraCharacteristics)
+  // for whether any camera on this device advertises RAW_SENSOR capability
+  // -- no capture, no new screen/UI (the prior diagnostic screen was
+  // explicitly removed, commit 4a832c0). Queried once per app session
+  // (cached statically) and attached to each capture's own Firestore doc,
+  // purely so a future RAW/DNG capture path can be scoped against real
+  // device data instead of a guess.
+  static const _cameraCapabilitiesChannel = MethodChannel('clearbridge/cameraCapabilities');
+  static Map<String, bool>? _rawSensorSupportCache;
+  static bool _rawSensorSupportQueried = false;
+
+  static Future<Map<String, bool>?> _queryRawSensorSupport() async {
+    if (_rawSensorSupportQueried) return _rawSensorSupportCache;
+    _rawSensorSupportQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getRawSensorSupport');
+      if (result != null) {
+        _rawSensorSupportCache = result.map((k, v) => MapEntry(k, v as bool));
+      }
+    } catch (e) {
+      debugPrint('[front] RAW sensor capability query failed (non-fatal): $e');
+    }
+    return _rawSensorSupportCache;
+  }
   static const Set<String> _uploadNonRetryableCodes = {
     'unauthorized', 'unauthenticated', 'no-default-bucket',
     'invalid-argument', 'invalid-url', 'object-not-found', 'quota-exceeded',
@@ -694,6 +727,8 @@ class FrontCaptureController extends ChangeNotifier {
         });
       }
 
+      final rawSensorSupport = await _queryRawSensorSupport();
+
       final firestoreFuture = FirebaseFirestore.instance.collection('captures').doc(id).set({
         'captureId': id,
         'userId': userId,
@@ -713,6 +748,7 @@ class FrontCaptureController extends ChangeNotifier {
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
+        if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
       }, SetOptions(merge: true));
 
       var completed = 0;
@@ -768,14 +804,37 @@ class FrontCaptureController extends ChangeNotifier {
             tmp = CameraController(desc, ResolutionPreset.max, enableAudio: false);
             await tmp.initialize().timeout(const Duration(seconds: 8));
             await tmp.setFlashMode(FlashMode.torch);
+            // Anti-blowout EV step -- the same -1.0 offset already validated
+            // for the main camera's flash burst (see the alternating
+            // ambient/flash burst above: an earlier all-flash burst blew out
+            // the pad centre at ~10cm). setExposureOffset() does not engage
+            // the Camera2 interop that setExposureMode() does, so this is
+            // safe to call without risking the torch (see CameraService
+            // comments on that conflict).
+            try {
+              final minEv = await tmp.getMinExposureOffset();
+              final maxEv = await tmp.getMaxExposureOffset();
+              await tmp.setExposureOffset((-1.0).clamp(minEv, maxEv));
+            } catch (_) {
+              // Some secondary sensors may not support exposure offset --
+              // non-fatal, the burst still fires at default exposure.
+            }
             await Future<void>.delayed(const Duration(milliseconds: 600));
-            final shot = await tmp.takePicture();
-            final bytes = await shot.readAsBytes();
-            await tmp.setFlashMode(FlashMode.off);
             final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-            final path = '$basePath/secondary_${safeName}_torch.jpg';
-            await _uploadWithRetry(bytes, path);
-            secondaryMeta.add({'name': desc.name, 'path': path});
+            final paths = <String>[];
+            for (var i = 0; i < _secondaryBurstCount; i++) {
+              final shot = await tmp.takePicture();
+              final bytes = await shot.readAsBytes();
+              final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
+              await _uploadWithRetry(bytes, path);
+              paths.add(path);
+              if (i < _secondaryBurstCount - 1) {
+                await Future<void>.delayed(
+                    const Duration(milliseconds: _burstShotDelayMs));
+              }
+            }
+            await tmp.setFlashMode(FlashMode.off);
+            secondaryMeta.add({'name': desc.name, 'paths': paths});
             secondaryDebug['${desc.name}_ok'] = true;
           } catch (e) {
             debugPrint('[front] secondary camera ${desc.name} skipped: $e');
@@ -793,6 +852,47 @@ class FrontCaptureController extends ChangeNotifier {
       try {
         final update = <String, dynamic>{'secondaryCameraDebug': secondaryDebug};
         if (secondaryMeta.isNotEmpty) update['secondaryCameras'] = secondaryMeta;
+        await FirebaseFirestore.instance.collection('captures').doc(id).update(update);
+      } catch (_) {}
+
+      // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: capture a second,
+      // meaningfully-closer distance zone as ONE MORE independent
+      // single-frame candidate (no fusion math yet -- the backend just
+      // scores it alongside best_afis_img and keeps whichever wins). Runs
+      // AFTER the main upload + secondary-camera capture, same "can't
+      // regress the primary result" discipline: best-effort, bounded by a
+      // timeout, any failure just skips this stage silently. Must land
+      // before the processEnhanceAndScore trigger below so the backend's
+      // one-time doc read sees it.
+      final distanceStage2 = <Map<String, dynamic>>[];
+      final distanceDebug = <String, dynamic>{'attempted': false};
+      try {
+        final cam2 = _camera;
+        if (cam2 != null && !_disposed) {
+          distanceDebug['attempted'] = true;
+          _apply((s) => s.copyWith(distanceHint: 'Move slightly closer for a bonus capture'));
+          final reachedNear = await _waitForNearDistanceZone(cam2);
+          distanceDebug['reachedNearZone'] = reachedNear;
+          if (reachedNear) {
+            await _refocus();
+            final frames = await _captureDistanceBurst(
+              cam2,
+              zone: 'near',
+              basePath: basePath,
+              count: 3,
+            );
+            distanceStage2.addAll(frames);
+          }
+        }
+      } catch (e) {
+        debugPrint('[front] distance-stage-2 capture skipped (non-fatal): $e');
+        distanceDebug['error'] = e.toString();
+      } finally {
+        _apply((s) => s.copyWith(distanceHint: null));
+      }
+      try {
+        final update = <String, dynamic>{'distanceStage2Debug': distanceDebug};
+        if (distanceStage2.isNotEmpty) update['distanceStage2'] = distanceStage2;
         await FirebaseFirestore.instance.collection('captures').doc(id).update(update);
       } catch (_) {}
 
@@ -839,6 +939,106 @@ class FrontCaptureController extends ChangeNotifier {
         await Future.delayed(Duration(milliseconds: _uploadRetryDelaysMs[attempt]));
       }
     }
+  }
+
+  /// docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: best-effort wait for the
+  /// user to move to a meaningfully CLOSER distance zone than the main
+  /// capture, using the same coverage signal _onFrame already computes
+  /// (`HybridCaptureService.meanLuma` over `_scoreRoi`) -- just a fresh,
+  /// short-lived stream since the main stream is already stopped by the
+  /// time this runs (inside _finishAndUpload, after _fireBurst's
+  /// _stopStream() call). No focus/exposure control here -- that happens
+  /// in _refocus() once this returns true. Never throws; a bounded timeout
+  /// (or any stream error) resolves false so this stage can never hang or
+  /// block the primary capture result already sitting in Firestore.
+  Future<bool> _waitForNearDistanceZone(CameraController cam) async {
+    const timeout = Duration(seconds: 6);
+    const nearThreshold = _coverageMax + 0.05;
+    final completer = Completer<bool>();
+    var streaming = false;
+    void onFrame(CameraImage image) {
+      if (completer.isCompleted) return;
+      try {
+        final coverage = HybridCaptureService.meanLuma(image, roi: _scoreRoi) / 255.0;
+        final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
+        if (coverage > nearThreshold && steady) completer.complete(true);
+      } catch (_) {}
+    }
+    try {
+      await cam.startImageStream(onFrame);
+      streaming = true;
+      return await completer.future.timeout(timeout, onTimeout: () => false);
+    } catch (_) {
+      return false;
+    } finally {
+      if (streaming) {
+        try {
+          await cam.stopImageStream();
+        } catch (_) {}
+      }
+    }
+  }
+
+  /// docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: fires a small alternating
+  /// ambient/flash burst at the CURRENT (already-refocused) distance and
+  /// uploads each frame tagged with `distanceZone`. Deliberately NOT a full
+  /// re-entry into the main hold/burst state machine (_onFrame/_fireBurst)
+  /// -- this is a best-effort bonus stage scored as one more independent
+  /// candidate by the backend, not part of the primary deliverable, so it
+  /// mirrors _fireBurst's alternating-EV pattern directly rather than
+  /// coupling to the primary phase/state-machine fields.
+  Future<List<Map<String, dynamic>>> _captureDistanceBurst(
+    CameraController cam, {
+    required String zone,
+    required String basePath,
+    required int count,
+  }) async {
+    final out = <Map<String, dynamic>>[];
+    final torchCapable = _flash?.isNeeded ?? false;
+    double? minEv, maxEv;
+    if (torchCapable) {
+      try {
+        minEv = await cam.getMinExposureOffset();
+        maxEv = await cam.getMaxExposureOffset();
+      } catch (_) {}
+    }
+    for (var i = 0; i < count; i++) {
+      final wantFlash = torchCapable && i.isOdd;
+      try {
+        if (wantFlash) {
+          await _flash!.activate();
+          if (minEv != null && maxEv != null) {
+            await cam.setExposureOffset((_appliedEvOffset + _flashEvStep).clamp(minEv, maxEv));
+          }
+          await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+        } else {
+          await _flash?.deactivate();
+          if (minEv != null && maxEv != null) {
+            await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+          }
+        }
+        final xfile = await cam.takePicture();
+        final jpeg = await xfile.readAsBytes();
+        final decoded = await decodeStillJpegToLuma(jpeg, _sensorOrientation);
+        if (decoded == null) continue;
+        final encoded = await compute(
+          _encodeBurstIsolate,
+          _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+        );
+        final path = '$basePath/distance_${zone}_$i.jpg';
+        await _uploadWithRetry(encoded, path);
+        out.add({'path': path, 'distanceZone': zone, 'flashOn': wantFlash});
+      } catch (e) {
+        debugPrint('[front] distance burst shot $i ($zone) failed (non-fatal): $e');
+      }
+      if (i < count - 1) {
+        await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
+      }
+    }
+    try {
+      await _flash?.deactivate();
+    } catch (_) {}
+    return out;
   }
 
   Future<void> _stopStream() async {

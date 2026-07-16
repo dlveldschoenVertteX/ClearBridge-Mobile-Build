@@ -602,6 +602,54 @@ build and run locally:
   fixes** (verified visually + wins as a real variant), vs. coverage which the noisy metrics
   can't confirm.
 
+## Capture-side scope items 2-4 built, NOT YET DEVICE-TESTED (2026-07-16)
+Per `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md` + the CTO's "let's go according
+to your recommendations": items #1 (validate the `906c0f8` deploy on a real
+device) and #2 (cross-polarization test) both need the CTO to physically act, so
+built the three remaining engineering items in parallel, all **unverified beyond
+`py_compile`/manual brace-balance checks — no Dart/Kotlin toolchain in this
+sandbox, no real device.** Do not treat any of these as working until an APK build
++ real capture confirms them.
+
+- **Secondary-camera burst + EV tuning** (`front_capture_controller.dart`
+  ~lines 765-812): each IR/ultrawide secondary camera now fires a 3-shot burst
+  (`_secondaryBurstCount`) instead of one still, with `setExposureOffset(-1.0)`
+  applied first (the same anti-blowout EV step already validated for the main
+  flash burst — confirmed safe: only `setExposureMode()`, never called here,
+  triggers the Camera2-interop/torch conflict). `secondaryCameras` docs now
+  carry a `paths: [...]` list (was a single `path`). `main.py`'s secondary-camera
+  loop (~line 751) picks the sharpest via the same Laplacian-variance pattern as
+  `_best_frame_from_paths`, backward-compatible with the old single-`path` schema.
+- **Physical distance-guided capture, Phase 0** (`front_capture_controller.dart`:
+  new `_waitForNearDistanceZone()`/`_captureDistanceBurst()` methods, called
+  after the secondary-camera block and before the `processEnhanceAndScore`
+  trigger): reuses the existing `_scoreRoi` coverage signal and `_coverageMax`
+  threshold to detect a meaningfully closer distance zone (6s bounded timeout,
+  never blocks the primary result if the user doesn't move), re-focuses, fires
+  a 3-shot alternating ambient/flash burst tagged `distanceZone: 'near'`. This
+  is a self-contained bonus stage, NOT a re-entry into the main hold/burst state
+  machine — deliberately avoids touching the already-tuned primary capture-
+  quality logic. `main.py` scores the sharpest stage-2 frame as one more
+  independent single-frame candidate (`afisSource: 'distanceStage2'`) — no
+  fusion math, per `docs/MULTI_DISTANCE_MESH_SCOPE.md`'s own Phase 0 design.
+- **RAW/DNG capability check, Phase 0** (`MainActivity.kt`: new
+  `MethodChannel('clearbridge/cameraCapabilities')` reading each camera's
+  `CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES` for `RAW_SENSOR`
+  support — a read-only query, no capture): result cached and attached to the
+  capture's own Firestore doc as `rawSensorSupport`. **Deliberately NOT a
+  revived diagnostic screen** — the prior one was explicitly removed (commit
+  `4a832c0`) as "test-only tooling with no place in the current build"; this is
+  silent, no new UI. Purely informational for now — answers "does any real
+  device support RAW_SENSOR" before committing to the much bigger native
+  RAW-capture platform-channel lift.
+
+**All three need a real APK build + real device capture before trusting them.**
+Watch for: the distance-stage-2 timeout actually resolving (not hanging the
+upload flow), the secondary-camera burst not exceeding per-camera session
+limits on real hardware, and whether `rawSensorSupport` ever comes back true on
+any device in the fleet (if not, the RAW/DNG item is dead on arrival, per the
+scope doc's own Phase 0 gate).
+
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
   datastore) bundle prebuilt `.so` for arm64-v8a + armeabi-v7a + x86_64, but
