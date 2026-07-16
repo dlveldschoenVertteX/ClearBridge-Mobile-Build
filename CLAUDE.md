@@ -684,3 +684,14 @@ scope doc's own Phase 0 gate).
   with unrestricted internet and a terminal — viable for a manual one-off build (install
   Flutter + Android cmdline-tools, clone, build, download the APK via the Jupyter file
   browser, stop the instance). Not automated; would need to be walked through with the user.
+- **GitHub Actions artifact downloads are ALSO blocked from this sandbox** (confirmed
+  2026-07-16): the GitHub API's artifact download endpoint redirects to a signed Azure
+  Blob Storage URL (`*.blob.core.windows.net`), which isn't allowlisted by this session's
+  egress policy — `curl` gets a 403 at the CONNECT step (`/root/.ccr/README.md`: "policy
+  denial... do not retry or route around it"). Same class of restriction as the GHCR/
+  dl.google.com blocks above. Even when a CI build succeeds and produces an APK artifact
+  (confirmed working: `build.yml` on `push` builds `clearbridge-beta-apk` +
+  `capture-harness-apk` successfully), **the artifact itself cannot be fetched into this
+  sandbox to relay to the user** — the user must download it directly from the GitHub
+  Actions run page in their own browser (Actions tab → the run → Artifacts section at the
+  bottom), which isn't subject to this sandbox's egress policy.
