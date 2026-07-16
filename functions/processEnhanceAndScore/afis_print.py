@@ -923,6 +923,7 @@ def generate(
     mosaic: bool = False,
     guide_region: Optional[dict] = None,
     enhance: str = 'gabor',
+    stack_cache: Optional[dict] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -956,6 +957,14 @@ def generate(
                      (None, params) if the sidecar isn't configured/reachable,
                      so the caller keeps the gabor-based renderings; this can
                      only ever add a candidate, never remove one.
+    stack_cache    : optional caller-owned dict, reused across repeated calls
+                     within ONE request (e.g. main.py's max-of-variants loop
+                     calling generate() once per fuse mode) to avoid redoing
+                     the expensive _stack_face_on ECC alignment for 'deep'/
+                     'deepMaxc'/'deepSoft', which share identical inputs.
+                     Pass a fresh {} per request -- never a module-level/
+                     global cache, which would risk stale reuse across
+                     different requests on a warm Cloud Run instance.
 
     Returns (binary uint8 image or None, params dict for Firestore).
     """
@@ -1020,8 +1029,29 @@ def generate(
         fb = [g for g in (flash_burst or []) if g is not None]
         if not ab and not fb:
             return None, params
-        da = _stack_face_on(ab) if len(ab) >= 2 else (ab[0] if ab else None)
-        df = _stack_face_on(fb) if len(fb) >= 2 else (fb[0] if fb else None)
+        # _stack_face_on does ECC-affine registration across the WHOLE burst --
+        # expensive, and identical for 'deep'/'deepMaxc'/'deepSoft' (they share
+        # the same ab/fb, differing only in the cheap final fusion mode below).
+        # Found 2026-07-16 (real device capture 9efb7d1e): on a burst with
+        # poorly-correlated flash frames, redoing this 3x (once per fuse-mode
+        # variant) took 15+ minutes for a single variant, blowing the Cloud
+        # Run request timeout and leaving the capture stuck forever. Cache
+        # across the family via the caller-supplied, request-scoped
+        # `stack_cache` dict (main.py creates one fresh dict per request and
+        # passes it to every variant call) -- never a module-level/global
+        # cache, so there's no risk of stale reuse across different requests.
+        if stack_cache is not None and 'da' in stack_cache:
+            da = stack_cache['da']
+        else:
+            da = _stack_face_on(ab) if len(ab) >= 2 else (ab[0] if ab else None)
+            if stack_cache is not None:
+                stack_cache['da'] = da
+        if stack_cache is not None and 'df' in stack_cache:
+            df = stack_cache['df']
+        else:
+            df = _stack_face_on(fb) if len(fb) >= 2 else (fb[0] if fb else None)
+            if stack_cache is not None:
+                stack_cache['df'] = df
         if da is not None and da.ndim != 2:
             da = cv2.cvtColor(da, cv2.COLOR_BGR2GRAY)
         if df is not None and df.ndim != 2:

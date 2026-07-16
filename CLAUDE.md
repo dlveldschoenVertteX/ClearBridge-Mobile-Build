@@ -602,6 +602,46 @@ build and run locally:
   fixes** (verified visually + wins as a real variant), vs. coverage which the noisy metrics
   can't confirm.
 
+## CRITICAL: production capture pipeline was hanging forever — found + fixed (2026-07-16)
+First real device test of the new APK (capture `9efb7d1e`, 18:51 UTC) got stuck at
+`status: "enhancing"` and never completed — confirmed via Cloud Run logs still
+running 2+ hours later. Root cause: `processenhanceandscore`'s Cloud Run service has
+a **2-minute request timeout** (`run_v2.ServicesClient` config check), but the real
+log trace showed the gap between adjacent `_afis_variants` entries `deepFuse`
+(18:54:48) and `deepMaxc` (19:10:08) was **15 minutes 20 seconds** — `deepFuse`/
+`deepMaxc`/`deepSoft` each independently redid the expensive ambient/flash burst ECC
+alignment (`_stack_face_on`) from scratch, even though all three share identical
+inputs and differ only in the final (cheap) fusion mode. This capture's flash frames
+scored unusually low sharpness (Laplacian ~60-73 vs. ambient ~3100-3345, a 40-50x
+gap) — ECC likely struggled to converge, and that cost got paid 3x instead of once.
+This is pre-existing architecture from an earlier session's commit (`906c0f8`), not
+something introduced by this session's pyfing/coherence/nns additions — but this was
+apparently the first real capture to actually exercise `deepMaxc` in production,
+exposing it. **This was a full outage**: every real capture reaching the fuse family
+(nearly all of them, since ambient+flash bursts are always preserved) would hang
+forever and never reach `status: "scored"`.
+
+**Fixed**: `afis_print.generate()` gained a `stack_cache` parameter (request-scoped
+dict, never a module-level/global cache to avoid stale reuse across different
+requests on a warm Cloud Run instance) — `main.py`'s variant loop creates one fresh
+`{}` per request and passes it to every `generate()` call, so `_stack_face_on(ab)`/
+`_stack_face_on(fb)` compute once and get reused across `deepFuse`/`deepMaxc`/
+`deepSoft` instead of 3x. Also added a 70s wall-clock budget on the whole
+`_afis_variants` loop as an independent safety net (stops trying further variants
+once exceeded, scores with whatever's already been produced — same as a variant
+self-skipping, can't make the result worse). **Verified locally**: `deepMaxc` on a
+real capture dropped from 15.9s to 4.7s reusing the cache (same real NFIQ2 score,
+81); full 14-capture regression sweep afterward matched the pre-fix baseline exactly
+(mean 74.4, same winning variant per capture) — zero regression.
+
+**Still needed, not yet done**: the Cloud Run request timeout itself (2 min) should
+probably be raised too as extra safety margin — an infra change needing its own
+explicit go-ahead, separate from this code fix. Also unresolved: this same capture's
+`secondaryCameras`/`distanceStage2` debug fields were completely absent (not just
+empty) despite the Dart code being structurally correct and the backend trigger
+firing — root cause not pinned down without device-side logs; asked the CTO whether
+an error banner appeared on screen during/after that capture.
+
 ## Capture-side scope items 2-4 built, NOT YET DEVICE-TESTED (2026-07-16)
 Per `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md` + the CTO's "let's go according
 to your recommendations": items #1 (validate the `906c0f8` deploy on a real

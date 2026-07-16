@@ -716,12 +716,34 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # quality.
                 ('nnsHybrid', dict(enhance='nnsHybrid')),
             )
+            # Wall-clock budget on the whole variant loop -- found 2026-07-16
+            # (real device capture 9efb7d1e): the deepFuse/deepMaxc/deepSoft
+            # family each independently redo the expensive ambient/flash
+            # burst ECC alignment (_stack_face_on) from scratch, and on a
+            # capture with poorly-correlated flash frames this took 15+
+            # minutes for a SINGLE variant, blowing through the Cloud Run
+            # service's 2-minute request timeout and leaving the capture
+            # stuck at status=enhancing forever. _stack_face_on is now
+            # cached across the fuse family (see afis_print.py), but this
+            # budget is kept as a second, independent safety net against
+            # ANY future slow variant: once exceeded, stop trying further
+            # NOT-yet-attempted variants and score with whatever's already
+            # been produced -- identical to a variant self-skipping, so
+            # this can never make the result worse, only bound the worst
+            # case latency.
+            _variants_deadline = time.monotonic() + 70.0
+            _stack_cache: dict = {}   # request-scoped; see afis_print.generate's docstring
             for _vname, _vkw in _afis_variants:
+                if time.monotonic() > _variants_deadline:
+                    logger.warning('AFIS variant loop: time budget exceeded, '
+                                    'skipping remaining variants from %s onward', _vname)
+                    break
                 _img, _p = afis_print.generate(
                     frames, angles_for_sfm, _laps,
                     ambient_frames=ambient_frames, flash_frames=flash_frames,
                     ambient_burst=ambient_burst, flash_burst=flash_burst,
                     guide_region=_guide_region,
+                    stack_cache=_stack_cache,
                     **_vkw)
                 if _img is None:
                     continue
