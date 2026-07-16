@@ -1,5 +1,38 @@
 # ClearBridge Mobile — persistent context
 
+## PRIME DIRECTIVE (CTO, 2026-07-16) — matchability, not NFIQ2
+NFIQ2 is already ~70% consistently even without the MAC3D dataset. The real
+problem is **ridge continuity / true AFIS matchability**: a high NFIQ2 is
+worthless if the print doesn't actually match the same finger in an AFIS
+database. Optimize matchability by any means (web research, downloading
+models/datasets allowed); exhaust everything doable solo before Beta. See
+**`docs/FIDELITY_WALL_SCOPE.md`** for the full plan.
+
+**Session finding (2026-07-16, three independent tools agree — this is a firm
+wall, not a theory):** stood up **SourceAFIS 3.18** locally (Java+Maven,
+`scratchpad/sourceafis/`, a much stronger matcher than bozorth3) and re-scored
+all 14 real captures. It STILL can't separate genuine from impostor: genuine
+cross-capture mean 2.8 vs impostor 1.2, **0/10** genuine pairs beat the
+impostor max (SourceAFIS needs ~40 for a real match). ORB+RANSAC (matcher-
+independent) confirms it: `3e54236a` vs `c34911b5` — SAME finger, BOTH NFIQ2
+**72** — share **0** geometrically-consistent features / 0 homography inliers.
+So the high NFIQ2 measures ridge-like *texture*, not fingerprint *identity*;
+the binarized AFIS template is largely Gabor-*synthesized* plausible ridges,
+not a repeatable transcription of true minutiae. Tested `render=`
+binary/continuous/raw as a possible lever — none separated genuine/impostor,
+and binary yields the most mindtct minutiae, so binary is confirmed correct;
+the `render=` experiment was **reverted** (production stays binary-only).
+**Root cause per the literature (C2CL, Grosz/Jain TIFS 2021):** our pipeline
+has no cross-domain geometry-correction stage — no perspective rectification,
+no TPS/RTPS elastic-deformation correction toward contact-print geometry —
+which is exactly the part that makes contactless prints AFIS-matchable.
+**Measurement blocker:** the single low-quality CTO ink scan can't tell a
+match from a non-match, so there is no reliable numeric fidelity target yet —
+the top priority is a better ≥500-DPI reference and/or a public paired dataset
+(RidgeBase/PolyU/ISPFD/NIST SD 302, all CTO-side: license forms + NIST hosts
+are egress-blocked here). **Use SourceAFIS, not bozorth3, as the fidelity gate
+from now on; select on cross-domain match score, never NFIQ2, for fidelity.**
+
 ## Repos & branches
 - `origin` (GitHub): `dlveldschoenVertteX/ClearBridge-Mobile-Build` — **now PUBLIC** (flipped
   2026-07-15 specifically to get unlimited free GitHub Actions minutes after both GitHub's
