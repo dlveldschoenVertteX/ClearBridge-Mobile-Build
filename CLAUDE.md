@@ -399,6 +399,43 @@ score, but doesn't (yet) make pyfing-based enhancement beat this project's own t
 Gabor chain overall — it's now a genuine, if narrow, additive candidate rather than a
 categorically-losing one. Committed (`e3007ff`), not deployed.
 
+## Coherence-enhancing diffusion variant (`enhance='coherenceDiff'`, 2026-07-16) — measured, underperforms as first implemented
+Per the CTO's request for a full ridge-continuity optimization scope
+(`docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md`), added a classical (no sidecar
+dependency) alternative to pyfing: `_coherence_diffusion()` in `afis_print.py`
+smooths lengthwise along the local ridge direction (an efficient directional-
+kernel approximation of Weickert-style coherence-enhancing diffusion, reusing
+`_gabor_enhance`'s own per-orientation-bank architecture rather than a full
+iterative PDE solve), then re-estimates orientation on the smoothed image and
+runs the existing tuned Gabor bank + binarization on top — same denoise-then-
+Gabor pattern as `pyfingHybrid`. Wired into `main.py`'s `_afis_variants` as
+`coherenceDiff`, max-of-variants.
+
+**Measured on all 14 real captures**: mean real NFIQ2 **55.1** — worse than the
+tuned Gabor pipeline (74.4) on every single capture (never won selection), and
+also worse than `pyfingHybrid` (61.4), though better than pure `pyfingSnfen`
+(49.4). Bozorth-vs-ink mean 4.64, roughly a wash vs. baseline, with one notable
+exception: `382cc4b2` scored bozorth **7** via coherenceDiff vs. **5** for the
+capture's actual NFIQ2-selected winner — another real instance of NFIQ2-only
+selection missing a fidelity gain on a specific capture (same pattern as the
+`pyfingHybrid`/`ccb9c85a` case and the earlier plain-`pyfing`/`7d7d0162` case).
+
+**Likely why it underperforms as shipped**: the smoothing parameters
+(`_COH_DIFF_SIGMA=1.2`, `_COH_DIFF_ORIENT_RATIO=2.5`) were a first guess, not
+run through the same real-data tuning sweep the Gabor gamma/sigma/frequency-
+floor parameters went through earlier this session (see "First tuning pass").
+An extra smoothing pass ahead of Gabor plausibly costs high-frequency ridge
+energy that NFIQ2 rewards (consistent with this project's own "NFIQ2 rewards
+high-frequency ridge-like texture" finding) unless the along-ridge elongation
+is tuned much more conservatively. Left wired in as-is (harmless, additive, a
+real fidelity win on one real capture) but **not tuned further without a real
+reason to prioritize it over the higher-value untested items in the scope
+doc** (cross-polarization, multi-camera burst, RAW capture, physical distance
+meshing) — a parameter sweep here would cost real iteration time for a
+technique that's currently the weakest of the three denoise-pre-pass variants
+tried this session (Gabor-only > pyfingHybrid > coherenceDiff > pyfingSnfen on
+mean NFIQ2). Committed (`25b6b44`), not deployed.
+
 ## Background contamination in AFIS masking — real fix, 2026-07-15
 CTO flagged real background contamination degrading scoring, and named the exact prior
 solution: a trained fingerprint segmentation model + flash captures as the finger-vs-

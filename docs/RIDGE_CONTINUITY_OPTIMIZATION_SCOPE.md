@@ -114,7 +114,16 @@ Gabor bank + hard binarization on top — same denoise-then-Gabor pattern as
 `pyfingHybrid`. Added to `main.py`'s `_afis_variants` as `('coherenceDiff', ...)`,
 max-of-variants, purely additive.
 
-**Measured across all 14 real captures — see CLAUDE.md for the exact numbers.**
+**Measured across all 14 real captures**: mean real NFIQ2 **55.1**, below the
+current best (tuned Gabor pipeline, 74.4) on every capture and below
+`pyfingHybrid` (61.4), though above pure `pyfingSnfen` (49.4). Bozorth-vs-ink
+roughly a wash (4.64 vs. the pipeline's realized 5.3), with one real fidelity
+win (`382cc4b2`: 7 vs. the NFIQ2-selected winner's 5). Likely cause: the
+smoothing parameters were a first guess, not tuned against real data the way
+Gabor's own gamma/sigma/frequency-floor were — a real parameter sweep could
+improve this, but isn't prioritized above the untested capture-side items
+above (1–4) given current evidence. Full details in CLAUDE.md. Left wired in
+as a harmless, additive, max-of-variants candidate.
 
 ### 6. Stretch ideas (flagged, not prioritized)
 - **Pixel-shift / handheld multi-frame super-resolution** — conceptually close
