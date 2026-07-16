@@ -708,6 +708,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # see docs/CAPTURE_OPTIMIZATION_SCOPE.md-adjacent scope work
                 # on ridge continuity, 2026-07-16.
                 ('coherenceDiff', dict(enhance='coherenceDiff')),
+                # NNS (this project's OTHER, older enhancement model --
+                # enhancement_pipeline.enhance(), CLAHE+Gabor+trained
+                # FingerprintUNet) as a denoise pre-pass ahead of the same
+                # Gabor+binarize chain -- CTO ask, 2026-07-16: combine NNS's
+                # ridge smoothness/continuity with the AFIS template's NFIQ2
+                # quality.
+                ('nnsHybrid', dict(enhance='nnsHybrid')),
             )
             for _vname, _vkw in _afis_variants:
                 _img, _p = afis_print.generate(

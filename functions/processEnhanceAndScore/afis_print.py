@@ -851,6 +851,63 @@ def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.
     # same as every other enhance path -- no need to duplicate it here.
 
 
+def _nns_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    """Runs this project's OTHER, older enhancement model (`enhancement_pipeline.
+    enhance()` -- CLAHE -> multi-scale Gabor -> trained FingerprintUNet ("NNS")
+    -> unsharp post-process) as a denoise PRE-PASS, same role as
+    `_pyfing_denoise`/`_coherence_diffusion`: feeds `enhance='nnsHybrid'` in
+    generate(), which then runs the result through this module's own tuned
+    Gabor bank + hard binarization for the final black-ridge/white-background
+    conversion, rather than using the NNS output directly as the final image.
+
+    Motivation (CTO, 2026-07-16): the NNS pipeline's continuous-tone output is
+    visibly smoother/more continuous ridge-wise than the AFIS binarized
+    template, but scores far lower on real NFIQ2 (measured: 39 vs 76 on the
+    same real capture) -- almost certainly because NFIQ2 was calibrated
+    against, and this project's whole Gabor pipeline has been tuned against,
+    a hard-binarized image, not a soft continuous-tone one (the same class of
+    convention gap `pyfingHybrid` addressed for pyfing). Unlike pyfing, NNS's
+    own output convention already matches this project's (ridges dark,
+    background light -- confirmed via `enhancement_pipeline.ink_scanner_style`'s
+    docstring and `_postprocess`'s contrast-stretch, which assume the same
+    polarity `_gabor_enhance`'s binarization does) -- no invert needed here.
+
+    Crops to the mask's own bounding box and grey-fills outside it (same
+    pattern as `_pyfing_denoise`) before calling `enhancement_pipeline.enhance()`,
+    which internally resizes to its fixed 512x512 NNS input and returns a
+    512x512 result -- resized back to the crop's own size afterward. Returns
+    None on any failure (missing dependency, degenerate crop, or the NNS
+    weights not being resolvable) -- same non-blocking contract as every
+    other optional signal in this module."""
+    try:
+        import enhancement_pipeline
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+    y0, x0 = max(0, ys.min() - 10), max(0, xs.min() - 10)
+    y1, x1 = min(g8.shape[0], ys.max() + 10), min(g8.shape[1], xs.max() + 10)
+    crop = g8[y0:y1, x0:x1].copy()
+    crop_mask = mask[y0:y1, x0:x1]
+    crop[crop_mask == 0] = 128
+
+    try:
+        enhanced_512, _params = enhancement_pipeline.enhance(crop, sfm_coverage=1.0)
+    except Exception as e:   # noqa: BLE001 -- must never block the pipeline
+        logger.warning('NNS denoise pre-pass failed (non-critical): %s', e)
+        return None
+    if enhanced_512 is None:
+        return None
+    enhanced = cv2.resize(enhanced_512, (crop.shape[1], crop.shape[0]),
+                           interpolation=cv2.INTER_CUBIC) if enhanced_512.shape != crop.shape else enhanced_512
+
+    full = g8.copy()
+    full[y0:y1, x0:x1] = enhanced
+    return full
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -1199,6 +1256,26 @@ def generate(
         enh = _gabor_enhance(denoised, orient, wl)
         binimg = 255 - (enh < 0).astype(np.uint8) * 255
         params['afisEnhance'] = 'coherenceDiff'
+    elif enhance == 'nnsHybrid':
+        # This project's OTHER enhancement model (enhancement_pipeline.enhance(),
+        # CLAHE+Gabor+FingerprintUNet -- see "NNS Enhancement" in main.py) as a
+        # denoise pre-pass: its continuous-tone output is visibly smoother/more
+        # ridge-continuous than the AFIS binarized template but scores far
+        # lower on real NFIQ2 alone (39 vs 76 on the same real capture,
+        # 2026-07-16) -- feed it through this module's own tuned Gabor bank +
+        # binarization instead of using it as the final image, same
+        # denoise-then-Gabor pattern as pyfingHybrid/coherenceDiff. Unlike
+        # pyfing, NNS's own convention already matches this project's
+        # (ridges dark, background light) -- no invert needed.
+        denoised = _nns_denoise(g8, mask)
+        if denoised is not None:
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'nnsHybrid'
+        else:
+            params['afisEnhance'] = 'nnsHybrid_unavailable'
     if binimg is None:
         # Either enhance == 'gabor', or a pyfing path was requested but the
         # sidecar wasn't configured/reachable -- same non-blocking contract
