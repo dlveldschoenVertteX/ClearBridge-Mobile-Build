@@ -382,6 +382,39 @@ def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
         return None
 
 
+def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
+                      flash_burst: Optional[List[np.ndarray]],
+                      shape: Tuple[int, int]) -> Optional[np.ndarray]:
+    """Content-aware thumb mask via flash-minus-ambient differencing (see
+    sfm_pipeline._segment_via_flash_diff) — picks the first ambient/flash
+    pair whose shape matches the frame being processed. Used to refine the
+    guide_region mask in generate(): the guide silhouette is a static,
+    purely geometric region with zero awareness of what's actually in the
+    frame, so background bleeding in past its edges (real-world alignment
+    isn't pixel-perfect) still gets Gabor-enhanced as if it were ridge
+    content. This is the same tier that already proved itself against real
+    captures for the (currently unguided-only) segmentation fallback —
+    reused here rather than re-derived. Best-effort: returns None on any
+    failure, same contract as _unet_mask."""
+    try:
+        import sfm_pipeline
+        ab = [g for g in (ambient_burst or []) if g is not None]
+        fb = [g for g in (flash_burst or []) if g is not None]
+        for a, f in zip(ab, fb):
+            a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+            f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            if a_gray.shape != shape or f_gray.shape != shape:
+                continue
+            result = sfm_pipeline._segment_via_flash_diff(a_gray, f_gray, ksize=7)
+            if result is not None:
+                mask, _tx, _ty = result
+                return mask
+        return None
+    except Exception as e:              # noqa: BLE001 — mask refinement is best-effort
+        logger.warning('flash-diff mask unavailable for AFIS print: %s', e)
+        return None
+
+
 def _coherence_hull_mask(g8: np.ndarray, bsize: int = _BLOCK) -> Optional[np.ndarray]:
     """Fallback mask: convex hull of the high-ridge-coherence region."""
     gf = g8.astype(np.float32)
@@ -870,6 +903,35 @@ def generate(
     if guide_mask is not None:
         mask = guide_mask
         params['afisMask'] = 'guide'
+
+        # Content-aware refinement: the guide silhouette is a static,
+        # purely geometric region (where the on-screen overlay sat) with
+        # zero awareness of what's actually in the frame, so background
+        # bleeding in past its edges (real-world alignment isn't
+        # pixel-perfect) still gets Gabor-enhanced as if it were ridge
+        # content. Intersect with a real per-capture signal that actually
+        # distinguishes thumb from background: flash-diff first (the
+        # torch falls off with distance-squared, so flash-minus-ambient
+        # isolates near-camera surfaces almost regardless of background
+        # brightness — see sfm_pipeline._segment_via_flash_diff), then the
+        # U-Net (trained on flash-diff pseudo-labels, a learned
+        # generalization of the same cue, useful when a clean ambient/
+        # flash pair isn't available). This can only ever SHRINK the mask
+        # (intersection stays within the guide's own bounds — never
+        # introduces new background outside it) and falls back to the
+        # guide mask alone if a refinement looks unreliable (wipes out
+        # most of the guide region), rather than trusting a failed/
+        # misfiring segmentation over the user's own on-screen alignment.
+        refine_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
+        refine_tag = 'flashdiff'
+        if refine_mask is None:
+            refine_mask = _unet_mask(gray)
+            refine_tag = 'unet'
+        if refine_mask is not None:
+            refined = cv2.bitwise_and(mask, refine_mask)
+            if (refined > 0).sum() >= 0.35 * (mask > 0).sum():
+                mask = refined
+                params['afisMask'] = f'guide+{refine_tag}'
     else:
         # Mask FIRST, at native resolution -- the U-Net was trained on native-res
         # frames, so segmenting a resampled image degrades the mask.
