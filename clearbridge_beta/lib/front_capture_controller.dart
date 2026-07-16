@@ -729,41 +729,21 @@ class FrontCaptureController extends ChangeNotifier {
 
       final rawSensorSupport = await _queryRawSensorSupport();
 
-      final firestoreFuture = FirebaseFirestore.instance.collection('captures').doc(id).set({
-        'captureId': id,
-        'userId': userId,
-        'createdAt': FieldValue.serverTimestamp(),
-        'status': 'pending',
-        'source': 'clearbridge_beta',
-        'captureMode': 'front_only_v1',
-        'captureMethod': 'front_only_v1',
-        'guideRegion': {
-          'cx': _guideCx,
-          'cy': _guideCy,
-          'rx': _guideRx,
-          'ry': _guideRy,
-          'n': _guideN,
-          'tipAngleDeg': tipAngleDeg,
-        },
-        'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
-        'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
-        'frames': framesMeta,
-        if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
-      }, SetOptions(merge: true));
-
-      var completed = 0;
-      final total = math.max(uploadTasks.length, 1);
-      for (var i = 0; i < uploadTasks.length; i += _uploadConcurrency) {
-        final end = math.min(i + _uploadConcurrency, uploadTasks.length);
-        await Future.wait([
-          for (var j = i; j < end; j++)
-            _uploadWithRetry(uploadTasks[j].$1, uploadTasks[j].$2).then((_) {
-              completed++;
-              _apply((s) => s.copyWith(uploadProgress: completed / total));
-            }),
-        ]);
-      }
-      await firestoreFuture;
+      // Secondary-camera capture and distance-stage-2 capture both run here,
+      // BEFORE the single Firestore document write below, and their results
+      // are folded directly into that one write. Firestore security rules
+      // evaluate a brand-new document's first write against `allow create`
+      // (which this project's rules permit for clients), but ANY subsequent
+      // `.update()` on that same doc is evaluated against `allow update`,
+      // which this project's rules blanket-deny for non-admin clients
+      // (`allow update, delete: if false;`). The two blocks below used to
+      // run AFTER the initial `.set()` and record their results via a
+      // separate `.update()` call each -- both silently rejected by the
+      // rules engine every single time, which is why secondaryCameras/
+      // distanceStage2 have never actually landed in a real capture doc.
+      // Both blocks only touch Cloud Storage (via _uploadWithRetry) for
+      // their own image uploads, which has no such restriction, so nothing
+      // here depends on the Firestore doc already existing.
 
       // Best-effort secondary-camera capture: try any OTHER back cameras this
       // device exposes (e.g. IR/night-vision + ultrawide sensors) for one
@@ -773,13 +753,14 @@ class FrontCaptureController extends ChangeNotifier {
       // competitively with -- and on one device, above -- the main camera's
       // best single frame; see docs/CAPTURE_OPTIMIZATION_SCOPE.md). Was never
       // wired into front_only_v1 before now since that flow didn't exist yet
-      // when this was built. Runs AFTER the main frames + Firestore doc are
-      // already committed, so there is nothing left for a failure here to
-      // jeopardise, and BEFORE the processEnhanceAndScore trigger below so
-      // the backend's one-time doc read sees secondaryCameras already
-      // present. Many devices can only hold one camera session open at a
-      // time -- opening a second physical camera here may simply fail, which
-      // is caught and skipped silently per-camera.
+      // when this was built. Runs BEFORE the single Firestore write below
+      // (see the note above) and BEFORE the processEnhanceAndScore trigger,
+      // so the backend's one-time doc read sees secondaryCameras already
+      // present. A failure here can't jeopardise the main burst, which is
+      // uploaded separately below regardless of this block's outcome. Many
+      // devices can only hold one camera session open at a time -- opening
+      // a second physical camera here may simply fail, which is caught and
+      // skipped silently per-camera.
       // Diagnostic trail written unconditionally (unlike secondaryMeta below,
       // which only ever reflects successes) -- added after a real device
       // test on the Doogee S118 (previously confirmed to expose separate
@@ -849,20 +830,15 @@ class FrontCaptureController extends ChangeNotifier {
         debugPrint('[front] secondary camera capture skipped entirely: $e');
         secondaryDebug['fatalError'] = e.toString();
       }
-      try {
-        final update = <String, dynamic>{'secondaryCameraDebug': secondaryDebug};
-        if (secondaryMeta.isNotEmpty) update['secondaryCameras'] = secondaryMeta;
-        await FirebaseFirestore.instance.collection('captures').doc(id).update(update);
-      } catch (_) {}
 
       // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: capture a second,
       // meaningfully-closer distance zone as ONE MORE independent
       // single-frame candidate (no fusion math yet -- the backend just
       // scores it alongside best_afis_img and keeps whichever wins). Runs
-      // AFTER the main upload + secondary-camera capture, same "can't
-      // regress the primary result" discipline: best-effort, bounded by a
-      // timeout, any failure just skips this stage silently. Must land
-      // before the processEnhanceAndScore trigger below so the backend's
+      // AFTER secondary-camera capture, same "can't regress the primary
+      // result" discipline: best-effort, bounded by a timeout, any failure
+      // just skips this stage silently. Must land in the Firestore payload
+      // below before the processEnhanceAndScore trigger so the backend's
       // one-time doc read sees it.
       final distanceStage2 = <Map<String, dynamic>>[];
       final distanceDebug = <String, dynamic>{'attempted': false};
@@ -890,11 +866,52 @@ class FrontCaptureController extends ChangeNotifier {
       } finally {
         _apply((s) => s.copyWith(distanceHint: null));
       }
-      try {
-        final update = <String, dynamic>{'distanceStage2Debug': distanceDebug};
-        if (distanceStage2.isNotEmpty) update['distanceStage2'] = distanceStage2;
-        await FirebaseFirestore.instance.collection('captures').doc(id).update(update);
-      } catch (_) {}
+
+      // Single Firestore write for the whole capture -- evaluated by the
+      // security rules as `create` (the doc doesn't exist yet), which is
+      // the only client-writable path. Everything gathered above (main
+      // burst frames, rawSensorSupport, secondary-camera results, distance-
+      // stage-2 results) goes into this one call; there is no later
+      // `.update()` on this doc from the client.
+      final firestoreFuture = FirebaseFirestore.instance.collection('captures').doc(id).set({
+        'captureId': id,
+        'userId': userId,
+        'createdAt': FieldValue.serverTimestamp(),
+        'status': 'pending',
+        'source': 'clearbridge_beta',
+        'captureMode': 'front_only_v1',
+        'captureMethod': 'front_only_v1',
+        'guideRegion': {
+          'cx': _guideCx,
+          'cy': _guideCy,
+          'rx': _guideRx,
+          'ry': _guideRy,
+          'n': _guideN,
+          'tipAngleDeg': tipAngleDeg,
+        },
+        'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
+        'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
+        'frames': framesMeta,
+        if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
+        'secondaryCameraDebug': secondaryDebug,
+        if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
+        'distanceStage2Debug': distanceDebug,
+        if (distanceStage2.isNotEmpty) 'distanceStage2': distanceStage2,
+      }, SetOptions(merge: true));
+
+      var completed = 0;
+      final total = math.max(uploadTasks.length, 1);
+      for (var i = 0; i < uploadTasks.length; i += _uploadConcurrency) {
+        final end = math.min(i + _uploadConcurrency, uploadTasks.length);
+        await Future.wait([
+          for (var j = i; j < end; j++)
+            _uploadWithRetry(uploadTasks[j].$1, uploadTasks[j].$2).then((_) {
+              completed++;
+              _apply((s) => s.copyWith(uploadProgress: completed / total));
+            }),
+        ]);
+      }
+      await firestoreFuture;
 
       () async {
         try {

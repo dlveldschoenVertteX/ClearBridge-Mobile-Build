@@ -645,11 +645,65 @@ functions:python-pipeline`).
 
 **Still needed, not yet done**: get a real device to re-test and confirm a capture
 now reaches `status: "scored"` — this fix is deployed but not yet confirmed against
-a real capture. Also unresolved: this same capture's `secondaryCameras`/
-`distanceStage2` debug fields were completely absent (not just empty) despite the
-Dart code being structurally correct and the backend trigger firing — root cause not
-pinned down without device-side logs; asked the CTO whether an error banner appeared
-on screen during/after that capture.
+a real capture. The `secondaryCameras`/`distanceStage2` missing-fields mystery
+mentioned here has since been root-caused and fixed — see the section below.
+
+## Root cause found + fixed: secondaryCameras/distanceStage2 fields silently never wrote (2026-07-16)
+Following up on a real device test where the CTO saw the flash fire again during
+the "uploading" screen (after the CTO believed capture was already done) — the
+secondary-camera and distance-stage-2 code WAS running (that's the extra flash),
+but its results kept coming up completely absent from Firestore, not just empty.
+
+**Root cause, confirmed via the live Firestore ruleset** (fetched directly from
+`firebaserules.googleapis.com`, active release `fb550ede-382d-4c36-b501-137c3b459579`,
+deployed 2026-07-02 — there's no local `firestore.rules` file in this repo, rules
+are managed purely via Firebase console/deploy): the `captures` collection's
+security rules are
+
+```
+allow create: if request.auth != null
+  && request.resource.data.userId == request.auth.uid
+  && request.resource.data.get('status', 'pending') == 'pending'
+  && request.resource.data.get('nfiqScore', 0) == 0
+  && request.resource.data.get('nfiqPass', false) == false
+  && !('scoredAt' in request.resource.data)
+  && !('processingStartedAt' in request.resource.data)
+  && !('lastCaptureCallAt' in request.resource.data);
+allow update, delete: if false;
+```
+
+A document's first write is evaluated against `allow create`; every subsequent
+write to that same doc is evaluated against `allow update` instead — which this
+ruleset blanket-denies for non-admin clients. `front_capture_controller.dart`'s
+`_finishAndUpload` wrote the initial capture doc via `.set(..., merge: true)`
+(allowed, since the doc didn't exist yet), then tried to record
+`secondaryCameraDebug`/`secondaryCameras`/`distanceStage2Debug`/`distanceStage2`
+via two later `.update()` calls — both **silently rejected** every single time
+(wrapped in `try { ... } catch (_) {}`, so the failure was invisible client-side
+too). This was true from the moment the secondary-camera feature was first built
+in an earlier session — never a regression, just never actually working. It also
+meant `main.py`'s secondary-camera/distanceStage2 scoring loops (already deployed)
+had never had real data to act on either.
+
+**Fix, per the CTO's explicit choice of restructuring the app over loosening the
+rules** (`front_capture_controller.dart`'s `_finishAndUpload`): moved the entire
+secondary-camera capture block and the entire distance-stage-2 capture block to
+run **before** the Firestore document write instead of after, and folded their
+resulting `secondaryDebug`/`secondaryMeta`/`distanceDebug`/`distanceStage2` data
+directly into that one `.set(..., merge: true)` call. Both blocks only ever
+touched Cloud Storage for their own image uploads (via `_uploadWithRetry`), which
+has no such create/update distinction, so nothing about their own logic needed to
+change — only the ordering, so everything lands in the single `create`-evaluated
+write instead of two always-rejected `update`-evaluated ones. The two `.update()`
+calls were deleted outright rather than kept as dead code. Deliberately did NOT
+touch the production security rules themselves, per the CTO's explicit "go with
+option 1" (app-side restructuring) over the alternative (loosening `allow update`
+for these specific fields).
+
+**Not yet device-tested** — same discipline as every other capture-side change
+this session: this compiles/reviews clean (manual brace-balance check; no Dart
+toolchain in this sandbox) but needs a real APK build + real capture to confirm
+`secondaryCameras`/`distanceStage2` actually populate in a real Firestore doc now.
 
 ## Capture-side scope items 2-4 built, NOT YET DEVICE-TESTED (2026-07-16)
 Per `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md` + the CTO's "let's go according
