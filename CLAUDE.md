@@ -321,6 +321,61 @@ crop) before deciding whether to integrate as a real `('pyfing', ...)` max-of-va
 candidate. `pyfing_service` itself is committed but **not deployed** — needs its own
 explicit go-ahead like every other backend change.
 
+## Background contamination in AFIS masking — real fix, 2026-07-15
+CTO flagged real background contamination degrading scoring, and named the exact prior
+solution: a trained fingerprint segmentation model + flash captures as the finger-vs-
+background signal. Investigation confirmed both **already exist and are already validated**
+in this codebase — `sfm_pipeline._segment_via_flash_diff` (flash-minus-ambient
+differencing; the torch falls off with distance², so it isolates near-camera surfaces
+almost regardless of background brightness/texture) and the trained U-Net
+(`_get_thumb_seg_session`/`thumb_seg_unet.onnx`, ~1.94M params, trained on flash-diff
+pseudo-labels) — but **both were completely bypassed for `front_only_v1`**: `guide_mask`
+(the static, purely-geometric `guideRegion` silhouette) short-circuited straight past any
+content-aware check whenever present (`afis_print.py`'s old `if guide_mask is not None:
+mask = guide_mask` — zero per-capture awareness of what's actually in the frame).
+
+**Fix (commit `84ea9c6`)**: `afis_print.py`'s `generate()` now intersects the guide mask
+with a flash-diff mask (primary — `ambient_burst`/`flash_burst` frames are already
+downloaded for `front_only_v1` via `_download_front_burst`, confirmed reaching every
+variant in `main.py`'s `_afis_variants` loop, not just the `deepFuse` one) or falls back to
+the U-Net mask (when no usable ambient/flash pair exists). New `afisMask` values:
+`'guide+flashdiff'` / `'guide+unet'`, alongside the existing `'guide'` when neither
+refinement is available. **Can only ever shrink the mask toward the guide's own bounds**
+(intersection — never introduces new background outside the guide) **and falls back to the
+guide mask alone if a refinement wipes out >65% of it** (likely a failed/misfiring
+segmentation, not evidence the guide itself is wrong) — cannot regress a previously-good
+capture, same discipline as every other change in this pipeline.
+
+**Verified against a real capture (`3e54236a`)**: the guide mask was already well-aligned to
+the visible pad on this specific capture — refinement kept 96% of its area, trimming only
+thin slivers at the top/bottom edges where the guide oval slightly overshoots the
+ridge-bearing pad (confirmed via a visual overlay: red = old guide boundary, green =
+refined boundary, both sitting on real finger skin, no background in either). **The severe
+background contamination visible in this session's earlier pyfing test images was from my
+own crude manual crop for that experiment, not the production pipeline's real masking** —
+worth being precise about, since they look superficially similar but have different causes.
+Re-ran the pyfing SNFEN test on the properly guide+flashdiff-masked crop (clean, no
+background at all): **bozorth3 match score unchanged at 7** — the fix didn't move this
+specific test's number (mindtct's own minutiae extraction apparently already discounted the
+plain wall texture in the cruder crop), but it's still the right, principled fix per the
+CTO's ask, and matters more for captures with textured/patterned backgrounds (wood-plank
+desks, patterned wallpaper — the exact cases `_segment_via_flash_diff`'s own docstring
+already documents defeating brightness-only thresholding).
+
+**Not yet deployed** — needs its own explicit go-ahead like every other backend change.
+
+## Thumb orientation in diagnostic images — display-only, no pipeline bug
+CTO noted raw thumb images shown in-session were sideways and asked for upright framing
+going forward (explicitly cosmetic, not a quality-metric concern). Checked: the actual
+production AFIS output (`superprint_afis.png`) is **already rotated upright** correctly via
+`afis_print.py`'s `_upright_from_tip` (uses `guideRegion.tipAngleDeg` — the app knows
+exactly which way the tip points on the portrait screen — deterministic, not a PCA guess).
+The sideways images were specifically **raw burst frames** (e.g. `front_burst_fl_0.jpg`)
+downloaded and displayed directly for the pyfing experiment, which are unrotated sensor-
+orientation JPEGs never passed through the pipeline's own upright-rotation step. No pipeline
+change needed or made — going forward, rotate raw/diagnostic frames upright before display
+whenever showing them for review.
+
 ## Known Android/Gradle gotchas (already fixed, keep in mind for new flavors/plugins)
 - **Partial-ABI APK / "can't unzip" crash on install**: plugin AARs (camerax, TFLite,
   datastore) bundle prebuilt `.so` for arm64-v8a + armeabi-v7a + x86_64, but
