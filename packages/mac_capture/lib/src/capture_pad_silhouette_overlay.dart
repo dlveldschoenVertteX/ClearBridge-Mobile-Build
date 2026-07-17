@@ -236,28 +236,61 @@ class _PadSilhouettePainter extends CustomPainter {
     // PadSilhouetteShape.coreTargetDyFrac). Hidden during the capturing state
     // to avoid clutter while the burst fires. UI-only — no mask impact.
     if (state != PadSilhouetteState.capturing) {
+      // Fixed gold (not `accent`, which shifts cyan/green/gold with capture
+      // state) so this reads as a DISTINCT marker from the guide outline
+      // itself, not just a differently-coloured echo of it -- a real device
+      // test found the original thin ring (10/18px radius, 1.5-2px stroke)
+      // effectively invisible against a live, textured camera feed. Redrawn
+      // as a bold reticle: a soft glow halo + a crisp crosshair-in-a-ring,
+      // both noticeably larger and thicker.
+      const target = CaptureColors.gold;
       final core = shape.coreTarget;
-      final cxp = core.dx * size.width;
-      final cyp = core.dy * size.height;
-      final ringPaint = Paint()
-        ..color = accent.withValues(alpha: 0.9)
-        ..style = PaintingStyle.stroke
-        ..strokeWidth = 2;
-      canvas.drawCircle(Offset(cxp, cyp), 10, ringPaint);
+      final c = Offset(core.dx * size.width, core.dy * size.height);
+      // Soft halo so it draws the eye even against busy skin texture.
       canvas.drawCircle(
-        Offset(cxp, cyp),
-        18,
+        c,
+        26,
         Paint()
-          ..color = accent.withValues(alpha: 0.4)
+          ..color = target.withValues(alpha: 0.35)
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 1.5,
+          ..strokeWidth = 8
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 6),
       );
-      // Centre dot.
+      // Crisp outer + inner rings.
       canvas.drawCircle(
-        Offset(cxp, cyp),
-        2.0,
-        Paint()..color = accent.withValues(alpha: 0.9),
+        c,
+        26,
+        Paint()
+          ..color = target.withValues(alpha: 0.9)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3,
       );
+      canvas.drawCircle(
+        c,
+        14,
+        Paint()
+          ..color = target
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 3.5,
+      );
+      // Crosshair ticks (N/E/S/W) -- the classic "aim here" reticle shape,
+      // reads instantly even at a glance.
+      final tick = Paint()
+        ..color = target
+        ..strokeWidth = 3
+        ..strokeCap = StrokeCap.round;
+      for (final d in [
+        const Offset(0, -1), const Offset(0, 1),
+        const Offset(-1, 0), const Offset(1, 0),
+      ]) {
+        canvas.drawLine(
+          c + Offset(d.dx * 18, d.dy * 18),
+          c + Offset(d.dx * 30, d.dy * 30),
+          tick,
+        );
+      }
+      // Centre dot.
+      canvas.drawCircle(c, 3.0, Paint()..color = target);
     }
 
     // Tip marker: a small chevron at the top of the pad, cueing "tip up".
