@@ -25,6 +25,7 @@ class PadSilhouetteShape {
     required this.ry,
     this.n = 2.5,
     this.taper = 0.0,
+    this.coreTargetDyFrac = -0.45,
   });
 
   final double cx;
@@ -36,6 +37,28 @@ class PadSilhouetteShape {
   /// Taper amount [0,1]: how much wider the base is vs the tip.
   /// At taper=0.20: base is rx*1.20 wide, tip is rx*0.80 wide.
   final double taper;
+
+  /// Where inside the pad the user should aim the DENSE RIDGE CORE (the whorl /
+  /// loop swirl), as a fraction of [ry] from the guide centre toward the tip
+  /// (negative = toward the tip/top of the portrait screen).
+  ///
+  /// Rationale (device-testable capture experiment, 2026-07-17): on a thumb the
+  /// ridge core sits toward the TIP, not the fleshy pad centre. A user who
+  /// naturally centres the pad in the oval leaves the ridge-dense core near or
+  /// outside the guide edge — the documented mis-centering that hurt real match
+  /// fidelity (CLAUDE.md: "guideRegion oval is sometimes MIS-CENTERED off the
+  /// ridge-dense pad ... the whorl core sits to the right, largely outside the
+  /// guide"). Drawing a small core-target marker at this position cues the user
+  /// to seat the swirl inside the guide, so the ridge-dense region — the part
+  /// that actually carries matchable minutiae — lands within the capture mask.
+  ///
+  /// UI-ONLY: this does NOT change [boundingRect]/the Firestore `guideRegion`/
+  /// the backend crop mask, so it cannot regress a previously well-placed
+  /// capture — it only nudges user placement. Tune on-device: if the core
+  /// still lands outside the guide, move this more negative (toward the tip);
+  /// if the cue pulls the pad too high and clips the core at the top, ease it
+  /// back toward 0.
+  final double coreTargetDyFrac;
 
   /// Default pad shape — a thumbprint oval: fatter base, narrower rounded tip.
   /// Bounding box kept in sync with FrontCaptureController._scoreRoi so
@@ -65,6 +88,9 @@ class PadSilhouetteShape {
 
   /// Max half-width (at the base).
   double get rxMax => rx * (1.0 + taper);
+
+  /// Normalized (0-1 preview coords) point where the ridge core should sit.
+  Offset get coreTarget => Offset(cx, cy + coreTargetDyFrac * ry);
 
   /// Normalized bounding rect (uses max width for conservative metering).
   Rect get boundingRect =>
@@ -202,6 +228,37 @@ class _PadSilhouettePainter extends CustomPainter {
         ..strokeWidth = 10
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 9),
     );
+
+    // Core-target marker: a small concentric ring at the spot where the user
+    // should seat the DENSE RIDGE CORE (the print's swirl), toward the tip
+    // rather than the fleshy pad centre. Cues the user to place the ridge-dense
+    // region inside the guide so it lands in the capture mask (see
+    // PadSilhouetteShape.coreTargetDyFrac). Hidden during the capturing state
+    // to avoid clutter while the burst fires. UI-only — no mask impact.
+    if (state != PadSilhouetteState.capturing) {
+      final core = shape.coreTarget;
+      final cxp = core.dx * size.width;
+      final cyp = core.dy * size.height;
+      final ringPaint = Paint()
+        ..color = accent.withValues(alpha: 0.9)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2;
+      canvas.drawCircle(Offset(cxp, cyp), 10, ringPaint);
+      canvas.drawCircle(
+        Offset(cxp, cyp),
+        18,
+        Paint()
+          ..color = accent.withValues(alpha: 0.4)
+          ..style = PaintingStyle.stroke
+          ..strokeWidth = 1.5,
+      );
+      // Centre dot.
+      canvas.drawCircle(
+        Offset(cxp, cyp),
+        2.0,
+        Paint()..color = accent.withValues(alpha: 0.9),
+      );
+    }
 
     // Tip marker: a small chevron at the top of the pad, cueing "tip up".
     final b = shape.boundingRect;
