@@ -30,3 +30,13 @@ functions/processEnhanceAndScore/__pycache__/
 # Firebase CLI deploy logs
 firebase-debug.log
 *firebase-debug*.log
+
+# ML local datasets/checkpoints -- never commit. This repo is PUBLIC; local
+# ml/*/dataset dirs can contain real user capture-derived images (e.g.
+# ml/thumb_seg/dataset/), and checkpoints/exports are large binaries this
+# project deploys via Cloud Storage, never git, same as every existing
+# *.onnx model already in the pipeline.
+ml/**/dataset/
+ml/**/runs/
+ml/**/*.onnx
+ml/**/*.pt
