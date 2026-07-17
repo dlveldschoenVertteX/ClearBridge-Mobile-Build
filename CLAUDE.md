@@ -1,5 +1,54 @@
 # ClearBridge Mobile — persistent context
 
+## CTO capture-geometry explanation: thumb-twist mirroring (2026-07-17) — real physical cause, root of the "mirrored print" mystery
+CTO explained the actual physical mechanism behind a mystery this project
+flagged earlier but never resolved (session note: "CTO directly observed the
+prints are mirrored... No code-traceable bug found, so the mirroring's root
+cause is still open"): **this capture flow requires the user to twist their
+thumb behind the phone to present the pad to the rear-facing lens.** That
+twist is physically equivalent to viewing the pad from the opposite side
+compared to a direct scan or ink impression (finger pressed straight down,
+never twisted) — a REAL geometric mirror baked into the capture ergonomics
+itself, not a software bug in the decode/rotation path (consistent with the
+earlier finding that decode/rotation code has no traceable flip anywhere).
+**Applies to every MAC3D/ClearBridge capture, not just one session's test.**
+
+- **Reticle fix, done**: a Poincaré-index core measurement on a real capture
+  (`9b0fb988`) found the true ridge core to the right of the guide centre —
+  matching an earlier, independently-derived finding from a different real
+  capture (see "BoxFit.cover guideRegion bug" section below: "the whorl core
+  sits to the right"). Both measurements were taken from the raw CAPTURED
+  (already twist-mirrored) image, so "right" there is actually "left" in how
+  the pipeline renders live to the user — which is exactly what the CTO
+  directly confirmed seeing. `PadSilhouetteShape.coreTargetDxFrac` set to
+  **-0.20** (left) per the CTO's direct, physically-reasoned report, not the
+  raw-image measurement — the reticle guides LIVE placement in the
+  already-mirrored capture domain, so it needs to match what the user
+  actually perceives, not the ink/scanner convention.
+- **Enhancement/matching implication, tested, honestly inconclusive**: if our
+  captures are systematically mirrored relative to "proper" scan/ink
+  convention, every fidelity/AFIS-matching comparison against the CTO's ink
+  scan this whole session could have been comparing a mirrored probe against
+  a non-mirrored gallery — a real, previously-unexamined candidate root cause
+  for the whole prime-directive matchability wall. **Tested directly**: ran
+  SourceAFIS (the trustworthy gate this project established) on all 14 real
+  captures, normal vs. mirrored, against the ink scan
+  (`scratchpad/safis_imgs/`, mirrored versions already existed from an
+  earlier bozorth3-based sweep, never previously re-tested with SourceAFIS).
+  **Result: mirroring did NOT help on average** — mean score dropped 1.53 →
+  0.92, normal orientation won 9/14 captures vs. mirrored winning 5/14. This
+  does NOT mean the CTO's physical explanation is wrong (the twist-geometry
+  reasoning is sound) — most likely the ink scan's own already-documented
+  weaknesses (blur, low contrast, whole-thumb vs. guideRegion coverage
+  mismatch, "best I could get") swamp any real mirror signal at this
+  reference quality, same "no reliable numeric target yet" limitation
+  flagged throughout `docs/FIDELITY_WALL_SCOPE.md`. **Do not apply a
+  blanket pipeline-wide mirror to AFIS template generation based on this one
+  inconclusive test** — re-test properly once a better reference exists (a
+  real ≥500dpi scan, or eventually real SD 302 pairs via `ml/deform_correct/`),
+  with rotation and mirror handled together and verified independently, not
+  layered on an already-uncertain base image set of unknown prep history.
+
 ## Real-device test round fixes (2026-07-17) — after testing the recenter-guide-experiment APK
 CTO tested that APK and reported two real problems, both now fixed and merged
 into the main dev branch (`claude/recenter-guide-experiment` merged in,
