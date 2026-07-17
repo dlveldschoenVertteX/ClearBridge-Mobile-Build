@@ -58,6 +58,15 @@ scores yet, and none is wired into production selection.
   oriented enhancement cannot be tuned on 5 noisy fingers without overfitting.**
   The Gabor bank SYNTHESISES ridges everywhere → aggressive synthesis buys NFIQ2
   not matchability; fidelity needs the opposite instinct (less hallucination).
+- **`enhance='gaborPyfingField'`** (2026-07-17): swaps pyfing's neural
+  Snfoe/Snffe orientation/frequency estimators in for this module's own
+  classical ones, feeding the SAME Gabor bank as `gaborVarFreq` (isolates the
+  field-estimate question). **Measured: real NFIQ2 win (mean 62.9 vs
+  gaborVarFreq's 52.9, beats it 10/14) but real matchability LOSS (SourceAFIS
+  genuine mean 9.3 ≈ impostor mean 9.4 — worse than gaborVarFreq and
+  production).** The clearest single demonstration this session of the prime
+  directive's thesis: NFIQ2-quality and matchability pulled in opposite
+  directions. Not adopted — quality win doesn't matter if matchability loses.
 - **External impostor check** (`github.com/Chenhao03/DATASET`, 55 public-domain
   contactless fingerphotos, one per subject = a real impostor population):
   SourceAFIS almost never false-matches (impostor mean 0.07, max 5.6, 0 pairs

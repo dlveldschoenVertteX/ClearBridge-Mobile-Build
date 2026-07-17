@@ -994,6 +994,102 @@ def _pyfing_denoise(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.
     return full
 
 
+def _pyfing_orientation_frequency(g8: np.ndarray, mask: np.ndarray):
+    """RESEARCH SCAFFOLD (docs/FIDELITY_WALL_SCOPE.md): swap this module's own
+    classical orientation (_orientation_field, gradient/structure-tensor) and
+    frequency (_ridge_frequency_map, block autocorrelation) estimators for
+    pyfing's neural equivalents (Snfoe/Snffe), while keeping the SAME
+    downstream Gabor bank (_gabor_enhance_varfreq) -- isolates whether the
+    FIELD ESTIMATE itself is the limiting factor, distinct from pyfing's
+    SNFEN *enhancer* (enhance='pyfing'/'pyfingHybrid'), which already lost to
+    the tuned Gabor pipeline.
+
+    Returns (orientation, freq_map) in this module's own conventions --
+    orientation in [0, pi) "ridge direction" (matching _orientation_field's
+    return convention), freq_map a full-resolution ridge-PERIOD-in-px map
+    (matching _ridge_frequency_map's return convention, so it drops straight
+    into _gabor_enhance_varfreq) -- or None on any failure/unavailability
+    (caller falls back to this module's own classical fields, same
+    non-blocking contract as every other optional signal here).
+
+    UNLIKE _pyfing_denoise, this does NOT internally rescale toward
+    _TARGET_PERIOD -- resizing a per-pixel ANGLE field (wraps at 0/pi) or a
+    per-pixel PERIOD-in-px field (values themselves change with scale) after
+    the fact is a real correctness trap, not just an implementation detail.
+    Callers MUST pass freq_normalize=True to generate() so g8/mask are
+    already close to the ~500dpi/_TARGET_PERIOD domain BEFORE this runs,
+    making dpi=500 a valid assumption for pyfing's calls without any
+    post-hoc resize of the returned fields.
+
+    PRODUCTION NOTE: this does a direct in-process `import pyfing` (NOT the
+    pyfing_client HTTP-sidecar pattern _pyfing_denoise uses). That isolation
+    exists for a real reason (pyfing_client.py's own docstring: keeps
+    Keras/TensorFlow out of this Cloud Function's deploy footprint). This
+    scaffold is safe today only because `pyfing` is not in this function's
+    requirements.txt, so it self-skips via ImportError in the real deployed
+    environment -- it is for LOCAL MEASUREMENT ONLY (scratchpad harness).
+    If this measurably wins, build proper pyfing_service endpoints before
+    ever wiring it into main.py's _afis_variants."""
+    try:
+        import pyfing
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+
+    try:
+        foe = _pyfing_orientation_frequency._foe
+        ffe = _pyfing_orientation_frequency._ffe
+    except AttributeError:
+        foe = pyfing.Snfoe(pyfing.SnfoeParameters())
+        ffe = pyfing.Snffe(pyfing.SnffeParameters())
+        _pyfing_orientation_frequency._foe = foe
+        _pyfing_orientation_frequency._ffe = ffe
+
+    try:
+        pyfing_orient, _confidence = foe.run(g8, mask=mask, dpi=500)
+        pyfing_freq = ffe.run(g8, mask, pyfing_orient, dpi=500)
+    except Exception as e:
+        logger.warning('pyfing orientation/frequency estimation failed: %s', e)
+        return None
+
+    # Convert pyfing's [-pi/2, pi/2] orientation convention to this module's
+    # own [0, pi) "ridge direction" convention (see _orientation_field) --
+    # both measure ridge angle mod pi (an undirected line, not a vector), so
+    # this is a phase shift, not a sign flip. NOT independently re-verified
+    # against a ground-truth angle beyond the sanity render this scaffold was
+    # built with -- re-check visually (e.g. overlay a few orientation arrows
+    # on a real print) before trusting downstream numbers.
+    orientation = np.mod(pyfing_orient + np.pi / 2, np.pi)
+
+    # pyfing marks low-confidence/background pixels with negative sentinel
+    # values in the frequency map (observed on real prints: valid ~5-20px,
+    # invalid negative) -- treat those as unreliable and reuse
+    # _ridge_frequency_map's own nearest-fill + smoothing tail so the output
+    # is a clean, full-resolution period-in-px map in the same units/shape
+    # _gabor_enhance_varfreq already expects.
+    grid = pyfing_freq.copy()
+    grid[grid <= 0] = np.nan
+    grid[mask == 0] = np.nan
+    if np.count_nonzero(~np.isnan(grid)) < 4:
+        return None
+    valid = ~np.isnan(grid)
+    filled = grid.copy()
+    known = valid.copy()
+    while not known.all():
+        dil = cv2.dilate(np.nan_to_num(filled), np.ones((3, 3), np.uint8))
+        cnt = cv2.dilate(known.astype(np.uint8), np.ones((3, 3), np.uint8))
+        take = (~known) & (cnt > 0)
+        filled[take] = dil[take]
+        known = known | take
+        if not take.any():
+            break
+    freq_map = cv2.GaussianBlur(filled, (0, 0), _FREQMAP_SMOOTH)
+    return orientation, freq_map
+
+
 def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
     """Alternative to _gabor_enhance: routes the masked pad through pyfing's
     SNFEN model and uses ITS output directly as the final print (inverted
@@ -1129,13 +1225,24 @@ def generate(
                      FIDELITY SCAFFOLDS (opt-in, default off, NOT in main.py's
                      production variant list, judged by SourceAFIS matchability
                      not NFIQ2 -- see docs/FIDELITY_WALL_SCOPE.md):
-                       'gaborVarFreq' -- local per-region ridge-frequency Gabor;
-                       'fidelity'     -- local-freq Gabor + ridge-confidence gate
-                                         that blanks hallucinated ridges.
-                     Both measurably reduce impostor false-matches (the right
-                     direction) but over-prune genuine signal at their current
-                     first-guess thresholds; they need the paired dataset to
-                     tune before they can win, so they stay unwired for now.
+                       'gaborVarFreq'     -- local per-region ridge-frequency
+                                             Gabor (own classical field
+                                             estimators);
+                       'fidelity'         -- local-freq Gabor + ridge-
+                                             confidence gate that blanks
+                                             hallucinated ridges;
+                       'gaborPyfingField' -- same Gabor bank as gaborVarFreq,
+                                             but orientation+frequency come
+                                             from pyfing's Snfoe/Snffe neural
+                                             estimators instead -- LOCAL
+                                             MEASUREMENT ONLY, requires
+                                             freq_normalize=True, see
+                                             _pyfing_orientation_frequency.
+                     gaborVarFreq/fidelity measurably reduce impostor false-
+                     matches (the right direction) but over-prune genuine
+                     signal at their current first-guess thresholds; they need
+                     the paired dataset to tune before they can win, so they
+                     stay unwired for now. gaborPyfingField not yet measured.
     stack_cache    : optional caller-owned dict, reused across repeated calls
                      within ONE request (e.g. main.py's max-of-variants loop
                      calling generate() once per fuse mode) to avoid redoing
@@ -1472,6 +1579,24 @@ def generate(
         else:
             enh = _gabor_enhance(norm, orient, wl)
             params['afisEnhance'] = 'gaborVarFreq_fallback'
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+    elif enhance == 'gaborPyfingField':
+        # RESEARCH: same Gabor bank as gaborVarFreq, but the orientation +
+        # frequency FIELDS feeding it come from pyfing's neural estimators
+        # (Snfoe/Snffe) instead of this module's own classical ones -- isolates
+        # whether the field estimate is the limiting factor. See
+        # _pyfing_orientation_frequency's docstring for the freq_normalize=True
+        # requirement and the LOCAL-MEASUREMENT-ONLY caveat.
+        norm = _normalize(g8)
+        fields = _pyfing_orientation_frequency(g8, mask)
+        if fields is not None:
+            orient, fmap = fields
+            enh = _gabor_enhance_varfreq(norm, orient, fmap)
+            params['afisEnhance'] = 'gaborPyfingField'
+        else:
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            params['afisEnhance'] = 'gaborPyfingField_fallback'
         binimg = 255 - (enh < 0).astype(np.uint8) * 255
     elif enhance == 'fidelity':
         # FIDELITY-oriented enhancement (prime directive): local-frequency

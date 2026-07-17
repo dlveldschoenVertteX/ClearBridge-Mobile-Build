@@ -289,6 +289,44 @@ Gabor inputs, and LEADER is a genuine matchability lever as a better extractor.
 Neither is a silver bullet — the wall stays geometric — but both are worth
 adopting/testing, LEADER especially once real paired data exists.
 
+### `gaborPyfingField` experiment (2026-07-17) — measured: real NFIQ2 win, real matchability loss
+Built the actual experiment: `_pyfing_orientation_frequency()` in
+`afis_print.py` swaps pyfing's neural `Snfoe`/`Snffe` in for this module's own
+classical orientation/frequency estimators, feeding the SAME
+`_gabor_enhance_varfreq` bank as `gaborVarFreq` — isolating the field-estimate
+question in isolation from the Gabor bank itself. Sanity-checked the
+[-π/2,π/2]→[0,π) orientation-convention conversion visually (a clean, coherent
+ridge-flow render, not scrambled noise, confirms it's correct) before trusting
+numbers. Wired as `enhance='gaborPyfingField'`, same opt-in/self-skipping/
+NOT-in-production-selection contract as every other scaffold; requires
+`freq_normalize=True` (documented — no internal rescale, to avoid corrupting
+angle/period field values).
+
+**Measured on all 14 real captures:**
+- **Real NFIQ2 (quality axis): mean 62.9 vs `gaborVarFreq`'s 52.9 — beats it
+  on 10/14 captures.** pyfing's neural field estimators ARE measurably better
+  inputs to our Gabor bank than our own classical (autocorrelation/gradient)
+  ones. Direct, positive answer to "can pyfing offer more on quality." Still
+  trails the tuned production pipeline overall (mean 73.4, wins on only 2/14
+  — production's advantage includes `deepMaxc` fusion this variant doesn't
+  use, plus heavily-tuned single-wavelength Gabor parameters).
+- **SourceAFIS (matchability axis): genuine mean 9.3 vs impostor mean
+  9.4 — essentially ZERO separation**, actually *worse* than `gaborVarFreq`
+  (genuine 16.1 vs impostor 5.4) and worse than production (genuine 21.5 vs
+  impostor 11.9). 0/10 genuine pairs beat the impostor max.
+
+**Conclusion: a real win on quality, a real loss on matchability — the two
+axes pulled in opposite directions, the clearest single demonstration this
+session of the prime directive's own thesis.** Plausible mechanism: pyfing's
+learned estimators likely REGULARIZE/smooth the field more than our own
+(a trained network's job is to be confidently "plausible" everywhere), which
+reads as cleaner texture to NFIQ2 but erases the real local ridge
+irregularities that carry genuine identity signal — the same "over-synthesis
+costs matchability" lesson as the Gabor bank itself. Kept as an opt-in
+scaffold (harmless, additive, NOT wired into production or `main.py`'s
+variant list) — not adopted, since matchability is the prime directive and
+this measurably loses on it despite winning on NFIQ2.
+
 **Web SOTA re-confirmed (2026-07-17):** the winning contactless→contact recipe
 is exactly segmentation → enhancement → **500ppi scale normalization +
 spatial-transformer deformation correction** → DeepPrint-style representation
