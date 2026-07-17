@@ -106,7 +106,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
     final showGuide = s.phase == FrontCapturePhase.idle ||
         s.phase == FrontCapturePhase.calibrating ||
         s.phase == FrontCapturePhase.holding ||
-        s.phase == FrontCapturePhase.capturing;
+        s.phase == FrontCapturePhase.capturing ||
+        s.phase == FrontCapturePhase.capturingExtra;
 
     final silhouetteState = s.isCapturingBurst
         ? PadSilhouetteState.capturing
@@ -287,6 +288,23 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               ),
             ),
 
+
+          // Extra-capture status -- primary burst already fired, still
+          // grabbing best-effort secondary-camera/distance-stage-2 bonus
+          // shots of the SAME thumb placement. Explicit "hold still" cue so
+          // the user doesn't move away thinking capture is already done
+          // (see FrontCapturePhase.capturingExtra's doc comment).
+          if (s.phase == FrontCapturePhase.capturingExtra)
+            Positioned(
+              bottom: 100,
+              left: 40,
+              right: 40,
+              child: CaptureGuidanceOverlay(
+                message: 'Hold still — capturing extra detail…',
+                isAllGreen: true,
+                greenFraction: 1.0,
+              ),
+            ),
 
           // Uploading overlay.
           if (s.phase == FrontCapturePhase.uploading)

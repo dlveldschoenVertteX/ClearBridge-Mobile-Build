@@ -16,7 +16,23 @@ import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
 
-enum FrontCapturePhase { idle, calibrating, holding, capturing, uploading, complete, error }
+enum FrontCapturePhase {
+  idle,
+  calibrating,
+  holding,
+  capturing,
+  // Primary burst is done and already scored well enough to keep — now
+  // grabbing best-effort secondary-camera (IR/ultrawide) and distance-stage-2
+  // bonus shots of the SAME thumb placement. Distinct from `uploading` so the
+  // UI can tell the user to hold still instead of implying capture is
+  // already finished (see the 2026-07-17 "fires blindly" report: the extra
+  // torch shots used to fire while the phase already said "Uploading…", so
+  // the user had already moved/looked away).
+  capturingExtra,
+  uploading,
+  complete,
+  error,
+}
 
 class FrontCaptureState {
   const FrontCaptureState({
@@ -691,7 +707,16 @@ class FrontCaptureController extends ChangeNotifier {
     double gyroAtCapture,
   ) async {
     _audio.silence();
-    _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
+    // NOT `uploading` yet -- the secondary-camera + distance-stage-2 blocks
+    // below still need the thumb held in place (same physical placement, a
+    // different lens/distance). Telling the user "Uploading…" here was the
+    // root cause of the 2026-07-17 "fires blindly" report: they saw that
+    // text, assumed capture was over, and had already moved by the time the
+    // extra torch shots actually fired. `capturingExtra` keeps the guide +
+    // camera preview up with an explicit "hold still" message instead; the
+    // real `uploading` transition happens below, right before the actual
+    // Firestore write + upload begin.
+    _apply((s) => s.copyWith(phase: FrontCapturePhase.capturingExtra), force: true);
 
     final userId = _userId;
     if (userId == null) {
@@ -866,6 +891,11 @@ class FrontCaptureController extends ChangeNotifier {
       } finally {
         _apply((s) => s.copyWith(distanceHint: null));
       }
+
+      // Real upload begins here -- the actual Firestore write + main burst
+      // upload below, not the best-effort extra-camera work above. This is
+      // the honest point to switch the UI to "Uploading…".
+      _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
 
       // Single Firestore write for the whole capture -- evaluated by the
       // security rules as `create` (the doc doesn't exist yet), which is
