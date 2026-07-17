@@ -365,6 +365,71 @@ SD 302 data** (not downloaded into any accessible storage yet) or on
 SageMaker (no AWS credentials in this sandbox yet). Full details/next steps:
 `ml/deform_correct/README.md`.
 
+## SD 302 landed in S3, real bug found + fixed, first real calibration target (2026-07-17)
+
+Dataset transferred via AWS CloudShell/EC2 streaming straight into S3 (this
+sandbox still can't reach `nigos.nist.gov` directly, 403, consistent with
+prior findings). SD302a (2.05GB), SD302b (4.79GB), SD302d (0.49GB) fully
+extracted and staged in `s3://.../sd302/extracted/`; SD302f (~66GB,
+contactless) still transferring as of this writing.
+
+**Real bug found in `ingest.py`'s `_sd302_record()` before trusting any of
+this data**: verified the real archive layout against the actual extracted
+files (not assumed) and found it does NOT match what the classifier expected.
+NIST's own `README_302d.txt` confirms filenames are
+`SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_FRGP.EXT` — subject and finger-position
+(FRGP) are ONLY in the filename, never in the directory path (the real path
+is organized by device/resolution/capture-type, e.g.
+`images/auxiliary/flat/M/500/plain/png/00002502_M_500_plain_04.png`). The old
+parser read `subject = parts[0]` from the PATH (would have collapsed every
+image in an archive into one fake subject) and required the finger digits
+sandwiched between two underscores (never matches — FRGP sits right before
+the extension, so `finger` came out empty for every real record, collapsing
+all 10 fingers of a subject into one). Fixed: subject = first underscore
+token in the FILENAME, finger = last. Verified against the real data:
+**204 real subjects, 30,598 images, ZERO subject/finger collapsing** after
+the fix (the self-test was also rewritten to use the real flat-by-device
+tree shape instead of the old, wrong, per-subject-directory assumption it
+had been passing against).
+
+**SD302a's DPI is NOT fixed** (unlike b/d, which have it in the path) — its
+own README says resolution "varies between the devices, but is encoded
+within the PNG's file header." Confirmed via real PNG header reads
+(`Image.info['dpi']`) rather than assumed; SD302b/d's path-encoded values
+(1000/500) also matched their actual headers exactly.
+
+### First real genuine/impostor calibration reference (contact-vs-contact only, no SD302f needed)
+203 of ~204 subjects appear in ALL THREE contact archives (a/b/d) — real
+cross-device, same-finger pairs available immediately, without waiting on
+SD302f. Ran 25 subjects × all 3 archives (75 real images, every pairwise
+archive combo) through the SourceAFIS harness with each image's real
+per-file DPI:
+
+| combo (capture types) | n | mean | median | max |
+|---|---|---|---|---|
+| SD302a×SD302b (rolled × rolled) | 25 | 57.4 | 42.4 | 164.1 |
+| SD302a×SD302d (rolled × plain) | 25 | 49.2 | 31.5 | 183.2 |
+| SD302b×SD302d (rolled × plain) | 25 | 56.4 | 31.9 | 259.2 |
+| **impostor** (different finger) | 5400 | **1.7** | — | 24.2 |
+
+**This is the real, numeric calibration target this project has never had.**
+Clean same-finger contact-to-contact matching on SourceAFIS scores ~50-75
+mean, clearing the ~40 "real match" threshold on roughly half of pairs.
+Compare to our own contactless captures: genuine mean has been sitting at
+**2.8-5.6** (this session's earlier SourceAFIS runs) — a **~10-25x gap**,
+not a vague "it doesn't match" statement. Capture-type mismatch (rolled vs.
+plain) costs a little (~49 vs ~57 mean) but nowhere near the size of the
+contactless-vs-contact gap — most of our deficit is the photo/scan modality
+gap this whole axis exists to close, not a rolled/plain-style geometry
+difference. Also confirms the tooling itself (SourceAFIS, the harness, DPI
+handling) produces a clean, sane separation on real good data — the near-
+zero genuine scores seen on our own captures are a real capture/domain
+problem, not a broken measurement.
+
+Not yet actionable for TRAINING `deform_correct` (that still needs SD302f's
+real contactless probes) — this is a calibration/target-setting result, and
+a real-data validation of the ingestion fix, not a training result.
+
 ## Standing discipline for this axis
 - **Select/optimize on cross-domain MATCH score, never NFIQ2**, for anything
   targeting fidelity. NFIQ2 stays as the quality floor only.
