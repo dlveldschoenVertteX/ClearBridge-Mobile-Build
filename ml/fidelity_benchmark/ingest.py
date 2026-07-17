@@ -41,7 +41,7 @@ import os
 import re
 import sys
 from dataclasses import dataclass, asdict
-from typing import Optional, List, Dict, Iterable
+from typing import Optional, List, Dict, Iterable, Tuple
 
 _IMG_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.pgm', '.wsq'}
 
@@ -99,6 +99,19 @@ def _ridgebase_record(root: str, path: str) -> Optional[Record]:
 
 _SD302_POS = re.compile(r'_(\d{1,2})\.[A-Za-z0-9]+$')   # trailing FRGP before ext
 
+# SD302f's OWN filename convention is different from a/b/d and was verified
+# against the real archive + NIST's own README_302f.txt, 2026-07-17:
+# SUBJECT_DEVICE_FRGPS_CAMERA.EXT, e.g. 00002302_T_02+03_01.jpg -- FRGPS is
+# TWO finger-position codes joined by '+' (one photo frames two adjacent
+# fingers at once), and the trailing number is WHICH OF 15 CAMERA RIGS shot
+# it, not a finger code at all. Reusing _SD302_POS here (which expects a
+# single trailing finger code right before the extension) would have parsed
+# the camera number AS a finger position -- silently corrupting every pair
+# built from this part. This dedicated pattern captures the FRGPS pair
+# instead and ignores the camera-number field entirely (camera angle isn't
+# needed for pairing -- extra angles just mean more real samples per finger).
+_SD302F_FRGPS = re.compile(r'_(\d{1,2})\+(\d{1,2})_\d{1,2}\.[A-Za-z0-9]+$')
+
 # Verified against NIST's own SD 302 (N2N) part descriptions, 2026-07-17
 # (the CTO's actual download-link email, not guessed): 302a (Challenger
 # rolled friction ridge), 302b (operator-assisted rolled + 4-4-2 slap,
@@ -119,7 +132,7 @@ _SD302_CONTACT_PARTS = ('sd302a', 'sd302b', 'sd302d')
 _SD302_CONTACTLESS_PARTS = ('sd302f',)
 
 
-def _sd302_record(root: str, path: str) -> Optional[Record]:
+def _sd302_record(root: str, path: str) -> List[Record]:
     # Verified against the REAL extracted archives + NIST's own
     # README_302d.txt, 2026-07-17: filenames are
     # SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_FRGP.EXT (token count varies by
@@ -135,6 +148,15 @@ def _sd302_record(root: str, path: str) -> Optional[Record]:
     # collapsing all 10 fingers of a subject into one. Both are fixed here:
     # subject is always the FIRST underscore token in the FILENAME, FRGP is
     # always the LAST, regardless of how many tokens sit between them.
+    #
+    # SD302f (the contactless part) uses a COMPLETELY DIFFERENT convention,
+    # verified against its own real README_302f.txt, 2026-07-17:
+    # SUBJECT_DEVICE_FRGPS_CAMERA.EXT, e.g. 00002302_T_02+03_01.jpg -- each
+    # photo frames TWO fingers at once (FRGPS = two codes joined by '+'), and
+    # the trailing number is which of 15 CAMERA RIGS shot it, not a finger
+    # code. Returns ONE record per constituent finger (so a dual-finger photo
+    # registers under both finger_keys' contactless pools) rather than one
+    # record per file -- callers must handle a list, not assume 1:1.
     rel = os.path.relpath(path, root)
     low = rel.lower()
     if any(p in low for p in _SD302_CONTACTLESS_PARTS):
@@ -142,12 +164,23 @@ def _sd302_record(root: str, path: str) -> Optional[Record]:
     elif any(p in low for p in _SD302_CONTACT_PARTS):
         modality = 'contact'
     else:
-        return None   # 302c/e/g/h/i or unrecognized -- not part of this pairing
+        return []   # 302c/e/g/h/i or unrecognized -- not part of this pairing
     base = os.path.basename(path)
     subject = base.split('_')[0] if base else 'unknown'
+    if modality == 'contactless':
+        m2 = _SD302F_FRGPS.search(base)
+        if not m2:
+            return []
+        f1, f2 = m2.group(1).zfill(2), m2.group(2).zfill(2)
+        if f1 == f2:
+            return [Record(path, f'sd302:{subject}', f1, modality, '')]
+        return [
+            Record(path, f'sd302:{subject}', f1, modality, ''),
+            Record(path, f'sd302:{subject}', f2, modality, ''),
+        ]
     m = _SD302_POS.search(base)
     finger = m.group(1).zfill(2) if m else ''
-    return Record(path, f'sd302:{subject}', finger, modality, '')
+    return [Record(path, f'sd302:{subject}', finger, modality, '')]
 
 
 def _generic_record(root: str, path: str) -> Optional[Record]:
@@ -190,9 +223,18 @@ def index_dataset(root: str, layout: str = 'auto') -> List[Record]:
         for f in files:
             if not _is_img(f):
                 continue
-            rec = parse(root, os.path.join(dirpath, f))
-            if rec is not None:
-                out.append(rec)
+            result = parse(root, os.path.join(dirpath, f))
+            # Most parsers return Optional[Record] (0 or 1 per file); the
+            # sd302 parser returns List[Record] since one SD302f photo can
+            # frame two fingers at once (registers under both finger_keys).
+            # Handle both shapes rather than forcing every parser onto the
+            # list interface just for this one part's real convention.
+            if result is None:
+                continue
+            elif isinstance(result, list):
+                out.extend(result)
+            else:
+                out.append(result)
     return out
 
 
@@ -216,23 +258,85 @@ def summarize(records: Iterable[Record]) -> Dict[str, object]:
     }
 
 
-def genuine_impostor_pairs(records: List[Record], max_impostors: int = 20000):
+def genuine_impostor_pairs(
+    records: List[Record],
+    max_impostors: int = 20000,
+    max_genuine: int = 200000,
+    seed: int = 0,
+) -> Tuple[List[Tuple[Record, Record]], List[Tuple[Record, Record]]]:
     """Build cross-modality (contactless probe vs contact gallery) pairs.
     Genuine = same finger_key; impostor = different. Returns (genuine, impostor)
-    lists of (probe_record, gallery_record)."""
+    lists of (probe_record, gallery_record).
+
+    Real-scale note: an earlier version built the full probe x gallery cross
+    product (every impostor combination) before subsampling down to
+    max_impostors -- fine on small synthetic self-test data, but on a real
+    dataset this is O(n*m): the full SD 302 a/b/d/f set (~30k contactless x
+    ~31k contact records) is ~9x10^8 pairs before the cap even applies,
+    which both never finishes and OOMs building the intermediate list
+    (confirmed: killed a real run pinned at 94% system memory). Genuine
+    pairs are grouped by finger_key first (cheap -- bounded by real
+    per-finger sample counts, not the full cross product) and capped at
+    max_genuine as a safety net; impostor pairs are RANDOMLY SAMPLED
+    directly rather than enumerated-then-subsampled, so cost is bounded by
+    max_impostors regardless of dataset size.
+    """
+    import random
+
     probes = [r for r in records if r.modality == 'contactless']
     gallery = [r for r in records if r.modality == 'contact']
-    gen, imp = [], []
-    for p in probes:
-        for g in gallery:
-            if p.finger_key == g.finger_key:
+
+    by_key_probe: Dict[str, List[Record]] = {}
+    for r in probes:
+        by_key_probe.setdefault(r.finger_key, []).append(r)
+    by_key_gallery: Dict[str, List[Record]] = {}
+    for r in gallery:
+        by_key_gallery.setdefault(r.finger_key, []).append(r)
+
+    gen: List[Tuple[Record, Record]] = []
+    for key, plist in by_key_probe.items():
+        glist = by_key_gallery.get(key)
+        if not glist:
+            continue
+        for p in plist:
+            for g in glist:
                 gen.append((p, g))
-            else:
+                if len(gen) >= max_genuine:
+                    break
+            if len(gen) >= max_genuine:
+                break
+        if len(gen) >= max_genuine:
+            break
+
+    cross_product = len(probes) * len(gallery)
+    if cross_product <= max_impostors * 4:
+        # Small enough to enumerate exactly (matches the original behavior
+        # exactly -- self-tests assert precise impostor counts on tiny
+        # synthetic data, which random sampling with replacement can't
+        # reproduce since the same pair could be drawn more than once).
+        imp = []
+        for p in probes:
+            for g in gallery:
+                if p.finger_key != g.finger_key:
+                    imp.append((p, g))
+        if len(imp) > max_impostors:
+            step = len(imp) // max_impostors
+            imp = imp[::step][:max_impostors]
+    else:
+        # Real-scale path: sample directly instead of enumerating ~10^8-10^9
+        # combinations just to throw almost all of them away.
+        rng = random.Random(seed)
+        seen: set = set()
+        imp = []
+        attempts = 0
+        max_attempts = max_impostors * 20
+        while len(imp) < max_impostors and attempts < max_attempts:
+            pi, gi = rng.randrange(len(probes)), rng.randrange(len(gallery))
+            p, g = probes[pi], gallery[gi]
+            if p.finger_key != g.finger_key and (pi, gi) not in seen:
+                seen.add((pi, gi))
                 imp.append((p, g))
-    if len(imp) > max_impostors:
-        # deterministic stride subsample to keep the matrix tractable
-        step = len(imp) // max_impostors
-        imp = imp[::step][:max_impostors]
+            attempts += 1
     return gen, imp
 
 
@@ -274,20 +378,26 @@ def _selftest() -> int:
         print('generic layout:   OK', gs)
 
         # Real SD 302 tree shape (verified against the actual archives,
-        # 2026-07-17): NOT per-subject directories -- flat, organized by
-        # device/resolution/capture-type, with subject+FRGP encoded only in
-        # the filename (SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_FRGP.EXT, token
-        # count varies by part). Deliberately has NO subject-named directory
-        # anywhere so this actually exercises "subject comes from the
-        # filename, not the path" rather than accidentally passing because a
-        # subject dir happens to still be part of the tree.
+        # 2026-07-17): NOT per-subject directories for a/b/d -- flat,
+        # organized by device/resolution/capture-type, with subject+FRGP
+        # encoded only in the filename (SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_
+        # FRGP.EXT, token count varies by part). Deliberately has NO subject-
+        # named directory anywhere for a/b/d so this actually exercises
+        # "subject comes from the filename, not the path".
+        #
+        # SD302f uses its OWN real convention (verified against its actual
+        # README_302f.txt): SUBJECT_DEVICE_FRGPS_CAMERA.EXT, e.g.
+        # 00001234_T_01+02_01.jpg -- ONE photo frames TWO fingers (01+02)
+        # from ONE of 15 camera angles (the trailing "01" here is the camera
+        # number, not a finger). 00001234_T_01+02_01.jpg must register under
+        # BOTH finger 01 and finger 02's contactless pools.
         for rel in [
             'SD302a/images/challengers/C/roll/png/00001234_C_roll_01.png',
             'SD302a/images/challengers/C/roll/png/00005678_C_roll_01.png',
             'SD302b/images/baseline/V/1000/roll/png/00001234_V_1000_roll_01.png',
             'SD302d/images/auxiliary/flat/M/500/plain/png/00001234_M_500_plain_02.png',
-            'SD302f/images/challengers/T/photo/png/00001234_T_photo_01.jpg',
-            'SD302f/images/challengers/T/photo/png/00005678_T_photo_01.jpg',
+            'SD302f/images/auxiliary/photograph/T/jpg/00001234/01+02/00001234_T_01+02_01.jpg',
+            'SD302f/images/auxiliary/photograph/T/jpg/00005678/01+03/00005678_T_01+03_05.jpg',
             'SD302c/images/palm/00001234_C_palm_00.png',   # irrelevant, must not pair
         ]:
             fp = Path(d) / 'sd302' / rel
@@ -295,18 +405,20 @@ def _selftest() -> int:
             fp.write_bytes(b'\xff\xd8\xff' if rel.endswith('.jpg') else b'\x89PNG\r\n')
         srecs = index_dataset(str(Path(d) / 'sd302'), 'sd302')
         ss = summarize(srecs)
-        # 6 classified records (subject1: a,b,d contact + f contactless;
-        # subject2: a contact + f contactless) -- the SD302c palm image is
-        # excluded entirely (returns None), not counted at all.
-        assert ss['images'] == 6, ss
-        assert ss['by_modality'] == {'contact': 4, 'contactless': 2}, ss
-        # pairable: subject 00001234 finger 01 (a+b+f all present) and
-        # subject 00005678 finger 01 (a+f present) => 2 pairable fingers.
-        # Subject 00001234's finger 02 (SD302d only, no contactless) is NOT
-        # pairable on its own.
-        assert ss['pairable_fingers'] == 2, ss
+        # 8 records from 6 real files: the two SD302f dual-finger photos each
+        # produce TWO records (one per constituent finger), everything else
+        # is 1:1. SD302c palm is excluded entirely (returns []), not counted.
+        assert ss['images'] == 8, ss
+        assert ss['by_modality'] == {'contact': 4, 'contactless': 4}, ss
+        # pairable finger_keys: 00001234/01 (a+b contact, f-photo1 contactless),
+        # 00001234/02 (d contact, f-photo1 contactless), 00005678/01 (a
+        # contact, f-photo2 contactless). 00005678/03 has contactless (from
+        # f-photo2) but no contact counterpart -- NOT pairable.
+        assert ss['pairable_fingers'] == 3, ss
         sgen, simp = genuine_impostor_pairs(srecs)
-        assert len(sgen) == 3, (len(sgen), sgen)   # a+f and b+f for 00001234, a+f for 00005678
+        # 00001234/01: 1 contactless x 2 contact = 2; 00001234/02: 1x1=1;
+        # 00005678/01: 1x1=1. Total 4.
+        assert len(sgen) == 4, (len(sgen), sgen)
         print('sd302 layout:     OK', ss)
     print('SELFTEST PASSED')
     return 0 if ok else 1
