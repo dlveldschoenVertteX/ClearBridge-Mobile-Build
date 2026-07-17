@@ -33,6 +33,44 @@ the top priority is a better ≥500-DPI reference and/or a public paired dataset
 are egress-blocked here). **Use SourceAFIS, not bozorth3, as the fidelity gate
 from now on; select on cross-domain match score, never NFIQ2, for fidelity.**
 
+### Prime-directive scaffolds built 2026-07-17 (all committed; all GATED on the paired dataset)
+Everything below is built, self-tested where possible, and **waiting on a real
+paired dataset** to validate/tune — nothing here is proven to move real match
+scores yet, and none is wired into production selection.
+- **`ml/fidelity_benchmark/`** (committed, self-tested, no data needed yet):
+  `ingest.py` indexes RidgeBase / NIST SD 302 / generic layouts into
+  (subject, finger, modality) records + genuine/impostor cross-modality pairs;
+  `benchmark.py` has the verification metric core (EER, TAR@FAR, d′) + the
+  `select_variant` matcher-based selection comparing `nfiq2`/`minutiae`/`oracle`
+  strategies. This produces the first real genuine/impostor ROC the moment data
+  lands. **Run `python3 ingest.py --selftest` / `benchmark.py --selftest`.**
+- **`functions/processEnhanceAndScore/geom_correct.py`** — C2CL-style geometry
+  correction: `cylindrical_rectify()` (single-image cylinder-foreshortening
+  undo, fully implemented) + `elastic_flatten()` (parametric RTPS placeholder).
+  Wired as `afis_print.generate(geom='cyl'|'cylElastic')`, default OFF,
+  self-skipping, NOT in `main.py`'s variant list.
+- **Fidelity-oriented enhance modes in `afis_print.py`**: `enhance='gaborVarFreq'`
+  (per-region local ridge-frequency Gabor) and `enhance='fidelity'` (local-freq
+  Gabor + a ridge-CONFIDENCE gate that blanks hallucinated ridges). Also default
+  OFF, NOT in the production variant list. **Measured negative on 5 fingers**:
+  both cut impostor false-matches (the right direction) but over-prune genuine
+  signal at first-guess thresholds — the recurring lesson that **fidelity-
+  oriented enhancement cannot be tuned on 5 noisy fingers without overfitting.**
+  The Gabor bank SYNTHESISES ridges everywhere → aggressive synthesis buys NFIQ2
+  not matchability; fidelity needs the opposite instinct (less hallucination).
+- **External impostor check** (`github.com/Chenhao03/DATASET`, 55 public-domain
+  contactless fingerphotos, one per subject = a real impostor population):
+  SourceAFIS almost never false-matches (impostor mean 0.07, max 5.6, 0 pairs
+  ≥20) — confirming it's a trustworthy gate — while our genuine same-finger sits
+  faintly above (mean 5.6, max 14.2). A faint real identity signal exists to
+  amplify; SourceAFIS is confirmed the right gate.
+- **Capture-side:** `claude/recenter-guide-experiment` branch adds a ridge-core
+  target cue to the capture guide (UI-only, no mask change) — device-testable
+  A/B for whether guiding the user to seat the whorl core in the guide lands
+  more matchable minutiae. The `camera` plugin has no JPEG-quality knob, so the
+  only real raw-quality lever left is RAW/DNG (native, gated on the
+  `rawSensorSupport` Phase-0 check that needs a device to report).
+
 ## Repos & branches
 - `origin` (GitHub): `dlveldschoenVertteX/ClearBridge-Mobile-Build` — **now PUBLIC** (flipped
   2026-07-15 specifically to get unlimited free GitHub Actions minutes after both GitHub's
