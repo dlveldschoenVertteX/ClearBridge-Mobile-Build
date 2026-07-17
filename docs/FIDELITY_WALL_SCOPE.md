@@ -82,6 +82,35 @@ There is still **no reliable numeric fidelity target**:
 from a non-match.** Every fidelity number this project has produced (bozorth
 4–7, SourceAFIS <15) is inside the noise floor of a weak reference.
 
+## External impostor benchmark (2026-07-16) — SourceAFIS is a trustworthy gate; a FAINT genuine signal exists
+
+Cloned the one reachable public contactless set from this sandbox —
+`github.com/Chenhao03/DATASET` (public domain, 55 real contactless
+fingerphotos, 320×240 `.pgm`, one per subject → every cross-pair is a
+different finger = a true **impostor** population). All other real datasets
+are behind license forms or egress-blocked hosts (see below). Ran the
+production `afis_print.generate()` on them (unguided → U-Net mask path;
+30/55 produced a usable mask, the rest are too full-frame for segmentation),
+then SourceAFIS all-pairs:
+
+- **External impostor pairs (different real fingers): mean 0.07, median 0,
+  max 5.6, ZERO pairs ≥20.** SourceAFIS essentially never false-matches —
+  it is a trustworthy gate, not a random scorer.
+- **Our own genuine same-finger pairs: mean 5.6, max 14.2** — i.e. clearly
+  above the external impostor floor (mean 0.07), but our genuine *mean* only
+  reaches the external impostor *max*, and both are far below SourceAFIS's
+  real-match threshold (~40).
+
+**Refined conclusion:** there IS a faint real identity signal (genuine sits
+above the impostor floor), so the pipeline is not pure noise — but it is
+~an order of magnitude short of operational AFIS matching. This is precisely
+the signal that cross-domain geometry correction (item B below) is meant to
+amplify. NFIQ2 (already ~70) is blind to this gap; SourceAFIS separation is
+the metric to move. Caveat: external prints used a different (U-Net) mask
+path and are lower-res, so treat the absolute numbers as indicative, not a
+controlled genuine-vs-impostor ROC — which still requires a proper paired
+dataset (item A).
+
 ## Path forward (prioritized; what's doable solo vs what needs the CTO)
 
 ### A. Get a real fidelity benchmark (highest priority — unblocks everything)
@@ -90,6 +119,15 @@ from a non-match.** Every fidelity number this project has produced (bozorth
    a well-inked card scanned at 1000 DPI flatbed), 2–3 impressions each. This
    turns fidelity from "noise floor" into a real genuine/impostor benchmark
    the SourceAFIS harness (already built, `scratchpad/sourceafis/`) can score.
+   **Reachability from this sandbox is the constraint.** Only `github.com`
+   and language package registries are allowed by egress policy; HuggingFace,
+   Kaggle, Zenodo, Google Drive, Buffalo, PolyU, NIST all return 403. The one
+   GitHub-hosted public set found (`Chenhao03/DATASET`, used for the impostor
+   benchmark above) is a 2019 partial upload — 55 low-res contactless images,
+   one per subject, **no paired contact prints and no same-finger repeats**,
+   so it can't produce genuine pairs. A complete paired dataset therefore has
+   to be brought in by the CTO (downloaded in a normal browser, then dropped
+   into the repo/session).
 2. **Public paired dataset** (parallel, also CTO — most need a signed license
    form, and NIST hosts are egress-blocked from this sandbox):
    - **RidgeBase** (U. Buffalo CUBS) — 15k+ contactless/contact pairs, 88
