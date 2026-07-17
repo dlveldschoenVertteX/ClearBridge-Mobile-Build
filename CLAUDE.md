@@ -129,6 +129,69 @@ scores yet, and none is wired into production selection.
   only real raw-quality lever left is RAW/DNG (native, gated on the
   `rawSensorSupport` Phase-0 check that needs a device to report).
 
+## Deformation-correction training pipeline (`ml/deform_correct/`, 2026-07-17)
+Built the learned piece `geom_correct.py`'s `elastic_flatten()` has been stubbing
+as an identity placeholder for — a network trained on real paired NIST SD 302
+data (contactless probe → contact gallery) to correct cross-domain geometry,
+per the prime-directive research (C2CL/Grosz-Jain TIFS 2021). `model.py`
+(`DeformFieldUNet` + differentiable `SpatialTransformer` warp, single-image
+input only — no paired gallery exists live in production), `dataset.py`
+(subject-disjoint splits by finger key), `train.py` (loss is primarily ridge-
+**orientation** similarity — a differentiable torch reimplementation of
+`afis_print._orientation_field`'s own math, chosen over raw pixel similarity
+since probe/gallery are different sensor modalities that don't share pixel
+statistics — plus small-weight SSIM and flow-smoothness), `build_manifest.py`
+(relative paths, so the manifest works inside a SageMaker container),
+`sagemaker_launch.py` (dry-run by default, `--go` required to spend, managed
+spot, hard runtime cap, prints cost estimate first). Smoke-tested end-to-end
+on synthetic placeholder data in-sandbox (full loop: load → forward → warp →
+loss → backward → checkpoint → ONNX export → ONNX Runtime inference, all
+verified). **Not yet run on real data.** The real validation gate is the
+SourceAFIS genuine-vs-impostor ROC (`ml/fidelity_benchmark/benchmark.py`) on
+the exported ONNX model, never the training loss itself or NFIQ2 — same
+standing discipline as everywhere else in this project.
+
+## AWS SageMaker + S3 — real credentials live, infra confirmed (2026-07-17)
+CTO provided real AWS credentials (root-level — explicitly overrode the
+recommendation to use a scoped IAM user after being shown the blast-radius
+tradeoff) to train `ml/deform_correct/` on real SD 302 data. **No secrets are
+recorded in this file or anywhere in the repo** — credentials live only in
+each sandbox's local `~/.aws` config (profile `clearbridge`), session-scoped,
+never committed. CTO set a $20 AWS Budgets alert as an independent safety net.
+- **Confirmed live** against account `085068687041` ("ClearBridge") via a
+  read-only `sts:GetCallerIdentity` call before doing anything else.
+- **The existing NNS-training infrastructure is directly reusable, no new
+  setup needed**: S3 bucket `clearbridge-fingerprint-training-085068687041-af-
+  south-1-an` and IAM role `ClearBridgeSageMakerRole` (region `af-south-1`,
+  same region as the Cloud Run functions).
+- **Real finding, checked before assuming**: not every AWS region offers
+  SageMaker GPU *Training* jobs (some only offer GPU for *Studio* notebooks).
+  Verified via the AWS Pricing API that `ml.g4dn.xlarge` Training **is**
+  available in `af-south-1` — real on-demand price **$0.977/hr** (~$0.34/hr
+  spot). A 4h-capped job worst-cases at ~$3.90 on-demand / ~$1.37 spot, well
+  inside the $20 budget — no region change needed.
+- **This sandbox still cannot reach `nigos.nist.gov` directly** (403,
+  consistent with the earlier-documented egress block) — the CTO downloads
+  SD 302 via **AWS CloudShell** instead (runs on AWS's own network, not
+  subject to this sandbox's restriction), streaming each file straight into
+  S3 via `curl | aws s3 cp -` (never touches CloudShell's own small disk),
+  inside a `tmux` session so it survives the browser tab losing focus.
+  Verified real transfer content directly via S3 byte-level reads (not just
+  trusting terminal output) before trusting the larger transfers — the two
+  small files came through as real CSV/text content, not an HTML error page,
+  confirming the tokenized NIST links authenticate correctly.
+- **In progress as of this session**: `SD302a.zip` (2.05GB) confirmed
+  complete; `SD302b/d/f` were transferring. `SD302f` (~66GB, the contactless
+  part) is the long pole. A recurring background check (this session only,
+  polls S3 directly) was set up to report progress without the CTO needing to
+  babysit CloudShell.
+- **Next once the dataset lands**: sanity-check the real NIST folder/filename
+  convention against `ml/fidelity_benchmark/ingest.py`'s `_sd302_record()`
+  classifier (built from NIST's documented part descriptions, never validated
+  against the real archive layout) before trusting `build_manifest.py`'s
+  output, then a local CPU smoke pass on real data, then a SageMaker dry-run
+  cost estimate for review before any `--go`.
+
 ## Repos & branches
 - `origin` (GitHub): `dlveldschoenVertteX/ClearBridge-Mobile-Build` — **now PUBLIC** (flipped
   2026-07-15 specifically to get unlimited free GitHub Actions minutes after both GitHub's
