@@ -761,6 +761,25 @@ def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
     return bin_r, mask_r
 
 
+def _geom_correct(g8: np.ndarray, mask: np.ndarray, mode: str):
+    """Cross-domain geometry correction (C2CL-style) via geom_correct.py.
+
+    Kept as a thin lazy-import wrapper (same non-blocking contract as the
+    pyfing/nns hooks): returns (g8, mask) warped toward contact-print
+    geometry, or None to self-skip the variant. See geom_correct.py and
+    docs/FIDELITY_WALL_SCOPE.md for why this exists and how it's validated
+    (SourceAFIS separation, not NFIQ2)."""
+    try:
+        import geom_correct
+    except ImportError:
+        return None
+    try:
+        return geom_correct.correct(g8, mask, mode=mode)
+    except Exception as e:      # never let a geometry experiment break scoring
+        logger.warning('AFIS geom correction (%s) failed: %s', mode, e)
+        return None
+
+
 def _pyfing_denoise(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
     """Runs the pyfing sidecar's SNFEN model as a denoising pre-pass and
     returns a full-frame-shaped CONTINUOUS-TONE image in pyfing's OWN
@@ -924,6 +943,7 @@ def generate(
     guide_region: Optional[dict] = None,
     enhance: str = 'gabor',
     stack_cache: Optional[dict] = None,
+    geom: Optional[str] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -965,6 +985,16 @@ def generate(
                      Pass a fresh {} per request -- never a module-level/
                      global cache, which would risk stale reuse across
                      different requests on a warm Cloud Run instance.
+
+    geom           : optional cross-domain geometry correction toward contact-
+                     print geometry (C2CL-style), applied to the masked pad
+                     before enhancement. None (default) = off. 'cyl' = single-
+                     image cylinder-curvature rectification; 'cylElastic' =
+                     cyl + (currently identity) elastic flatten. See
+                     geom_correct.py / docs/FIDELITY_WALL_SCOPE.md. SCAFFOLD:
+                     validated by SourceAFIS genuine-vs-impostor separation
+                     (NOT NFIQ2), not yet tuned/wired into production variants
+                     — needs the paired dataset (scope doc item A) first.
 
     Returns (binary uint8 image or None, params dict for Firestore).
     """
@@ -1227,6 +1257,22 @@ def generate(
         # g8 (CLAHE-boosted): raw contrast is too low across most of the frame
         # for the block-std gate to pass at all.
         mask = _crop_to_pad_mask(g8, mask)
+
+    # Cross-domain geometry correction (C2CL-style), OFF unless requested via
+    # `geom`. Undoes the contactless-vs-contact geometric mismatch (cylinder
+    # foreshortening + eventually elastic flatten) on the masked pad BEFORE
+    # enhancement, warping g8 and mask together so the rest of the pipeline
+    # (freq-normalise, Gabor, feather, upright) is unchanged. Wired as its own
+    # max-of-variants candidate in main.py — can only add a print, never
+    # regress the best. Success is SourceAFIS genuine-vs-impostor separation,
+    # NOT NFIQ2 (see geom_correct.py / docs/FIDELITY_WALL_SCOPE.md). Returns
+    # None to self-skip (kept the un-corrected image) if the pad is degenerate.
+    if geom:
+        _gc = _geom_correct(g8, mask, geom)
+        if _gc is None:
+            return None, params
+        g8, mask = _gc
+        params['afisGeom'] = geom
 
     # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
     # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.

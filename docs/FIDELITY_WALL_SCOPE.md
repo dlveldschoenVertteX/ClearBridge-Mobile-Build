@@ -140,7 +140,7 @@ dataset (item A).
    (the real numeric fidelity target the project lacks) and later fine-tune
    enhancement on real paired data.
 
-### B. Build the missing geometry-correction stage (solo, high value)
+### B. Build the missing geometry-correction stage (solo, high value) — SCAFFOLD BUILT 2026-07-16
 Independent of new data, port the C2CL-style correction our pipeline lacks:
 1. **Perspective/curvature rectification** of the pad before enhancement
    (the finger is a cylinder photographed off-axis; unwarp toward a frontal
@@ -153,6 +153,34 @@ Independent of new data, port the C2CL-style correction our pipeline lacks:
 Validate both with the SourceAFIS harness on the same-finger captures — the
 right success signal is **cross-capture genuine score rising above impostor**,
 NOT NFIQ2 (which is already saturated and can't see this).
+
+**Status — scaffold built (`functions/processEnhanceAndScore/geom_correct.py`,
+wired into `afis_print.generate(geom=...)`, default OFF, self-skipping,
+compile-clean):**
+- `cylindrical_rectify()` — the deterministic single-image cylinder-curvature
+  correction (item 1), fully implemented (arc-length column remap of the
+  masked pad, `strength`-blended toward identity, mask warped in lockstep).
+- `elastic_flatten()` — item 2's interface, present as a PARAMETRIC identity
+  placeholder (`gain=0`) with the exact signature a trained RTPS will drop
+  into. Not the real learned warp — that needs paired data.
+- **Deliberately NOT yet wired into `main.py`'s `_afis_variants`.** Two
+  reasons: (a) unvalidated on real paired data, and (b) production variant
+  selection is by NFIQ2, which is blind to this axis, so it wouldn't be
+  selected even if added — geom must be selected by a MATCHER, which needs
+  the dataset. Kept as an offline-measurable scaffold until then.
+
+**Preliminary measurement (our own 5-finger set, SourceAFIS, base vs `cyl`)
+— directional only, NOT conclusive:** cyl raised genuine-pair mean 21.5→28.4
+and, notably, **cut the worst impostor false-matches** (different fingers
+scoring 101→58; the 87-scoring false pair dropped out of the top) — i.e. the
+correction reduced spurious cross-identity minutiae alignment, the right
+direction. BUT: genuine median fell (13.6→3.9), variance is huge, and several
+scores are implausibly high (235 genuine, 101 impostor) — spurious minutiae
+from small synthetic-ridge prints on a 5-finger sample. **This is exactly why
+item A (a many-finger paired dataset) is the gate**: 5 fingers / 81 impostor
+pairs with spurious matches cannot validate or tune this. The scaffold is
+ready to be tuned (`_CYL_HALF_ANGLE_DEG`, `_CYL_STRENGTH`) and RTPS-fitted the
+day real paired data lands.
 
 ### C. Fix capture-side centering (solo, cheap, already scoped)
 Re-center the on-screen guide so the whorl core lands inside it
