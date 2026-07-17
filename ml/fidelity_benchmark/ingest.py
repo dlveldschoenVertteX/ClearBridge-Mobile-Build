@@ -99,6 +99,25 @@ def _ridgebase_record(root: str, path: str) -> Optional[Record]:
 
 _SD302_POS = re.compile(r'_(\d{2})_')   # NIST FMR finger-position code _NN_
 
+# Verified against NIST's own SD 302 (N2N) part descriptions, 2026-07-17
+# (the CTO's actual download-link email, not guessed): 302a (Challenger
+# rolled friction ridge), 302b (operator-assisted rolled + 4-4-2 slap,
+# "baseline"), and 302d (plain fingerprints from AUXILIARY DEVICES) are ALL
+# still sensor/scanner captures -- "auxiliary" means a different SENSOR
+# vendor, not a different acquisition MODALITY. 302f (unprocessed
+# PHOTOGRAPHS from Challenger T's PROTOTYPE device) is the one genuinely
+# contactless/photographic, unassisted part -- confirmed via NIST TN 2007's
+# own description of the N2N challenge (untrained users, no operator, full
+# nail-to-nail capture). An earlier version of this classifier incorrectly
+# grouped 302d in with contactless via a vague 'aux|device' regex -- fixed
+# here to key off the literal, documented part codes instead of guessing
+# from loose keywords. 302c (palm), 302e (latent), 302g/h/i (EBTS
+# annotation/transaction files, not raw images) are all out of scope for
+# this contactless-vs-contact pairing and won't classify as either modality
+# below (never matched as contact OR contactless -> excluded from pairing).
+_SD302_CONTACT_PARTS = ('sd302a', 'sd302b', 'sd302d')
+_SD302_CONTACTLESS_PARTS = ('sd302f',)
+
 
 def _sd302_record(root: str, path: str) -> Optional[Record]:
     rel = os.path.relpath(path, root)
@@ -106,11 +125,12 @@ def _sd302_record(root: str, path: str) -> Optional[Record]:
     # subject is the first path component that looks like an id
     subject = parts[0] if parts else 'unknown'
     low = rel.lower()
-    # 302a / 302b = examiner/operator rolled+plain contact; 302c/302d = devices
-    if re.search(r'sd302[cd]|aux|device|contactless', low):
+    if any(p in low for p in _SD302_CONTACTLESS_PARTS):
         modality = 'contactless'
-    else:
+    elif any(p in low for p in _SD302_CONTACT_PARTS):
         modality = 'contact'
+    else:
+        return None   # 302c/e/g/h/i or unrecognized -- not part of this pairing
     m = _SD302_POS.search(os.path.basename(path))
     finger = m.group(1) if m else ''
     return Record(path, f'sd302:{subject}', finger, modality, '')
@@ -238,6 +258,37 @@ def _selftest() -> int:
         gs = summarize(grecs)
         assert gs['pairable_fingers'] == 1, gs
         print('generic layout:   OK', gs)
+
+        # Fake SD 302-ish tree: per-subject dirs, part folders SD302a/b/d
+        # (contact) and SD302f (contactless), FMR position codes in
+        # filenames, plus an irrelevant SD302c (palm) that must NOT pair.
+        for rel in [
+            '00001234/SD302a/00001234_01_00.png',
+            '00001234/SD302b/00001234_01_00.png',
+            '00001234/SD302d/00001234_02_00.png',
+            '00001234/SD302f/00001234_01_00.jpg',
+            '00001234/SD302c/00001234_palm_00.png',   # irrelevant, must not pair
+            '00005678/SD302a/00005678_01_00.png',
+            '00005678/SD302f/00005678_01_00.jpg',
+        ]:
+            fp = Path(d) / 'sd302' / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(b'\xff\xd8\xff' if rel.endswith('.jpg') else b'\x89PNG\r\n')
+        srecs = index_dataset(str(Path(d) / 'sd302'), 'sd302')
+        ss = summarize(srecs)
+        # 6 classified records (subject1: a,b,d contact + f contactless;
+        # subject2: a contact + f contactless) -- the SD302c palm image is
+        # excluded entirely (returns None), not counted at all.
+        assert ss['images'] == 6, ss
+        assert ss['by_modality'] == {'contact': 4, 'contactless': 2}, ss
+        # pairable: subject 00001234 finger 01 (a+b+f all present) and
+        # subject 00005678 finger 01 (a+f present) => 2 pairable fingers.
+        # Subject 00001234's finger 02 (SD302d only, no contactless) is NOT
+        # pairable on its own.
+        assert ss['pairable_fingers'] == 2, ss
+        sgen, simp = genuine_impostor_pairs(srecs)
+        assert len(sgen) == 3, (len(sgen), sgen)   # a+f and b+f for 00001234, a+f for 00005678
+        print('sd302 layout:     OK', ss)
     print('SELFTEST PASSED')
     return 0 if ok else 1
 
