@@ -99,7 +99,19 @@ def score_nfiq2(image_array) -> int | None:
             return None
 
         score = resp.json().get('score')
-        return int(score) if score is not None else None
+        if score is None:
+            return None
+        score = int(score)
+        # Defense in depth: NFIQ2 is defined on 0-100. A real production
+        # capture once got an impossible nfiq2Score=898 written to Firestore
+        # (root cause: the sidecar's own parser picked up the wrong field --
+        # fixed in nfiq2_service/app.py). Validate here too, at the last gate
+        # before this value reaches Firestore, in case a future sidecar
+        # revision regresses the same class of bug.
+        if not (0 <= score <= 100):
+            logger.warning('NFIQ2 sidecar returned out-of-range score %r -- discarding', score)
+            return None
+        return score
 
     except Exception as e:   # noqa: BLE001 — must never block or fail the pipeline
         logger.warning('NFIQ2 scoring failed (non-critical): %s', e)

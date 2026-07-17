@@ -66,6 +66,42 @@ def _parse_score(stdout: str) -> int | None:
     return None
 
 
+def _parse_nfiq2_score(stdout: str) -> int | None:
+    """NFIQ2-SPECIFIC parse for /score, stricter than the generic
+    _parse_score() above (which /match also uses and must stay permissive,
+    since bozorth3's match score has no fixed range).
+
+    Real production bug found 2026-07-17: the `nfiq2 -i <path>` call below
+    was missing `-F`, and _parse_score()'s permissive "first numeric field"
+    fallback then picked up the WRONG field from nfiq2's non-`-F` default
+    output, writing an impossible nfiq2Score=898 to a real capture doc (NFIQ2
+    is defined on 0-100). Fixed by always passing `-F` (this project's own
+    local NFIQ2 build was calibrated against exactly the `-F` CSV format —
+    column index 2, "QualityScore" — and confirmed an exact match to a real
+    production score; see CLAUDE.md), preferring that column explicitly here,
+    and hard-validating the final result is in [0,100] -- an out-of-range
+    number is DEFINITIONALLY a parsing error, not a real NFIQ2 score, so this
+    returns None (the route's existing 'could not parse' 502) rather than
+    ever writing a nonsense value to Firestore again."""
+    stdout = stdout.strip()
+    score = None
+    for line in stdout.splitlines():
+        fields = line.split(',')
+        if len(fields) >= 3:
+            try:
+                score = int(round(float(fields[2])))
+                break
+            except ValueError:
+                continue
+    if score is None:
+        score = _parse_score(stdout)
+    if score is None or not (0 <= score <= 100):
+        logger.warning('NFIQ2 score failed range validation: parsed=%r stdout=%r',
+                        score, stdout)
+        return None
+    return score
+
+
 @app.route('/healthz', methods=['GET'])
 def healthz():
     return jsonify({'ok': True}), 200
@@ -83,8 +119,13 @@ def score():
             f.write(image_bytes)
             tmp_path = f.name
 
+        # -F forces NFIQ2's documented CSV output format -- REQUIRED, not
+        # cosmetic: without it, a real production capture got an impossible
+        # nfiq2Score=898 written to Firestore because the generic permissive
+        # parser below picked up the wrong field from nfiq2's non-`-F`
+        # default output. See _parse_nfiq2_score's docstring.
         proc = subprocess.run(
-            [NFIQ2_BIN, '-i', tmp_path],
+            [NFIQ2_BIN, '-i', tmp_path, '-F'],
             capture_output=True, text=True, timeout=NFIQ2_TIMEOUT_SEC,
         )
         logger.info('nfiq2 rc=%s stdout=%r stderr=%r', proc.returncode, proc.stdout, proc.stderr)
@@ -92,9 +133,9 @@ def score():
         if proc.returncode != 0:
             return jsonify({'error': f'nfiq2 exited {proc.returncode}', 'stderr': proc.stderr[:500]}), 502
 
-        parsed = _parse_score(proc.stdout)
+        parsed = _parse_nfiq2_score(proc.stdout)
         if parsed is None:
-            return jsonify({'error': 'could not parse score from stdout', 'stdout': proc.stdout[:500]}), 502
+            return jsonify({'error': 'could not parse a valid (0-100) score from stdout', 'stdout': proc.stdout[:500]}), 502
 
         return jsonify({'score': parsed}), 200
 
