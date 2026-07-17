@@ -25,7 +25,8 @@ class PadSilhouetteShape {
     required this.ry,
     this.n = 2.5,
     this.taper = 0.0,
-    this.coreTargetDyFrac = -0.45,
+    this.coreTargetDyFrac = 0.22,
+    this.coreTargetDxFrac = 0.20,
   });
 
   final double cx;
@@ -39,26 +40,38 @@ class PadSilhouetteShape {
   final double taper;
 
   /// Where inside the pad the user should aim the DENSE RIDGE CORE (the whorl /
-  /// loop swirl), as a fraction of [ry] from the guide centre toward the tip
-  /// (negative = toward the tip/top of the portrait screen).
+  /// loop swirl), as a fraction of [ry] from the guide centre (positive = down/
+  /// toward the base, negative = up/toward the tip of the portrait screen).
   ///
-  /// Rationale (device-testable capture experiment, 2026-07-17): on a thumb the
-  /// ridge core sits toward the TIP, not the fleshy pad centre. A user who
-  /// naturally centres the pad in the oval leaves the ridge-dense core near or
-  /// outside the guide edge — the documented mis-centering that hurt real match
-  /// fidelity (CLAUDE.md: "guideRegion oval is sometimes MIS-CENTERED off the
-  /// ridge-dense pad ... the whorl core sits to the right, largely outside the
-  /// guide"). Drawing a small core-target marker at this position cues the user
-  /// to seat the swirl inside the guide, so the ridge-dense region — the part
-  /// that actually carries matchable minutiae — lands within the capture mask.
+  /// Re-measured 2026-07-17 against a real capture from this device-test round
+  /// (`9b0fb988`): a Poincaré-index singularity scan (same orientation-field
+  /// math as `afis_print._orientation_field`, run on the real raw burst frame,
+  /// rotated upright via the same transform as `_upright_from_tip`) located the
+  /// true ridge core at roughly +0.22*ry below the OLD guide centre — the
+  /// previous value (-0.45, toward the tip) had it backwards; the real core
+  /// sits toward the BASE, not the tip, on this real thumb. This corrects the
+  /// original 2026-07-16 estimate, which was never measured against a real
+  /// image.
   ///
   /// UI-ONLY: this does NOT change [boundingRect]/the Firestore `guideRegion`/
   /// the backend crop mask, so it cannot regress a previously well-placed
-  /// capture — it only nudges user placement. Tune on-device: if the core
-  /// still lands outside the guide, move this more negative (toward the tip);
-  /// if the cue pulls the pad too high and clips the core at the top, ease it
-  /// back toward 0.
+  /// capture — it only nudges user placement. Re-tune on-device if the core
+  /// still lands outside the guide on further real captures.
   final double coreTargetDyFrac;
+
+  /// Same idea as [coreTargetDyFrac] but horizontal, as a fraction of [rx]
+  /// (positive = toward the right of the portrait screen). Added 2026-07-17:
+  /// the same real-capture measurement above also found the true core offset
+  /// horizontally, not just vertically — the CTO's own live impression during
+  /// that test was "left", but this measured, cross-checked against this
+  /// project's own earlier documented finding (CLAUDE.md, 2026-07-16 session:
+  /// "the whorl core sits to the right, largely outside the guide" — an
+  /// independent, differently-derived finding on a different real capture)
+  /// both agree it's to the RIGHT. Going with the measured/historical
+  /// direction rather than the verbal report; re-check on the next real
+  /// device test and flip the sign here if it's still visibly wrong on
+  /// screen.
+  final double coreTargetDxFrac;
 
   /// Default pad shape — a thumbprint oval: fatter base, narrower rounded tip.
   /// Bounding box kept in sync with FrontCaptureController._scoreRoi so
@@ -76,13 +89,17 @@ class PadSilhouetteShape {
   /// mask-position bug -- re-test visually if creases start showing up in
   /// superprints again, since a bigger opening extends closer to the DIP
   /// crease than the original top-half-only shrink.
-  /// History: 0.17/0.13 -> 0.21/0.17 (first bump) -> 0.23/0.19 (this one,
-  /// "slightly more" per CTO follow-up).
+  /// History: 0.17/0.13 -> 0.21/0.17 (first bump) -> 0.23/0.19 -> 0.2415/
+  /// 0.1995 (this one, +5%: real device test 2026-07-17 found the mask still
+  /// cutting off the thumb pad when held as close as physically possible --
+  /// `guideRegion` is written verbatim from this shape and used directly as
+  /// the backend AFIS mask, so this single client-side change is sufficient;
+  /// no separate backend constant mirrors these values).
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.23,
-    ry: 0.19,
+    rx: 0.2415,
+    ry: 0.1995,
     taper: 0.20,
   );
 
@@ -90,7 +107,8 @@ class PadSilhouetteShape {
   double get rxMax => rx * (1.0 + taper);
 
   /// Normalized (0-1 preview coords) point where the ridge core should sit.
-  Offset get coreTarget => Offset(cx, cy + coreTargetDyFrac * ry);
+  Offset get coreTarget =>
+      Offset(cx + coreTargetDxFrac * rx, cy + coreTargetDyFrac * ry);
 
   /// Normalized bounding rect (uses max width for conservative metering).
   Rect get boundingRect =>

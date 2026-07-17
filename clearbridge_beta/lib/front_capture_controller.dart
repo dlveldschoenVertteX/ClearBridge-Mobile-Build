@@ -228,6 +228,7 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _maxSteadyDegPerSec = 6.0;
 
   CameraController? _camera;
+  CameraService? _cameraService;
   String? _userId;
   AdaptiveFlashController? _flash;
   int _sensorOrientation = 0;
@@ -276,11 +277,13 @@ class FrontCaptureController extends ChangeNotifier {
     required CameraController camera,
     required String userId,
     required Size screenSize,
+    CameraService? cameraService,
   }) async {
     if (_starting || _streamRunning) return;
     _starting = true;
     _disposed = false;
     _camera = camera;
+    _cameraService = cameraService;
     _userId = userId;
     _sensorOrientation = camera.description.sensorOrientation;
 
@@ -794,35 +797,40 @@ class FrontCaptureController extends ChangeNotifier {
       // "every attempt failed". Written even on total failure so the next
       // real capture actually explains itself instead of staying silent.
       // Real device test (2026-07-17) found the live preview lags/freezes
-      // hard through this whole block, effectively invisible to the user --
-      // root cause: the main camera's CameraController stays fully active
-      // (its texture still bound to the on-screen CameraPreview) for the
-      // ENTIRE secondary-camera loop below, while a SECOND CameraController
-      // is opened, initialized, and driven concurrently. The `camera` plugin
-      // shares a native rendering/platform-channel thread across
-      // controllers, so two simultaneously-live sessions contend and stall
-      // Flutter's texture updates -- not (only) a sensor-hardware limit, a
-      // plugin-level threading one, which is why this reproduces even on a
-      // device that ultimately succeeds at capturing from both (per the
-      // secondaryCameras data landing fine in Storage; the DATA path was
-      // never broken, only the live view). Pausing the main preview here
-      // stops it competing for that thread; resumePreview() below (before
-      // distance-stage-2, which reuses `_camera`) brings it back once the
-      // secondary-camera work is done. pausePreview()/resumePreview() don't
-      // touch the underlying CameraController identity, so nothing else in
-      // this function needs to change.
-      try {
-        await _camera?.pausePreview();
-      } catch (_) {
-        // Non-fatal -- if pausing isn't supported on this device/controller
-        // state, fall through to the same behavior as before this fix.
-      }
-
+      // hard through this whole block, with no visible sign of the other
+      // cameras firing -- root cause: the main camera's CameraController
+      // stayed fully active (its texture still bound to the on-screen
+      // CameraPreview) for the ENTIRE secondary-camera loop while a SECOND,
+      // completely separate CameraController was opened and driven at the
+      // same time. The `camera` plugin shares a native rendering/platform-
+      // channel thread across controllers, so two simultaneously-live
+      // sessions contend and stall Flutter's texture updates -- not (only) a
+      // sensor-hardware limit, a plugin-level threading one, which is why
+      // this reproduced even though secondaryCameras data landed fine in
+      // Storage (the DATA path was never broken, only the live view). A
+      // first fix (pausePreview()/resumePreview() on the main controller)
+      // was NOT sufficient on real hardware -- pausing stops Flutter from
+      // requesting new frames but doesn't release the underlying camera
+      // session, so the second controller still contended for it.
+      //
+      // Real fix: route secondary-camera capture through the SAME
+      // CameraService the screen's CameraPreview already reads its
+      // controller from (a live getter, not a cached reference) via
+      // `initializeCamera(cameraDescription: ...)`, which internally
+      // disposes the current controller before opening the next one -- a
+      // full, clean handoff, not two sessions open at once. Side benefit
+      // this also directly satisfies "so I can see the captures firing live
+      // for all cameras before upload": since the screen's preview always
+      // shows whatever CameraService.controller currently is, switching to
+      // each secondary camera this way makes ITS live feed appear on screen
+      // while it's active, instead of a frozen/paused main-camera frame.
       final secondaryDebug = <String, dynamic>{'foundBackCams': <String>[]};
       final secondaryMeta = <Map<String, dynamic>>[];
+      final mainCameraDescription = _camera?.description;
+      final svc = _cameraService;
       try {
         final allCams = await availableCameras();
-        final mainName = _camera?.description.name;
+        final mainName = mainCameraDescription?.name;
         secondaryDebug['allCamsCount'] = allCams.length;
         secondaryDebug['mainCamName'] = mainName;
         final others = allCams.where((c) =>
@@ -830,11 +838,34 @@ class FrontCaptureController extends ChangeNotifier {
         secondaryDebug['foundBackCams'] =
             others.map((c) => c.name).toList(growable: false);
         for (final desc in others) {
-          CameraController? tmp;
           try {
-            tmp = CameraController(desc, ResolutionPreset.max, enableAudio: false);
-            await tmp.initialize().timeout(const Duration(seconds: 8));
-            await tmp.setFlashMode(FlashMode.torch);
+            CameraController active;
+            if (svc != null) {
+              await svc
+                  .initializeCamera(
+                    lensDirection: CameraLensDirection.back,
+                    resolution: ResolutionPreset.max,
+                    cameraDescription: desc,
+                  )
+                  .timeout(const Duration(seconds: 8));
+              active = svc.controller!;
+              _camera = active; // resync so distance-stage-2/UI see the current controller
+            } else {
+              // Defensive fallback if no CameraService was supplied (should
+              // not happen via the real screen, which always passes one) --
+              // same isolated-controller behavior as before this fix, so
+              // this path still works, just without the live-preview fix.
+              active = CameraController(desc, ResolutionPreset.max, enableAudio: false);
+              await active.initialize().timeout(const Duration(seconds: 8));
+            }
+            final labelName = desc.name.toLowerCase();
+            final friendly = labelName.contains('ir') || labelName.contains('night')
+                ? 'IR camera'
+                : labelName.contains('wide')
+                    ? 'wide lens'
+                    : 'secondary camera';
+            _apply((s) => s.copyWith(distanceHint: 'Capturing with $friendly…'));
+            await active.setFlashMode(FlashMode.torch);
             // Anti-blowout EV step -- the same -1.0 offset already validated
             // for the main camera's flash burst (see the alternating
             // ambient/flash burst above: an earlier all-flash burst blew out
@@ -843,9 +874,9 @@ class FrontCaptureController extends ChangeNotifier {
             // safe to call without risking the torch (see CameraService
             // comments on that conflict).
             try {
-              final minEv = await tmp.getMinExposureOffset();
-              final maxEv = await tmp.getMaxExposureOffset();
-              await tmp.setExposureOffset((-1.0).clamp(minEv, maxEv));
+              final minEv = await active.getMinExposureOffset();
+              final maxEv = await active.getMaxExposureOffset();
+              await active.setExposureOffset((-1.0).clamp(minEv, maxEv));
             } catch (_) {
               // Some secondary sensors may not support exposure offset --
               // non-fatal, the burst still fires at default exposure.
@@ -854,7 +885,7 @@ class FrontCaptureController extends ChangeNotifier {
             final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
             final paths = <String>[];
             for (var i = 0; i < _secondaryBurstCount; i++) {
-              final shot = await tmp.takePicture();
+              final shot = await active.takePicture();
               final bytes = await shot.readAsBytes();
               final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
               await _uploadWithRetry(bytes, path);
@@ -864,32 +895,55 @@ class FrontCaptureController extends ChangeNotifier {
                     const Duration(milliseconds: _burstShotDelayMs));
               }
             }
-            await tmp.setFlashMode(FlashMode.off);
+            await active.setFlashMode(FlashMode.off);
             secondaryMeta.add({'name': desc.name, 'paths': paths});
             secondaryDebug['${desc.name}_ok'] = true;
+            if (svc == null) {
+              try {
+                await active.dispose();
+              } catch (_) {}
+            }
           } catch (e) {
             debugPrint('[front] secondary camera ${desc.name} skipped: $e');
             secondaryDebug['${desc.name}_error'] = e.toString();
-          } finally {
-            try {
-              await tmp?.dispose();
-            } catch (_) {}
           }
         }
       } catch (e) {
         debugPrint('[front] secondary camera capture skipped entirely: $e');
         secondaryDebug['fatalError'] = e.toString();
+      } finally {
+        _apply((s) => s.copyWith(distanceHint: null));
       }
 
-      // Resume the main camera's live preview now that the secondary-camera
-      // loop (which had it paused, see above) is done -- distance-stage-2
-      // right below reuses `_camera` and calls _refocus()/takePicture() on
-      // it, which need an active (non-paused) preview.
-      try {
-        await _camera?.resumePreview();
-      } catch (_) {
-        // Non-fatal -- _refocus()/_captureDistanceBurst() below will surface
-        // any real problem with the controller itself.
+      // Switch back to the main camera now that the secondary-camera loop is
+      // done -- distance-stage-2 right below reuses `_camera` and needs the
+      // main sensor active again (same clean dispose-then-open handoff as
+      // each secondary-camera switch above, not a resume of a paused one).
+      if (svc != null && mainCameraDescription != null &&
+          svc.controller?.description.name != mainCameraDescription.name) {
+        try {
+          await svc
+              .initializeCamera(
+                lensDirection: CameraLensDirection.back,
+                resolution: ResolutionPreset.max,
+                cameraDescription: mainCameraDescription,
+              )
+              .timeout(const Duration(seconds: 8));
+          _camera = svc.controller;
+          // AdaptiveFlashController binds permanently to the CameraController
+          // instance passed at construction (final field, no update method) --
+          // the old `_flash` still points at the now-disposed pre-switch main
+          // controller. Rebuild it against the fresh one so distance-stage-2's
+          // _flash!.activate()/deactivate() calls below don't operate on a
+          // disposed controller.
+          if (_camera != null) {
+            _flash = AdaptiveFlashController(_camera!);
+          }
+        } catch (e) {
+          debugPrint('[front] failed to switch back to main camera: $e');
+          // distance-stage-2 below checks `_camera` is non-null/initialized
+          // and just skips itself (non-fatal) if this didn't work.
+        }
       }
 
       // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: capture a second,

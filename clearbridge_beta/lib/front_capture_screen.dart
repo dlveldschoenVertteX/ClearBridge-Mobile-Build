@@ -87,6 +87,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
       camera: cam,
       userId: userId,
       screenSize: MediaQuery.sizeOf(context),
+      cameraService: _cameraService,
     );
   }
 
