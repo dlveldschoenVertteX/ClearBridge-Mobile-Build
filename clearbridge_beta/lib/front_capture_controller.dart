@@ -793,6 +793,31 @@ class FrontCaptureController extends ChangeNotifier {
       // with no way to tell whether that meant "no other camera found" or
       // "every attempt failed". Written even on total failure so the next
       // real capture actually explains itself instead of staying silent.
+      // Real device test (2026-07-17) found the live preview lags/freezes
+      // hard through this whole block, effectively invisible to the user --
+      // root cause: the main camera's CameraController stays fully active
+      // (its texture still bound to the on-screen CameraPreview) for the
+      // ENTIRE secondary-camera loop below, while a SECOND CameraController
+      // is opened, initialized, and driven concurrently. The `camera` plugin
+      // shares a native rendering/platform-channel thread across
+      // controllers, so two simultaneously-live sessions contend and stall
+      // Flutter's texture updates -- not (only) a sensor-hardware limit, a
+      // plugin-level threading one, which is why this reproduces even on a
+      // device that ultimately succeeds at capturing from both (per the
+      // secondaryCameras data landing fine in Storage; the DATA path was
+      // never broken, only the live view). Pausing the main preview here
+      // stops it competing for that thread; resumePreview() below (before
+      // distance-stage-2, which reuses `_camera`) brings it back once the
+      // secondary-camera work is done. pausePreview()/resumePreview() don't
+      // touch the underlying CameraController identity, so nothing else in
+      // this function needs to change.
+      try {
+        await _camera?.pausePreview();
+      } catch (_) {
+        // Non-fatal -- if pausing isn't supported on this device/controller
+        // state, fall through to the same behavior as before this fix.
+      }
+
       final secondaryDebug = <String, dynamic>{'foundBackCams': <String>[]};
       final secondaryMeta = <Map<String, dynamic>>[];
       try {
@@ -854,6 +879,17 @@ class FrontCaptureController extends ChangeNotifier {
       } catch (e) {
         debugPrint('[front] secondary camera capture skipped entirely: $e');
         secondaryDebug['fatalError'] = e.toString();
+      }
+
+      // Resume the main camera's live preview now that the secondary-camera
+      // loop (which had it paused, see above) is done -- distance-stage-2
+      // right below reuses `_camera` and calls _refocus()/takePicture() on
+      // it, which need an active (non-paused) preview.
+      try {
+        await _camera?.resumePreview();
+      } catch (_) {
+        // Non-fatal -- _refocus()/_captureDistanceBurst() below will surface
+        // any real problem with the controller itself.
       }
 
       // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0: capture a second,
