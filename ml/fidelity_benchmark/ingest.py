@@ -97,7 +97,7 @@ def _ridgebase_record(root: str, path: str) -> Optional[Record]:
     return Record(path, f'rb:{subject}', finger, modality, sample)
 
 
-_SD302_POS = re.compile(r'_(\d{2})_')   # NIST FMR finger-position code _NN_
+_SD302_POS = re.compile(r'_(\d{1,2})\.[A-Za-z0-9]+$')   # trailing FRGP before ext
 
 # Verified against NIST's own SD 302 (N2N) part descriptions, 2026-07-17
 # (the CTO's actual download-link email, not guessed): 302a (Challenger
@@ -120,10 +120,22 @@ _SD302_CONTACTLESS_PARTS = ('sd302f',)
 
 
 def _sd302_record(root: str, path: str) -> Optional[Record]:
+    # Verified against the REAL extracted archives + NIST's own
+    # README_302d.txt, 2026-07-17: filenames are
+    # SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_FRGP.EXT (token count varies by
+    # part -- 302a has no resolution field, 302b/d do) and the DIRECTORY tree
+    # is organized by device/resolution/capture-type, NOT by subject at all
+    # (e.g. images/auxiliary/flat/M/500/plain/png/00002502_M_500_plain_04.png).
+    # An earlier version of this parser read `subject = parts[0]` from the
+    # PATH, which for the real layout grabs a device/collection directory
+    # name -- collapsing every image in an archive into one fake "subject".
+    # It also required the FRGP digits to be sandwiched between two
+    # underscores, which never matches (FRGP sits right before the
+    # extension), so `finger` silently came out empty for every real record,
+    # collapsing all 10 fingers of a subject into one. Both are fixed here:
+    # subject is always the FIRST underscore token in the FILENAME, FRGP is
+    # always the LAST, regardless of how many tokens sit between them.
     rel = os.path.relpath(path, root)
-    parts = rel.split(os.sep)
-    # subject is the first path component that looks like an id
-    subject = parts[0] if parts else 'unknown'
     low = rel.lower()
     if any(p in low for p in _SD302_CONTACTLESS_PARTS):
         modality = 'contactless'
@@ -131,8 +143,10 @@ def _sd302_record(root: str, path: str) -> Optional[Record]:
         modality = 'contact'
     else:
         return None   # 302c/e/g/h/i or unrecognized -- not part of this pairing
-    m = _SD302_POS.search(os.path.basename(path))
-    finger = m.group(1) if m else ''
+    base = os.path.basename(path)
+    subject = base.split('_')[0] if base else 'unknown'
+    m = _SD302_POS.search(base)
+    finger = m.group(1).zfill(2) if m else ''
     return Record(path, f'sd302:{subject}', finger, modality, '')
 
 
@@ -259,17 +273,22 @@ def _selftest() -> int:
         assert gs['pairable_fingers'] == 1, gs
         print('generic layout:   OK', gs)
 
-        # Fake SD 302-ish tree: per-subject dirs, part folders SD302a/b/d
-        # (contact) and SD302f (contactless), FMR position codes in
-        # filenames, plus an irrelevant SD302c (palm) that must NOT pair.
+        # Real SD 302 tree shape (verified against the actual archives,
+        # 2026-07-17): NOT per-subject directories -- flat, organized by
+        # device/resolution/capture-type, with subject+FRGP encoded only in
+        # the filename (SUBJECT_DEVICE[_RESOLUTION]_CAPTURE_FRGP.EXT, token
+        # count varies by part). Deliberately has NO subject-named directory
+        # anywhere so this actually exercises "subject comes from the
+        # filename, not the path" rather than accidentally passing because a
+        # subject dir happens to still be part of the tree.
         for rel in [
-            '00001234/SD302a/00001234_01_00.png',
-            '00001234/SD302b/00001234_01_00.png',
-            '00001234/SD302d/00001234_02_00.png',
-            '00001234/SD302f/00001234_01_00.jpg',
-            '00001234/SD302c/00001234_palm_00.png',   # irrelevant, must not pair
-            '00005678/SD302a/00005678_01_00.png',
-            '00005678/SD302f/00005678_01_00.jpg',
+            'SD302a/images/challengers/C/roll/png/00001234_C_roll_01.png',
+            'SD302a/images/challengers/C/roll/png/00005678_C_roll_01.png',
+            'SD302b/images/baseline/V/1000/roll/png/00001234_V_1000_roll_01.png',
+            'SD302d/images/auxiliary/flat/M/500/plain/png/00001234_M_500_plain_02.png',
+            'SD302f/images/challengers/T/photo/png/00001234_T_photo_01.jpg',
+            'SD302f/images/challengers/T/photo/png/00005678_T_photo_01.jpg',
+            'SD302c/images/palm/00001234_C_palm_00.png',   # irrelevant, must not pair
         ]:
             fp = Path(d) / 'sd302' / rel
             fp.parent.mkdir(parents=True, exist_ok=True)
