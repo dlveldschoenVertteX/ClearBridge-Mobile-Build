@@ -257,6 +257,46 @@ documented mis-centering root cause) — but changing guide geometry needs devic
 iteration to avoid regressing well-placed captures, so it's a flagged
 recommendation, not a blind constant change.
 
+## pyfing has untapped capabilities beyond the SNFEN enhancer we tried (2026-07-17)
+
+We had only ever used pyfing's SNFEN *enhancement* (which didn't beat tuned
+Gabor). pyfing 0.6 (installed, MIT, Cappelli/Bologna — already vetted) exposes
+much more, and two pieces are directly prime-directive-relevant:
+
+- **`Leader` — a learned minutiae EXTRACTOR** (Lightweight End-to-end
+  Attention-gated Dual autoencodER; detection + direction + type, with a
+  `minutia_quality_threshold`). This is the matchability axis, not quality.
+  **Measured on our 14 prints (LEADER minutiae → bozorth3):** genuine mean
+  **13.4** vs impostor **9.3** — a REAL (if small) separation, where
+  mindtct+bozorth3 was pure noise floor (4–7 both). So LEADER is a measurably
+  better minutiae front-end for our contactless domain — it surfaces more of
+  the faint genuine signal. BUT still **0/10 genuine above impostor max**, so a
+  better extractor does NOT clear the wall: it confirms the gap is GEOMETRIC
+  (the prints don't truly match), not extraction-limited. **Adopt LEADER as the
+  extractor once the dataset lands** (it compounds with geometry correction);
+  it is not a standalone fix. Fast (~1s/print after warmup).
+- **`Snfoe`/`Gbfoe` (orientation) + `Snffe`/`Xsffe`/`Gmfs` (frequency)
+  estimators** — untried. These could feed BETTER orientation + frequency maps
+  into our own Gabor bank (and into the `gaborVarFreq`/`fidelity` scaffolds,
+  replacing my autocorrelation frequency map) — a real, measurable QUALITY
+  lever we have not yet tested. Recommended next enhancement experiment.
+- `Sufs` segmentation — an alternative to our U-Net/flash-diff mask.
+
+**Answer to "can pyfing offer more on quality?":** its *enhancement* (SNFEN)
+already lost to tuned Gabor, so more enhancement is not the win. But its
+orientation/frequency estimators (untried) are a genuine quality lever for our
+Gabor inputs, and LEADER is a genuine matchability lever as a better extractor.
+Neither is a silver bullet — the wall stays geometric — but both are worth
+adopting/testing, LEADER especially once real paired data exists.
+
+**Web SOTA re-confirmed (2026-07-17):** the winning contactless→contact recipe
+is exactly segmentation → enhancement → **500ppi scale normalization +
+spatial-transformer deformation correction** → DeepPrint-style representation
+(EER 0.3–1.2% in the literature; "Deep Contactless Fingerprint Unwarping",
+IMPOSE 2025-26). That is precisely what `geom_correct.py` targets — the learned
+spatial-transformer version needs the paired dataset to train. No new
+open-source silver bullet beyond what this scope already covers.
+
 ## Standing discipline for this axis
 - **Select/optimize on cross-domain MATCH score, never NFIQ2**, for anything
   targeting fidelity. NFIQ2 stays as the quality floor only.
