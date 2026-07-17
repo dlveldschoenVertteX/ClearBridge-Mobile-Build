@@ -114,8 +114,12 @@ def ssim(x: torch.Tensor, y: torch.Tensor, win: torch.Tensor) -> torch.Tensor:
     pad = ks // 2
     mux, muy = F.conv2d(x, win, padding=pad), F.conv2d(y, win, padding=pad)
     mux2, muy2, muxy = mux * mux, muy * muy, mux * muy
-    sx = F.conv2d(x * x, win, padding=pad) - mux2
-    sy = F.conv2d(y * y, win, padding=pad) - muy2
+    # Variance is mathematically non-negative, but E[x^2] - mu^2 can go
+    # slightly negative from fp32 round-off on near-uniform patches (e.g. the
+    # grey-filled area outside a crop's mask) -- clamp before it compounds
+    # through Adam's running moments into a NaN cascade a few epochs later.
+    sx = (F.conv2d(x * x, win, padding=pad) - mux2).clamp_min(0.0)
+    sy = (F.conv2d(y * y, win, padding=pad) - muy2).clamp_min(0.0)
     sxy = F.conv2d(x * y, win, padding=pad) - muxy
     c1, c2 = 0.01 ** 2, 0.03 ** 2
     s = ((2 * muxy + c1) * (2 * sxy + c2)) / ((mux2 + muy2 + c1) * (sx + sy + c2))
@@ -180,6 +184,11 @@ def main() -> None:
                     + args.w_smooth * l_smooth)
             opt.zero_grad()
             loss.backward()
+            # Standard safeguard against exploding-gradient divergence on a
+            # small, noisy real dataset (181 pairs) -- caps how far a single
+            # bad batch can push the weights, same discipline as clamping
+            # ssim()'s variance terms above.
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             tr_loss += loss.item()
         tr_loss /= max(len(train_dl), 1)
