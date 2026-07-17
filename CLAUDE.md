@@ -241,6 +241,91 @@ never committed. CTO set a $20 AWS Budgets alert as an independent safety net.
   output, then a local CPU smoke pass on real data, then a SageMaker dry-run
   cost estimate for review before any `--go`.
 
+## SD302 baseline calibration: contactless-vs-contact structural gap confirmed on real NIST data (2026-07-17)
+With the full SD302 dataset landed in S3 (a/b/d contact scanner parts + f
+contactless N2N-rig part), ran the real "critical missing measurement" the
+prime directive flagged: SourceAFIS genuine-vs-impostor separation between
+SD302f (contactless) probes and SD302a/b/d (contact scanner, real ≥500dpi)
+galleries — the same measurement previously only possible against the CTO's
+one noisy ink scan.
+
+**Building a working automatic fingertip cropper for SD302f's raw rig photos
+took three real, visually-disproven failed attempts before landing on
+something trustworthy** (same "verify visually before trusting" discipline
+as the guideRegion/mask work): broad HSV skin-tone thresholding grabbed
+almost the whole frame; a center-crop heuristic included too much smooth
+finger-shaft skin; a "tall narrow blob" HSV+aspect heuristic confidently
+cropped background fabric texture on the same test image. Switching to
+`afis_print._ridge_confidence` (orientation coherence gated by in-band ridge
+energy, already proven this session for reticle placement) looked promising
+on a single spot check but **a wider visual check found it was ALSO
+regularly fooled** — the rig's own metal support rail has coherent,
+energetic oriented texture indistinguishable from ridges to that metric
+alone, and a Poincaré-index core search across the full frame got fooled
+even worse, by circular/facial content in the loose photos scattered around
+the rig as background clutter (a deliberately adversarial-looking scene:
+real people's faces on paper, similar in color and local texture to skin).
+**Final working approach** (`scratchpad/sd302/crop_and_manifest.py`, not
+committed — research-only): (1) restrict the search to an empirically-
+observed ROI sub-region (confirmed by eye across 28 real samples that the
+rig's finger-insertion slot always lands in roughly the same part of the
+frame regardless of which of the rig's 15 cameras took the shot); (2) within
+that ROI, gate ridge-confidence by a local orientation-CURVATURE score (near
+0 for a straight edge like the rail, near 1 near a real fingertip's
+loop/whorl core) — the rail is coherent but never curves, only a real
+fingertip does; (3) a post-hoc whole-crop quality re-check (mean
+confidence×curvature over the WHOLE crop, not just the seed patch that
+picked its center) as a final accept/reject gate, since a good seed patch
+can still sit at the edge of an otherwise-bad crop. Net result on the real
+40-sample calibration set: 21/40 passed all three gates and were visually
+confirmed (grid spot check) to be genuinely centered on real finger ridge
+detail, not rig/background clutter — the other 19 were correctly
+self-rejected rather than silently contaminating the measurement.
+
+**DPI normalization also needed a real fix mid-flight**: naively reusing
+`afis_print._ridge_wavelength` (which clips to [5,20]px, correct for its own
+production use case) under-corrected scale on these much-larger raw crops,
+where the true native wavelength was often >20px (confirmed: a crop whose
+clipped estimate read 20.0 still measured 20.0 after resampling by 9/20,
+consistent with the true unclipped wavelength being ~44px). Fixed with an
+uncapped variant (`_ridge_wavelength_uncapped`, clip raised to [5,60]) used
+only for this calibration's scale correction.
+
+**Result** (SourceAFIS, `scratchpad/sourceafis/`, same tool as every fidelity
+measurement this session): genuine (n=42, 21 real cross-domain pairs, cross-
+subject SD302f-vs-SD302a/b/d) mean **0.28**, impostor (n=840) mean **0.16** —
+genuine trends slightly higher but **0/42 genuine pairs beat the impostor
+max (5.31)**, and most genuine scores are literal zero (SourceAFIS found no
+matching minutiae at all). **This is the same "no reliable separation"
+result already found against the CTO's one noisy ink scan — but now backed
+by a real, clean, ≥500dpi reference dataset with 21 independent subjects
+instead of 1, and a validated (not just assumed) real-finger crop.** This
+substantially raises confidence that the gap is a genuine structural
+domain-transfer problem (per the prime directive's standing C2CL/Grosz-Jain
+citation), not primarily an artifact of the ink scan's own known quality
+issues or of MAC3D's specific capture pipeline. **Directly validates
+proceeding with `ml/deform_correct/`'s geometry-correction network** as the
+right next lever, rather than continued raw-matching parameter tuning.
+
+**Caveat, stated plainly**: the DPI-normalization wavelength estimate on
+these crops was often still landing in the 17-30px range after resampling
+(should converge near `_TARGET_PERIOD=9.0`), meaning scale correction on
+this quick calibration pass was itself imperfect on noisy real photos, same
+category of estimator-convergence issue already documented for
+`mindtct_client._estimate_ridge_wavelength_px`. Some fraction of this gap
+could still be residual scale mismatch rather than pure geometric/domain
+distortion — worth keeping in mind, not a reason to distrust the
+directionally-clear zero-separation result.
+
+**First real-data smoke test of `ml/deform_correct/train.py`** (previously
+only smoke-tested on synthetic placeholder data): ran against these same 21
+real cropped/DPI-normalized SD302 pairs (`scratchpad/sd302/
+deform_manifest_smoke.json`, data_root = the cropped-image folder), CPU,
+small size/epoch count, purely to confirm the full real-data loop (load →
+augment → forward → warp → orientation-similarity loss → backward →
+checkpoint) runs end-to-end without a shape/dtype/path error before ever
+considering a paid SageMaker run.
+
 ## Repos & branches
 - `origin` (GitHub): `dlveldschoenVertteX/ClearBridge-Mobile-Build` — **now PUBLIC** (flipped
   2026-07-15 specifically to get unlimited free GitHub Actions minutes after both GitHub's
