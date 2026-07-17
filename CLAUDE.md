@@ -1,5 +1,54 @@
 # ClearBridge Mobile — persistent context
 
+## Real-device test round fixes (2026-07-17) — after testing the recenter-guide-experiment APK
+CTO tested that APK and reported two real problems, both now fixed and merged
+into the main dev branch (`claude/recenter-guide-experiment` merged in,
+commit `89c4970`):
+- **Core-target reticle was invisible.** The original marker (thin 10/18px
+  double-ring, 1.5-2px stroke, using the same shifting `accent` colour as the
+  guide outline) was real but effectively unnoticeable over a live camera
+  feed. Redrawn as a bold, FIXED-gold crosshair reticle (14/26px rings,
+  3-3.5px stroke, 4 crosshair ticks, blurred halo) — unmistakable, visually
+  distinct from the guide outline's own colour.
+- **Secondary-camera/distance-stage-2 shots fired "blindly."** Root cause:
+  `_finishAndUpload` flipped the UI to "Uploading…" at the very top of the
+  function, BEFORE the secondary-camera/distance-stage-2 capture blocks ran
+  (which fire their own torch shots of the same thumb placement) — so the
+  user saw "done, uploading" and moved/looked away before those extra shots
+  actually fired. Fixed with a new `FrontCapturePhase.capturingExtra`
+  (explicit "Hold still — capturing extra detail…" banner, guide + camera
+  preview kept visible) shown for that whole window; `uploading` now only
+  triggers right before the real Firestore write + main upload begin. Side
+  effect: also fixed `distanceHint` text never displaying (was gated on
+  `showGuide`, which excluded the phase it was actually set during).
+- **Real backend bug found via live Firestore data**: capture `a6bd9f81`
+  (2026-07-17) got `nfiq2Score: 898` written — impossible, NFIQ2 is 0-100.
+  Root cause: `nfiq2_service/app.py`'s `/score` route called `nfiq2 -i <path>`
+  WITHOUT `-F` (the flag that forces NFIQ2's documented CSV format this
+  project's own local build was calibrated against), so the generic
+  permissive parser (shared with `/match`, which has no fixed range) picked
+  up the wrong field. Fixed: always pass `-F`; added a stricter
+  `_parse_nfiq2_score()` for `/score` only that prefers the documented CSV
+  column and hard-validates the result is in [0,100], returning None (existing
+  502 path) rather than ever writing an impossible value again. Added the same
+  range check as a second gate in `nfiq2_client.py` (last stop before
+  Firestore). **Confirmed the secondaryCameras Firestore-rules fix (`c13f45a`)
+  IS working in production** — both real captures from this test round have
+  real `secondaryCameras` data with real paths, `secondaryCameraDebug` showing
+  `2_ok`/`3_ok: true`. `distanceStage2` stayed empty both times
+  (`reachedNearZone: false`) — working as designed (best-effort, 6s timeout),
+  not a bug.
+- **Observation, not yet actioned**: both real captures from this round had
+  `afisWavelengthPx` 14.0 and 20.0 — well above the pipeline's `_TARGET_PERIOD
+  =9.0` target. Per this project's own established finding (native ridge
+  wavelength ≥15px correlates with catastrophic real NFIQ2; 9-11px scores
+  well), this suggests the phone was held too far from the thumb during this
+  test round — a capture-technique point worth flagging to the CTO directly,
+  not a code fix.
+- **None of this is deployed/built yet** — backend fix needs the standard
+  explicit deploy go-ahead; app fixes need a new APK build + real-device
+  confirmation, same as every other capture-side change this project.
+
 ## PRIME DIRECTIVE (CTO, 2026-07-16) — matchability, not NFIQ2
 NFIQ2 is already ~70% consistently even without the MAC3D dataset. The real
 problem is **ridge continuity / true AFIS matchability**: a high NFIQ2 is
