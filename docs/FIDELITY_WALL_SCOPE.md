@@ -335,6 +335,36 @@ IMPOSE 2025-26). That is precisely what `geom_correct.py` targets — the learne
 spatial-transformer version needs the paired dataset to train. No new
 open-source silver bullet beyond what this scope already covers.
 
+## SD 302 acquired, deformation-correction training pipeline built (2026-07-17)
+
+CTO received NIST's SD 302 download links (SD302a/b/d = contact rolled/slap/
+auxiliary-device baselines; SD302f = unassisted photographic capture from the
+N2N challenge — confirmed via NIST's own part descriptions this is the one
+genuinely contactless part; SD302c/e/g/h/i are palm/latent/EBTS-annotation
+and out of scope). `ml/fidelity_benchmark/ingest.py`'s SD302 classifier was
+corrected accordingly (an earlier version incorrectly grouped 302d in with
+contactless via a loose keyword guess).
+
+CTO also has an ~$40 AWS SageMaker account (previously used to train the NNS
+enhancement model) and asked to use it to train the missing piece:
+**`ml/deform_correct/`** — a learned deformation-correction network for
+`geom_correct.py`'s `elastic_flatten()` placeholder, built and smoke-tested
+end-to-end on synthetic data (dataset → model → warp → loss → backward →
+checkpoint → ONNX export → ONNX Runtime inference all verified working).
+Key design point: at production inference time only the contactless probe
+exists (no live paired contact scan), so the network takes ONLY the probe as
+input, trained with real (probe, gallery) pairs for supervision but the
+gallery is used only in the loss — matches `elastic_flatten`'s existing
+single-image signature exactly. Loss is primarily ridge-ORIENTATION
+similarity (differentiable torch reimplementation of `afis_print
+._orientation_field`), not raw pixel similarity, since orientation survives
+the photograph-vs-scan modality gap where pixel intensity doesn't.
+`sagemaker_launch.py` has real budget guardrails (spot instances, hard
+runtime cap, checkpointing, dry-run-by-default). **Not yet run against real
+SD 302 data** (not downloaded into any accessible storage yet) or on
+SageMaker (no AWS credentials in this sandbox yet). Full details/next steps:
+`ml/deform_correct/README.md`.
+
 ## Standing discipline for this axis
 - **Select/optimize on cross-domain MATCH score, never NFIQ2**, for anything
   targeting fidelity. NFIQ2 stays as the quality floor only.
