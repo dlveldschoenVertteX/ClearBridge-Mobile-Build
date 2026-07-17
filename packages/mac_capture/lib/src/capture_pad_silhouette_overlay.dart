@@ -26,7 +26,7 @@ class PadSilhouetteShape {
     this.n = 2.5,
     this.taper = 0.0,
     this.coreTargetDyFrac = 0.22,
-    this.coreTargetDxFrac = 0.20,
+    this.coreTargetDxFrac = -0.20,
   });
 
   final double cx;
@@ -60,17 +60,23 @@ class PadSilhouetteShape {
   final double coreTargetDyFrac;
 
   /// Same idea as [coreTargetDyFrac] but horizontal, as a fraction of [rx]
-  /// (positive = toward the right of the portrait screen). Added 2026-07-17:
-  /// the same real-capture measurement above also found the true core offset
-  /// horizontally, not just vertically — the CTO's own live impression during
-  /// that test was "left", but this measured, cross-checked against this
-  /// project's own earlier documented finding (CLAUDE.md, 2026-07-16 session:
-  /// "the whorl core sits to the right, largely outside the guide" — an
-  /// independent, differently-derived finding on a different real capture)
-  /// both agree it's to the RIGHT. Going with the measured/historical
-  /// direction rather than the verbal report; re-check on the next real
-  /// device test and flip the sign here if it's still visibly wrong on
-  /// screen.
+  /// (positive = toward the right of the portrait screen).
+  ///
+  /// A pixel-level measurement on a real capture (Poincare-index singularity
+  /// scan) found the core to the RIGHT, matching an earlier, independently-
+  /// derived finding from a different real capture (CLAUDE.md, 2026-07-16:
+  /// "the whorl core sits to the right") -- but the CTO's own explanation
+  /// (2026-07-17) resolves why both of those still point the WRONG way to
+  /// guide from: this capture flow has the user twist the thumb behind the
+  /// phone to present the pad to the rear lens, which physically mirrors the
+  /// print relative to a direct scan or ink impression (where the finger
+  /// presses straight down, un-twisted). Both measurements above were taken
+  /// from the raw captured (already-mirrored) image, so "right" in that
+  /// domain is genuinely "left" relative to how the CTO's own capture
+  /// pipeline actually renders it live -- confirmed directly by the CTO, who
+  /// sees the real core on the LEFT in this pipeline. The reticle guides
+  /// live, in-pipeline placement, so it needs the CTO's stated (mirrored-
+  /// domain) direction, not the raw-image measurement.
   final double coreTargetDxFrac;
 
   /// Default pad shape — a thumbprint oval: fatter base, narrower rounded tip.
