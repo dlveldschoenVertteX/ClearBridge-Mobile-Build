@@ -196,6 +196,67 @@ is license-clean and runnable locally, add it as a second independent
 fidelity metric — a texture-based matcher can catch identity signal a
 minutiae-only matcher misses on partial contactless prints.
 
+## Solo work done 2026-07-17 (pre-dataset): scaffolds + honest negative results
+
+Per the CTO's "improve everything you can before I upload the datasets / think
+out the box," worked all four fronts and measured each against SourceAFIS
+(matchability), not just NFIQ2:
+
+### Backend enhancement — two fidelity-oriented variants built, both currently NEGATIVE on 5 fingers (kept as tunable scaffolds, NOT in production selection)
+The key realized insight: the Gabor bank SYNTHESISES a ridge everywhere it
+runs, inventing plausible-but-wrong ridges in low-signal regions. Those become
+spurious minutiae that false-match different fingers and don't repeat across
+genuine captures — aggressive synthesis buys NFIQ2, not matchability. Two
+`afis_print.generate(enhance=...)` scaffolds attack this:
+- `gaborVarFreq` — per-region local ridge-frequency Gabor (Hong/Wan/Jain)
+  instead of one global wavelength (`_ridge_frequency_map`,
+  `_gabor_enhance_varfreq`).
+- `fidelity` — local-freq Gabor + a ridge-CONFIDENCE gate that blanks
+  hallucinated ridges where orientation coherence × in-band energy is low
+  (`_ridge_confidence`, `_apply_confidence_gate`).
+Measured (SourceAFIS, our 5-finger set): **both cut impostor false-matches**
+(the right direction — `gaborVarFreq` impostor p90 24→11, max 101→75) but also
+**lost genuine signal** (`fidelity` genuine mean 21.5→5.7: the gate over-prunes
+at its first-guess threshold). Neither beats the tuned baseline yet. They stay
+opt-in, default-off, OUT of `main.py`'s variant list (NFIQ2 selection wouldn't
+pick them anyway) — the machinery is correct and the direction is right; the
+gate/level thresholds need the paired ROC to tune. Same "built, ready, not
+validated" status as the geom scaffold. Confirms the wall: **fidelity-oriented
+enhancement cannot be tuned on 5 noisy fingers without overfitting.**
+
+### Fidelity benchmark harness — BUILT and self-tested (`ml/fidelity_benchmark/`)
+The tooling to turn a real dataset into a verdict, ready before the data:
+- `ingest.py` — indexes RidgeBase / NIST SD 302 / generic layouts into
+  (subject, finger, modality) records and builds genuine/impostor cross-modality
+  pairs. Self-tests pass with no data present.
+- `benchmark.py` — verification metric core (EER, TAR@FAR, d′) plus the
+  **matcher-based variant-selection** logic comparing three strategies:
+  `nfiq2` (today's prod), `minutiae` (a deployable mindtct reliable-minutiae
+  proxy), `oracle` (per-probe genuine-max upper bound). The oracle−nfiq2 gap
+  will quantify exactly how much matchability today's NFIQ2 selection leaves on
+  the table, and minutiae−nfiq2 how much a deployable proxy recovers. Metric +
+  selection core unit-tested via `--selftest` (no data, no Java needed).
+
+### Matcher-based selection — offline path built; production path identified, deliberately NOT switched blind
+`benchmark.select_variant` does matcher-based selection offline today. For
+PRODUCTION, the deployable signal is mindtct reliable-minutiae count (the
+sidecar already runs mindtct) — but switching production selection off NFIQ2
+is exactly the kind of change that must be validated on the ROC first, so it is
+staged for the post-dataset step, not flipped on speculatively.
+
+### Capture-side — assessed honestly; camera-plugin ceiling reached, real lever is gated on a device
+The `camera` plugin's `takePicture()` is always platform JPEG with no
+quality/format knob, so there is no safe blind capture-constant tweak that
+provably raises raw print quality. The real remaining lever is RAW/DNG capture
+(bypasses JPEG's 8px DCT grid that sits almost on the 9px ridge target) — a
+native Camera2 lift gated on the Phase-0 `rawSensorSupport` capability check
+already built, which needs a real device to report back. The single highest-
+value capture-side change that IS grounded in this project's own data is
+**re-centering the on-screen guide** so the whorl core lands inside it (the
+documented mis-centering root cause) — but changing guide geometry needs device
+iteration to avoid regressing well-placed captures, so it's a flagged
+recommendation, not a blind constant change.
+
 ## Standing discipline for this axis
 - **Select/optimize on cross-domain MATCH score, never NFIQ2**, for anything
   targeting fidelity. NFIQ2 stays as the quality floor only.

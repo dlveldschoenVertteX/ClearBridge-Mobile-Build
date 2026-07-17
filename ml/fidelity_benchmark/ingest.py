@@ -1,0 +1,265 @@
+"""Dataset ingestion for the contactless->contact fidelity benchmark.
+
+Prime-directive tooling (docs/FIDELITY_WALL_SCOPE.md): the moment a real paired
+contactless/contact dataset (RidgeBase / PolyU / NIST SD 302) lands, this loader
+maps its on-disk layout into (subject, finger, sample, modality) records so the
+benchmark (`benchmark.py`) can score genuine (same finger) vs impostor
+(different finger) separation of OUR pipeline through a real matcher (SourceAFIS).
+
+Nothing here depends on any dataset being present — it is pure parsing/indexing
+plus a self-test on synthetic paths, so it can be committed and verified before
+the data arrives. Point it at a dataset root with `--root` once you have one.
+
+Supported layouts (auto-detected from the directory tree; add more in
+`_LAYOUTS` as needed):
+
+  RidgeBase (WACV 2023, Buffalo CUBS)
+    Task1/ (CL2CL) and Task2/ (C2CL) splits; images named with a subject and
+    finger identifier and a "CL"/"CB" (contactless / contact-based) tag.
+    We index every image and recover (subject, finger, modality) from the
+    filename token pattern, robust to the exact separator used.
+
+  NIST SD 302 (N2N)
+    Per-subject directories; contact rolled/plain baselines (302a/302b) vs
+    auxiliary/N2N device captures (302c/302d). Modality inferred from the part
+    (a/b = contact, c/d = "contactless-ish" device). Finger position from the
+    standard NIST frmt position code in the filename.
+
+  generic
+    Fallback: any tree of images where the immediate parent directory names the
+    subject, an optional next-level directory names the finger, and a
+    'contactless'/'contact' token (in path or filename) names the modality.
+
+Usage:
+    python ingest.py --root /path/to/dataset [--layout auto|ridgebase|sd302|generic]
+    python ingest.py --selftest          # no dataset needed
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import re
+import sys
+from dataclasses import dataclass, asdict
+from typing import Optional, List, Dict, Iterable
+
+_IMG_EXT = {'.png', '.jpg', '.jpeg', '.bmp', '.tif', '.tiff', '.pgm', '.wsq'}
+
+
+@dataclass(frozen=True)
+class Record:
+    path: str
+    subject: str          # opaque subject/person id (namespaced per dataset)
+    finger: str           # finger id within subject; '' if unknown/single
+    modality: str         # 'contactless' | 'contact'
+    sample: str           # sample/impression id; '' if unknown
+
+    @property
+    def finger_key(self) -> str:
+        """Identity key a genuine pair must share (same physical finger)."""
+        return f'{self.subject}/{self.finger}'
+
+
+# ---- filename parsers -------------------------------------------------------
+
+def _is_img(name: str) -> bool:
+    return os.path.splitext(name)[1].lower() in _IMG_EXT
+
+
+def _ridgebase_record(root: str, path: str) -> Optional[Record]:
+    """RidgeBase filenames encode subject, finger, and a CL/CB modality tag.
+    The dataset uses tokens like  <sid>_<finger>_<sample>_CL.png  /  ..._CB.png
+    (contactless / contact-based). We stay tolerant to separators and case."""
+    base = os.path.splitext(os.path.basename(path))[0]
+    toks = re.split(r'[ _\-.]+', base)
+    up = [t.upper() for t in toks]
+    if 'CL' in up:
+        modality = 'contactless'
+    elif 'CB' in up or 'CT' in up:
+        modality = 'contact'
+    else:
+        # fall back to a path token
+        pl = path.lower()
+        if 'contactless' in pl or '/cl' in pl:
+            modality = 'contactless'
+        elif 'contact' in pl or '/cb' in pl:
+            modality = 'contact'
+        else:
+            return None
+    # First long alphanumeric token = subject; a following short numeric = finger.
+    subject = toks[0] if toks else base
+    finger = ''
+    for t in toks[1:]:
+        if t.isdigit() and len(t) <= 2:
+            finger = t
+            break
+    sample = toks[-1] if toks and toks[-1].isdigit() else ''
+    return Record(path, f'rb:{subject}', finger, modality, sample)
+
+
+_SD302_POS = re.compile(r'_(\d{2})_')   # NIST FMR finger-position code _NN_
+
+
+def _sd302_record(root: str, path: str) -> Optional[Record]:
+    rel = os.path.relpath(path, root)
+    parts = rel.split(os.sep)
+    # subject is the first path component that looks like an id
+    subject = parts[0] if parts else 'unknown'
+    low = rel.lower()
+    # 302a / 302b = examiner/operator rolled+plain contact; 302c/302d = devices
+    if re.search(r'sd302[cd]|aux|device|contactless', low):
+        modality = 'contactless'
+    else:
+        modality = 'contact'
+    m = _SD302_POS.search(os.path.basename(path))
+    finger = m.group(1) if m else ''
+    return Record(path, f'sd302:{subject}', finger, modality, '')
+
+
+def _generic_record(root: str, path: str) -> Optional[Record]:
+    rel = os.path.relpath(path, root)
+    parts = rel.split(os.sep)
+    low = rel.lower()
+    if 'contactless' in low or 'touchless' in low or 'photo' in low:
+        modality = 'contactless'
+    elif 'contact' in low or 'rolled' in low or 'slap' in low or 'scanner' in low:
+        modality = 'contact'
+    else:
+        return None
+    subject = parts[0] if len(parts) >= 1 else 'unknown'
+    finger = parts[1] if len(parts) >= 3 else ''
+    return Record(path, f'gen:{subject}', finger, modality, '')
+
+
+_LAYOUTS = {
+    'ridgebase': _ridgebase_record,
+    'sd302': _sd302_record,
+    'generic': _generic_record,
+}
+
+
+def detect_layout(root: str) -> str:
+    names = ' '.join(os.listdir(root)).lower() if os.path.isdir(root) else ''
+    if 'task1' in names or 'task2' in names or 'ridgebase' in names:
+        return 'ridgebase'
+    if 'sd302' in names or '302a' in names or '302b' in names:
+        return 'sd302'
+    return 'generic'
+
+
+def index_dataset(root: str, layout: str = 'auto') -> List[Record]:
+    if layout == 'auto':
+        layout = detect_layout(root)
+    parse = _LAYOUTS[layout]
+    out: List[Record] = []
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            if not _is_img(f):
+                continue
+            rec = parse(root, os.path.join(dirpath, f))
+            if rec is not None:
+                out.append(rec)
+    return out
+
+
+def summarize(records: Iterable[Record]) -> Dict[str, object]:
+    records = list(records)
+    subjects = {r.subject for r in records}
+    fingers = {r.finger_key for r in records}
+    by_mod: Dict[str, int] = {}
+    for r in records:
+        by_mod[r.modality] = by_mod.get(r.modality, 0) + 1
+    # a finger is "pairable" if it has >=1 contactless AND >=1 contact image
+    cl = {r.finger_key for r in records if r.modality == 'contactless'}
+    ct = {r.finger_key for r in records if r.modality == 'contact'}
+    pairable = cl & ct
+    return {
+        'images': len(records),
+        'subjects': len(subjects),
+        'fingers': len(fingers),
+        'by_modality': by_mod,
+        'pairable_fingers': len(pairable),
+    }
+
+
+def genuine_impostor_pairs(records: List[Record], max_impostors: int = 20000):
+    """Build cross-modality (contactless probe vs contact gallery) pairs.
+    Genuine = same finger_key; impostor = different. Returns (genuine, impostor)
+    lists of (probe_record, gallery_record)."""
+    probes = [r for r in records if r.modality == 'contactless']
+    gallery = [r for r in records if r.modality == 'contact']
+    gen, imp = [], []
+    for p in probes:
+        for g in gallery:
+            if p.finger_key == g.finger_key:
+                gen.append((p, g))
+            else:
+                imp.append((p, g))
+    if len(imp) > max_impostors:
+        # deterministic stride subsample to keep the matrix tractable
+        step = len(imp) // max_impostors
+        imp = imp[::step][:max_impostors]
+    return gen, imp
+
+
+# ---- self-test (no dataset needed) ------------------------------------------
+
+def _selftest() -> int:
+    import tempfile
+    from pathlib import Path
+    ok = True
+    with tempfile.TemporaryDirectory() as d:
+        # Fake RidgeBase-ish tree
+        for rel in [
+            'Task2/S001_1_0_CL.png', 'Task2/S001_1_0_CB.png',
+            'Task2/S001_2_0_CL.png', 'Task2/S002_1_0_CL.png',
+            'Task2/S002_1_0_CB.png',
+        ]:
+            fp = Path(d) / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(b'\x89PNG\r\n')
+        recs = index_dataset(d, 'ridgebase')
+        s = summarize(recs)
+        assert s['images'] == 5, s
+        assert s['pairable_fingers'] == 2, s   # S001/1 and S002/1
+        gen, imp = genuine_impostor_pairs(recs)
+        # S001/1 CL x S001/1 CB, and S002/1 CL x S002/1 CB => 2 genuine
+        assert len(gen) == 2, (len(gen), gen)
+        # 3 CL probes x 2 CB gallery = 6 total; 2 genuine => 4 impostor
+        assert len(imp) == 4, (len(imp), imp)
+        print('ridgebase layout: OK', s)
+
+        # Generic tree
+        for rel in ['P1/f1/contactless/a.png', 'P1/f1/contact/a.png']:
+            fp = Path(d) / 'gen' / rel
+            fp.parent.mkdir(parents=True, exist_ok=True)
+            fp.write_bytes(b'\x89PNG\r\n')
+        grecs = index_dataset(str(Path(d) / 'gen'), 'generic')
+        gs = summarize(grecs)
+        assert gs['pairable_fingers'] == 1, gs
+        print('generic layout:   OK', gs)
+    print('SELFTEST PASSED')
+    return 0 if ok else 1
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--root')
+    ap.add_argument('--layout', default='auto',
+                    choices=['auto', 'ridgebase', 'sd302', 'generic'])
+    ap.add_argument('--selftest', action='store_true')
+    a = ap.parse_args()
+    if a.selftest or not a.root:
+        return _selftest()
+    recs = index_dataset(a.root, a.layout)
+    s = summarize(recs)
+    print(f'layout={a.layout if a.layout != "auto" else detect_layout(a.root)}')
+    for k, v in s.items():
+        print(f'  {k}: {v}')
+    gen, imp = genuine_impostor_pairs(recs)
+    print(f'  genuine_pairs: {len(gen)}  impostor_pairs(capped): {len(imp)}')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

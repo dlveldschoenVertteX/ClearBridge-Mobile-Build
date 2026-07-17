@@ -149,6 +149,155 @@ def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np
     return outs[idx, yy, xx]
 
 
+# Spatially-varying ridge frequency. The single-wavelength _gabor_enhance above
+# applies ONE ridge period across the whole print, but a real fingerprint's
+# ridge frequency varies across the pad (finer toward the tip, coarser toward
+# the base/joint) — the classic Hong/Wan/Jain (1998) observation. Filtering a
+# region with the wrong period smears or splits ridges there, which reads
+# exactly as the "ridge-continuity distortion" the prime directive targets.
+# The var-freq path below estimates a per-BLOCK period map, then runs a Gabor
+# bank over (orientation x a few discrete frequency levels) and selects each
+# pixel by its LOCAL orientation AND period. Kept as its own variant (max-of-
+# variants) so it can only ever add a candidate.
+_FREQ_LEVELS = 5          # discrete ridge-period levels spanning the map's range
+_FREQMAP_BLOCK = 24       # block size for the local-period estimate
+_FREQMAP_SMOOTH = 24.0    # Gaussian smoothing (px) of the interpolated map
+
+
+def _ridge_frequency_map(img: np.ndarray, orient: np.ndarray, mask: np.ndarray,
+                         bsize: int = _FREQMAP_BLOCK) -> Optional[np.ndarray]:
+    """Per-pixel ridge-period (wavelength) map, in px, over the masked pad.
+
+    Same per-block projected-autocorrelation estimate as _ridge_wavelength, but
+    keeps every reliable block value instead of collapsing to one median, fills
+    unreliable/void blocks by nearest-reliable interpolation, and smooths. None
+    if too few reliable blocks (caller falls back to the single-wavelength path).
+    """
+    h, w = img.shape
+    ys = np.arange(0, h - bsize, bsize // 2)
+    xs = np.arange(0, w - bsize, bsize // 2)
+    grid = np.full((len(ys), len(xs)), np.nan, np.float32)
+    for iy, y in enumerate(ys):
+        for ix, x in enumerate(xs):
+            if mask[y:y + bsize, x:x + bsize].mean() < 128:
+                continue
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks):
+                grid[iy, ix] = float(np.clip(peaks[0], 5, 20))
+    if np.isnan(grid).all() or np.count_nonzero(~np.isnan(grid)) < 4:
+        return None
+    # Fill unreliable/void blocks by iterative dilation of known values
+    # (simple nearest-fill), then upscale to full res and smooth into a
+    # continuous period field.
+    valid = ~np.isnan(grid)
+    filled = grid.copy()
+    known = valid.copy()
+    while not known.all():
+        dil = cv2.dilate(np.nan_to_num(filled), np.ones((3, 3), np.uint8))
+        cnt = cv2.dilate(known.astype(np.uint8), np.ones((3, 3), np.uint8))
+        take = (~known) & (cnt > 0)
+        # average of dilated neighbourhood approximated by the dilation value
+        filled[take] = dil[take]
+        known = known | take
+        if not take.any():
+            break
+    fmap = cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)
+    fmap = cv2.GaussianBlur(fmap, (0, 0), _FREQMAP_SMOOTH)
+    return fmap
+
+
+def _gabor_enhance_varfreq(img: np.ndarray, orient: np.ndarray,
+                           wl_map: np.ndarray, n_levels: int = _FREQ_LEVELS) -> np.ndarray:
+    """Gabor enhancement with a per-pixel ridge period (wl_map) instead of one
+    global wavelength. Builds a bank over (_N_ORIENT orientations x n_levels
+    discrete period levels) spanning the map's actual range, then selects each
+    pixel's response by its local orientation bin AND nearest period level."""
+    h, w = img.shape
+    lo, hi = float(np.percentile(wl_map, 5)), float(np.percentile(wl_map, 95))
+    lo = max(lo, 4.0)
+    hi = max(hi, lo + 1.0)
+    levels = np.linspace(lo, hi, n_levels)
+    # Response cube: [level, orient, h, w] is too big; instead compute the
+    # selected response incrementally to keep memory ~one image per level.
+    o_idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
+    l_idx = np.clip(np.round((wl_map - lo) / max(hi - lo, 1e-6) * (n_levels - 1)),
+                    0, n_levels - 1).astype(int)
+    yy, xx = np.mgrid[0:h, 0:w]
+    out = np.zeros((h, w), np.float32)
+    for li, wl in enumerate(levels):
+        sel_l = (l_idx == li)
+        if not sel_l.any():
+            continue
+        sigma = _GABOR_SIGMA_RATIO * wl
+        ksize = int(2 * np.ceil(3 * sigma) + 1)
+        bank = np.zeros((_N_ORIENT, h, w), np.float32)
+        for i in range(_N_ORIENT):
+            th = np.pi * i / _N_ORIENT
+            k = cv2.getGaborKernel((ksize, ksize), sigma, th + np.pi / 2,
+                                   wl, _GABOR_GAMMA, 0, cv2.CV_32F)
+            k -= k.mean()
+            bank[i] = cv2.filter2D(img, cv2.CV_32F, k)
+        resp = bank[o_idx, yy, xx]
+        out[sel_l] = resp[sel_l]
+    return out
+
+
+# Ridge-confidence gate — the fidelity lever (prime directive). The Gabor bank
+# synthesizes a ridge EVERYWHERE it runs, including low-signal regions where it
+# invents plausible-but-wrong ridges. Those hallucinated ridges become spurious
+# minutiae that (a) can false-match a DIFFERENT finger and (b) don't repeat
+# across genuine captures of the SAME finger — measured: aggressive synthesis
+# raises NFIQ2 but does NOT improve (and can hurt) SourceAFIS genuine-vs-
+# impostor separation. This gate BLANKS the binarized print to background where
+# the local ridge signal is unreliable (low orientation coherence AND/OR weak
+# in-band ridge energy), so only trustworthy ridges survive to be transcribed
+# into minutiae. Deliberately trades NFIQ2 texture for match fidelity — judged
+# by SourceAFIS separation, never NFIQ2. See docs/FIDELITY_WALL_SCOPE.md.
+_CONF_COH_MIN = 0.35        # below this orientation coherence => blank
+_CONF_SOFT = 0.12           # soft transition width around the threshold
+
+
+def _ridge_confidence(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Per-pixel ridge trustworthiness in [0,1]: orientation coherence gated by
+    presence of real ridge-band energy. High only where ridges genuinely flow
+    coherently — i.e. where extracted minutiae are likely to be REPEATABLE."""
+    coh = _block_coherence(gray)
+    # In-band ridge energy: bandpass around the ridge frequency (DoG) then local
+    # RMS. Distinguishes true ridges from flat/blurred skin the coherence of
+    # noise can otherwise score high on.
+    g = gray.astype(np.float32)
+    band = cv2.GaussianBlur(g, (0, 0), 1.2) - cv2.GaussianBlur(g, (0, 0), 3.5)
+    energy = cv2.GaussianBlur(np.abs(band), (0, 0), _BLOCK)
+    if mask is not None:
+        m = mask > 0
+        e_hi = np.percentile(energy[m], 75) if m.any() else 1.0
+    else:
+        e_hi = np.percentile(energy, 75)
+    energy_n = np.clip(energy / max(e_hi, 1e-6), 0, 1)
+    return np.clip(coh, 0, 1) * energy_n
+
+
+def _apply_confidence_gate(binimg_signed: np.ndarray, conf: np.ndarray) -> np.ndarray:
+    """Turn a signed Gabor response into a binarized print, but fade ridges
+    toward background (white) where confidence is low, via a soft threshold on
+    `conf`. Returns a uint8 ridges-black-on-white image."""
+    ridges = (binimg_signed < 0).astype(np.float32)   # 1 where ridge
+    w = np.clip((conf - _CONF_COH_MIN) / _CONF_SOFT + 0.5, 0.0, 1.0)
+    gated = ridges * w                                 # keep ridge only if confident
+    return (255 - (gated * 255)).astype(np.uint8)
+
+
 _COH_DIFF_SIGMA = 1.2        # across-ridge smoothing extent (px) -- narrow, preserves ridge/valley contrast
 _COH_DIFF_ORIENT_RATIO = 2.5  # along-ridge : across-ridge elongation of the smoothing kernel
 
@@ -977,6 +1126,16 @@ def generate(
                      (None, params) if the sidecar isn't configured/reachable,
                      so the caller keeps the gabor-based renderings; this can
                      only ever add a candidate, never remove one.
+                     FIDELITY SCAFFOLDS (opt-in, default off, NOT in main.py's
+                     production variant list, judged by SourceAFIS matchability
+                     not NFIQ2 -- see docs/FIDELITY_WALL_SCOPE.md):
+                       'gaborVarFreq' -- local per-region ridge-frequency Gabor;
+                       'fidelity'     -- local-freq Gabor + ridge-confidence gate
+                                         that blanks hallucinated ridges.
+                     Both measurably reduce impostor false-matches (the right
+                     direction) but over-prune genuine signal at their current
+                     first-guess thresholds; they need the paired dataset to
+                     tune before they can win, so they stay unwired for now.
     stack_cache    : optional caller-owned dict, reused across repeated calls
                      within ONE request (e.g. main.py's max-of-variants loop
                      calling generate() once per fuse mode) to avoid redoing
@@ -1298,7 +1457,37 @@ def generate(
             wl = _TARGET_PERIOD
 
     binimg = None
-    if enhance == 'pyfing':
+    if enhance == 'gaborVarFreq':
+        # Spatially-varying ridge-frequency Gabor: fit each region with its own
+        # LOCAL ridge period instead of one global wavelength, so ridges stay
+        # continuous where the pad's frequency deviates from the median (tip vs
+        # base). Falls back to the single-wavelength Gabor if too few reliable
+        # period blocks. See _ridge_frequency_map / _gabor_enhance_varfreq.
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        fmap = _ridge_frequency_map(norm, orient, mask)
+        if fmap is not None:
+            enh = _gabor_enhance_varfreq(norm, orient, fmap)
+            params['afisEnhance'] = 'gaborVarFreq'
+        else:
+            enh = _gabor_enhance(norm, orient, wl)
+            params['afisEnhance'] = 'gaborVarFreq_fallback'
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+    elif enhance == 'fidelity':
+        # FIDELITY-oriented enhancement (prime directive): local-frequency
+        # Gabor + a ridge-CONFIDENCE gate that blanks hallucinated ridges in
+        # low-signal regions, so only repeatable, matchable minutiae survive.
+        # Trades NFIQ2 texture for genuine-vs-impostor separation; judged by
+        # SourceAFIS, not NFIQ2. See _ridge_confidence / _apply_confidence_gate.
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        fmap = _ridge_frequency_map(norm, orient, mask)
+        enh = (_gabor_enhance_varfreq(norm, orient, fmap) if fmap is not None
+               else _gabor_enhance(norm, orient, wl))
+        conf = _ridge_confidence(g8, mask)
+        binimg = _apply_confidence_gate(enh, conf)
+        params['afisEnhance'] = 'fidelity'
+    elif enhance == 'pyfing':
         binimg = _pyfing_enhance(g8, mask, wl)
         params['afisEnhance'] = 'pyfing' if binimg is not None else 'pyfing_unavailable'
     elif enhance == 'pyfingHybrid':
