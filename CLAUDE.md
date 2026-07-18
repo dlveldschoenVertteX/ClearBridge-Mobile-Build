@@ -1,5 +1,56 @@
 # ClearBridge Mobile — persistent context
 
+## deform_correct on SD302f: trained on real GPU, DEFINITIVE NEGATIVE — the data has no generalizable contactless→contact deformation to learn (2026-07-18)
+Ran `ml/deform_correct/` end-to-end on real SageMaker GPU (af-south-1
+`ml.g4dn.xlarge`, ~$2.81 total across the whole debugging chain, all under
+budget) against the 181 real cropped/aligned SD302 pairs. **Conclusion: a
+shared deformation network cannot learn a generalizable contactless→contact
+correction from this data.** This is a data finding, not a code failure —
+every bug found along the way was real and is fixed/committed, but the trained
+model converges to ~identity (does nothing) and would not help MAC3D.
+
+**The debugging chain (each layer only visible after fixing the one before,
+all committed):**
+1. **Training plateau (loss stuck ~0.75).** Root cause: pairs were fed to the
+   net at random rotation/scale relative to their galleries, and the net's
+   ±12% local-displacement budget physically can't undo a gross global
+   misalignment. A brute-force alignment diagnostic proved real signal exists
+   (orientation-field loss 1.21 identity → 0.45 under global rotation+scale).
+   Fixed with the standard C2CL order: global pre-registration offline
+   (`scratchpad/sd302/align_pairs.py`, research-only) + augmentation narrowed
+   from rot90 to small rotations (`dataset.py`).
+2. **NaN cascade (three distinct real bugs).** (a) SSIM local variance
+   `E[x^2]-mu^2` going slightly negative from fp32 round-off → clamp_min(0).
+   (b) A single non-finite-loss batch permanently corrupting weights (grad
+   clip turns Inf→NaN via inf*0) → skip the optimizer step on any non-finite
+   loss. (c) The orientation loss backpropping through `atan2`, whose gradient
+   diverges on the uniform white borders that alignment/augmentation create →
+   rewrote the doubled-angle field as `(vy/r, vx/r)` (atan2-free, bounded
+   gradient; uniform-patch grad 4990→0.28). Plus a GPU-only cuDNN NaN that
+   never reproduced on CPU → `nan_to_num` guards on the field + flow, smaller
+   orientation-smoothing kernel (91×91→31×31), and a ridge-masked loss.
+3. **Frozen val (the real verdict).** Once numerically stable, val loss froze
+   at the identity-warp value across lr=1e-4, 1e-3, and 3e-3. **Decisive
+   diagnostic: a shared net overfits a FIXED set of 1 or 8 pairs cleanly
+   (orient 0.48→0.13), but full 164-pair minibatch training stays flat.**
+   That exact pattern = contradictory per-pair targets: each minibatch of 8
+   pulls the shared weights a different direction, they average to ~0 flow,
+   and the net correctly learns "no consistent correction exists here." The
+   residual after global alignment is per-pair crop/alignment NOISE, not a
+   shared physical distortion.
+
+**Consistent with the whole session's evidence** — the SD302f→contact
+SourceAFIS baseline separation is already near-zero at the raw-data level
+(genuine 0.28 vs impostor 0.16); there was never much matchable signal for a
+deformation net to amplify. **SD302f is not a productive training source for a
+deformation model that helps MAC3D.** The real unlock remains a better paired
+reference (real ≥500dpi contact scans of the SAME fingers MAC3D captures, or a
+cleaner paired dataset), not more tuning on SD302f. **All the code fixes are
+genuine hardening of `ml/deform_correct/` for whenever such data exists** —
+the pipeline now trains stably on real GPU end-to-end; it just needs data with
+a learnable shared signal. Do NOT re-run SD302f deform training expecting a
+different result without first changing the data.
+
 ## CTO capture-geometry explanation: thumb-twist mirroring (2026-07-17) — real physical cause, root of the "mirrored print" mystery
 CTO explained the actual physical mechanism behind a mystery this project
 flagged earlier but never resolved (session note: "CTO directly observed the
