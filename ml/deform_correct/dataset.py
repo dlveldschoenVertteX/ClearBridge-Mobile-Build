@@ -65,23 +65,29 @@ class DeformPairDataset(Dataset):
         probe = self._load(rec['probe'])
         gallery = self._load(rec['gallery'])
         if self.augment:
-            # Flip/rotate BOTH images together -- the correction relationship
-            # between probe and gallery is preserved under a shared spatial
-            # transform (a flip just relabels coordinates), unlike augmenting
-            # them independently, which would corrupt the pairing. NOTE: our
-            # production pipeline always uprights prints to a canonical
-            # tip-up orientation before this stage would ever run (see
-            # afis_print._upright_from_tip) -- SD 302's raw captures are NOT
-            # guaranteed to already be in that canonical orientation, so this
-            # augmentation is deliberately kept broad for now. Revisit once
-            # real SD 302 orientation conventions are confirmed (may be safe
-            # to narrow to the actual upright-adjacent range only).
-            if random.random() < 0.5:
-                probe, gallery = probe[:, ::-1].copy(), gallery[:, ::-1].copy()
-            k = random.randint(0, 3)
-            if k:
-                probe = np.rot90(probe, k).copy()
-                gallery = np.rot90(gallery, k).copy()
+            # Pairs are GLOBALLY PRE-ALIGNED upstream (align_pairs.py: probe
+            # registered to its gallery by a rotation+scale+translation grid
+            # search on the ridge-orientation field) so the network only has to
+            # learn the residual LOCAL elastic deformation -- the standard C2CL
+            # "global align -> residual deform" order, and the fix for the
+            # training plateau (a full rotation the net's small displacement
+            # budget could never undo was previously left in the input).
+            # Augmentation must therefore stay SMALL: a big rot90/flip here
+            # would throw the pair back out of global alignment and recreate
+            # exactly the plateau we just removed. Small shared rotation +
+            # translation only, so the pair stays registered while the net still
+            # sees mild pose variation.
+            ang = random.uniform(-15.0, 15.0)
+            tx = random.uniform(-0.04, 0.04) * self.size
+            ty = random.uniform(-0.04, 0.04) * self.size
+            c = (self.size / 2.0, self.size / 2.0)
+            M = cv2.getRotationMatrix2D(c, ang, 1.0)
+            M[0, 2] += tx
+            M[1, 2] += ty
+            probe = cv2.warpAffine(probe, M, (self.size, self.size),
+                                   borderValue=1.0)
+            gallery = cv2.warpAffine(gallery, M, (self.size, self.size),
+                                     borderValue=1.0)
             # Photometric jitter on the PROBE only -- the gallery is the
             # fixed reference the loss compares against, jittering it would
             # make the training target itself noisy.
