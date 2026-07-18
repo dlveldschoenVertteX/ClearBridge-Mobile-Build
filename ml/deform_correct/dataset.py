@@ -17,9 +17,123 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import torch
+from PIL import Image
 from torch.utils.data import Dataset
 
 from synth_distort import synth_contactless
+
+_TARGET_PERIOD = 9.0  # matches afis_print._TARGET_PERIOD / mindtct_client's ~500dpi convention
+_BASE_DPI = 500.0     # the DPI _TARGET_PERIOD=9.0 was calibrated against (SD302d is 500dpi)
+
+
+def _ridge_wavelength_uncapped(img: np.ndarray, bsize: int = 48) -> float:
+    """Native ridge period (px) via per-block projected autocorrelation --
+    self-contained port of the same technique afis_print._ridge_wavelength /
+    scratchpad/sd302's SD302 calibration used, kept dependency-light (no
+    afis_print import) per this module's own design. FALLBACK ONLY -- see
+    _dpi_normalize's docstring for why this isn't the primary signal."""
+    h, w = img.shape
+    gray = img.astype(np.float32)
+    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+    vx = cv2.boxFilter(2 * gx * gy, -1, (16, 16))
+    vy = cv2.boxFilter(gx * gx - gy * gy, -1, (16, 16))
+    orient = 0.5 * np.arctan2(vx, vy)
+    freqs = []
+    for y in range(0, h - bsize, bsize):
+        for x in range(0, w - bsize, bsize):
+            blk = gray[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks):
+                freqs.append(peaks[0])
+    if not freqs:
+        return _TARGET_PERIOD
+    return float(np.clip(np.median(freqs), 3, 80))
+
+
+def _read_dpi(path) -> float | None:
+    """Real scanner-written DPI from the PNG's pHYs chunk, via PIL. Confirmed
+    present and correct on real SD302 files: SD302a=500, SD302b=1000,
+    SD302d=500 (matches this project's own already-established per-part DPI
+    findings)."""
+    try:
+        with Image.open(path) as im:
+            dpi = im.info.get('dpi')
+            if dpi and dpi[0] > 10:
+                return float(dpi[0])
+    except Exception:
+        pass
+    return None
+
+
+def _dpi_normalize(gray: np.ndarray, path=None) -> np.ndarray:
+    """Resample so native ridge period -> _TARGET_PERIOD, BEFORE the fixed-
+    size training canvas fit. Necessary because the consolidated SD302a/b/d
+    clean source mixes real DPIs -- confirmed empirically: the same 256px
+    resize gave wavelengths of 20px/9px/13px for a/b/d respectively, a 2x+
+    scale mismatch that plausibly explains why training on the combined set
+    went flat (net has to fit an inconsistent ridge-scale distribution,
+    diluting the reconstruction signal) when the single-DPI 930-print
+    SD302d-only run learned cleanly.
+
+    PRIMARY signal: the PNG's own embedded DPI metadata (real scanner ground
+    truth) -- NOT the content-based wavelength estimator. Tried the estimator
+    first and it was unreliable on SD302a specifically: block-autocorrelation
+    on a real 500dpi SD302a rolled print gave 12-21px depending on block size
+    (should read ~9-10px like SD302d, which IS the same nominal 500dpi) --
+    the same "needs convergence across parameters, not a single lucky number"
+    unreliability already documented for this exact technique on noisy real
+    images elsewhere in this project. DPI metadata has no such instability.
+    Content-based estimation is kept only as a fallback for the rare file
+    with no/corrupt DPI tag."""
+    if path is not None:
+        dpi = _read_dpi(path)
+        if dpi is not None:
+            scale = float(np.clip(_BASE_DPI / dpi, 0.15, 4.0))
+            new_w = max(32, int(round(gray.shape[1] * scale)))
+            new_h = max(32, int(round(gray.shape[0] * scale)))
+            interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+            return cv2.resize(gray, (new_w, new_h), interpolation=interp)
+    wl = _ridge_wavelength_uncapped(gray)
+    if not np.isfinite(wl) or wl <= 1.0:
+        return gray
+    scale = float(np.clip(_TARGET_PERIOD / wl, 0.15, 4.0))
+    new_w = max(32, int(round(gray.shape[1] * scale)))
+    new_h = max(32, int(round(gray.shape[0] * scale)))
+    interp = cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC
+    return cv2.resize(gray, (new_w, new_h), interpolation=interp)
+
+
+def _center_crop_or_pad(gray: np.ndarray, size: int) -> np.ndarray:
+    """Fit to a size x size canvas via center crop (if larger) / white pad
+    (if smaller) -- never a resize, which would change ridge scale again."""
+    h, w = gray.shape
+    if h >= size:
+        y0 = (h - size) // 2
+        gray = gray[y0:y0 + size]
+    else:
+        pad = size - h
+        gray = cv2.copyMakeBorder(gray, pad // 2, pad - pad // 2, 0, 0,
+                                  cv2.BORDER_CONSTANT, value=255)
+    h, w = gray.shape
+    if w >= size:
+        x0 = (w - size) // 2
+        gray = gray[:, x0:x0 + size]
+    else:
+        pad = size - w
+        gray = cv2.copyMakeBorder(gray, 0, 0, pad // 2, pad - pad // 2,
+                                  cv2.BORDER_CONSTANT, value=255)
+    return gray
 
 
 def make_synth_splits(manifest_path: str, val_frac: float = 0.15, seed: int = 0
@@ -48,11 +162,12 @@ class SynthDeformDataset(Dataset):
     reliable signal (it was weak cross-modality)."""
 
     def __init__(self, clean_paths: List[str], data_root: str, size: int = 512,
-                 augment: bool = True):
+                 augment: bool = True, dpi_normalize: bool = True):
         self.paths = clean_paths
         self.data_root = Path(data_root)
         self.size = size
         self.augment = augment
+        self.dpi_normalize = dpi_normalize
         if not self.paths:
             raise RuntimeError('empty clean-print list -- check the synth manifest/split')
 
@@ -64,6 +179,15 @@ class SynthDeformDataset(Dataset):
         g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
         if g is None:
             raise RuntimeError(f'unreadable clean print: {p} (rel={rel_path!r})')
+        if self.dpi_normalize:
+            # DPI-normalize to a consistent ridge scale, THEN center-crop/pad
+            # to the fixed training canvas -- deliberately NOT a resize after
+            # normalizing, which would rescale by a different factor per
+            # image (normalized images land at different pixel dimensions:
+            # confirmed empirically 288x288 / 550x338 / 287x223 for SD302a/b/
+            # d respectively) and silently undo the whole normalization.
+            g = _dpi_normalize(g, path=p)
+            return _center_crop_or_pad(g, self.size)
         return cv2.resize(g, (self.size, self.size))
 
     def __getitem__(self, i: int):
