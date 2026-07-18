@@ -177,9 +177,20 @@ commit `89c4970`):
   `afisWavelengthPx` 14.0 and 20.0 — well above the pipeline's `_TARGET_PERIOD
   =9.0` target. Per this project's own established finding (native ridge
   wavelength ≥15px correlates with catastrophic real NFIQ2; 9-11px scores
-  well), this suggests the phone was held too far from the thumb during this
+  well), this suggests the thumb was held at the wrong distance during this
   test round — a capture-technique point worth flagging to the CTO directly,
-  not a code fix.
+  not a code fix. **DIRECTION CORRECTED 2026-07-18 (this note originally said
+  "too far" — that is BACKWARDS):** higher wavelength = held too CLOSE. Real
+  Firestore evidence across ~10 captures: wl>=17 (nfiq2 5-9) had mean
+  `afisMaskCoverPx` ~262k (big pad in frame = close), wl<=14 (nfiq2 72) had
+  ~167k (small pad = farther); the wl 9/11/14 captures all scored 72. This is
+  just optics — closer thumb = more magnified = more px per physical ridge =
+  higher px wavelength. So the fix is to hold the thumb FARTHER (pad smaller
+  in the guide) so wavelength drops to the 9-14 sweet spot. Corollary: the
+  on-screen guide SIZE controls capture distance — a bigger guide makes users
+  hold closer (worse). The +5% mask enlargement (done to stop clipping) likely
+  pushes wavelength UP into the bad zone; holding farther fixes BOTH clipping
+  and wavelength, so the guide arguably wants to be smaller, not bigger.
 - **None of this is deployed/built yet** — backend fix needs the standard
   explicit deploy go-ahead; app fixes need a new APK build + real-device
   confirmation, same as every other capture-side change this project.
