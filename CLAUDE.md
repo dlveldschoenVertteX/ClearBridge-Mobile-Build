@@ -1,5 +1,32 @@
 # ClearBridge Mobile — persistent context
 
+## Synth-trained model tested on REAL MAC3D captures vs the ink scan — biggest real gain of the session (2026-07-18)
+Per the CTO's ask, applied the synth-trained checkpoint (930 SD302d prints,
+val 0.345->0.249) to the actual deployment domain: all 14 real MAC3D captures
+in `scratchpad/safis_imgs/`, SourceAFIS-matched against the CTO's real ink
+scan (not a SD302 proxy). 4 of the 14 are the CTO's own same finger (uid
+`Sgsk0mvnECac`: `3e54236a`/`c34911b5`/`382cc4b2`/`722ae3b0`), the other 10 are
+real impostors.
+
+**Uncorrected baseline**: genuine mean 5.45, impostor mean 4.39 (max 10.08) —
+already mildly positive separation (+1.06), but 0/4 genuine beat the impostor
+max; `c34911b5` scored a flat **0** (SourceAFIS found zero matching minutiae).
+
+**After the deform correction**: genuine mean **7.48** (+2.03), impostor mean
+**2.74** (-1.65, impostor max dropped to 8.31) — separation **+4.74**, a 4.5x
+improvement, moving in BOTH directions at once (genuine up, impostor down).
+**`382cc4b2` scored 13.67, beating the corrected impostor max of 8.31 — the
+first real case all session where a genuine pair would actually be
+distinguishable from every impostor.** `c34911b5` went from a flat 0 to 3.01 —
+real matchability where there was previously none. Caveat stated plainly: n=4
+genuine examples is small, not a statistically overwhelming result, but it's
+real, measured on the actual deployment domain, and the clearest positive
+signal the prime directive has produced this session — stronger than the
+cross-domain SD302f test (where correction helped but 0/42 ever beat the
+impostor max). Consistent explanation: MAC3D's own captures vs the CTO's own
+ink scan is a cleaner single-subject domain than 21-subject SD302f-vs-SD302abd,
+so there was more real signal for the correction to unlock.
+
 ## Synthetic-distortion deform training WORKS + first real matchability gain (2026-07-18)
 Per the CTO's dataset question, pivoted `ml/deform_correct/` from the dead-end
 SD302f contactless-probe pairing to **self-supervised synthetic distortion**:
