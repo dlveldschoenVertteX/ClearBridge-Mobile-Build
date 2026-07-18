@@ -1,5 +1,40 @@
 # ClearBridge Mobile — persistent context
 
+## Direct sunlight KILLS captures via finger transillumination (2026-07-18) — real root cause of a whole low-scoring test round
+Round-3 APK test (capture `ca93829d` + siblings `9b0fb988`/`b1c50ca2`) all
+scored catastrophic real NFIQ2 (6-8). Pulled the raw frame: the entire thumb
+pad glows **deep monochromatic red** with sharp-but-contrast-free ridges
+(laplacian ~30 across ALL 8 burst frames vs ~3000 on good captures; NOT a
+frame-selection bug — every frame was equally soft). CTO confirmed these were
+shot in **pure direct sunlight**. Root cause is **transillumination**: with the
+thumb held behind the phone (pad facing the rear camera), sun hits the nail
+side and passes THROUGH the translucent fingertip; tissue/hemoglobin absorb
+blue-green and pass red/NIR, so the pad lights up red *from within*, and that
+diffuse subsurface glow floods over the SURFACE ridge/valley shadows the camera
+needs. Result: ridges are in focus but have almost no contrast → NFIQ2 floor.
+Also secondary: held moderately far (`afisWavelengthPx` 17-20 vs the 14 of the
+72-scorer; native distance, per the standing wavelength≥15px→catastrophic
+finding). **Fix: capture indoors / in diffuse light so the white TORCH becomes
+the dominant light and lights the pad by surface reflection (which carries
+ridge contrast) instead of sun transillumination — the regime the pipeline was
+tuned in. Get the thumb closer so the torch overpowers ambient AND ridges image
+finer.** This is a recurrence of the earlier "red ambient-light cast" note but
+now with the real cause pinned (sunlight, not a red bulb). Possible future
+code-side aid (offered, not built): a capture-time red-cast/low-contrast
+detector that warns "move out of direct sun" before firing the burst.
+
+**On the freq-normalizer question (the CTO asked why the 9px px-changer doesn't
+rescue a 20px capture):** `afisWavelengthPx` is the NATIVE pre-resample
+wavelength (`afis_print.py:1554`, measured before the resample at :1556). The
+resample is deliberately capped at `_FREQ_SCALE_MIN=0.7` (raised from 0.35
+after the real 24-capture Firestore correlation showed aggressive shrinking
+HURTS), so a 20px native only comes down to ~14px, never 9px. And more
+fundamentally, resampling changes pixel *spacing*, not optical *resolution* —
+downsampling a coarse/soft capture can't invent the crisp ridge definition a
+natively-close, well-lit capture records. NFIQ2 measures real ridge clarity,
+fixed at capture time. So the normalizer is a mild correction by design, never
+a rescue for a far or badly-lit capture.
+
 ## deform_correct on SD302f: trained on real GPU, DEFINITIVE NEGATIVE — the data has no generalizable contactless→contact deformation to learn (2026-07-18)
 Ran `ml/deform_correct/` end-to-end on real SageMaker GPU (af-south-1
 `ml.g4dn.xlarge`, ~$2.81 total across the whole debugging chain, all under
