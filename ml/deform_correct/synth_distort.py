@@ -51,7 +51,18 @@ def synth_contactless(clean: np.ndarray, rng: np.random.Generator | None = None,
     if rng is None:
         rng = np.random.default_rng()
     h, w = clean.shape[:2]
-    A = wrap_angle if wrap_angle is not None else float(rng.uniform(0.9, 1.4))  # ~52-80 deg
+    # Range widened + reweighted 2026-07-18 per calibrate_synth.py: fit a
+    # per-pair best wrap angle against REAL data (4 real MAC3D captures vs the
+    # CTO's ink scan -- the actual deployment domain -- plus 21 real SD302f
+    # probes vs SD302a/b/d). Honest finding: for most pairs (16/25) NO wrap
+    # angle beat plain rigid alignment at all -- the real residual after
+    # rotation/scale is mostly elastic/unstructured, not clean cylinder
+    # foreshortening. Where a wrap angle DID help (9/25, incl. 2/4 real MAC3D
+    # pairs), fitted values spanned 0.3-1.46, wider than the original guessed
+    # 0.9-1.4. Widened to match the real evidence and shifted weight toward
+    # elastic (the calibration's actual dominant real signal) rather than
+    # trusting a narrow cylinder-only band the data doesn't really support.
+    A = wrap_angle if wrap_angle is not None else float(rng.uniform(0.3, 1.6))
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
     nx = (xs / (w - 1)) * 2 - 1
     ny = (ys / (h - 1)) * 2 - 1
@@ -60,8 +71,17 @@ def synth_contactless(clean: np.ndarray, rng: np.random.Generator | None = None,
     sinA = float(np.sin(A))
     src_nx = np.arcsin(np.clip(nx * sinA, -1.0, 1.0)) / A
     src_ny = ny
-    # residual elastic
-    em = elastic_mag if elastic_mag is not None else float(rng.uniform(0.0, 0.04))
+    # residual elastic. Range widened 0.0-0.04 -> 0.0-0.05 (same calibration
+    # pass): 16/25 real pairs found NO cylinder wrap angle that beat plain
+    # rigid alignment, meaning the dominant real residual is elastic/
+    # unstructured, not clean foreshortening -- so a modest increase is
+    # justified. NOT pushed further: visually checked 0.06-0.08 (synth_recheck
+    # .png / synth_elastic_sweep.png) and they tear the silhouette into
+    # physically implausible shapes -- training on that would teach the net
+    # to invert noise, not real finger deformation, the exact SD302f-pairs
+    # failure mode. 0.05 is the highest value that still looks like a real,
+    # if aggressive, finger.
+    em = elastic_mag if elastic_mag is not None else float(rng.uniform(0.0, 0.05))
     edx, edy = _elastic_field(h, w, em, smooth=max(h, w) * 0.06, rng=rng)
     src_nx = src_nx + edx
     src_ny = src_ny + edy

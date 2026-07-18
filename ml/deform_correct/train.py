@@ -187,6 +187,13 @@ def main() -> None:
                          'while the clean print is the target. Use for the '
                          'SD302a/b/d-based training that replaces the failed '
                          'SD302f contactless-probe pairing.')
+    ap.add_argument('--init-from', default=None,
+                    help='path to a checkpoint (.pt with a "model" key) to '
+                         'initialise weights from, instead of the model\'s own '
+                         'zero-init. Used for fine-tuning a synth-trained model '
+                         'on real pairs -- starts from a network that already '
+                         'knows a plausible correction, rather than discovering '
+                         'structure from scratch on noisy real per-pair targets.')
     args = ap.parse_args()
 
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -211,6 +218,11 @@ def main() -> None:
     val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2)
 
     model = DeformFieldUNet().to(dev)
+    if args.init_from:
+        ck = torch.load(args.init_from, map_location=dev)
+        model.load_state_dict(ck['model'])
+        print(f'initialised from {args.init_from} '
+              f'(epoch={ck.get("epoch")}, val_loss={ck.get("val_loss")})')
     warp = SpatialTransformer().to(dev)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     ssim_win = _gaussian_window().to(dev)
