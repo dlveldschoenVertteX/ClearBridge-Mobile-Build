@@ -180,8 +180,8 @@ def main() -> None:
     ap.add_argument('--w-orient', type=float, default=1.0)
     ap.add_argument('--w-ssim', type=float, default=0.2)
     ap.add_argument('--w-smooth', type=float, default=0.5)
-    ap.add_argument('--synth', action='store_true',
-                    help='self-supervised synthetic-distortion mode: the '
+    ap.add_argument('--synth', type=int, default=0,
+                    help='1 = self-supervised synthetic-distortion mode: the '
                          'manifest is a list of clean contact prints, each '
                          'distorted on the fly (synth_distort) into the input '
                          'while the clean print is the target. Use for the '
