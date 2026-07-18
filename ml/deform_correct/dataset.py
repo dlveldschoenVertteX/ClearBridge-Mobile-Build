@@ -19,6 +19,76 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset
 
+from synth_distort import synth_contactless
+
+
+def make_synth_splits(manifest_path: str, val_frac: float = 0.15, seed: int = 0
+                      ) -> Tuple[List[str], List[str]]:
+    """Split a synth manifest (JSON list of {'clean': relpath} for clean
+    contact prints) into train/val lists of relative paths. Split is by print
+    (each print is an independent finger impression here), held-out val prints
+    never seen in training."""
+    recs = json.load(open(manifest_path))
+    paths = [r['clean'] for r in recs]
+    rng = random.Random(seed)
+    rng.shuffle(paths)
+    n_val = max(1, int(len(paths) * val_frac))
+    return paths[n_val:], paths[:n_val]
+
+
+class SynthDeformDataset(Dataset):
+    """Self-supervised synthetic-distortion dataset. Each item is a clean
+    contact print (SD302a/b/d) plus a synthetically contactless-distorted copy
+    of it (synth_distort.synth_contactless): the distorted image is the network
+    INPUT, the clean print is the reconstruction TARGET. Unlike the SD302f
+    (real contactless probe -> real contact gallery) pairing that had no
+    generalizable shared signal, the distortion here is a consistent, known
+    geometric family, so the net can actually learn to invert it -- and since
+    input and target are the SAME modality, the SSIM/pixel loss is now a strong
+    reliable signal (it was weak cross-modality)."""
+
+    def __init__(self, clean_paths: List[str], data_root: str, size: int = 512,
+                 augment: bool = True):
+        self.paths = clean_paths
+        self.data_root = Path(data_root)
+        self.size = size
+        self.augment = augment
+        if not self.paths:
+            raise RuntimeError('empty clean-print list -- check the synth manifest/split')
+
+    def __len__(self) -> int:
+        return len(self.paths)
+
+    def _load(self, rel_path: str) -> np.ndarray:
+        p = self.data_root / rel_path
+        g = cv2.imread(str(p), cv2.IMREAD_GRAYSCALE)
+        if g is None:
+            raise RuntimeError(f'unreadable clean print: {p} (rel={rel_path!r})')
+        return cv2.resize(g, (self.size, self.size))
+
+    def __getitem__(self, i: int):
+        clean_u8 = self._load(self.paths[i])
+        rng = np.random.default_rng()  # fresh per call -> different distortion each epoch
+        dist_u8 = synth_contactless(clean_u8, rng=rng)
+        clean = clean_u8.astype(np.float32) / 255.0
+        dist = dist_u8.astype(np.float32) / 255.0
+        if self.augment:
+            # small shared rotation/translation so the net sees pose variety
+            # without leaving the (already-centered) frame -- same discipline as
+            # the pre-aligned SD302f path.
+            ang = random.uniform(-12.0, 12.0)
+            tx = random.uniform(-0.03, 0.03) * self.size
+            ty = random.uniform(-0.03, 0.03) * self.size
+            M = cv2.getRotationMatrix2D((self.size / 2.0, self.size / 2.0), ang, 1.0)
+            M[0, 2] += tx
+            M[1, 2] += ty
+            dist = cv2.warpAffine(dist, M, (self.size, self.size), borderMode=cv2.BORDER_REFLECT)
+            clean = cv2.warpAffine(clean, M, (self.size, self.size), borderMode=cv2.BORDER_REFLECT)
+        return (
+            torch.from_numpy(dist)[None].float(),   # network input (distorted)
+            torch.from_numpy(clean)[None].float(),  # reconstruction target (clean)
+        )
+
 
 def make_splits(manifest_path: str, val_frac: float = 0.15, seed: int = 0
                 ) -> Tuple[List[dict], List[dict]]:

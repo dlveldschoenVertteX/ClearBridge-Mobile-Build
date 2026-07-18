@@ -180,21 +180,35 @@ def main() -> None:
     ap.add_argument('--w-orient', type=float, default=1.0)
     ap.add_argument('--w-ssim', type=float, default=0.2)
     ap.add_argument('--w-smooth', type=float, default=0.5)
+    ap.add_argument('--synth', action='store_true',
+                    help='self-supervised synthetic-distortion mode: the '
+                         'manifest is a list of clean contact prints, each '
+                         'distorted on the fly (synth_distort) into the input '
+                         'while the clean print is the target. Use for the '
+                         'SD302a/b/d-based training that replaces the failed '
+                         'SD302f contactless-probe pairing.')
     args = ap.parse_args()
 
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    train_pairs, val_pairs = make_splits(args.manifest)
-    print(f'train pairs={len(train_pairs)} val pairs={len(val_pairs)} '
-          f'data_root={args.data_root}')
-    train_dl = DataLoader(
-        DeformPairDataset(train_pairs, args.data_root, args.size, augment=True),
-        batch_size=args.batch, shuffle=True, num_workers=4, drop_last=True)
-    val_dl = DataLoader(
-        DeformPairDataset(val_pairs, args.data_root, args.size, augment=False),
-        batch_size=args.batch, shuffle=False, num_workers=2)
+    if args.synth:
+        from dataset import SynthDeformDataset, make_synth_splits
+        train_items, val_items = make_synth_splits(args.manifest)
+        print(f'SYNTH mode: train prints={len(train_items)} val prints={len(val_items)} '
+              f'data_root={args.data_root}')
+        train_ds = SynthDeformDataset(train_items, args.data_root, args.size, augment=True)
+        val_ds = SynthDeformDataset(val_items, args.data_root, args.size, augment=False)
+    else:
+        train_items, val_items = make_splits(args.manifest)
+        print(f'train pairs={len(train_items)} val pairs={len(val_items)} '
+              f'data_root={args.data_root}')
+        train_ds = DeformPairDataset(train_items, args.data_root, args.size, augment=True)
+        val_ds = DeformPairDataset(val_items, args.data_root, args.size, augment=False)
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                          num_workers=4, drop_last=True)
+    val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2)
 
     model = DeformFieldUNet().to(dev)
     warp = SpatialTransformer().to(dev)
