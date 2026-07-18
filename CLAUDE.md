@@ -1,5 +1,75 @@
 # ClearBridge Mobile — persistent context
 
+## Bigger recalibrated deform-correct model (v2, DPI-fixed dataset) DOES NOT beat the smaller one on the real gate — but exposed a genuinely new, cheaper lever (2026-07-18)
+Per the CTO's "find the best way to train the model... think out the box" ask,
+fixed a real DPI-inconsistency bug in the scaled-up training data (SD302a+b+d
+consolidated, 3810 prints vs the earlier 930-print SD302d-only run) and
+retrained from scratch on real SageMaker GPU. Training itself was healthy and
+confirms the fix worked: val loss descended cleanly 0.42 -> 0.2836 over 100
+epochs (job `deform-synth-v2-1784399333`, `ml.g4dn.xlarge`, ~3h), never
+plateauing the way the pre-fix run did. **But the real gate — SourceAFIS
+matchability on the full 26-capture real MAC3D library — tells a more
+complicated, honestly negative story.**
+
+**First pass (naive resize, same eval code as every prior MAC3D test this
+session): v2 is WORSE than the smaller v1 checkpoint, and worse than not
+correcting at all.** Genuine-vs-ink mean dropped 5.45 -> **1.80** (v1 had
+raised it to 7.48); impostor max rose 10.08 -> **14.43** (worse, same
+noise-amplification direction as the earlier full-library finding). 0/4
+genuine beat impostor max in both cases.
+
+**Investigated why before accepting that verdict** (per this project's own
+standing discipline): confirmed real MAC3D captures have **zero DPI metadata
+and range from 289px to 2904px native resolution** (a 10x spread) — the eval
+script's naive resize-to-256 was applying a wildly different, arbitrary ridge
+scale per capture. v2 was specifically trained to expect a consistent
+physical ridge-scale convention (the whole point of the DPI fix), so this is
+a real train/eval domain mismatch, not just an old-vs-new noise difference.
+
+**Re-ran with the eval-side preprocessing matched to training** (same
+content-based ridge-wavelength estimate -> resample to the 9px target ->
+center-crop/pad used in `dataset.py`, applied to both the probe and the ink
+gallery). Measured native wavelengths spread 8.5-22px across captures (ink
+scan itself at 17px) — confirming the scale mismatch was real and large.
+Three-way comparison, same 26 captures:
+
+| condition | genuine-vs-ink mean | impostor max | beat max | cross-session mean |
+|---|---|---|---|---|
+| naive resize, uncorrected | 5.45 | 10.08 | 0/4 | 9.49 |
+| naive resize, v2-corrected | 1.80 | 14.43 | 0/4 | 12.50 |
+| **scale-normalized, uncorrected** | 2.56 | 5.86 | **1/4** | **22.62** |
+| scale-normalized, v2-corrected | 3.16 | 7.51 | 0/4 | 4.85 |
+
+**The real finding: properly matching ridge SCALE alone — with no learned
+deformation model at all — is a bigger, cleaner lever than the deform-correct
+network itself.** Scale-normalization alone beat every other condition on
+cross-session matching (22.62 vs 9.49-12.50) and was the ONLY condition where
+a genuine pair ever beat the impostor max. Sanity-checked the standout case
+(`9bdc9f85` vs `fcfa2e93`, two independent real captures of the same finger:
+confirmed distinct files via MD5, not a duplicate-image bug) — scale-norm
+alone scored a strong genuine match (**83.23**), but running the SAME
+scale-matched pair through the v2 deform-correct model on top actually **cut
+it to 16.94** — the learned warp made an already-good match worse. This
+strongly suggests most of the earlier v1 checkpoint's apparent "gain" on this
+exact pair (17.78 -> ~44) was likely riding on an incidental scale-matching
+side effect of the model's own fixed-size input resize, not the actual
+learned geometric correction doing real work.
+
+**Honest conclusion**: neither deform-correct checkpoint (v1 small-dataset or
+v2 bigger-DPI-fixed-dataset) shows a clean, reliable real-matchability win
+once evaluated fairly — this is now THREE real-data rounds (small-sample v1,
+full-library v1, full-library v2) without a uniform positive result, each
+with a different failure mode (regressions on already-good pairs, noise
+amplification on garbage captures, and now a demonstrated net-negative on a
+properly scale-matched pair). **Not recommending wiring either deform-correct
+checkpoint into production.** The scale-normalization idea, however, is a
+new, real, and much CHEAPER candidate worth testing directly in the
+production AFIS pipeline (no GPU model, no inference cost) — `afis_print.py`
+already has its own DPI/wavelength-based resampling logic (`_TARGET_PERIOD`,
+`_FREQ_SCALE_MIN`) that could plausibly be extended/tuned toward this same
+effect, separately from the deform_correct line of work. Worth a dedicated
+follow-up measurement before further deform-model GPU spend.
+
 ## Full-library MAC3D re-test: the earlier gain holds but is NOT uniform — real regressions + a noise-amplification risk found (2026-07-18)
 Per the CTO's ask to use the full library, pulled ALL 26 real scored MAC3D
 superprints from Firestore/Storage (not just the 14 cached locally) and
