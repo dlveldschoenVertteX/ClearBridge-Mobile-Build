@@ -1,5 +1,39 @@
 # ClearBridge Mobile — persistent context
 
+## Full-library MAC3D re-test: the earlier gain holds but is NOT uniform — real regressions + a noise-amplification risk found (2026-07-18)
+Per the CTO's ask to use the full library, pulled ALL 26 real scored MAC3D
+superprints from Firestore/Storage (not just the 14 cached locally) and
+re-ran the deform-correct gate. Two honest findings temper the earlier
+positive result:
+
+**1. Bigger impostor pool (22, was 10) exposed a noise-amplification risk.**
+Genuine-vs-ink mean still improved (5.45->7.47, same as before), but impostor
+max jumped 10.08->**27.08** after correction — traced to `ca93829d`, the
+**sunlight-transillumination capture** (nfiq2=7, catastrophic quality,
+documented earlier this session). Correcting an already noisy/low-signal
+print can manufacture a spurious false-match artifact rather than real ridge
+structure — the model amplifies whatever weak minutiae-like noise exists,
+good OR bad. Still 0/4 genuine beat the impostor max either way, but the
+margin is now clearly worse-case than the small-sample result suggested.
+
+**2. NEW signal (no ink needed): 5 real same-user cross-session pairs**
+(two independent real captures of presumably the same finger, different
+sessions) — tests whether correcting BOTH images makes them match EACH OTHER
+better. Genuinely mixed: **3/5 improved** (one substantially — `9bdc9f85` vs
+`fcfa2e93` roughly tripled, ~17.8 -> ~44 avg), but **2/5 regressed**,
+including `ccb9c85a` vs `f2fa606b` dropping from an already-good ~17.85 down
+to ~0.2 — a real regression on a pair that was already working.
+
+**Conclusion, revised from the earlier single-cluster result**: the
+correction has real, sometimes dramatic positive potential, but is **NOT a
+uniform win** — it can hurt already-good matches and can turn noise into a
+false positive on garbage input. This rules out ever blind-replacing the
+existing pipeline output. It reinforces the project's own standing
+discipline: wire in as ONE more max-of-variants candidate (never force-
+replace), so per-capture NFIQ2/matchability-based selection picks whichever
+variant actually wins, and existing quality gating keeps catastrophic inputs
+(like sunlight captures) from being trusted on a spurious score.
+
 ## Synth-trained model tested on REAL MAC3D captures vs the ink scan — biggest real gain of the session (2026-07-18)
 Per the CTO's ask, applied the synth-trained checkpoint (930 SD302d prints,
 val 0.345->0.249) to the actual deployment domain: all 14 real MAC3D captures
