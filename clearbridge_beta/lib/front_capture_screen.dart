@@ -300,8 +300,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               bottom: 100,
               left: 40,
               right: 40,
+              // Name the specific camera being used (distanceHint carries e.g.
+              // "Capturing with wide lens…") so the user can actually confirm
+              // WHICH camera is firing -- the generic "extra detail" banner
+              // left the CTO unable to tell a secondary capture was happening
+              // at all (device test 2026-07-18, note #4).
               child: CaptureGuidanceOverlay(
-                message: 'Hold still — capturing extra detail…',
+                message: s.distanceHint ?? 'Hold still — capturing extra detail…',
                 isAllGreen: true,
                 greenFraction: 1.0,
               ),

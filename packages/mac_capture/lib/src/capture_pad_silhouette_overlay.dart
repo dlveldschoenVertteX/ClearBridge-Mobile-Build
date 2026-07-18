@@ -95,17 +95,24 @@ class PadSilhouetteShape {
   /// mask-position bug -- re-test visually if creases start showing up in
   /// superprints again, since a bigger opening extends closer to the DIP
   /// crease than the original top-half-only shrink.
-  /// History: 0.17/0.13 -> 0.21/0.17 (first bump) -> 0.23/0.19 -> 0.2415/
-  /// 0.1995 (this one, +5%: real device test 2026-07-17 found the mask still
-  /// cutting off the thumb pad when held as close as physically possible --
+  /// History: 0.17/0.13 -> 0.21/0.17 (first bump) -> 0.23/0.19 (the size the
+  /// only NFIQ2=72 capture `c2104d45` was taken at) -> 0.2415/0.1995 (+5%,
+  /// 2026-07-17, to stop the mask clipping when held "as close as possible")
+  /// -> REVERTED back to 0.23/0.19 (2026-07-18). The +5% enlargement was a
+  /// mistake: real Firestore data across ~10 captures shows a bigger on-screen
+  /// guide makes the user hold the thumb CLOSER to fill it, which raises the
+  /// native ridge wavelength (closer = more magnified = more px/ridge) into
+  /// the >=17px zone that scores catastrophic NFIQ2 -- every capture at wl>=17
+  /// scored 5-9, while wl 9-14 scored 72. Holding farther (smaller guide)
+  /// fixes BOTH the original clipping complaint (a smaller pad can't clip) AND
+  /// the wavelength. CTO independently asked to revert to the 72-capture size.
   /// `guideRegion` is written verbatim from this shape and used directly as
-  /// the backend AFIS mask, so this single client-side change is sufficient;
-  /// no separate backend constant mirrors these values).
+  /// the backend AFIS mask, so this single client-side change is sufficient.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.2415,
-    ry: 0.1995,
+    rx: 0.23,
+    ry: 0.19,
     taper: 0.20,
   );
 

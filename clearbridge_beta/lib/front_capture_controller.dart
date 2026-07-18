@@ -881,7 +881,25 @@ class FrontCaptureController extends ChangeNotifier {
               // Some secondary sensors may not support exposure offset --
               // non-fatal, the burst still fires at default exposure.
             }
-            await Future<void>.delayed(const Duration(milliseconds: 600));
+            // AUTOFOCUS on the near thumb before firing. Without this the
+            // secondary sensor stays at its resting focus (usually far), so a
+            // ~10cm thumb comes back badly out of focus -- real device test
+            // 2026-07-18: the wide lens returned laplacian ~18 (vs ~1900 on the
+            // focused main camera) and never converged. Point AF at the frame
+            // centre (where the thumb sits) and give it time to converge before
+            // the burst; guard each call since some secondary sensors are
+            // fixed-focus and will throw.
+            try {
+              await active.setFocusPoint(const Offset(0.5, 0.5));
+              await active.setFocusMode(FocusMode.auto);
+            } catch (_) {
+              // fixed-focus secondary sensor -- nothing to converge, fall
+              // through to the settle delay and shoot at native focus.
+            }
+            // Longer settle than the main path: continuous AF on a secondary
+            // sensor that just powered on needs time to hunt and lock on the
+            // near subject (600ms was too short -- it shot mid-hunt).
+            await Future<void>.delayed(const Duration(milliseconds: 1400));
             final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
             final paths = <String>[];
             for (var i = 0; i < _secondaryBurstCount; i++) {
