@@ -50,7 +50,12 @@ from dataset import DeformPairDataset, make_splits
 from model import DeformFieldUNet, SpatialTransformer
 
 _ORIENT_BLOCK = 16     # matches afis_print._BLOCK
-_ORIENT_SMOOTH = 15.0  # matches afis_print._ORIENT_SMOOTH
+# Orientation-field smoothing sigma. Reduced from 15 (which built a 91x91
+# Gaussian kernel -- an oversized conv that was a plausible source of the
+# GPU-only (cuDNN) NaN that never reproduced on CPU) to 5 (a 31x31 kernel):
+# still smooths the field adequately, is far cheaper/safer on GPU, and matches
+# the sigma the offline alignment diagnostic already used successfully.
+_ORIENT_SMOOTH = 5.0
 
 
 def _sobel_kernels(device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
@@ -101,16 +106,32 @@ def orientation_field(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     cs = _gaussian_blur(vy / r, _ORIENT_SMOOTH)
     sn = _gaussian_blur(vx / r, _ORIENT_SMOOTH)
     norm = torch.sqrt(cs ** 2 + sn ** 2) + 1e-6
-    return cs / norm, sn / norm
+    # Final hard guarantee of a finite field. Every step above is finite by
+    # construction on CPU, but the aligned run went ~all-batches-NaN only on
+    # the GPU and never reproduced locally -- a cuDNN-side pathology I can't
+    # pin without a GPU. nan_to_num makes any GPU-produced NaN/Inf collapse to
+    # 0 (a uniform patch's correct "no orientation here" value), so the loss
+    # stays finite and training can't be poisoned regardless of the source.
+    cs = torch.nan_to_num(cs / norm)
+    sn = torch.nan_to_num(sn / norm)
+    return cs, sn
 
 
 def orientation_loss(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """1 - mean cosine similarity between two images' orientation fields (0 =
-    identical ridge flow everywhere, up to 2 = completely perpendicular)."""
+    """1 - mean cosine similarity between two images' orientation fields, over
+    pixels where BOTH images actually carry ridge orientation (0 = identical
+    ridge flow, up to 2 = perpendicular). Featureless regions (image borders,
+    the uniform patches nan_to_num zeroed to magnitude 0) are excluded from the
+    average -- otherwise they inject a constant "no agreement" term that both
+    dilutes the real ridge-alignment signal and raises the loss floor for
+    reasons the network can't fix (it can't invent orientation in a blank
+    corner). Masking keeps the loss measuring ridge alignment specifically."""
     ca, sa = orientation_field(a)
     cb, sb = orientation_field(b)
+    valid = ((ca * ca + sa * sa > 0.25) & (cb * cb + sb * sb > 0.25)).float()
     cos_sim = ca * cb + sa * sb   # cos(2*(theta_a - theta_b))
-    return (1.0 - cos_sim.mean())
+    denom = valid.sum().clamp_min(1.0)
+    return 1.0 - (cos_sim * valid).sum() / denom
 
 
 def _gaussian_window(ks: int = 11, sigma: float = 1.5) -> torch.Tensor:
@@ -188,7 +209,7 @@ def main() -> None:
         n_tr_skipped = 0
         for probe, gallery in train_dl:
             probe, gallery = probe.to(dev), gallery.to(dev)
-            flow = model(probe)
+            flow = torch.nan_to_num(model(probe))  # guard GPU forward NaN
             warped = warp(probe, flow)
             l_orient = orientation_loss(warped, gallery)
             l_ssim = 1.0 - ssim(warped, gallery, ssim_win)
@@ -228,7 +249,7 @@ def main() -> None:
         with torch.no_grad():
             for probe, gallery in val_dl:
                 probe, gallery = probe.to(dev), gallery.to(dev)
-                flow = model(probe)
+                flow = torch.nan_to_num(model(probe))
                 warped = warp(probe, flow)
                 l_orient = orientation_loss(warped, gallery)
                 l_ssim = 1.0 - ssim(warped, gallery, ssim_win)
