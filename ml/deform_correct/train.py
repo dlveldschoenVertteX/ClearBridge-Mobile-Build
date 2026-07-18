@@ -87,9 +87,19 @@ def orientation_field(img: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     gy = F.conv2d(img, ky, padding=1)
     vx = _box_blur(2 * gx * gy, _ORIENT_BLOCK)
     vy = _box_blur(gx * gx - gy * gy, _ORIENT_BLOCK)
-    theta = 0.5 * torch.atan2(vx, vy)
-    cs = _gaussian_blur(torch.cos(2 * theta), _ORIENT_SMOOTH)
-    sn = _gaussian_blur(torch.sin(2 * theta), _ORIENT_SMOOTH)
+    # Doubled-angle orientation vector computed WITHOUT atan2. For
+    # theta = 0.5*atan2(vx, vy) the identities cos(2*theta) = vy/r and
+    # sin(2*theta) = vx/r hold (r = |(vx, vy)|), so we form the same vector
+    # directly. This is not a cosmetic rewrite: atan2's gradient is
+    # vy/(vx^2+vy^2) which blows up to +/-inf on uniform patches where
+    # vx,vy -> 0 (exactly the large white borders that global pre-alignment +
+    # rotation augmentation introduce). Those Inf grads, once fed through
+    # clip_grad_norm_, became NaN (inf * (max_norm/inf)) and corrupted the
+    # weights -- the cause of ~all-batches-non-finite on the aligned run.
+    # Flooring r with eps keeps the gradient bounded everywhere.
+    r = torch.sqrt(vx * vx + vy * vy + 1e-6)
+    cs = _gaussian_blur(vy / r, _ORIENT_SMOOTH)
+    sn = _gaussian_blur(vx / r, _ORIENT_SMOOTH)
     norm = torch.sqrt(cs ** 2 + sn ** 2) + 1e-6
     return cs / norm, sn / norm
 

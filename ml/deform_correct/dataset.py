@@ -84,10 +84,14 @@ class DeformPairDataset(Dataset):
             M = cv2.getRotationMatrix2D(c, ang, 1.0)
             M[0, 2] += tx
             M[1, 2] += ty
+            # Reflect (not a flat fill) at the borders so the small aug rotation
+            # doesn't introduce new large uniform regions -- reflected ridges
+            # stay locally oriented, which is both more realistic and avoids
+            # feeding the orientation loss more near-degenerate patches.
             probe = cv2.warpAffine(probe, M, (self.size, self.size),
-                                   borderValue=1.0)
+                                   borderMode=cv2.BORDER_REFLECT)
             gallery = cv2.warpAffine(gallery, M, (self.size, self.size),
-                                     borderValue=1.0)
+                                     borderMode=cv2.BORDER_REFLECT)
             # Photometric jitter on the PROBE only -- the gallery is the
             # fixed reference the loss compares against, jittering it would
             # make the training target itself noisy.
