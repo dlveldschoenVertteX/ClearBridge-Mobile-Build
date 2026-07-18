@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 
 import torch
@@ -173,6 +174,8 @@ def main() -> None:
     for epoch in range(args.epochs):
         model.train()
         tr_loss = 0.0
+        n_tr_finite = 0
+        n_tr_skipped = 0
         for probe, gallery in train_dl:
             probe, gallery = probe.to(dev), gallery.to(dev)
             flow = model(probe)
@@ -182,6 +185,19 @@ def main() -> None:
             l_smooth = flow_smoothness(flow)
             loss = (args.w_orient * l_orient + args.w_ssim * l_ssim
                     + args.w_smooth * l_smooth)
+            if not torch.isfinite(loss):
+                # A single pathological batch (e.g. a near-degenerate crop)
+                # producing a NaN/Inf loss is a real, observed failure mode on
+                # this small, noisy real dataset (confirmed: training NaN'd
+                # permanently from a single such batch on two prior runs,
+                # epoch 12 and epoch 41 respectively -- gradient clipping
+                # alone doesn't help here, since it only bounds an otherwise-
+                # finite gradient, and can't rescue a loss that's already
+                # NaN/Inf going INTO backward()). Skipping the update entirely
+                # keeps the weights clean instead of permanently poisoning
+                # every subsequent batch/epoch with a single corrupted step.
+                n_tr_skipped += 1
+                continue
             opt.zero_grad()
             loss.backward()
             # Standard safeguard against exploding-gradient divergence on a
@@ -191,10 +207,14 @@ def main() -> None:
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             opt.step()
             tr_loss += loss.item()
-        tr_loss /= max(len(train_dl), 1)
+            n_tr_finite += 1
+        tr_loss /= max(n_tr_finite, 1)
+        if n_tr_skipped:
+            print(f'  (skipped {n_tr_skipped} non-finite training batch(es))')
 
         model.eval()
         val_loss = 0.0
+        n_val_finite = 0
         with torch.no_grad():
             for probe, gallery in val_dl:
                 probe, gallery = probe.to(dev), gallery.to(dev)
@@ -203,9 +223,12 @@ def main() -> None:
                 l_orient = orientation_loss(warped, gallery)
                 l_ssim = 1.0 - ssim(warped, gallery, ssim_win)
                 l_smooth = flow_smoothness(flow)
-                val_loss += (args.w_orient * l_orient + args.w_ssim * l_ssim
-                            + args.w_smooth * l_smooth).item()
-        val_loss /= max(len(val_dl), 1)
+                v = (args.w_orient * l_orient + args.w_ssim * l_ssim
+                     + args.w_smooth * l_smooth).item()
+                if math.isfinite(v):
+                    val_loss += v
+                    n_val_finite += 1
+        val_loss /= max(n_val_finite, 1)
         print(f'epoch {epoch:03d} train={tr_loss:.4f} val={val_loss:.4f}')
 
         ckpt = {'model': model.state_dict(), 'epoch': epoch, 'val_loss': val_loss,
