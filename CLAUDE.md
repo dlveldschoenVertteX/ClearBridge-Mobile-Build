@@ -1,5 +1,32 @@
 # ClearBridge Mobile — persistent context
 
+## Synthetic-distortion deform training WORKS + first real matchability gain (2026-07-18)
+Per the CTO's dataset question, pivoted `ml/deform_correct/` from the dead-end
+SD302f contactless-probe pairing to **self-supervised synthetic distortion**:
+take clean SD302d contact prints, apply a known physically-grounded
+contactless distortion (cylinder foreshortening + elastic, `synth_distort.py`,
+physics visually verified), train the net to invert it. Perfect ground truth,
+consistent distortion family, clean abundant source. Trained on real GPU (930
+prints, 120 epochs, af-south-1). **Unlike SD302f (frozen val, no learning),
+this DESCENDED cleanly: val 0.345 -> 0.249, generalizing to held-out prints.**
+The machinery was never broken — SD302f just had no learnable shared signal.
+
+**First real-transfer win (the actual gate):** applied the synth-trained model
+to REAL SD302f contactless probes and re-ran SourceAFIS vs the SD302a/b/d
+contact galleries (`scratchpad/sd302/eval_synth_real.py`). Genuine same-finger
+mean **0.120 -> 0.315** (2.6x), and genuine-minus-impostor separation flipped
+from **-0.229 (worse than random) to +0.059 (positive)**. This is the FIRST
+deformation approach all session to move real contactless->contact matchability
+in the right direction. **Honest caveat:** absolute scores still tiny (~0.3 vs
+the ~40 SourceAFIS needs; 0/42 genuine beat the impostor max), consistent with
+SD302f's near-zero baseline signal — the correction amplifies what little exists
+but can't manufacture matchability from near-signal-free data. Real usable
+matches need (a) real MAC3D paired data to tune the synthetic distortion to
+actual capture geometry, (b) a refined distortion model. But the APPROACH is
+now validated as a genuine lever — the synthetic-self-supervision route is the
+one to build on, not SD302f pairs. Checkpoint: S3
+`deform-correct/deform-synth-sd302d-1784372557/checkpoints/best.pt`.
+
 ## Direct sunlight KILLS captures via finger transillumination (2026-07-18) — real root cause of a whole low-scoring test round
 Round-3 APK test (capture `ca93829d` + siblings `9b0fb988`/`b1c50ca2`) all
 scored catastrophic real NFIQ2 (6-8). Pulled the raw frame: the entire thumb
