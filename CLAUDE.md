@@ -1,5 +1,42 @@
 # ClearBridge Mobile — persistent context
 
+## Frequency-floor relaxation hypothesis TESTED on the real production pipeline and REFUTED — keep `_FREQ_SCALE_MIN=0.7` as-is (2026-07-19)
+Per the CTO's "validate it, act as CTO" ask, followed up on the scale-
+normalization finding above with a properly controlled test: real raw
+`front_only_v1` burst frames + `guideRegion` for the 14 key MAC3D captures
+were pulled fresh from Firestore/Storage and run through the ACTUAL
+production `afis_print.generate(freq_normalize=True)` — not a standalone
+reimplementation — once at the current floor (`_FREQ_SCALE_MIN=0.7`) and
+once relaxed to `0.15`. Confirmed via real diagnostics that every one of
+these captures has native wavelength 16.5-20px, so the current floor clamps
+ALL of them to scale=0.7 (proper correction would need 0.45-0.55) — exactly
+the under-correction the hypothesis predicted.
+
+**Result: relaxing the floor made real matchability WORSE, not better.**
+
+| condition | genuine-vs-ink mean | beat impostor max | cross-session mean |
+|---|---|---|---|
+| **current (floor=0.7)** | 5.01 | **2/4** | **37.99** |
+| relaxed (floor=0.15) | 1.52 | 0/4 | 27.00 |
+
+The standout cross-session pair (`9bdc9f85` vs `fcfa2e93`) scored a huge
+**163.38** at the current floor and *dropped* to 116.76 when relaxed. 2/4
+genuine captures beating the impostor max at the current floor is the best
+real-matchability result measured all session (previous best was 1/4).
+
+**Why this contradicts the earlier post-hoc scale-normalization finding**:
+that test resampled the ALREADY-binarized final AFIS print (a crude,
+lossy operation on hard black/white pixels) as a bolt-on AFTER the real
+pipeline ran. This test varies the floor INSIDE the real pipeline, resampling
+the continuous-tone image BEFORE Gabor enhancement — the actual mechanism.
+The post-hoc test was a real methodological artifact, not a production
+insight. **Conclusion: the earlier decision to raise `_FREQ_SCALE_MIN` from
+0.35 to 0.7 (documented above, based on a real 24-capture NFIQ2 correlation)
+was correct on the matchability axis too, not just NFIQ2 quality — do not
+lower it.** This is a case of a hypothesis being taken seriously, tested
+rigorously against the real system, and refuted — the discipline this
+project has run on all session. No code change made.
+
 ## Bigger recalibrated deform-correct model (v2, DPI-fixed dataset) DOES NOT beat the smaller one on the real gate — but exposed a genuinely new, cheaper lever (2026-07-18)
 Per the CTO's "find the best way to train the model... think out the box" ask,
 fixed a real DPI-inconsistency bug in the scaled-up training data (SD302a+b+d
