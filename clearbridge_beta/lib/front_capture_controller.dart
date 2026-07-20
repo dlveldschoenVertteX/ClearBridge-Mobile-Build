@@ -141,6 +141,22 @@ class FrontCaptureController extends ChangeNotifier {
   // instead of the bare 2-frame minimum.
   static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 50;
+  // decodeStillJpegToLuma's own default (2048) was chosen purely for
+  // decode speed/peak-memory safety on budget devices (still_jpeg_
+  // downscaler.dart's own docstring), never evaluated as a data-quality
+  // tradeoff. The on-screen pad guide only covers ~46%x38% of the frame
+  // (capture_pad_silhouette_overlay.dart's defaultShape, rx=0.23/ry=0.19),
+  // so at 2048px wide the actual pad region is only ~900-950px across
+  // before any further processing -- discarding most of a modern sensor's
+  // native detail before the crop even happens. Same principle already
+  // proven to matter at a later pipeline stage (two-step downscale before
+  // NFIQ's 500x500 resize -- preserving more source resolution before a
+  // downsample measurably helps via better anti-aliasing). Bumped to 3200
+  // (~2.4x the decode's peak memory, not full native res) as a first,
+  // conservative test of the same principle here -- needs a real device
+  // capture + NFIQ2/SourceAFIS comparison against the 2048 baseline before
+  // trusting it; revert if budget devices show memory/latency regressions.
+  static const int _stillDecodeTargetWidth = 3200;
   // Secondary-camera (IR/ultrawide) burst depth. Was a single takePicture()
   // per camera with no sharpness ranking -- a short burst here lets the
   // backend keep the sharpest shot per camera (same Laplacian-variance
@@ -669,7 +685,10 @@ class FrontCaptureController extends ChangeNotifier {
       final futures = <Future<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})>>[];
       for (final raw in rawShots) {
         futures.add(() async {
-          final decoded = await decodeStillJpegToLuma(raw.jpeg, _sensorOrientation);
+          final decoded = await decodeStillJpegToLuma(
+            raw.jpeg, _sensorOrientation,
+            targetWidth: _stillDecodeTargetWidth,
+          );
           if (decoded == null) throw StateError('decode failed');
           final sharp = _lumaSharpness(decoded.luma, decoded.width, decoded.height);
           final encoded = await compute(
@@ -1174,7 +1193,10 @@ class FrontCaptureController extends ChangeNotifier {
         }
         final xfile = await cam.takePicture();
         final jpeg = await xfile.readAsBytes();
-        final decoded = await decodeStillJpegToLuma(jpeg, _sensorOrientation);
+        final decoded = await decodeStillJpegToLuma(
+          jpeg, _sensorOrientation,
+          targetWidth: _stillDecodeTargetWidth,
+        );
         if (decoded == null) continue;
         final encoded = await compute(
           _encodeBurstIsolate,
