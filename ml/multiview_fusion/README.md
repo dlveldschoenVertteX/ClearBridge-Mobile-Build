@@ -1,8 +1,11 @@
 # Multi-view fusion + flash enhancement — isolated R&D track
 
-## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO, Phase 2 (learned model) in
-progress (2026-07-22). NOT wired into production. NOT merged into
+## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO, Phase 2 NO-GO at the
+signal-ceiling level (2026-07-22, five independent negative results total —
+see close-out section below). NOT wired into production. NOT merged into
 `front_only_v1`. Lives entirely on `claude/multiview-fusion-blend-experiment`.
+Branch is closed pending a CTO go/no-go on the two remaining paths (phase-
+demodulation rebuild, or abandon multi-view fusion for capture-side levers).
 
 ## Why this exists
 
@@ -330,3 +333,137 @@ the seam metric, which lost its control band on 2/4 captures in earlier
 phases); (2) the same seam-continuity metric as Phases 0/1 for
 comparability. Result to be reported honestly either way, as with every
 phase in this branch.
+
+## Phase 2 real-GPU training (`multiview-pair-deform-v3`, 2026-07-22) —
+FLAT, root-caused to mean-collapse, pyramid fix built, still NO-GO after a
+four-part diagnostic chain
+
+Submitted the SageMaker job (`ml.g4dn.xlarge`, af-south-1, on-demand after
+two earlier submissions hit spot-capacity and a numpy/torch ABI crash — see
+launcher history above) on the real 313-frame/26-user pull. Training ran to
+completion without crashing, but val EPE never moved off the identity
+baseline for the full run (flat ~4.40 vs. identity 4.40, every logged
+epoch).
+
+**Checkpoint forensics (before assuming "bug" vs. "no signal"):** loaded the
+trained checkpoint, ran it on held-out synthetic pairs with known ground
+truth, and directly measured `cosine(pred_flow, gt_flow) = -0.050` (should
+be near +1 for real learning) with mean `|pred|` **0.034px** vs. mean `|gt|`
+**6.7px** — the network is not predicting small-but-wrong flows, it is
+predicting essentially **zero** everywhere. This is the textbook signature
+of mean-collapse under an EPE/L1 regression loss: when a regressor can't
+extract the answer from its inputs, the loss-optimal fallback is the
+marginal mean of the target, which for a zero-centered random flow family
+is identity — exactly what a flat val-EPE-equals-identity-baseline curve
+looks like from the outside.
+
+**Literature check (web research, per the CTO's explicit "you may use web to
+search for relevant info" ask) confirmed this is a known, named failure
+mode for this exact data type, not a novel problem**: real fingerprint
+dense-registration methods (Cui & Feng, TIFS 2018, "2-D Phase Demodulation
+for Deformable Fingerprint Registration"; PDRNet, T-IFS 2024) do not
+register on raw intensity correlation at all — they treat ridge texture as
+a 2-D cosine wave and register via **phase**, specifically because raw
+correlation on periodic ridge texture is multi-modal (one near-equal peak
+per ridge cycle) and any correlation-based estimator will systematically
+regress toward the prior mean under exactly this kind of ambiguity. This
+matches Phase 0/Phase 1's own classical findings (NCC block-matching and
+minutiae nearest-neighbor both failed via periodicity/density aliasing) —
+the learned single-level correlation net hit the same wall by a parallel
+mechanism.
+
+**Built the literature-motivated fix**: `ctf_deform_net.py`,
+`CoarseToFinePairNet` — a minimal PWC-Net-style 3-level coarse-to-fine
+pyramid (1/16 -> 1/8 -> 1/4 resolution), the standard fix for exactly this
+ambiguity: at 1/16 resolution a 9-20px ridge period is well below one pixel
+of that grid (0.6-1.25px), so the texture is effectively non-periodic blur
+at that scale and a small correlation window there is unambiguous while
+still reaching +-64px of full-resolution displacement; each finer level
+then only has to resolve a residual well below half a ridge period at its
+own scale — the regime where correlation genuinely has a single peak.
+Flows carried in full-resolution pixel units throughout (same scale-trap-
+avoidance contract as `deform_net.py`/`corr_deform_net.py`), multi-scale
+EPE supervision at all 3 levels, zero-init heads at every level. Verified
+via shape/gradient smoke test (zero-init gives exact-zero flow at every
+level; multi-scale EPE backward pass runs; `predict()` returns full-res
+flow; 0.24M params) before spending any more GPU time.
+
+**Before re-running the full pyramid on GPU, ran four cheap CPU probes to
+isolate which of several candidate causes was real** — the standing
+project discipline of investigating a negative result's actual mechanism
+rather than guessing at the next fix:
+
+1. **Small-vs-full flow magnitude** (`probe_small_full.py`-equivalent):
+   trained the SAME single-level corr net on small (<=0.25 strength) vs.
+   full (<=1.0 strength) synthetic flows, 240 steps each. **Both stayed
+   flat at their own identity baseline** (small: val 1.228 vs. ident 1.228;
+   full: val 4.939 vs. ident 4.910) — ruling out "the flow range itself is
+   too extreme to learn" as a standalone explanation; even the easiest
+   (smallest-shift) version never moved.
+
+2. **Jitter x BatchNorm 2x2 grid** (`probe2x2_fast.py`): trained 4 cells
+   (photometric jitter on/off) x (BatchNorm on/off), sub-period flows
+   (strength<=0.25), 200 steps each, on real preloaded frames. Every cell
+   stayed flat at its own identity baseline regardless of condition —
+   ruling out both photometric jitter and BatchNorm (a specific concern
+   given BatchNorm's known interaction with small-batch flow regression)
+   as the sole cause.
+
+3. **Stride-2 vs. stride-4 encoder** (tested via the same harness):
+   ruled out the "sub-stride invisibility" hypothesis (displacements
+   smaller than a feature map's stride should be invisible to correlation
+   computed at that stride) — a stride-2 variant did not resolve the flat
+   result either, so under-stride blindness was not the (sole) cause.
+
+4. **Deepest probe, `probe_minimal.py`, two parts, the decisive one:**
+   - **Part A — zero-learning signal ceiling**: with NO network and NO
+     training in the loop at all, applied a KNOWN small constant shift
+     (dx,dy in [-3,3]) to real fingerprint crops and checked whether raw
+     local-correlation argmax (81-channel, +-4px window) recovers the
+     exact known shift. **Result: 3/20 hits (15%)** — about 12x above the
+     1/81 chance rate (binomial p~0.001, a real, non-random signal) but
+     practically far too weak and noisy to serve as a reliable training
+     target: 85% of the time even the exact-answer correlation computation
+     itself picks the wrong peak on this real data.
+   - **Part B — simplest possible learnable task**: stride-1 features (no
+     downsampling at all, so no periodicity-aliasing at a coarse grid is
+     even possible), CONSTANT per-crop translation (not a spatially-varying
+     field — the easiest possible regression target), 64px crops, 300
+     steps. **Still flat**: val EPE pinned at the identity baseline the
+     entire run, never moving.
+
+**Final verdict for this branch**: Part A quantifies the actual ceiling —
+raw intensity correlation on these real fingerprint crops carries a real
+but very weak signal (~15% exact-recovery rate for a trivial known shift),
+consistent with every other finding in this branch (NCC block-matching
+periodicity aliasing, minutiae density chance-matching, PDRNet/Cui-Feng's
+own reason for abandoning intensity correlation in favor of phase). Part B
+shows that weak a signal is not learnable within this branch's realistic
+compute/data budget (313 frames, 26 users) even on the easiest conceivable
+version of the task. The coarse-to-fine pyramid fix is architecturally
+sound and addresses a real, literature-confirmed failure mode, but does not
+change the underlying signal ceiling Part A measured — a correlation-based
+architecture at any number of pyramid levels is still built on the same
+intensity-correlation primitive that Part A shows is weak on this data. **A
+phase-based approach (per Cui & Feng / PDRNet) is the literature-correct
+next architecture, but is a materially larger rebuild (a different feature
+representation, not a drop-in change to the existing correlation-net
+family) — not a quick follow-up to this branch's existing code.**
+
+Combined with Phase 0/1's three independent classical NO-GOs, this is now
+**five independent negative-to-mixed results** on multi-view fusion for
+this architecture family: NCC block-matching, minutiae correspondence,
+seam-routed compositing, single-level learned correlation, and (via the
+probes) coarse-to-fine learned correlation at the signal-ceiling level.
+**Recommendation: do not continue sinking GPU/engineering time into
+intensity-correlation-based multi-view fusion on this branch.** The two
+honest paths forward, neither cheap, both requiring a real go/no-go
+conversation with the CTO before starting: (a) a phase-demodulation-based
+registration net (the literature's actual answer for periodic fingerprint
+texture — a genuinely different feature representation, several days of
+new build); or (b) abandon multi-view geometric fusion as a lever entirely
+and focus remaining effort on the capture-side/optics levers already
+identified as untried elsewhere in this project (`docs/
+RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md`'s cross-polarization test, physical
+distance bracketing, secondary-camera AF fixes) — none of which depend on
+solving this correspondence problem at all.
