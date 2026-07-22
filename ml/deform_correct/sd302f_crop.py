@@ -41,7 +41,23 @@ import cv2
 import numpy as np
 
 _BLOCK = 16
-_QUALITY_CUTOFF = 0.012   # calibrated threshold, see crop_quality's docstring
+_QUALITY_CUTOFF = 0.02   # re-calibrated 2026-07-22 against the real 1454-crop score
+                          # distribution from the first full sampling run (was 0.012,
+                          # inherited from the original 40-sample calibration). Visual
+                          # spot check at 0.012 found real background-clutter
+                          # contamination (the rig's loose scattered photos) in a
+                          # meaningful fraction of "passing" crops; 0.02 sits at the
+                          # real median of the score distribution and removes the
+                          # worst ~37%. HONEST CAVEAT, not fully solved by this alone:
+                          # even the highest-scoring crops in this run often centered
+                          # on the INTERDIGITAL CREASE between the rig's paired finger
+                          # slots (e.g. "02+03") rather than a single pad -- the
+                          # curvature gate (designed to find a loop/whorl core) also
+                          # fires on that crease. Raising the cutoff further trades
+                          # corpus size for MORE of that bias, not cleaner pad crops --
+                          # a genuinely different failure mode needing a different
+                          # fix (e.g. detecting the crease itself to reject it), not
+                          # attempted here. Treat this corpus as real but noisy.
 _SEED_CONF_MIN = 0.15
 _SD302F_ROI = (0.08, 0.02, 0.66, 0.82)  # (x0,y0,x1,y1) as frac of (w,h)
 
