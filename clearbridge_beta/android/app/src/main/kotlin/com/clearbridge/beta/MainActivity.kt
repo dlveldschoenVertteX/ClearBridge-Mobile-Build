@@ -85,7 +85,7 @@ class MainActivity : FlutterActivity() {
         val support = mutableMapOf<String, Map<String, Boolean>>()
         for (id in cameraManager.cameraIdList) {
             val chars = cameraManager.getCameraCharacteristics(id)
-            val nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_MODES)
+            val nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_NOISE_REDUCTION_MODES)
                 ?: IntArray(0)
             val edgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
                 ?: IntArray(0)
