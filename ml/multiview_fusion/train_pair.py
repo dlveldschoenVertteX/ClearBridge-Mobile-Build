@@ -40,6 +40,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
 
 from deform_net import PairDeformFieldUNet, PixelWarp
+from corr_deform_net import CorrPairDeformNet
 from synth_multiview import synth_pair
 
 _VAL_FRac = 0.2   # fraction of USERS held out for validation
@@ -120,6 +121,10 @@ def main():
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--smooth-w', type=float, default=0.02)
     ap.add_argument('--limit-frames', type=int, default=0)
+    ap.add_argument('--model', choices=['plain', 'corr'], default='plain',
+                    help='plain = PairDeformFieldUNet (baseline, does not '
+                         'generalize -- see README Phase 2); corr = '
+                         'CorrPairDeformNet (correlation-layer fix).')
     args = ap.parse_args()
 
     os.makedirs(args.out_dir, exist_ok=True)
@@ -136,7 +141,11 @@ def main():
     val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = PairDeformFieldUNet(base=args.base).to(device)
+    if args.model == 'corr':
+        model = CorrPairDeformNet(base=args.base).to(device)
+    else:
+        model = PairDeformFieldUNet(base=args.base).to(device)
+    print(f'model: {args.model} ({type(model).__name__})', flush=True)
     warp = PixelWarp().to(device)   # noqa: F841 -- available for eval-time use
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
@@ -180,7 +189,8 @@ def main():
         if va < best_val:
             best_val = va
             torch.save({'model': model.state_dict(), 'epoch': ep,
-                        'val_epe': va, 'base': args.base},
+                        'val_epe': va, 'base': args.base,
+                        'model_type': args.model},
                        os.path.join(args.out_dir, 'best.pt'))
             marker = '  *saved*'
         print(f'ep {ep:3d}  train {tr:.3f}  val_epe {va:.3f} px '

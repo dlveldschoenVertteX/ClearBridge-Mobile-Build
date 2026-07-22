@@ -34,6 +34,7 @@ import torch
 from common import (block_coherence, coherence_weighted_blend,
                     ecc_homography_align, orientation_field)
 from continuity_metric import seam_continuity_score
+from corr_deform_net import CorrPairDeformNet
 from deform_net import PairDeformFieldUNet, PixelWarp
 
 _COH_MIN = 0.35   # both-coherent gate for the orientation-agreement metric
@@ -124,7 +125,10 @@ def run_one(cap_dir: str, model, warp) -> dict:
 
 def main(pulled_dir: str, ckpt_path: str) -> None:
     ck = torch.load(ckpt_path, map_location='cpu')
-    model = PairDeformFieldUNet(base=ck.get('base', 24))
+    if ck.get('model_type') == 'corr':
+        model = CorrPairDeformNet(base=ck.get('base', 24))
+    else:
+        model = PairDeformFieldUNet(base=ck.get('base', 24))
     model.load_state_dict(ck['model'])
     model.eval()
     warp = PixelWarp()
