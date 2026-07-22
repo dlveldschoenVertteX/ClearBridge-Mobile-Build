@@ -140,7 +140,14 @@ def main() -> int:
         framework_version='2.3',
         py_version='py311',
         hyperparameters={
-            'manifest': '/opt/ml/input/data/manifest/manifest.json',
+            # SageMaker mounts the 'manifest' channel preserving whatever
+            # filename the S3 object actually has -- hardcoding
+            # 'manifest.json' here previously caused a real
+            # FileNotFoundError (job deform-synth-v3-mac3d-sd302f-od,
+            # 2026-07-22) when the uploaded manifest was named something
+            # else. Derive from args.manifest's own basename instead so
+            # the two can never drift apart.
+            'manifest': f'/opt/ml/input/data/manifest/{args.manifest.rsplit("/", 1)[-1]}',
             'data-root': '/opt/ml/input/data/images',
             'epochs': args.epochs,
             'batch': args.batch,
