@@ -325,6 +325,25 @@ class FrontCaptureController extends ChangeNotifier {
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0;
 
+  // Zoom-to-fill (2026-07-22): compensates for the pad under-filling the
+  // guide at the ALREADY-correct working distance, WITHOUT asking the user
+  // to physically move closer -- physically moving closer is exactly what
+  // this project's own real data (native ridge wavelength -> NFIQ2/
+  // matchability) says to avoid; the guide has been shrunk twice specifically
+  // to push users FARTHER back. Zoom-in-only is deliberate: it recovers
+  // framing without paying the wavelength cost a "move closer" fix would.
+  // Never zooms OUT to fix over-fill -- backing away physically is the
+  // correct (and free) fix there, per the same reasoning in reverse.
+  double _zoomLevel = 1.0;
+  double _maxZoomLevel = 1.0;
+  bool _zoomChangeInFlight = false;
+  int _underfillStreak = 0;
+  bool _zoomEverApplied = false;
+  static const int _underfillStreakThreshold = 8; // ~consecutive frames, not
+      // a single noisy reading -- same hysteresis rationale as
+      // _maxSteadyDegPerSec's gyro smoothing.
+  static const double _zoomStep = 0.15;
+
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   double _gyroMagnitudeDegPerSec = 0.0;
 
@@ -371,6 +390,13 @@ class FrontCaptureController extends ChangeNotifier {
     _appliedEvOffset = 0.0;
     _refocusedThisHold = false;
     _gyroMagnitudeDegPerSec = 0.0;
+    _zoomLevel = 1.0;
+    _maxZoomLevel = 1.0;
+    _underfillStreak = 0;
+    _zoomEverApplied = false;
+    try {
+      _maxZoomLevel = await camera.getMaxZoomLevel();
+    } catch (_) {}
 
     _flash = AdaptiveFlashController(camera);
 
@@ -472,7 +498,13 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
     final tooFar = coverage != null && coverage < _coverageMin;
     final tooClose = coverage != null && coverage > _coverageMax;
-    final hint = tooFar
+    // Try zoom-to-fill before ever telling the user to physically move
+    // closer -- zooming preserves the guided working distance (and the
+    // native ridge wavelength it was tuned for); physically moving closer
+    // does not. Only fall back to the "Move closer" hint once zoom is
+    // already maxed out and genuinely can't help further.
+    final zoomMaxedOut = _maybeAdjustZoom(tooFar);
+    final hint = (tooFar && zoomMaxedOut)
         ? 'Move closer'
         : tooClose
             ? 'Move back slightly'
@@ -631,6 +663,35 @@ class FrontCaptureController extends ChangeNotifier {
         await cam.setExposureOffset(_appliedEvOffset.clamp(min, max));
       }).catchError((_) {}).whenComplete(() => _evChangeInFlight = false);
     }
+  }
+
+  /// Zoom-to-fill: called every frame with the current under-fill reading.
+  /// Only ever zooms IN, only after a sustained (not single-frame) under-fill
+  /// streak, and only up to the device's own max zoom -- see the field
+  /// comments above `_zoomLevel` for why this never zooms back out. Returns
+  /// true once zoom is maxed out and can no longer help (the caller falls
+  /// back to the existing "Move closer" hint at that point).
+  bool _maybeAdjustZoom(bool tooFar) {
+    if (!tooFar) {
+      _underfillStreak = 0;
+      return false;
+    }
+    final atMax = _zoomLevel >= _maxZoomLevel - 0.01;
+    if (atMax) return true;
+    _underfillStreak++;
+    if (_underfillStreak < _underfillStreakThreshold) return false;
+    _underfillStreak = 0;
+    if (_zoomChangeInFlight) return false;
+    final cam = _camera;
+    if (cam == null) return false;
+    final target = (_zoomLevel + _zoomStep).clamp(1.0, _maxZoomLevel);
+    if ((target - _zoomLevel).abs() < 0.01) return false;
+    _zoomChangeInFlight = true;
+    cam.setZoomLevel(target).then((_) {
+      _zoomLevel = target;
+      _zoomEverApplied = true;
+    }).catchError((_) {}).whenComplete(() => _zoomChangeInFlight = false);
+    return false;
   }
 
   static double _lumaSharpness(Uint8List luma, int w, int h) {
@@ -1157,6 +1218,11 @@ class FrontCaptureController extends ChangeNotifier {
         },
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
         'flashEvDebug': _flashEvDebug,
+        'zoomDebug': {
+          'zoomApplied': _zoomEverApplied,
+          'finalZoomLevel': double.parse(_zoomLevel.toStringAsFixed(3)),
+          'maxZoomLevel': double.parse(_maxZoomLevel.toStringAsFixed(3)),
+        },
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
