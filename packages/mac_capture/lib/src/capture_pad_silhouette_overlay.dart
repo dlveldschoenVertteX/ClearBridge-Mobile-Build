@@ -119,11 +119,28 @@ class PadSilhouetteShape {
   /// close" rather than a coincidence.
   /// `guideRegion` is written verbatim from this shape and used directly as
   /// the backend AFIS mask, so this single client-side change is sufficient.
+  // Shrunk a further -15% (2026-07-22, real device test round): the
+  // 2026-07-20 -15% cut (0.23/0.19 -> 0.1955/0.1615) got real NFIQ2 up to
+  // 46 and the CTO again reported "mask still feels big" -- this time
+  // independently corroborated by measurement, not just feel. That
+  // capture's afisMaskCoverPx (607615px) was measured under the
+  // 2048->3200px decode-width bump (2026-07-20), which inflates pixel
+  // COUNT ~2.44x at the same physical/relative size vs. the historical
+  // 2048px-pipeline reference clusters this project's own wavelength/
+  // coverage correlation was built on. Adjusted back (607615/2.44 ≈
+  // 249000px) lands between the established "good/far" cluster (~167000px,
+  // the real 72-scorers) and the "too-close/bad" cluster (~262000px) --
+  // much closer to the bad end, i.e. still held measurably closer than the
+  // capture distance that has produced this project's best real scores.
+  // Same lever as the 2026-07-20 cut, applied again at the same -15%
+  // magnitude (not the full ~18% the area ratio would imply -- this is a
+  // single real data point, not enough to trust an exact target per this
+  // project's own "don't overfit to one sample" discipline).
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.1955,
-    ry: 0.1615,
+    rx: 0.166175,
+    ry: 0.137275,
     taper: 0.20,
   );
 

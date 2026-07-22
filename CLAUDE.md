@@ -1,5 +1,52 @@
 # ClearBridge Mobile — persistent context
 
+## Second real-device test of the hang-fix build: fix confirmed working, mask shrunk again (real data, not just feel), secondary cameras still can't focus (2026-07-22)
+CTO tested the APK built from the previous round's 4 fixes (commit `9b51781`).
+Real capture `cb684c57` (uid `3P9IKtAB8dM3T5HGNEVLSSrDl1y1`, 2026-07-22 13:57
+UTC) reached `status: scored`, real `nfiq2Score: 46` — a real, decent score,
+and **the hang-fix is confirmed working**: `secondaryCameraDebug` shows
+`2_timeout`/`3_timeout: true` instead of the app hanging forever the way it
+did before the 12s-timeout fix — the CTO's "IR cam struggled to focus"
+report is exactly what a clean timeout on an AF-convergence failure looks
+like, not a regression from the fix itself.
+
+**Mask-size complaint independently confirmed by measurement, not just
+feel** (`superprintParams.afisMaskCoverPx: 607615`). That number was
+measured under the 2026-07-20 2048->3200px decode-width bump, which inflates
+pixel COUNT ~2.44x at the same physical/relative size vs. the historical
+2048px-pipeline reference clusters this project's own wavelength/coverage
+correlation was built on. Resolution-adjusted (607615/2.44 ≈ 249000px), it
+lands between the established "good/far" cluster (~167000px, the real
+72-scorers) and the "too-close/bad" cluster (~262000px) — much closer to the
+bad end. **Action**: shrunk `PadSilhouetteShape.defaultShape` a further -15%
+(rx 0.1955->0.166175, ry 0.1615->0.137275; `_scoreRoi` recomputed to match)
+— same lever, same magnitude as the 2026-07-20 cut, not the full ~18% the
+area ratio would imply (n=1 real data point isn't enough to trust an exact
+target, per this project's own discipline).
+
+**Real, currently self-correcting finding, not actioned**: this capture's
+flash-lit burst frames scored Laplacian 15-19 vs. 343-395 on ambient frames
+from the SAME hold (gyro only 1.22°/s, ruling out motion blur) — contrast
+collapse from overexposure, the same "torch blows out an already-decently-
+lit pad" failure mode documented earlier this project, just triggered by
+moderate ambient light rather than close range this time. Self-corrected
+this round (`afisSource` shows `frameIndex: 0`, an ambient frame, won
+selection) so the final print wasn't hurt, but the flash half of this
+capture's burst was dead weight. Not fixed yet — a real next candidate is
+scaling the flash EV step to calibrated ambient brightness instead of a
+fixed `-1.0`, but needs its own dedicated real-data test before changing,
+same standing discipline as everywhere else.
+
+**Secondary-camera AF convergence remains a real, unresolved problem.**
+Added stage-diagnostic instrumentation (`_captureSecondaryBurst` now takes a
+`stageDebug` map, written synchronously before each major await —
+`flash_on`/`exposure_setup`/`focus_setup`/`settle_delay`/`shot_N`/etc. —
+survives even though `.timeout()` doesn't cancel the underlying Future) so
+the NEXT test's `secondaryDebug['<cam>_stuckAt']` will show exactly which
+step the IR/wide camera stalled on, rather than just "timed out" — this
+capture predates that instrumentation, so it's unknown yet whether AF itself
+never converges or a specific `takePicture()` call hangs.
+
 ## CTO device-test round: burst-end lag, no progress cue on secondary cameras, wide-cam capture hang, splash mismatch (2026-07-22)
 Four real-device findings from testing the previous round's APK, all addressed:
 

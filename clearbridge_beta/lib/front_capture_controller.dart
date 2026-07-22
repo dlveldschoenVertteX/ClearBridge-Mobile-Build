@@ -223,11 +223,13 @@ class FrontCaptureController extends ChangeNotifier {
   // ROI the focus/exposure meters score on — aligned to the pad silhouette
   // bounding box so framing, metering and the superprint crop all agree.
   // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper.
-  // Updated 2026-07-20 for the -15% mask shrink (CTO real-device test: guide
-  // too big, thumb still too close):
-  //   cx=0.5, cy=0.37, rx=0.1955*(1+0.20)=0.2346, ry=0.1615
-  //   -> [0.2654,0.2085,0.7346,0.5315]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.2654, 0.2085, 0.7346, 0.5315);
+  // Updated 2026-07-22 for the second -15% mask shrink (real device test:
+  // afisMaskCoverPx on that capture, resolution-adjusted, sits between the
+  // established "good" and "too-close" reference clusters -- see
+  // defaultShape's own docstring for the full derivation):
+  //   cx=0.5, cy=0.37, rx=0.166175*(1+0.20)=0.19941, ry=0.137275
+  //   -> [0.30059,0.232725,0.69941,0.507275]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.3006, 0.2327, 0.6994, 0.5073);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -959,11 +961,19 @@ class FrontCaptureController extends ChangeNotifier {
             // the ENTIRE per-camera exposure/focus/burst sequence in one
             // timeout so a hang here can only ever cost this one camera's
             // data, never the rest of the capture.
-            final paths = await _captureSecondaryBurst(active, desc, basePath)
+            final stageDebug = <String, dynamic>{'stage': 'not_started'};
+            final paths = await _captureSecondaryBurst(active, desc, basePath, stageDebug)
                 .timeout(const Duration(seconds: 12), onTimeout: () {
               debugPrint(
-                  '[front] secondary camera ${desc.name} timed out mid-capture -- skipping');
+                  '[front] secondary camera ${desc.name} timed out mid-capture '
+                  '(stuck at: ${stageDebug['stage']}) -- skipping');
               secondaryDebug['${desc.name}_timeout'] = true;
+              // Last stage entered before the timeout fired -- e.g.
+              // 'settle_delay'/'focus_setup' points at AF convergence never
+              // completing, 'shot_N' points at takePicture() itself hanging.
+              // See _captureSecondaryBurst's docstring for why this survives
+              // even though the underlying Future never resolves.
+              secondaryDebug['${desc.name}_stuckAt'] = stageDebug['stage'];
               return <String>[];
             });
             if (paths.isNotEmpty) {
@@ -1154,11 +1164,23 @@ class FrontCaptureController extends ChangeNotifier {
   /// below) is a raw platform-channel await with no bound of its own, so a
   /// hang on a secondary sensor's native capture session previously stalled
   /// the entire remaining capture forever, not just this one camera.
+  /// `stageDebug` is mutated SYNCHRONOUSLY right before each major await --
+  /// real device test 2026-07-22: both secondary cameras timed out with no
+  /// way to tell whether they stalled on AF convergence, exposure setup, or
+  /// a specific shot's takePicture() call (the CTO separately reported "IR
+  /// cam struggled to focus", consistent with an AF-convergence stall, but
+  /// the raw timeout alone couldn't confirm that). Since `.timeout()` on
+  /// the caller's side doesn't cancel this function -- it just stops
+  /// waiting for it -- a synchronous write immediately before the await
+  /// that ends up hanging is what survives into secondaryDebug even though
+  /// the overall Future never completes in time.
   Future<List<String>> _captureSecondaryBurst(
     CameraController active,
     CameraDescription desc,
     String basePath,
+    Map<String, dynamic> stageDebug,
   ) async {
+    stageDebug['stage'] = 'flash_on';
     await active.setFlashMode(FlashMode.torch);
     // Anti-blowout EV step -- the same -1.0 offset already validated for the
     // main camera's flash burst (see the alternating ambient/flash burst
@@ -1166,6 +1188,7 @@ class FrontCaptureController extends ChangeNotifier {
     // setExposureOffset() does not engage the Camera2 interop that
     // setExposureMode() does, so this is safe to call without risking the
     // torch (see CameraService comments on that conflict).
+    stageDebug['stage'] = 'exposure_setup';
     try {
       final minEv = await active.getMinExposureOffset();
       final maxEv = await active.getMaxExposureOffset();
@@ -1181,6 +1204,7 @@ class FrontCaptureController extends ChangeNotifier {
     // and never converged. Point AF at the frame centre (where the thumb
     // sits) and give it time to converge before the burst; guard each call
     // since some secondary sensors are fixed-focus and will throw.
+    stageDebug['stage'] = 'focus_setup';
     try {
       await active.setFocusPoint(const Offset(0.5, 0.5));
       await active.setFocusMode(FocusMode.auto);
@@ -1191,20 +1215,26 @@ class FrontCaptureController extends ChangeNotifier {
     // Longer settle than the main path: continuous AF on a secondary sensor
     // that just powered on needs time to hunt and lock on the near subject
     // (600ms was too short -- it shot mid-hunt).
+    stageDebug['stage'] = 'settle_delay';
     await Future<void>.delayed(const Duration(milliseconds: 1400));
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
     final paths = <String>[];
     for (var i = 0; i < _secondaryBurstCount; i++) {
+      stageDebug['stage'] = 'shot_$i';
       final shot = await active.takePicture();
+      stageDebug['stage'] = 'shot_${i}_readBytes';
       final bytes = await shot.readAsBytes();
       final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
+      stageDebug['stage'] = 'shot_${i}_upload';
       await _uploadWithRetry(bytes, path);
       paths.add(path);
       if (i < _secondaryBurstCount - 1) {
         await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
       }
     }
+    stageDebug['stage'] = 'flash_off';
     await active.setFlashMode(FlashMode.off);
+    stageDebug['stage'] = 'done';
     return paths;
   }
 
