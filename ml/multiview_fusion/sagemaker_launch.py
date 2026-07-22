@@ -87,7 +87,8 @@ def main() -> int:
         role=args.role_arn,
         instance_type=args.instance_type,
         instance_count=1,
-        framework_version='2.4',
+        framework_version='2.3',   # newest image the pinned sagemaker==2.232.1
+                                   # SDK knows; our code is version-agnostic torch
         py_version='py311',
         hyperparameters={
             'frames-dir': '/opt/ml/input/data/frames',
@@ -107,7 +108,9 @@ def main() -> int:
         output_path=out,
         base_job_name=args.job_name,
     )
-    estimator.fit({'frames': args.frames_s3}, job_name=args.job_name)
+    # wait=False: submit and return -- job progress is polled separately via
+    # describe_training_job rather than blocking this process on a log stream.
+    estimator.fit({'frames': args.frames_s3}, job_name=args.job_name, wait=False)
     print(f'\nSubmitted {args.job_name}\nCheckpoints: {ckpt}\nOutput: {out}')
     return 0
 
