@@ -110,7 +110,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
         s.phase == FrontCapturePhase.capturing ||
         s.phase == FrontCapturePhase.capturingExtra;
 
-    final silhouetteState = s.isCapturingBurst
+    // capturingExtra reads as "capturing" (gold fill) too -- it's still
+    // actively taking shots (secondary cameras / distance-stage-2), not a
+    // settled "locked" state; without this the fill rendered green (whatever
+    // `onTarget` was frozen at from the completed hold) while genuinely new
+    // work was still in progress.
+    final silhouetteState = (s.isCapturingBurst || s.phase == FrontCapturePhase.capturingExtra)
         ? PadSilhouetteState.capturing
         : (s.onTarget ? PadSilhouetteState.locked : PadSilhouetteState.aligning);
 
@@ -121,10 +126,17 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
             : null);
 
     // Same "fills up as capture progresses" cue as the oscillating dial's
-    // scan-fill arc: hold-timer progress before the burst fires, then
-    // per-shot burst progress once it does (CTO real-device feedback
-    // 2026-07-20: front_only_v1 had no equivalent progress indicator).
-    final silhouetteProgress = s.isCapturingBurst ? s.burstProgress : s.holdProgress;
+    // scan-fill arc: hold-timer progress before the burst fires, per-shot
+    // burst progress once it does, then extra-capture progress (secondary
+    // cameras + distance-stage-2) during capturingExtra -- CTO real-device
+    // feedback 2026-07-20/22: front_only_v1 had no progress indicator at
+    // all, and the first fix only covered the main burst, leaving the
+    // wide-lens/IR stage static the whole time.
+    final silhouetteProgress = s.isCapturingBurst
+        ? s.burstProgress
+        : (s.phase == FrontCapturePhase.capturingExtra
+            ? s.extraProgress
+            : s.holdProgress);
 
     return Scaffold(
       backgroundColor: CaptureColors.void_,

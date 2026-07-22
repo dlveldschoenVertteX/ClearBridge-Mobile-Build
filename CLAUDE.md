@@ -1,5 +1,74 @@
 # ClearBridge Mobile — persistent context
 
+## CTO device-test round: burst-end lag, no progress cue on secondary cameras, wide-cam capture hang, splash mismatch (2026-07-22)
+Four real-device findings from testing the previous round's APK, all addressed:
+
+1. **Small lag right at the end of the main burst.** The pad-guide fill ring
+   reached 100% on the last shutter click, then the app went visually silent
+   during the decode+sharpness+re-encode `Future.wait` over all 8 burst
+   frames before "✓ Captured" appeared — read as a freeze. Real, not
+   imagined: this work got measurably heavier after the
+   `_stillDecodeTargetWidth` 2048->3200px bump (2026-07-20, ~2.4x more decode
+   pixels across all 8 frames), plausibly what made an always-present pause
+   newly noticeable. Fix: show an explicit `confirmationText: 'Processing…'`
+   banner for this window (`front_capture_controller.dart`, `_fireBurst`)
+   instead of a silent gap — it naturally gets replaced by the existing
+   `'✓ Captured'` text once decode/encode finishes.
+2. **Wide cam / IR had no progressive fill cue.** `silhouetteProgress` only
+   ever read `burstProgress` (main burst) or `holdProgress` (frozen from
+   before the burst fired) — during `FrontCapturePhase.capturingExtra`
+   (secondary cameras + distance-stage-2), the guide sat static the whole
+   time. Added `FrontCaptureState.extraProgress`, incremented per secondary-
+   camera attempt (success, failure, or timeout all count) and per the
+   distance-stage-2 attempt, wired into `front_capture_screen.dart`'s
+   `silhouetteProgress` when `phase == capturingExtra`. Also made
+   `silhouetteState` read `capturing` (gold fill) rather than whatever
+   `onTarget` was frozen at during this phase, since it's still actively
+   working, not settled.
+3. **Wide cam capture got permanently stuck, never progressed** (real device
+   test, photo not received but description was unambiguous). Root cause,
+   found by re-reading the secondary-camera loop line by line:
+   `svc.initializeCamera(...)` already had an 8s timeout, but NOTHING after
+   it did — `setFlashMode`/exposure/focus calls and, critically,
+   `takePicture()` itself were raw awaits with no bound. If a secondary
+   sensor's native capture session hangs (plausible on a wide-angle lens
+   with different AF/AE convergence behavior than the already-exercised IR
+   sensor, especially given this project's own extensive prior history of
+   camera-session contention on this exact code path), the await never
+   resolves — and since this whole block runs BEFORE the real Firestore
+   write/upload, a hang here blocks the ENTIRE capture forever, not just
+   that one camera's data. Fix: extracted the per-camera exposure/focus/
+   burst sequence into `_captureSecondaryBurst()` and wrapped the whole call
+   in a single `.timeout(12s)` that returns an empty path list on expiry
+   (logged as `secondaryDebug['<cam>_timeout']`) — the loop then moves on
+   instead of hanging. Added the same defensive `.timeout(6s)` to
+   `_captureDistanceBurst`'s `takePicture()` call for the same risk
+   category. Not yet confirmed on the real device that previously got stuck.
+4. **Splash screen didn't resemble the actual reference animation.** The
+   prior pass (2026-07-20) built a plain 900ms fade+scale — a real
+   simplification gap, not a bug: the CTO's reference
+   (`Logo_background_refinement.zip` -> `ClearBridgeReveal.jsx`) is a genuine
+   13s scan-reveal animation (logo entry -> a cyan scan-line sweeps down the
+   medallion revealing a green fingerprint layer top-to-bottom in sync with
+   a 0-100% counter -> a capture-confirm flash + two expanding verification
+   rings -> eyebrow label swaps BIOMETRIC IDENTITY -> SCANNING FINGERPRINT ->
+   IDENTITY VERIFIED -> tagline), never actually built. Rebuilt
+   `splash_screen.dart` as a faithful port of that mechanic, condensed
+   proportionally to ~4.7s (still an app-launch splash, not a 13s block, and
+   the reference's later marketing-copy rows — FOR THE WORKER / BADGE row /
+   etc — trimmed to one tagline line since the feedback was about the
+   *animation*, not the extra copy). New assets `cb-base-nofp.png` (base
+   medallion, no fingerprint) + `cb-fp-masked.png` (green fingerprint reveal
+   layer, revealed via a `CustomClipper` that grows top-to-bottom in sync
+   with the scan line — the Flutter equivalent of the reference's `clipPath:
+   inset(...)` reveal), resized to 640x640 to match the existing
+   `app_logo.png` convention, added to `assets/images/`.
+
+All four fixes are client-side only (`clearbridge_beta/lib/`), no backend
+changes. Not yet device-tested — same standing discipline as every other
+capture-side change this project: needs a real APK build + real device
+confirmation, especially item 3 (the actual reported hang).
+
 ## Real device test of the resolution-bump build: pipeline healthy, secondary-camera fix confirmed working, mask still too big (2026-07-20)
 CTO tested the APK built from the 2048->3200px still-decode resolution bump
 (commit `8f1bb6f`). Real capture `2a85bb36` (uid `K7LNUP7leQO3q2E3rGMufMZx19q2`,
