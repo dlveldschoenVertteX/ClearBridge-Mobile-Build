@@ -1,5 +1,48 @@
 # ClearBridge Mobile — persistent context
 
+## Prime-directive roadmap delivered + distanceStage2 diagnostic instrumentation (2026-07-22)
+CTO asked directly for a prioritized roadmap toward the prime directive
+(real matchability, not NFIQ2). Delivered one grounded in real project
+history + two facts verified fresh this session rather than assumed:
+
+- **RidgeBase dataset**: confirmed via a full CLAUDE.md/docs re-read — the
+  CTO said they'd acquire this 2026-07-17, `ml/fidelity_benchmark/ingest.py`
+  is built and self-tested specifically to consume it, but it has never
+  actually landed. Still the single biggest standing blocker on the whole
+  fidelity axis, alongside the CTO's own ink scan being too weak to
+  discriminate genuine from impostor (bozorth3-vs-ink sits at noise-floor
+  4-7 for everyone, not just the CTO's own finger).
+- **RAW/DNG capture: CLOSED OUT.** Queried Firestore directly across all 26
+  real `front_only_v1` captures — `rawSensorSupport` has never once come
+  back `true` for any camera on any real device. Per this item's own stated
+  gate ("if not, dead on arrival"), this closes the question: no device in
+  the fleet supports it, don't pursue the native RAW/DNG platform-channel
+  effort.
+- **`distanceStage2` ("move closer for a bonus capture") has NEVER
+  succeeded**: queried Firestore directly — 9/9 real attempts show
+  `reachedNearZone: false`. Not a fluke. Real hypothesis found on re-read
+  (not just "threshold is wrong"): `nearThreshold = _coverageMax + 0.05 =
+  0.90` asks users to get CLOSER than an already-successful primary hold
+  (which already requires coverage in [0.35, 0.85]) — but this feature was
+  built 2026-07-16, BEFORE the project's own strongest real finding (native
+  ridge wavelength predicts NFIQ2; the guide mask has since been shrunk
+  TWICE specifically to push users FARTHER away to hit the 9-14px sweet
+  spot). distanceStage2's "closer = more detail" premise may now directly
+  contradict the primary flow's own calibration — the 9/9 failure could be
+  the system correctly resisting a request that would make the capture
+  worse, not a bug.
+
+**CTO chose this as the next concrete step.** Rather than guess and loosen
+the threshold blind, added diagnostic-only instrumentation:
+`_waitForNearDistanceZone` now returns `(reached, maxCoverage)` instead of
+a bare bool, and `distanceDebug` gains `maxCoverageObserved` — the highest
+coverage actually reached during the real 6s window, recorded regardless
+of outcome. The next real capture will show whether users land well short
+of 0.90 (miscalibrated ask / unclear prompt) or right at its edge but run
+out of time (window too short) — turning the next test into real evidence
+instead of another guess. No capture behavior changed, no threshold
+touched yet, per this project's own "measure before tuning" discipline.
+
 ## Second real-device test of the hang-fix build: fix confirmed working, mask shrunk again (real data, not just feel), secondary cameras still can't focus (2026-07-22)
 CTO tested the APK built from the previous round's 4 fixes (commit `9b51781`).
 Real capture `cb684c57` (uid `3P9IKtAB8dM3T5HGNEVLSSrDl1y1`, 2026-07-22 13:57

@@ -1054,8 +1054,17 @@ class FrontCaptureController extends ChangeNotifier {
         if (cam2 != null && !_disposed) {
           distanceDebug['attempted'] = true;
           _apply((s) => s.copyWith(distanceHint: 'Move slightly closer for a bonus capture'));
-          final reachedNear = await _waitForNearDistanceZone(cam2);
+          final nearResult = await _waitForNearDistanceZone(cam2);
+          final reachedNear = nearResult.reached;
           distanceDebug['reachedNearZone'] = reachedNear;
+          // Diagnostic only (2026-07-22): real Firestore data showed this
+          // stage has NEVER succeeded across 9 real attempts. Recording how
+          // close users actually got vs. nearThreshold (_coverageMax + 0.05
+          // = 0.90) tells us whether that's a miscalibrated/unclear ask or
+          // users are landing right at the edge and just running out of
+          // the 6s window -- see _waitForNearDistanceZone's docstring.
+          distanceDebug['maxCoverageObserved'] =
+              double.parse(nearResult.maxCoverage.toStringAsFixed(3));
           if (reachedNear) {
             await _refocus();
             final frames = await _captureDistanceBurst(
@@ -1265,15 +1274,28 @@ class FrontCaptureController extends ChangeNotifier {
   /// in _refocus() once this returns true. Never throws; a bounded timeout
   /// (or any stream error) resolves false so this stage can never hang or
   /// block the primary capture result already sitting in Firestore.
-  Future<bool> _waitForNearDistanceZone(CameraController cam) async {
+  ///
+  /// Returns (reached, maxCoverage) rather than a bare bool -- real
+  /// Firestore data showed this stage has NEVER once succeeded across 9
+  /// real attempts (2026-07-22 analysis). `maxCoverage` is the highest
+  /// coverage actually observed during the window, recorded into
+  /// distanceDebug regardless of outcome, so the NEXT real capture tells us
+  /// whether users are landing well short of `nearThreshold` (miscalibrated
+  /// threshold / unclear prompt) or right at its edge but running out of
+  /// time (window too short) -- rather than continuing to guess. Diagnostic
+  /// only: does not change capture behavior.
+  Future<({bool reached, double maxCoverage})> _waitForNearDistanceZone(
+      CameraController cam) async {
     const timeout = Duration(seconds: 6);
     const nearThreshold = _coverageMax + 0.05;
     final completer = Completer<bool>();
     var streaming = false;
+    var maxCoverage = 0.0;
     void onFrame(CameraImage image) {
       if (completer.isCompleted) return;
       try {
         final coverage = HybridCaptureService.meanLuma(image, roi: _scoreRoi) / 255.0;
+        if (coverage > maxCoverage) maxCoverage = coverage;
         final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
         if (coverage > nearThreshold && steady) completer.complete(true);
       } catch (_) {}
@@ -1281,9 +1303,10 @@ class FrontCaptureController extends ChangeNotifier {
     try {
       await cam.startImageStream(onFrame);
       streaming = true;
-      return await completer.future.timeout(timeout, onTimeout: () => false);
+      final reached = await completer.future.timeout(timeout, onTimeout: () => false);
+      return (reached: reached, maxCoverage: maxCoverage);
     } catch (_) {
-      return false;
+      return (reached: false, maxCoverage: maxCoverage);
     } finally {
       if (streaming) {
         try {
