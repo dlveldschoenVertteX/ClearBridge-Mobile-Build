@@ -1,8 +1,8 @@
 # Multi-view fusion + flash enhancement — isolated R&D track
 
-## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO (2026-07-22). NOT wired into
-production. NOT merged into `front_only_v1`. Lives entirely on
-`claude/multiview-fusion-blend-experiment`.
+## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO, Phase 2 (learned model) in
+progress (2026-07-22). NOT wired into production. NOT merged into
+`front_only_v1`. Lives entirely on `claude/multiview-fusion-blend-experiment`.
 
 ## Why this exists
 
@@ -275,3 +275,58 @@ real examples (same architecture family as `ml/deform_correct/`) — a much
 larger real-GPU-training commitment than anything tried so far in this
 branch, not a quick follow-up. Recommend a direct go/no-go conversation with
 the CTO before starting that, rather than building it speculatively.
+
+## Phase 2 (learned pair-deformation model, 2026-07-22) — design + why it
+can succeed where the classical estimators couldn't
+
+All three classical correspondence methods failed for the same underlying
+reason: estimating deformation fresh from ONE noisy real pair is
+underdetermined — periodic texture aliases NCC, minutiae density creates
+chance matches, and no per-pair estimator has a prior for "what real skin
+deformation looks like." A learned model changes the problem: train on
+thousands of pairs where the true deformation is KNOWN, so the network
+internalizes the prior and applies it to real pairs in one shot.
+
+**The supervision trick** (`synth_multiview.py`): take a real frame `R`,
+draw a random smooth residual flow `g`, synthesize `front(p) = R(p+g(p))`
+— the flow warping `R`-as-side into the front is then EXACTLY `g` by
+construction, no field inversion. The residual family models what remains
+AFTER production ECC alignment (small affine residual + multi-scale
+elastic, range includes zero so identity is in-distribution). Photometric
+jitter (smooth illumination-gradient gain fields — the moving-torch
+effect — plus gamma/contrast/blur/noise) is applied INDEPENDENTLY per
+view, forcing the net to match ridge STRUCTURE, not intensity — precisely
+the axis NCC failed on.
+
+**Contract decisions** (`deform_net.py`):
+- 2-channel pair input (front + ECC-registered side): both exist live at
+  inference here, unlike `ml/deform_correct/`'s single-image constraint —
+  standard VoxelMorph-style pair registration, a strictly easier task.
+- Flow in PIXELS with per-size grid conversion (`PixelWarp`): trains on
+  256px crops (preserving native ridge scale — crops, never resizes),
+  runs fully-convolutionally on 912px frames meaning the same physical
+  displacement — avoiding the normalized-unit scale trap that invalidated
+  the first deform-correct v2 evaluation (CLAUDE.md 2026-07-18).
+- Zero-init tanh-capped flow head (±24px): an undertrained checkpoint
+  degrades gracefully to identity, never scrambles ridges.
+
+**Training** (`train_pair.py`): direct supervised L1 end-point-error
+against the exact ground-truth flow (the structural advantage over both
+the classical estimators and deform_correct's unsupervised orientation
+loss) + small smoothness term. Subject-disjoint user split; deterministic
+val pairs; identity-baseline EPE (= mean |g|) reported every epoch — val
+EPE must land well below it for learning to be real. Verified before
+training: synthesis↔PixelWarp convention consistency (0.1 grey-level MAE
+reconstructing the synthetic front by warping the side with the gt flow).
+
+**Data**: 313 real frames, 26 users, pulled via `pull_training_frames.py`
+(schema-drift-robust recursive Storage-path scan over capture docs — all
+capture modes usable, since synthesis needs only single frames).
+
+**Go/no-go** (`run_phase2.py`): the REAL gate is real front/side pairs,
+not synthetic val. Two metrics: (1) direct overlap orientation agreement
+between front and corrected side (dense, paired, pre-blend — sharper than
+the seam metric, which lost its control band on 2/4 captures in earlier
+phases); (2) the same seam-continuity metric as Phases 0/1 for
+comparability. Result to be reported honestly either way, as with every
+phase in this branch.
