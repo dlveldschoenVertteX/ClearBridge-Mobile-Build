@@ -1,8 +1,8 @@
 # Multi-view fusion + flash enhancement — isolated R&D track
 
-## Status: Phase 0 NO-GO (2026-07-22), root cause identified, real next step
-proposed below. NOT wired into production. NOT merged into `front_only_v1`.
-Lives entirely on `claude/multiview-fusion-blend-experiment`.
+## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO (2026-07-22). NOT wired into
+production. NOT merged into `front_only_v1`. Lives entirely on
+`claude/multiview-fusion-blend-experiment`.
 
 ## Why this exists
 
@@ -217,3 +217,61 @@ true correspondence from noise in a way a fresh per-pair classical estimate
 cannot. Recommend (a) next, since it's far cheaper to test and doesn't
 depend on ever solving the correspondence problem this section just spent
 two rounds failing to solve.
+
+## Phase 1 (`seam_composite.py`, 2026-07-22) — MIXED, not a clear win either
+
+Tried (a) above directly on top of ECC-only alignment (no local correction —
+that's dead per above). Before reusing OpenCV's own stitching seam finders
+(`cv2.detail_DpSeamFinder`, `cv2.detail_GraphCutSeamFinder` — both confirmed
+available, `cv2` 4.10.0) as-is, checked the assumption they're built on:
+real panorama seam-finding assumes each source's "locally better" region is
+a large, roughly bipartite area (e.g. left half vs. right half). **Measured
+this directly first**: per-row, which of front/side has higher local
+`block_coherence` flips 7-23 times per row on real data (not a single clean
+left/right split), and handing `cv2.detail_DpSeamFinder` the raw full-
+overlap masks gave a degenerate result — it assigned the ENTIRE frame to one
+source and nothing to the other, no real cut at all. A single-seam DP/graph-
+cut model assumes exactly the large-coherent-region structure this data
+doesn't have.
+
+**Adapted instead**: `seam_composite()` uses front's own local coherence
+weakness (vs. each ECC-registered side) to define candidate substitution
+regions, drops small/speckled candidates via connected-component area
+filtering (`_MIN_BLOB_AREA_PX=400` — collapses the per-pixel speckle into a
+handful of real regions), and feathers only a narrow band
+(`_FEATHER_BAND_PX=10`) around each surviving region's boundary — hard
+partition + narrow feather, instead of the OLD `coherence_weighted_blend`'s
+whole-frame weighted average.
+
+**Confirmed real, substantial substitution happens** (not a no-op): 25-54%
+of the frame was substituted across the 4 real test captures. **Measured
+result vs. the OLD whole-frame blend, same `seam_continuity_score` metric**:
+
+| capture | OLD (whole-frame blend) | NEW (seam-routed) |
+|---|---|---|
+| `3edf5455` | 1.080 | **1.042** (slightly better) |
+| `7f53940f` | 0.540 | **1.040** (worse) |
+| `2927b6bd` | n/a (no control band) | 1.097 |
+| `b615e6e7` | n/a (no control band) | 1.155 |
+
+Paired result (the 2 captures where both arms have a valid ratio): NEW
+better on 1/2, worse on 1/2 — no clear win. Both of the unpaired NEW ratios
+sit modestly above 1 (seam ~4-16% worse than the front-only control band,
+not dramatically so — nowhere near the ~2x regressions Phase 0's TPS attempt
+produced, but not an improvement either).
+
+**Conclusion**: seam-routed compositing, adapted to this data's actual
+(non-bipartite) quality-difference pattern, does not clearly beat the
+already-shipped whole-frame coherence blend on real seam-continuity — it's
+roughly comparable, mixed capture-to-capture. **This is now three real,
+independently-measured negative-to-mixed results in this branch** (NCC
+block-matching, minutiae correspondence, seam-routed compositing), on top
+of the original 2026-07-12 small-roll NO-GO — a second, differently-
+implemented confirmation that classical/moderate-effort multi-view fusion
+techniques don't reliably fix this architecture's ridge-continuity problem
+on real MAC3D-style captures. The one lever left genuinely untried is Phase
+2: a **learned** per-pair deformation/compositing model trained on many
+real examples (same architecture family as `ml/deform_correct/`) — a much
+larger real-GPU-training commitment than anything tried so far in this
+branch, not a quick follow-up. Recommend a direct go/no-go conversation with
+the CTO before starting that, rather than building it speculatively.
