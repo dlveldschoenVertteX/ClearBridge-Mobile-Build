@@ -155,3 +155,65 @@ side frame, correspond by nearest-neighbor-in-position-and-orientation within
 a small radius, fit TPS to the surviving minutiae pairs instead of a dense
 grid) — a genuinely different, not-yet-tried correspondence method, before
 concluding the whole local-correction direction is a dead end.
+
+## Minutiae-based correspondence (`minutiae_align.py`, 2026-07-22) — ALSO
+NO-GO, same failure signature via a genuinely different method
+
+Built exactly the proposed next step: `common.gabor_binarize()` (a port of
+`afis_print.generate()`'s default Gabor+binarize chain — confirmed necessary
+first, since mindtct detects **zero** minutiae on a raw fingerphoto and 406
+on the same capture after this chain) feeds `mindtct -m1` on both the front
+anchor and each ECC-registered side frame, correspondence by greedy nearest-
+neighbor gated on BOTH position (`_MATCH_RADIUS_PX`) and ridge-angle
+agreement (`_MATCH_ANGLE_DEG`) — a genuinely different method from dense NCC
+block-matching, since minutiae are sparse discrete points, not generic image
+patches, and shouldn't be fooled by ridge periodicity the same way.
+
+**Measured the same failure signature, via a different mechanism.** Re-ran
+the radius-scaling diagnostic (same test as Phase 0's decisive experiment,
+now on minutiae): median match displacement again scaled almost linearly
+with the match radius (R=10/15/20/30/45 -> median disp 8.1/10.3/12.9/20.2/
+28.4px) instead of converging to a stable small value. Root cause here is
+different from the NCC case but equally real: real minutiae density on
+these captures (~400 over a ~900x900px pad) gives an *expected* ~1.4 chance
+candidates within a 30px radius purely from density, regardless of whether
+any of them is the true corresponding point — a greedy nearest-neighbor
+match with no global consistency constraint can't tell a real correspondence
+from a nearby chance one at this density.
+
+**Added the standard remedy and it still failed**: fit `cv2.estimateAffine
+Partial2D(..., method=cv2.RANSAC)` on top of the raw greedy matches to keep
+only a geometrically-CONSISTENT subset (real correspondences from the same
+finger should share one locally-affine transform; chance matches should not).
+On the same real pair, RANSAC found only **8 inliers out of 121** raw
+matches even at a generous 5px reprojection threshold — i.e. no strong
+consensus exists among these matches at all, and the few "inliers" RANSAC
+did accept still spanned 6-32px displacement, not a tight cluster.
+
+**Conclusion**: three independent correspondence methods now fail the same
+way on this real data — dense NCC block-matching (periodicity aliasing),
+minutiae nearest-neighbor (density-driven chance matching), and RANSAC-
+filtered minutiae (no geometric consensus to filter toward). This is no
+longer plausibly a single implementation bug; it's evidence that **classical,
+per-pair point correspondence cannot reliably recover local elastic
+deformation from these front/side view pairs** — likely because the true
+residual misalignment after ECC is either small and swamped by minutiae-
+detection noise between two different photos of deformable skin under
+different lighting/angle, or genuinely large and non-smooth in a way a
+sparse point-correspondence estimate (with no learned prior) can't safely
+disambiguate from noise on this little real data per pair.
+
+**This rules out any classical local-TPS-correction approach for this
+architecture, not just the two correspondence methods tried.** The two
+remaining honest options, neither yet started: (a) skip local geometric
+correction entirely and go straight to **seam-routed compositing** (Phase 1's
+technique) on top of the existing ECC-only alignment — since routing the
+blend seam through low-disagreement regions doesn't require solving
+correspondence at all, it might still reduce visible discontinuity even
+without a working local correction step; or (b) a **learned** per-pair
+deformation model (Phase 2, `ml/deform_correct/`'s own architecture family)
+trained on many real examples, since a network can learn to disambiguate
+true correspondence from noise in a way a fresh per-pair classical estimate
+cannot. Recommend (a) next, since it's far cheaper to test and doesn't
+depend on ever solving the correspondence problem this section just spent
+two rounds failing to solve.
