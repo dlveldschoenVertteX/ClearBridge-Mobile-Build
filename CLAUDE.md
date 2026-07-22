@@ -1,5 +1,73 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the resolution-bump build: pipeline healthy, secondary-camera fix confirmed working, mask still too big (2026-07-20)
+CTO tested the APK built from the 2048->3200px still-decode resolution bump
+(commit `8f1bb6f`). Real capture `2a85bb36` (uid `K7LNUP7leQO3q2E3rGMufMZx19q2`,
+2026-07-20 15:04 UTC) landed `status: scored`, real `nfiq2Score: 72` — matches
+the historical best (same as `c34911b5`/`3e54236a` under the OLD 2048px
+pipeline), confirming the bigger decode didn't break anything. **Bonus
+confirmation**: `secondaryCameraDebug` shows `2_ok`/`3_ok: true` with real
+`secondaryCameras` paths present — the 2026-07-16 Firestore-rules fix for this
+data is definitively working in production now, on a fresh real capture.
+
+**Honest caveat on "did the resolution bump help":** no controlled comparison
+exists (different real user/subject than the CTO's own ink-scan-referenced
+finger, no paired before/after of the identical physical capture). What IS
+observable: this capture's `afisWavelengthPx` read 15.0 vs. two historical
+72-scorers' 9.0/11.0 under the old 2048px pipeline — expected, since more
+decode pixels naturally read a higher raw pixel-wavelength for the same
+physical ridge spacing (freq_normalize compensates downstream). Not proof the
+change helped, but proof it's at least neutral — same top-tier score,
+pipeline handled the new resolution regime gracefully.
+
+**Real, actionable finding from this same test round**: wl=15 sits right at
+the edge of this project's own established >=15px "catastrophic" correlation
+— and the CTO independently reported "thumb still too close" on this exact
+test. Directly corroborates each other. **Action taken**: shrunk the guide
+-15% (see below) rather than treating the resolution bump and the mask-size
+complaint as unrelated.
+
+## CTO device-test round: mask -15%, secondary-camera audio, capture-progress fill ring, refined splash logo (2026-07-20)
+Four real-device findings from testing the resolution-bump APK, all
+addressed same-session:
+
+1. **Guide mask still too big, thumb still too close.** Shrunk `PadSilhouetteShape.defaultShape` -15% (rx 0.23->0.1955, ry 0.19->0.1615;
+   `_scoreRoi` in `front_capture_controller.dart` recomputed to match — kept
+   1:1 per the shape's own docstring contract). Same lever, same direction as
+   the 2026-07-18 revert, taken further — corroborated by this same test
+   round's real wl=15 data point (see above).
+2. **No audio confirmation on secondary-camera (IR/wide) captures.** The main
+   burst already played a success chime via the existing
+   `CaptureAudioService` (`just_audio`-backed, pre-generated WAV assets,
+   already wired for the oscillating flow) — but each secondary camera's own
+   capture in `front_capture_controller.dart` had zero audio feedback. Added
+   `_audio.playAngleSuccess(isFinal: false)` right after each secondary
+   camera's burst completes.
+3. **No capture-progress indicator on the guide, unlike the oscillating dial's
+   scan-fill arc.** `CapturePadSilhouetteOverlay`/`_PadSilhouettePainter`
+   gained a `progress` parameter that traces a partial arc along the pad's
+   OWN boundary path (`Path.computeMetrics()`/`extractPath()`, gold while
+   capturing, green once the hold locks) rather than a separate circular
+   ring — visually consistent with the pad shape itself. Driven by a new
+   `FrontCaptureState.burstProgress` (per-shot fraction during the burst),
+   falling back to the existing `holdProgress` before the burst fires —
+   same two-phase pattern the oscillating dial already uses.
+4. **Splash screen replaced with the refined brand assets** (CTO-provided
+   zip, `Logo_background_refinement.zip`): confirmed the new
+   `clearbridge-logo-circular.png` is the same badge design as the existing
+   `app_logo.png`, just a higher-fidelity render (crisper metal/fingerprint
+   texture) — replaced in place (resized 640x640, ~620KB) since both the
+   splash and the thank-you screen share this one asset file. Gave the
+   splash a brief fade/scale-in reveal + "BIOMETRIC IDENTITY" tagline beat
+   matching the provided animated-reveal concept's key beats, condensed to
+   ~2.2s total — the source asset was a ~13s marketing animation (logo ->
+   scanning-fingerprint sweep with a percentage counter -> "Police clearance
+   in 2-5 hours" tagline), deliberately NOT reproduced verbatim since that
+   far exceeds what an app-launch splash should ever block a cold start for.
+
+All four changes are UI/client-side only, no backend changes, committed
+together (`551beee`). Not yet device-tested.
+
 ## Frequency-floor relaxation hypothesis TESTED on the real production pipeline and REFUTED — keep `_FREQ_SCALE_MIN=0.7` as-is (2026-07-19)
 Per the CTO's "validate it, act as CTO" ask, followed up on the scale-
 normalization finding above with a properly controlled test: real raw
