@@ -105,14 +105,25 @@ class PadSilhouetteShape {
   /// the >=17px zone that scores catastrophic NFIQ2 -- every capture at wl>=17
   /// scored 5-9, while wl 9-14 scored 72. Holding farther (smaller guide)
   /// fixes BOTH the original clipping complaint (a smaller pad can't clip) AND
-  /// the wavelength. CTO independently asked to revert to the 72-capture size.
+  /// the wavelength.
+  /// -> SHRUNK -15% to 0.1955/0.1615 (2026-07-20, CTO real-device test:
+  /// "fingerprint mask is too big, thumb is still too close"). Same lever as
+  /// the 2026-07-18 revert, taken further in the same direction: a real
+  /// device test on the resolution-bump build again reported the thumb held
+  /// too close, and a smaller opening is what forces users farther back (a
+  /// bigger opening only invites getting closer to fill it, never the
+  /// reverse). Consistent with real Firestore data from that same test
+  /// session (capture `2a85bb36`, still at the pre-shrink size): native ridge
+  /// wavelength 15px -- right at the edge of the >=15px bad zone this
+  /// project's own correlation already established -- backing "still too
+  /// close" rather than a coincidence.
   /// `guideRegion` is written verbatim from this shape and used directly as
   /// the backend AFIS mask, so this single client-side change is sufficient.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.23,
-    ry: 0.19,
+    rx: 0.1955,
+    ry: 0.1615,
     taper: 0.20,
   );
 
@@ -169,17 +180,26 @@ class CapturePadSilhouetteOverlay extends StatelessWidget {
     this.state = PadSilhouetteState.aligning,
     this.hint,
     this.shape = PadSilhouetteShape.defaultShape,
+    this.progress = 0.0,
   });
 
   final PadSilhouetteState state;
   final String? hint;
   final PadSilhouetteShape shape;
+  /// 0..1 capture-progress fill traced around the pad outline, starting at
+  /// the tip and sweeping clockwise -- the same "fills up around the guide
+  /// as capture progresses" cue the oscillating dial's scan-fill arc gives
+  /// (CTO real-device feedback 2026-07-20: front_only_v1 had no equivalent).
+  /// 0 draws nothing; the base outline is unaffected either way.
+  final double progress;
 
   @override
   Widget build(BuildContext context) {
     return IgnorePointer(
       child: CustomPaint(
-        painter: _PadSilhouettePainter(state: state, hint: hint, shape: shape),
+        painter: _PadSilhouettePainter(
+          state: state, hint: hint, shape: shape, progress: progress,
+        ),
         child: const SizedBox.expand(),
       ),
     );
@@ -193,11 +213,13 @@ class _PadSilhouettePainter extends CustomPainter {
     required this.state,
     required this.shape,
     this.hint,
+    this.progress = 0.0,
   });
 
   final PadSilhouetteState state;
   final PadSilhouetteShape shape;
   final String? hint;
+  final double progress;
 
   Color get _accent {
     switch (state) {
@@ -259,6 +281,38 @@ class _PadSilhouettePainter extends CustomPainter {
         ..strokeWidth = 10
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 9),
     );
+
+    // Capture-progress fill: a bright arc traced along the pad's own
+    // boundary (not a separate circle) starting at the tip and sweeping
+    // clockwise, growing with [progress] -- the same "fills up as capture
+    // progresses" cue the oscillating dial's scan-fill arc already gives.
+    if (progress > 0) {
+      final metrics = pad.computeMetrics().toList();
+      if (metrics.isNotEmpty) {
+        final metric = metrics.first;
+        final fillLen = metric.length * progress.clamp(0.0, 1.0);
+        final fillPath = metric.extractPath(0, fillLen);
+        final fillColor =
+            state == PadSilhouetteState.capturing ? CaptureColors.gold : CaptureColors.success;
+        canvas.drawPath(
+          fillPath,
+          Paint()
+            ..color = fillColor
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 6
+            ..strokeCap = StrokeCap.round,
+        );
+        canvas.drawPath(
+          fillPath,
+          Paint()
+            ..color = fillColor.withValues(alpha: 0.5)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 14
+            ..strokeCap = StrokeCap.round
+            ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 8),
+        );
+      }
+    }
 
     // Core-target marker: a small concentric ring at the spot where the user
     // should seat the DENSE RIDGE CORE (the print's swirl), toward the tip
@@ -364,5 +418,8 @@ class _PadSilhouettePainter extends CustomPainter {
 
   @override
   bool shouldRepaint(_PadSilhouettePainter old) =>
-      old.state != state || old.hint != hint || old.shape != shape;
+      old.state != state ||
+      old.hint != hint ||
+      old.shape != shape ||
+      old.progress != progress;
 }

@@ -120,6 +120,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
             ? (s.isSteady ? 'Align your thumb and hold still' : null)
             : null);
 
+    // Same "fills up as capture progresses" cue as the oscillating dial's
+    // scan-fill arc: hold-timer progress before the burst fires, then
+    // per-shot burst progress once it does (CTO real-device feedback
+    // 2026-07-20: front_only_v1 had no equivalent progress indicator).
+    final silhouetteProgress = s.isCapturingBurst ? s.burstProgress : s.holdProgress;
+
     return Scaffold(
       backgroundColor: CaptureColors.void_,
       body: Stack(
@@ -134,6 +140,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
                 child: CapturePadSilhouetteOverlay(
                   state: silhouetteState,
                   hint: silhouetteHint,
+                  progress: silhouetteProgress,
                 ),
               ),
             )

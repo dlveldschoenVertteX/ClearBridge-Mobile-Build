@@ -40,6 +40,7 @@ class FrontCaptureState {
     this.onTarget = false,
     this.holdProgress = 0.0,
     this.isCapturingBurst = false,
+    this.burstProgress = 0.0,
     this.uploadProgress = 0.0,
     this.captureId,
     this.error,
@@ -53,6 +54,12 @@ class FrontCaptureState {
   final bool onTarget;
   final double holdProgress;
   final bool isCapturingBurst;
+  // Fraction of the main burst fired so far (0..1) -- drives the pad-guide
+  // fill animation during FrontCapturePhase.capturing, same "fills up as
+  // capture progresses" cue the oscillating dial's scan-fill arc already
+  // gives (CTO real-device feedback 2026-07-20: front_only_v1 had no
+  // equivalent progress indicator).
+  final double burstProgress;
   final double uploadProgress;
   final String? captureId;
   final String? error;
@@ -72,6 +79,7 @@ class FrontCaptureState {
     bool? onTarget,
     double? holdProgress,
     bool? isCapturingBurst,
+    double? burstProgress,
     double? uploadProgress,
     Object? captureId = _sentinel,
     Object? error = _sentinel,
@@ -85,6 +93,7 @@ class FrontCaptureState {
         onTarget: onTarget ?? this.onTarget,
         holdProgress: holdProgress ?? this.holdProgress,
         isCapturingBurst: isCapturingBurst ?? this.isCapturingBurst,
+        burstProgress: burstProgress ?? this.burstProgress,
         uploadProgress: uploadProgress ?? this.uploadProgress,
         captureId: identical(captureId, _sentinel) ? this.captureId : captureId as String?,
         error: identical(error, _sentinel) ? this.error : error as String?,
@@ -204,9 +213,12 @@ class FrontCaptureController extends ChangeNotifier {
 
   // ROI the focus/exposure meters score on — aligned to the pad silhouette
   // bounding box so framing, metering and the superprint crop all agree.
-  // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper:
-  //   cx=0.5, cy=0.37, rx=0.23*(1+0.20)=0.276, ry=0.19 → [0.224,0.18,0.776,0.56]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.224, 0.18, 0.776, 0.56);
+  // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper.
+  // Updated 2026-07-20 for the -15% mask shrink (CTO real-device test: guide
+  // too big, thumb still too close):
+  //   cx=0.5, cy=0.37, rx=0.1955*(1+0.20)=0.2346, ry=0.1615
+  //   -> [0.2654,0.2085,0.7346,0.5315]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.2654, 0.2085, 0.7346, 0.5315);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -612,6 +624,7 @@ class FrontCaptureController extends ChangeNotifier {
     _apply(
       (s) => s.copyWith(
         isCapturingBurst: true,
+        burstProgress: 0.0,
         phase: FrontCapturePhase.capturing,
       ),
       force: true,
@@ -669,6 +682,10 @@ class FrontCaptureController extends ChangeNotifier {
         } catch (e) {
           debugPrint('[front] burst shot $i failed (non-fatal): $e');
         }
+        _apply(
+          (s) => s.copyWith(burstProgress: (i + 1) / _burstFrameCount),
+          force: true,
+        );
         if (i < _burstFrameCount - 1) {
           await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
         }
@@ -935,6 +952,12 @@ class FrontCaptureController extends ChangeNotifier {
             await active.setFlashMode(FlashMode.off);
             secondaryMeta.add({'name': desc.name, 'paths': paths});
             secondaryDebug['${desc.name}_ok'] = true;
+            // Audio confirmation per camera -- CTO real-device feedback
+            // 2026-07-20: only the main burst had a success chime
+            // (playAngleSuccess above in _fireBurst), so a user had no
+            // feedback that each secondary camera's own capture actually
+            // completed during the silent "capturingExtra" phase.
+            unawaited(_audio.playAngleSuccess(isFinal: false));
             if (svc == null) {
               try {
                 await active.dispose();
