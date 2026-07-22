@@ -251,10 +251,38 @@ class FrontCaptureController extends ChangeNotifier {
 
   static const double _glareHighLuma = 205.0;
   static const double _glareEvStep = -0.7;
-  // Extra EV reduction applied when the torch fires at close range (~10 cm).
-  // Flash overexposure killed NFIQ on the first real capture — the pad centre
-  // blew out completely. -1.0 EV at close range keeps ridges in the histogram.
-  static const double _flashEvStep = -1.0;
+  // Adaptive flash EV step (2026-07-22): the fixed -1.0 this replaces was
+  // sized off the FIRST real overexposure capture, then never revisited —
+  // but a later real capture (cb684c57) showed the opposite failure at a
+  // DIFFERENT ambient level: flash frames scored Laplacian 15-19 vs 343-395
+  // on ambient frames from the SAME hold (gyro only 1.22°/s, ruling out
+  // motion blur) — contrast collapse from the torch adding on top of
+  // already-decent ambient light, the fixed -1.0 wasn't enough headroom at
+  // that brightness. A single constant can't be right for both a
+  // near-pitch-dark hold (torch is the ONLY light — a big EV cut there
+  // needlessly darkens the one useful frame) and a bright-normal hold
+  // (torch competes with substantial existing light — under-cutting risks
+  // exactly cb684c57's blowout). Scale off AdaptiveFlashController's own
+  // already-calibrated `intensity` (the fraction of exposure the torch
+  // itself contributes, derived from the session's one-time ambient
+  // calibration) instead of guessing a second fixed constant.
+  //
+  // Endpoints are a first-cut, physically-reasoned curve, NOT fit to real
+  // data (n=1 real overexposure case is not enough to calibrate a curve
+  // from) — same "needs its own dedicated real-data test" caveat this
+  // item carried before being built. Needs a real device round to confirm
+  // before tuning further.
+  static const double _flashEvMinCut = -0.3; // intensity=1.0 (pitch dark: torch is
+                                              // the sole light source, minimal cut needed)
+  static const double _flashEvMaxCut = -1.6; // intensity=0.3 (near the bright-mode
+                                              // threshold: torch adds on top of
+                                              // substantial ambient, needs the most cut)
+  double _adaptiveFlashEvStep() {
+    final intensity = (_flash?.intensity ?? 0.6).clamp(0.3, 1.0);
+    final t = (1.0 - intensity) / 0.7; // 0 at intensity=1.0, 1 at intensity=0.3
+    return _flashEvMinCut + (_flashEvMaxCut - _flashEvMinCut) * t;
+  }
+
   static const double _coverageMin = 0.35;
   static const double _coverageMax = 0.85;
 
@@ -265,6 +293,13 @@ class FrontCaptureController extends ChangeNotifier {
   // distance or exposure. First-cut threshold; tune from real telemetry
   // (gyroMagnitudeDegPerSec is stored per-frame below).
   static const double _maxSteadyDegPerSec = 6.0;
+
+  // Diagnostic snapshot of _adaptiveFlashEvStep()'s inputs/output for the
+  // burst just fired -- written to the capture doc so the next real device
+  // round gives concrete evidence on whether this first-cut curve is sane,
+  // same "measure before tuning further" discipline as every other capture
+  // parameter in this file.
+  Map<String, dynamic> _flashEvDebug = {};
 
   CameraController? _camera;
   CameraService? _cameraService;
@@ -643,6 +678,12 @@ class FrontCaptureController extends ChangeNotifier {
 
     final cam = _camera;
     final torchCapable = _flash?.isNeeded ?? false;
+    final flashEvStep = _adaptiveFlashEvStep();
+    _flashEvDebug = {
+      'evStep': double.parse(flashEvStep.toStringAsFixed(3)),
+      'flashIntensity': _flash?.intensity,
+      'flashMode': _flash?.modeName,
+    };
 
     double? minEv, maxEv;
     if (torchCapable) {
@@ -670,7 +711,7 @@ class FrontCaptureController extends ChangeNotifier {
           if (wantFlash) {
             await _flash!.activate();
             if (minEv != null && maxEv != null) {
-              final target = _appliedEvOffset + _flashEvStep;
+              final target = _appliedEvOffset + flashEvStep;
               await cam.setExposureOffset(target.clamp(minEv, maxEv));
             }
             await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
@@ -1115,6 +1156,7 @@ class FrontCaptureController extends ChangeNotifier {
           'tipAngleDeg': tipAngleDeg,
         },
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
+        'flashEvDebug': _flashEvDebug,
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
@@ -1345,7 +1387,7 @@ class FrontCaptureController extends ChangeNotifier {
         if (wantFlash) {
           await _flash!.activate();
           if (minEv != null && maxEv != null) {
-            await cam.setExposureOffset((_appliedEvOffset + _flashEvStep).clamp(minEv, maxEv));
+            await cam.setExposureOffset((_appliedEvOffset + _adaptiveFlashEvStep()).clamp(minEv, maxEv));
           }
           await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
         } else {
