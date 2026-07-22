@@ -74,11 +74,56 @@ distance** — past that it goes blurry, not sharper. So the levers are:
 1. **Disable computational photography / "AI" beautification.** The 50MP "AI"
    pipeline may smooth/denoise skin — which *erases fine ridges*. Capture in the
    most "raw"/pro mode the camera exposes; measure ridge energy with AI on vs off.
+   **Status (2026-07-22): not built, no Phase-0 probe yet.** Needs a native
+   `CaptureRequest.NOISE_REDUCTION_MODE`/`EDGE_MODE=OFF` override — no cheap
+   read-only characteristics check exists yet (unlike RAW/DNG's
+   `rawSensorSupport`), and reaching Camera2 interop for a live capture-request
+   override may hit the same `setExposureMode()`/torch-blocking conflict
+   already documented in `camera_service.dart` (~lines 318-344). Build the
+   cheap `NOISE_REDUCTION_AVAILABLE_MODES` characteristics probe first.
 2. **RAW/DNG capture** where supported: JPEG compression damages exactly the
    high-frequency ridge band. RAW preserves it. Today the app uploads a JPEG /
-   Y-plane; test RAW → ridge-energy delta.
+   Y-plane; test RAW → ridge-energy delta. **CLOSED OUT 2026-07-22**:
+   `rawSensorSupport` has never come back `true` on any real device in the
+   fleet (26 real `front_only_v1` captures checked) — no device supports it.
 3. **Full-res, un-binned** capture if it resolves ridges better than the binned
    default (verify — binning can also *reduce noise*; empirical).
+4. **Raw Y-plane capture instead of JPEG entirely** (bypasses BOTH the native
+   still-JPEG compression and this app's own secondary re-encode) — the
+   discontinued four-angle/arc-sweep flow already proved this pattern works
+   (`HybridCaptureService`/`TaggedFrame` in
+   `packages/mac_capture/lib/src/frame_capture_service.dart`, uploads the raw
+   `image.planes[0].bytes` Y-plane directly from `startImageStream`, no
+   `takePicture()` JPEG involved at all), but `front_only_v1` has never used
+   it. **Investigated and NOT RECOMMENDED, 2026-07-22 (real-data feasibility
+   arithmetic, no new device round needed):**
+   - Queried Firestore across all historical captures with recorded raw-frame
+     dimensions (207 frames across the four-angle/oscillating flows): the
+     real, observed analysis-stream resolution on this device fleet is
+     **1600×1200** (183/207 frames) with a smaller cluster at 1920×1080
+     (24/207) — this is the plugin's own negotiated ceiling for
+     `startImageStream`, confirmed from real data, not assumed.
+   - This project's own established real-data reference clusters (2026-07-17
+     tuning session, at `_stillDecodeTargetWidth=2048`): captures whose pad
+     crop landed **≥~167,000px** scored well (NFIQ2 72); a **~262,000px**
+     cluster correlated with too-close/bad captures. Projecting the SAME
+     real pad-crop fraction onto the real 1600×1200 raw-stream ceiling gives
+     only **~102,000–162,000px** (cross-checked two ways: via the historical
+     2048-decode fraction, and directly via two real current
+     `afisMaskCoverPx` values — `cb684c57`: 607615px/7.68Mpx frame → 151,904px
+     projected; `2a85bb36`: 647958px/7.68Mpx frame → 161,990px projected).
+   - **Conclusion**: the raw analysis stream's real resolution ceiling caps
+     its pad crop below this project's own established "good" pixel-count
+     threshold, even before any benefit from avoiding JPEG compression is
+     accounted for (that benefit was never independently quantified, and
+     would need to be large to close an already-adverse ~5,000–65,000px
+     deficit). **JPEG is not the limiting factor here — the live analysis
+     stream's resolution ceiling is.** Not proceeding to build the raw-Y-plane
+     capture path on this hardware. Revisit only if a future device/plugin
+     version negotiates a higher analysis-stream resolution, or if the
+     `camera` plugin is ever forked/replaced such that native still-JPEG
+     quality becomes directly controllable (see item 1's own native-surface
+     caveat) instead.
 
 ## Lever D — IR illumination (ties A + C together)
 
