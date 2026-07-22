@@ -1,5 +1,78 @@
 # ClearBridge Mobile — persistent context
 
+## deform_correct v3 (SD302f domain-matched + real MAC3D source): MIXED result, not a clean win over v2 (2026-07-22)
+Per the CTO's redirected idea — after multiview-fusion's phase-demodulation
+rebuild became this branch's sixth negative result on the front/side
+registration task, use the NIST SD302 corpus (confirmed live in S3, not
+Firestore as first framed) for the ALREADY-partially-working
+`ml/deform_correct` synthetic-distortion line instead, using the subset
+"closest to MAC3D domain" — trained a new checkpoint (v3) on 953 clean
+source prints: 912 SD302f crops (the only PHOTOGRAPHED, not scanned, part
+of SD302 — real contactless skin, quality-gated via a new self-contained
+`sd302f_crop.py` three-gate cropper, 72.7% raw pass rate before a further
+median-cutoff tightening) + all 41 real MAC3D `enhancedImagePath` prints
+pulled straight from Firestore (the literal target domain, not a proxy).
+Deliberately did NOT re-include SD302a/b/d volume — that was v2, already
+found NOT to beat v1 on this same real gate.
+
+**Real bugs found and fixed along the way** (all committed): the S3
+downloader needed retry-with-backoff (a transient `ProxyConnectionError`
+killed the first sampling attempt at 8/2000); the SageMaker launcher had
+the same `framework_version` 2.4-vs-2.3 SDK mismatch already fixed on the
+multiview-fusion branch, plus an unbounded `torch`/`numpy` pin in
+requirements.txt that risked the same DataLoader ABI crash found there;
+the manifest channel's in-container path was hardcoded to `manifest.json`
+while the actual uploaded object was named differently, causing a real
+`FileNotFoundError` on the first submission (fixed by deriving the path
+from the manifest's own basename); the first spot-instance submission hit
+the same `InsufficientCapacity` stall seen on earlier SageMaker jobs this
+project has run, resolved the same way (stop + resubmit on-demand, cost
+difference negligible: ~$0.74 spot estimate vs. the job's actual real
+on-demand cost, well under budget).
+
+**Training itself was healthy**: val loss descended cleanly 0.176 -> 0.123
+over 100 epochs (job `deform-synth-v3-mac3d-sd302f-od2`, `ml.g4dn.xlarge`,
+~41 min), no mean-collapse, consistent with this line's established
+"synthetic self-distortion has a real learnable signal" pattern (unlike
+every front/side pairwise-registration attempt on the other branch).
+
+**The real gate — same scale-normalized SourceAFIS methodology as v1/v2,
+same 26-capture real MAC3D library, same ink-scan/cross-session groups —
+gives a genuinely MIXED result, not a win:**
+
+| condition | genuine-vs-ink mean | impostor max | beat max | cross-session mean |
+|---|---|---|---|---|
+| scale-normalized, uncorrected | 2.56 | 5.86 | 1/4 | 22.62 |
+| scale-normalized, v2-corrected (a+b+d volume) | 3.16 | 7.51 | 0/4 | 4.85 |
+| **scale-normalized, v3-corrected (SD302f+MAC3D domain)** | **3.01** | **14.43** | **0/4** | **9.13** |
+
+v3 roughly doubles v2's cross-session same-finger matching (4.85 -> 9.13,
+a real improvement on genuine-pair matching) but also roughly doubles v2's
+worst-case impostor false-match risk (7.51 -> 14.43) and doesn't change the
+headline failure (still 0/4 genuine pairs beat the impostor max, same as
+v2). The single impostor capture driving the blowup (`e5cb52fc`) scored
+14.43 alone; every other impostor stayed in the 0-6.2 range, the same
+"one noisy real capture's correction gets misread as false-match-like
+signal" pattern already documented for v1's full-library test (there it
+was the sunlight-transillumination capture; here it's a different real
+capture, same underlying failure mode: correcting an already-noisy print
+can manufacture spurious minutiae-like structure rather than real ridge
+detail).
+
+**Conclusion**: domain-matching the synthetic-distortion source data
+(photographed contactless skin + the literal real target domain, instead
+of clean contact-scanner volume) measurably changes what the model learns
+in a real, non-random way — but doesn't fix the underlying problem this
+whole `ml/deform_correct` line has never solved: correcting an
+already-noisy real capture can still manufacture false-match-adjacent
+noise as easily as it can help. **Not recommending wiring v3 into
+production over v2 or v1** without further work — if any of these
+checkpoints are ever wired in, it must be as one more max-of-variants
+candidate gated by existing quality selection (same standing discipline as
+every other addition to this pipeline), never a blind replacement, and
+this real noise-amplification behavior is exactly why. Checkpoint: S3
+`deform-correct/deform-synth-v3-mac3d-sd302f-od2/checkpoints/best.pt`.
+
 ## Prime-directive roadmap delivered + distanceStage2 diagnostic instrumentation (2026-07-22)
 CTO asked directly for a prioritized roadmap toward the prime directive
 (real matchability, not NFIQ2). Delivered one grounded in real project
