@@ -120,6 +120,13 @@ def main():
     ap.add_argument('--base', type=int, default=24)
     ap.add_argument('--lr', type=float, default=1e-3)
     ap.add_argument('--smooth-w', type=float, default=0.02)
+    # Default 0 (main-process loading, no forked workers): the SageMaker
+    # PyTorch 2.3 DLC hit a real "Numpy is not available" crash specifically
+    # inside forked DataLoader workers (multiview-pair-deform-v2, 2026-07-22)
+    # -- fixed at the root by pinning numpy<2 in requirements.txt, but this
+    # dataset/model is small enough that worker parallelism buys little, so
+    # default to the strictly safer path rather than trust the pin alone.
+    ap.add_argument('--num-workers', type=int, default=0)
     ap.add_argument('--limit-frames', type=int, default=0)
     ap.add_argument('--model', choices=['plain', 'corr'], default='plain',
                     help='plain = PairDeformFieldUNet (baseline, does not '
@@ -137,8 +144,10 @@ def main():
 
     train_ds = SynthPairDataset(train_paths, args.crop)
     val_ds = SynthPairDataset(val_paths, args.crop, deterministic_seed=1234)
-    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True, num_workers=2)
-    val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False, num_workers=2)
+    train_dl = DataLoader(train_ds, batch_size=args.batch, shuffle=True,
+                          num_workers=args.num_workers)
+    val_dl = DataLoader(val_ds, batch_size=args.batch, shuffle=False,
+                        num_workers=args.num_workers)
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if args.model == 'corr':

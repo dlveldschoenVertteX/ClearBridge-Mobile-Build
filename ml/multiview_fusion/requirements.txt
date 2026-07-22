@@ -1,2 +1,9 @@
 opencv-python-headless>=4.8
-numpy>=1.24
+# Pinned <2: the SageMaker PyTorch 2.3 DLC ships torch built against numpy's
+# 1.x ABI. Leaving this unbounded let pip install numpy 2.x on top of it,
+# which torch.from_numpy tolerates in the main process but fails on inside
+# forked DataLoader workers ("RuntimeError: Numpy is not available",
+# multiview-pair-deform-v2, 2026-07-22) -- a known class of SageMaker DLC
+# numpy/torch ABI mismatch, not a bug in this project's own dataset code
+# (the same train_pair.py ran fine locally, where numpy was already <2).
+numpy>=1.24,<2
