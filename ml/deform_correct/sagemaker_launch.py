@@ -80,6 +80,11 @@ def main() -> int:
     ap.add_argument('--epochs', type=int, default=60)
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--size', type=int, default=512)
+    ap.add_argument('--synth', type=int, default=0, choices=[0, 1],
+                    help='1 = self-supervised synthetic-distortion mode '
+                         '(SynthDeformDataset over a {"clean": relpath} '
+                         'manifest); 0 = paired probe/gallery mode '
+                         '(DeformPairDataset)')
     ap.add_argument('--job-name', default='deform-correct-v1')
     ap.add_argument('--go', action='store_true',
                     help='actually submit the job (default: dry run / print only)')
@@ -128,7 +133,11 @@ def main() -> int:
         role=args.role_arn,
         instance_type=args.instance_type,
         instance_count=1,
-        framework_version='2.4',              # matches this repo's torch 2.4.x
+        # 2.3, not 2.4 -- the pinned sagemaker SDK here (2.232.1) can't
+        # resolve a prebuilt DLC image URI for 2.4 (ValueError: Unsupported
+        # pytorch version), confirmed the same way on the multiview-fusion
+        # branch's own SageMaker launcher this same session.
+        framework_version='2.3',
         py_version='py311',
         hyperparameters={
             'manifest': '/opt/ml/input/data/manifest/manifest.json',
@@ -136,6 +145,7 @@ def main() -> int:
             'epochs': args.epochs,
             'batch': args.batch,
             'size': args.size,
+            'synth': args.synth,
             'out': '/opt/ml/checkpoints',      # SageMaker syncs this to checkpoint_s3_uri
         },
         max_run=max_run_sec,
