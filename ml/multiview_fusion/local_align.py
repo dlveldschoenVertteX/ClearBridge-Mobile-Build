@@ -20,6 +20,7 @@ import cv2
 import numpy as np
 
 from common import block_coherence
+from phase_align import phase_residual_shift, warp_by_normal_shift
 
 _GRID_STEP = 24        # control-point grid spacing (px) in the overlap region
 _PATCH = 24            # template patch half-independent size for matchTemplate
@@ -161,4 +162,56 @@ def tps_correct(front: np.ndarray, side_registered: np.ndarray
     except cv2.error as e:
         diag['error'] = str(e)
         return None
+    return warped, diag
+
+
+_PHASE_SMOOTH_KSIZE = 31   # confidence-weighted box-smoothing window (px) for the
+                           # dense per-pixel normal-shift field before warping --
+                           # phase_align's raw per-pixel estimate is noisy pixel to
+                           # pixel (same reason any per-pixel signal estimate is);
+                           # real elastic deformation varies smoothly, so averaging
+                           # locally (weighted by confidence, never by a fixed
+                           # unweighted box that would let background zero-confidence
+                           # pixels drag the estimate toward 0) suppresses that noise
+                           # without needing TPS's separate sparse-control-point step.
+_MIN_VALID_FRAC = 0.05     # below this fraction of confident pixels, there's too
+                           # little reliable ridge signal to trust any correction --
+                           # fall back to ECC-only, same non-regressing discipline
+                           # as tps_correct's _MIN_CONTROL_POINTS gate.
+
+
+def phase_correct(front: np.ndarray, side_registered: np.ndarray,
+                   mask: Optional[np.ndarray] = None
+                   ) -> Optional[Tuple[np.ndarray, dict]]:
+    """The phase-demodulation alternative to tps_correct -- see
+    phase_align.py's module docstring for why this replaces block-matching
+    + TPS (both already measured NO-GO in README.md's Phase 0/minutiae
+    sections): dense analytic-phase-difference residual shift along each
+    pixel's local ridge-normal direction, confidence-weighted box-smoothed
+    (real deformation is spatially smooth; the raw per-pixel phase read is
+    not), then applied via a direct dense remap -- no sparse control
+    points, no TPS solve. Returns (corrected side image, diagnostics) or
+    None if too little of the frame has confident ridge signal (falls back
+    to ECC-only, same non-regressing contract as tps_correct)."""
+    result = phase_residual_shift(front, side_registered, mask=mask)
+    valid = result['valid']
+    frac_valid = float(valid.mean())
+    diag = {'frac_valid': frac_valid, 'wavelength': result['wavelength']}
+    if frac_valid < _MIN_VALID_FRAC:
+        return None
+
+    ns = result['normal_shift_px']
+    conf = result['confidence'] * valid.astype(np.float32)
+    k = _PHASE_SMOOTH_KSIZE
+    num = cv2.boxFilter(ns * conf, -1, (k, k))
+    den = cv2.boxFilter(conf, -1, (k, k))
+    smoothed = np.divide(num, den, out=np.zeros_like(num), where=den > 1e-6)
+
+    orient = result['orient']
+    nx, ny = np.cos(orient + np.pi / 2), np.sin(orient + np.pi / 2)
+    shift_vec = np.stack([smoothed * nx, smoothed * ny], axis=0)
+    diag['mean_abs_normal_shift_px'] = float(np.abs(smoothed[den > 1e-6]).mean()) \
+        if (den > 1e-6).any() else 0.0
+
+    warped = warp_by_normal_shift(side_registered, dict(shift_vec=shift_vec))
     return warped, diag

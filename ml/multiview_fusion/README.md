@@ -1,11 +1,15 @@
 # Multi-view fusion + flash enhancement — isolated R&D track
 
 ## Status: Phase 0 NO-GO, Phase 1 MIXED/NO-GO, Phase 2 NO-GO at the
-signal-ceiling level (2026-07-22, five independent negative results total —
-see close-out section below). NOT wired into production. NOT merged into
-`front_only_v1`. Lives entirely on `claude/multiview-fusion-blend-experiment`.
-Branch is closed pending a CTO go/no-go on the two remaining paths (phase-
-demodulation rebuild, or abandon multi-view fusion for capture-side levers).
+signal-ceiling level, phase-demodulation rebuild ALSO NO-GO on real capture
+pairs despite being independently validated as correct (2026-07-22, six
+independent negative-to-mixed results total on the front/side registration
+task — see close-out sections below). NOT wired into production. NOT
+merged into `front_only_v1`. Lives entirely on
+`claude/multiview-fusion-blend-experiment`. The evidence now points at the
+capture GEOMETRY (real multi-angle pose change between shots), not the
+registration algorithm, as the actual bottleneck — see the phase-
+demodulation close-out for the reasoning.
 
 ## Why this exists
 
@@ -467,3 +471,130 @@ identified as untried elsewhere in this project (`docs/
 RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md`'s cross-polarization test, physical
 distance bracketing, secondary-camera AF fixes) — none of which depend on
 solving this correspondence problem at all.
+
+## Phase-demodulation rebuild (`phase_align.py`, 2026-07-22) — the core
+method is VALIDATED and correctly implemented, but STILL NO-GO on real
+front/side pairs — the sixth independent negative-to-mixed result, and the
+first to fail despite being individually proven correct
+
+Per the CTO's explicit "do the phase-demodulation rebuild" ask (following
+the Phase 2 close-out above), built the literature-correct alternative to
+every intensity-correlation method tried so far: Cui & Feng (TIFS 2018) /
+PDRNet (T-IFS 2024) treat ridge texture as a local 2-D cosine wave and read
+displacement directly off the PHASE of an analytic signal, never doing
+patch/template matching at all — sidestepping the periodicity-aliasing
+mechanism that broke every correlation-based method on this branch (NCC
+block-matching, minutiae nearest-neighbor, the learned corr-net).
+
+**Built** (`phase_align.py`): `analytic_phase()` — a per-pixel-varying
+quadrature Gabor bank (even=cos-phase, odd=sin-phase, same discretized-
+orientation/per-pixel-index trick as `common.gabor_enhance`) forms a local
+analytic signal `Z = even + i*odd`; phase = `angle(Z)`, amplitude =
+`|Z|`. `phase_residual_shift()` demodulates front and an ECC-registered
+side with front's own orientation/wavelength field, takes the wrapped
+phase difference, and converts it to a displacement ONLY along the local
+ridge-**normal** direction (`dphi * wavelength / (2*pi)`).
+
+**The aperture problem is treated as the correct scope, not a limitation
+to work around**: a single local orientation/frequency estimate can only
+resolve the ridge-normal component (shift along a ridge's own tangent is
+invisible to phase, the classical Fleet & Jepson aperture problem for
+periodic texture) — but ridge-normal misalignment is *exactly* the only
+component that breaks visible ridge continuity; tangential slip produces
+no visible seam. This is also, by construction, a **residual-only**
+method: phase differences only resolve displacement up to half a ridge
+period before wrapping/aliasing the same way correlation does over a full
+period, so it is scoped as a refinement on top of the existing ECC
+coarse-alignment step, same "coarse handles the big motion, fine only
+resolves the sub-period residual" contract the abandoned
+`CoarseToFinePairNet` pyramid was built around.
+
+**Decisive validation BEFORE any real-pair test** (mirroring
+`probe_minimal.py` Part A's zero-learning methodology exactly, so the
+comparison is apples-to-apples): applied a KNOWN shift, confined to each
+crop's own local ridge-normal direction and within its half-wavelength
+regime, to real fingerprint crops, and measured `phase_residual_shift`'s
+recovery error with **zero training or learning in the loop** — the same
+kind of test that measured raw correlation argmax at a mere 15% exact-hit
+rate. **Result (n=80 real crops): mean error 0.79px, median 0.32px, 94%
+of trials within 2px** of the true known shift — against a 2.75px mean
+chance baseline (guessing zero shift). This is a night-and-day
+improvement over correlation's signal ceiling and a direct, real
+confirmation that the literature's phase-based approach is fundamentally
+sound and was implemented correctly here — not a re-run of the same
+failure by another name.
+
+**Real-pair test (the actual gate): does NOT improve, and mildly-to-
+moderately REGRESSES, real seam continuity.** Wired `phase_correct()`
+into `local_align.py` (confidence-weighted dense box-smoothing of the raw
+per-pixel field, then a direct remap — no TPS, no sparse control points
+needed since the phase field is already dense) and re-ran the same
+three-way Phase 0 harness (`run_phase0_v2.py`) on the same 4 real
+`oscillating_8phase` captures used throughout Phase 0/1. One real bug
+found and fixed en route: the confidence normalization originally divided
+by the raw per-image amplitude MAX, which worked fine on the small,
+photometrically-uniform validation crops above but collapsed almost the
+entire real overlap region below threshold on full real captures (a
+handful of outlier-bright pixels made the max 100x+ the typical in-ridge
+value; median normalized confidence inside the real overlap region was
+0.0002-0.0013). Fixed by normalizing against the 95th percentile within
+the valid mask instead of the raw max — robust to that outlier, and
+confirmed not to change the validation test's own result.
+
+Paired comparison (the 2 of 4 captures where both arms have a valid
+seam/control ratio):
+
+| capture | OLD (ECC-only) | PHASE-corrected (1 pass) | PHASE-corrected (3 iters) |
+|---|---|---|---|
+| `3edf5455` | 1.080 | 1.116 (worse) | **1.292** (worse still) |
+| `7f53940f` | 0.540 | 0.596 (worse) | **0.661** (worse still) |
+
+**Iterating made it monotonically worse, not better — the decisive
+finding.** Chained `phase_correct` 3-4 times (re-estimate the residual on
+the already-corrected image, repeat), the standard Lucas-Kanade-style way
+to handle a residual larger than one pass can safely resolve. The
+per-iteration diagnostics show the raw measured residual (`mean_abs_
+normal_shift_px`) shrinking cleanly and monotonically each iteration
+(e.g. `3edf5455`: 3.03 -> 1.88 -> 1.67px; `7f53940f`: 3.40 -> 2.17 ->
+1.67px) — the algorithm IS converging by its own internal metric — while
+the actual seam-continuity outcome gets steadily worse with every
+iteration applied. If the phase estimate were tracking real geometric
+misalignment, converging it further should improve, not degrade, the
+composite. It doesn't, on either real paired capture tested.
+
+**Root-cause interpretation, consistent with this whole branch's other
+five results**: `oscillating_8phase` side frames are captured at real,
+independent physical angles (the pulled manifest's own `angleDeg` field:
+-11deg to +11deg per side, not simulated). A single global ECC homography
+per side-frame — already established as unable to fully capture non-
+planar skin deformation across a real angle change — evidently leaves a
+residual that is NOT confined to the sub-half-period regime this method
+(and the abandoned learned pyramid) assumes: TPS's own raw NCC control-
+point displacements on this same data landed at 12-16px against 9-20px
+wavelengths, i.e. comparable to a FULL ridge period, not a small
+residual. Genuine perspective/pose change between shots also very
+plausibly changes local ridge SHADING/amplitude asymmetrically between
+front and side (not just position), which would read as phase "signal"
+to this method without being a real spatial shift at all — plausibly
+explaining why "correcting" it, and correcting it harder via iteration,
+makes the print worse rather than better.
+
+**Conclusion**: this is the sixth independent negative-to-mixed result on
+this branch's front/side registration task (NCC block-matching, minutiae
+correspondence, seam-routed compositing, single-level learned
+correlation, coarse-to-fine correlation at the signal-ceiling level, and
+now phase demodulation) — and the first of the six to fail DESPITE being
+individually validated as a correct, working implementation of its
+underlying technique. That combination is the strongest evidence yet
+that the bottleneck is not any single registration algorithm (six
+genuinely different ones have now been tried) but the **capture geometry
+itself**: real independent-angle shots of deformable, non-planar skin
+produce a residual misalignment field after coarse alignment that is too
+large, and/or too contaminated by genuine photometric/perspective
+change (not pure position shift), for any single-shot 2-D correction —
+classical or learned — to safely resolve. **Recommend against further
+per-pair 2-D registration work on this specific front/side fusion task.**
+A geometrically-honest fix would need actual 3-D surface modeling of the
+finger pad (well beyond this branch's original 2-D scope), which is a
+materially different and much larger undertaking, not a next tweak to
+try here.
