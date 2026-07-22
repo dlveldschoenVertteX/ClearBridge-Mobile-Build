@@ -215,6 +215,32 @@ class FrontCaptureController extends ChangeNotifier {
     }
     return _rawSensorSupportCache;
   }
+
+  // docs/CAPTURE_OPTIMIZATION_SCOPE.md Lever C.1, Phase 0: same read-only,
+  // no-capture, no-UI, once-per-session-cached pattern as
+  // _queryRawSensorSupport() above -- answers whether real devices even
+  // ADVERTISE support for disabling noise-reduction/edge smoothing before
+  // any harder live-session Camera2-interop override work is attempted.
+  static Map<String, Map<String, bool>>? _noiseReductionSupportCache;
+  static bool _noiseReductionSupportQueried = false;
+
+  static Future<Map<String, Map<String, bool>>?> _queryNoiseReductionSupport() async {
+    if (_noiseReductionSupportQueried) return _noiseReductionSupportCache;
+    _noiseReductionSupportQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getNoiseReductionOffSupport');
+      if (result != null) {
+        _noiseReductionSupportCache = result.map((k, v) => MapEntry(
+              k,
+              (v as Map).map((k2, v2) => MapEntry(k2 as String, v2 as bool)),
+            ));
+      }
+    } catch (e) {
+      debugPrint('[front] noise-reduction capability query failed (non-fatal): $e');
+    }
+    return _noiseReductionSupportCache;
+  }
   static const Set<String> _uploadNonRetryableCodes = {
     'unauthorized', 'unauthenticated', 'no-default-bucket',
     'invalid-argument', 'invalid-url', 'object-not-found', 'quota-exceeded',
@@ -921,6 +947,7 @@ class FrontCaptureController extends ChangeNotifier {
       }
 
       final rawSensorSupport = await _queryRawSensorSupport();
+      final noiseReductionOffSupport = await _queryNoiseReductionSupport();
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
@@ -1226,6 +1253,8 @@ class FrontCaptureController extends ChangeNotifier {
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
+        if (noiseReductionOffSupport != null)
+          'noiseReductionOffSupport': noiseReductionOffSupport,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
         'distanceStage2Debug': distanceDebug,

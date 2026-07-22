@@ -7,6 +7,7 @@ import android.hardware.SensorEventListener
 import android.hardware.SensorManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
+import android.hardware.camera2.CaptureRequest
 import io.flutter.embedding.android.FlutterActivity
 import io.flutter.embedding.engine.FlutterEngine
 import io.flutter.plugin.common.EventChannel
@@ -36,14 +37,18 @@ class MainActivity : FlutterActivity() {
         // Firestore doc, no new UI.
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "clearbridge/cameraCapabilities")
             .setMethodCallHandler { call, result ->
-                if (call.method == "getRawSensorSupport") {
-                    try {
+                when (call.method) {
+                    "getRawSensorSupport" -> try {
                         result.success(rawSensorSupportByCameraId())
                     } catch (e: Exception) {
                         result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
                     }
-                } else {
-                    result.notImplemented()
+                    "getNoiseReductionOffSupport" -> try {
+                        result.success(noiseReductionOffSupportByCameraId())
+                    } catch (e: Exception) {
+                        result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
+                    }
+                    else -> result.notImplemented()
                 }
             }
     }
@@ -58,6 +63,35 @@ class MainActivity : FlutterActivity() {
                 ?: IntArray(0)
             support[id] = caps.contains(
                 CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW
+            )
+        }
+        return support
+    }
+
+    // docs/CAPTURE_OPTIMIZATION_SCOPE.md Lever C.1, Phase 0: a read-only
+    // characteristics query (same shape/precedent as rawSensorSupportByCameraId
+    // above -- never fires a capture, never touches a live session) so a
+    // future decision on whether to attempt the much harder live
+    // CaptureRequest.NOISE_REDUCTION_MODE/EDGE_MODE=OFF override (which needs
+    // Camera2 interop and has NOT been de-risked the way RAW/DNG was) is
+    // grounded in whether real devices even ADVERTISE support for turning
+    // this off, not a guess. A device that doesn't list OFF among its
+    // available modes can't honor the override no matter how it's reached,
+    // so this alone can rule the harder work out the same way rawSensorSupport
+    // ruled out RAW/DNG.
+    private fun noiseReductionOffSupportByCameraId(): Map<String, Map<String, Boolean>> {
+        val cameraManager = applicationContext
+            .getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val support = mutableMapOf<String, Map<String, Boolean>>()
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val nrModes = chars.get(CameraCharacteristics.NOISE_REDUCTION_AVAILABLE_MODES)
+                ?: IntArray(0)
+            val edgeModes = chars.get(CameraCharacteristics.EDGE_AVAILABLE_EDGE_MODES)
+                ?: IntArray(0)
+            support[id] = mapOf(
+                "noiseReductionOff" to nrModes.contains(CaptureRequest.NOISE_REDUCTION_MODE_OFF),
+                "edgeModeOff" to edgeModes.contains(CaptureRequest.EDGE_MODE_OFF),
             )
         }
         return support
