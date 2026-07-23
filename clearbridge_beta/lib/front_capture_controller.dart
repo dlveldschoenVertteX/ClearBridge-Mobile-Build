@@ -1260,6 +1260,15 @@ class FrontCaptureController extends ChangeNotifier {
               secondaryDebug['${desc.name}_stuckAt'] = stageDebug['stage'];
               return <String>[];
             });
+            // Real bug found 2026-07-23: the per-camera stageDebug map (now
+            // carrying focusConvergedMs/focusScoreAtFire and per-shot
+            // capture/upload timings) was only ever read for its 'stage'
+            // key on timeout -- every other field silently never reached
+            // Firestore, regardless of outcome. Preserve the whole map here,
+            // unconditionally, so the next real capture's data actually
+            // shows the new diagnostics.
+            secondaryDebug['${desc.name}_stageDebug'] =
+                Map<String, dynamic>.from(stageDebug);
 
             // Step 5: explicit, AWAITED stop -- regardless of success or
             // timeout -- before this iteration ends. Previously this loop
