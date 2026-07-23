@@ -1,5 +1,54 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the focus-convergence build: first genuine secondary-camera win (nfiq2Score 72), stageDebug-merge bug found + fixed (2026-07-23, round 5)
+CTO tested the build with the focus-convergence fix (`6b6b606`). Real
+capture `03b91b6f` (2026-07-23T18:03 UTC) scored **nfiq2Score 72** via
+`afisSource: "secondary_3"` — the **first real, non-proxy-fooled win for a
+secondary camera** in this project's history (the one prior secondary-
+camera win, `70d69867`, was a proxy-fooled false positive with real
+nfiq2Score 6). Downloaded and visually confirmed both the raw secondary
+frame (thumb well-centered, in focus) and the resulting `superprint_afis.png`
+(clean, dense whorl) — a real, legitimate result, not an artifact.
+
+**Why this matters**: the main camera's own burst was unusually soft this
+capture (ambient Laplacian only 19-24, flash 31-36 — both far below typical
+good captures, and for once flash wasn't even worse than ambient). The
+secondary camera saved the capture. This is the first real demonstration of
+the CTO's original multi-camera vision actually working: when one camera's
+capture is weak, another camera's data can still win.
+
+**New `cameraLensInfo` diagnostic (shipped last round) paid off immediately**:
+camera "2" (the one that times out almost every capture) has a much smaller
+sensor (3.92×2.94mm) and shorter focal length (2.37mm) than the main camera
+(5.98×4.49mm, 4.15mm) — consistent with being a lower-spec auxiliary/macro
+sensor, plausibly explaining its consistently slower encode/upload pipeline.
+Camera "3" (the consistently reliable one, and this test's winner) has the
+**largest** sensor of all four cameras (6.64×4.97mm, even bigger than main).
+Camera "2" **still timed out at the exact same step** (`shot_2_upload`) for
+the 4th real capture in a row — now a very strong, reproducible signal
+pointing at that specific weak sensor's own upload/encode speed, not
+intermittent flakiness.
+
+**Real bug found + fixed**: the per-camera `stageDebug` map (carrying the
+last two rounds' new diagnostics — `focusConvergedMs`/`focusScoreAtFire`,
+per-shot `captureMs`/`uploadMs`) was only ever read for its single `'stage'`
+key on timeout; every other field was silently discarded regardless of
+outcome, so none of those new diagnostics actually reached this test's
+Firestore doc. Fixed: the whole map is now preserved under
+`'<camera>_stageDebug'` unconditionally, so the *next* real capture's data
+will actually show focus-convergence timing and per-shot upload duration.
+
+**ambientClose/flashFar: now 0/6 fresh real attempts** (3 tests × 2 stages)
+with the guide-resize visibility bug already fixed — coverage stayed in the
+0.49-0.73 range across every attempt, nowhere near either target (>0.90 /
+<0.25). Combined with the predecessor design's 0/12, this is **0/18
+all-time**. Recommendation stands: relax the thresholds substantially or
+retire the feature rather than continuing to tune blind — awaiting CTO
+direction.
+
+Committed (`4daacc6`), not yet pushed (standing process rule) or further
+device-tested.
+
 ## Secondary-camera focus now actually measured, not guessed; ridge-continuity/TAR status recap (2026-07-23, round 4)
 CTO tested the round-3 build (audio fix + camera diagnostics + splash
 rebuild, run `30027872912`, confirmed successful) and raised two points:
