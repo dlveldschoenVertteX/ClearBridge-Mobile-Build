@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## Local rebuild of `dadd4ef9` with the segmentation fix: real trade-off found, not a clean win (2026-07-23, round 10)
+Per the CTO's ask ("rebuild the 81% print but even better"), pulled
+`dadd4ef9`'s full real raw burst (8 main-camera frames + all 3 secondary
+camera-3 frames) and re-ran it locally through the just-fixed
+`afis_print.generate()` across every available variant, scored by the
+real local NFIQ2 binary (calibrated to match production).
+
+**Honest result: could not reach 81 locally, and the reason is fully
+explained, not a mystery.** Best achievable with the segmentation fix
+applied is **71** (`native`, guide-only mask — no content-aware refinement
+engaged at all, since this capture's flash burst was too blown out for
+flash-diff and the U-Net fallback scored lower). Production's real 81 came
+via `afisMask: "guide+flashdiff"` — the exact buggy, holed mask fixed last
+round. Root cause of the gap: that buggy mask's real shape happened to crop
+down to `afisWavelengthPx=13.0` (inside this project's own established
+9-14px NFIQ2 sweet spot), while EVERY correctly-functioning mask option on
+this same raw capture (guide-only, U-Net-refined) lands at `wl=16.0`
+instead — a real property of how this particular capture was framed, not
+an artifact of which mask option is chosen. The bug's own hole/jagged crop
+was accidentally cropping into the higher-wavelength periphery in a way
+that (per NFIQ2's own well-documented foolability) scored better without
+being a more faithful print. The flash burst itself was unrecoverable —
+all 4 flash frames scored Laplacian 17-20 (fully blown out), so no
+fuse/deepFuse variant had usable flash content to work with, and the 3
+real secondary camera-3 frames all self-rejected (U-Net segmentation
+covered 82-96% of frame — no usable pad boundary found in a plain, no-
+guide-region crop of those specific frames).
+
+**Guide-only (71) beat the U-Net-refined result (69, `coherenceDiff`) on
+this specific capture** — worth noting since it means the "unet" fallback
+isn't automatically better than no refinement at all when a capture's
+flash-diff signal is unusable; not changed as a global default off one
+real data point, same discipline as everywhere else, but worth watching
+on future similarly-blown-out captures.
+
+**Sent the CTO the guide-only/native rebuild (71, clean smooth boundary,
+no hole, no jagged edges — visually matching the reference image's clean
+look)** rather than chase the higher-but-defective number. This is the
+honest trade-off of the round-9 fix: it can't invent ridge detail a
+capture's own raw material doesn't have, and a correct mask sometimes
+scores lower than a broken one on NFIQ2 specifically because NFIQ2 doesn't
+penalize the defects a correct mask avoids — consistent with this
+project's own long-standing "NFIQ2 is foolable, don't optimize it blind"
+finding. No code changed this round (analysis only, scratchpad-side).
+
 ## Real segmentation bug found + fixed: blown-out flash frame corrupts the flash-diff mask, punches a real hole in the print (2026-07-23, round 9)
 CTO flagged a visible segmentation defect in the `dadd4ef9` (nfiq2Score 81)
 superprint sent last round — a jagged, "toothed" boundary plus a real
