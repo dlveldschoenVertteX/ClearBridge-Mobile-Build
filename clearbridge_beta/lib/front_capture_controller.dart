@@ -1336,10 +1336,15 @@ class FrontCaptureController extends ChangeNotifier {
           // engages this whole stage, so there is no blowout risk regardless
           // of how close the user actually gets.
           ambientCloseDebug['attempted'] = true;
+          // force:true -- without it, _apply's 80ms notification throttle can
+          // (and in a real device test, did) silently drop this update, since
+          // nothing else touches the UI during _waitForDistanceZone's own
+          // wait. Same must-not-drop treatment as the uploading transition
+          // below and _fail.
           _apply((s) => s.copyWith(
                 distanceHint: 'Move slightly closer for a bonus capture',
                 activeGuideShape: _ambientCloseShape,
-              ));
+              ), force: true);
           final nearResult = await _waitForDistanceZone(
             cam2,
             target: _ambientCloseCoverageTarget,
@@ -1352,8 +1357,9 @@ class FrontCaptureController extends ChangeNotifier {
           // short of its own threshold (0.444/0.684 vs 0.90) -- record the
           // same signal here so the next real round tells us directly
           // whether this stage's ask is reachable, rather than guessing.
-          ambientCloseDebug['maxCoverageObserved'] =
-              double.parse(nearResult.maxCoverage.toStringAsFixed(3));
+          // direction-appropriate extreme (above wants the max reached).
+          ambientCloseDebug['coverageObserved'] =
+              double.parse(nearResult.coverageObserved.toStringAsFixed(3));
           if (nearResult.reached) {
             await _refocus();
             await _showCountdown();
@@ -1389,18 +1395,25 @@ class FrontCaptureController extends ChangeNotifier {
           // already-tuned default, on top of (not instead of) the existing
           // adaptive-EV step, to further cut flash-blowout risk.
           flashFarDebug['attempted'] = true;
+          // force:true -- this call runs synchronously right after
+          // ambientClose's own cleanup _apply above with no await in
+          // between, so without force it always lands inside the 80ms
+          // throttle window and gets silently dropped (confirmed via a real
+          // device test: the CTO saw this stage's hint text but never the
+          // shrunk guide).
           _apply((s) => s.copyWith(
                 distanceHint: 'Move slightly back for a bonus capture',
                 activeGuideShape: _flashFarShape,
-              ));
+              ), force: true);
           final farResult = await _waitForDistanceZone(
             cam3,
             target: _flashFarCoverageTarget,
             direction: _DistanceDirection.below,
           );
           flashFarDebug['reachedZone'] = farResult.reached;
-          flashFarDebug['maxCoverageObserved'] =
-              double.parse(farResult.maxCoverage.toStringAsFixed(3));
+          // direction-appropriate extreme (below wants the min reached).
+          flashFarDebug['coverageObserved'] =
+              double.parse(farResult.coverageObserved.toStringAsFixed(3));
           if (farResult.reached) {
             await _refocus();
             await _showCountdown();
@@ -1431,7 +1444,15 @@ class FrontCaptureController extends ChangeNotifier {
 
       // Real upload begins here -- the actual Firestore write + main burst
       // upload below, not the best-effort extra-camera work above. This is
-      // the honest point to switch the UI to "Uploading…".
+      // the honest point to switch the UI to "Uploading…". Stop the camera
+      // FIRST (real device test, 2026-07-23: the live preview kept running
+      // visibly behind the uploading screen -- nothing here needs the
+      // camera again; `uploading` only ever transitions to `complete`/
+      // `error`), so by the time the UI actually shows "Uploading…" the
+      // camera has genuinely stopped, not just been painted over.
+      try {
+        await _cameraService?.disposeCamera();
+      } catch (_) {}
       _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
 
       // Single Firestore write for the whole capture -- evaluated by the
@@ -1630,30 +1651,46 @@ class FrontCaptureController extends ChangeNotifier {
   /// resolves false so this stage can never hang or block the primary
   /// capture result already sitting in Firestore.
   ///
-  /// Returns (reached, maxCoverage) rather than a bare bool -- real
+  /// Returns (reached, coverageObserved) rather than a bare bool -- real
   /// Firestore data showed the old single "closer" stage NEVER once
   /// succeeded across 12 real attempts (2026-07-22/23 analysis), always
-  /// landing well short of its own threshold. `maxCoverage` is the highest
-  /// (for `above`) coverage actually observed during the window, recorded
-  /// into the caller's debug map regardless of outcome, so the NEXT real
-  /// capture tells us whether users are landing well short of the target
-  /// (miscalibrated threshold / unclear prompt) or right at its edge but
-  /// running out of time (window too short) -- rather than continuing to
-  /// guess. Diagnostic only: does not change capture behavior.
-  Future<({bool reached, double maxCoverage})> _waitForDistanceZone(
+  /// landing well short of its own threshold. `coverageObserved` is the
+  /// direction-appropriate extreme actually observed during the window --
+  /// the highest reached for `above` (ambientClose wants coverage to RISE),
+  /// the lowest reached for `below` (flashFar wants coverage to FALL) --
+  /// recorded into the caller's debug map regardless of outcome, so the NEXT
+  /// real capture tells us whether users are landing well short of the
+  /// target (miscalibrated threshold / unclear prompt) or right at its edge
+  /// but running out of time (window too short) -- rather than continuing to
+  /// guess. Fixed 2026-07-23: this used to always report the MAX regardless
+  /// of direction, which for `below` reported the starting coverage, not how
+  /// close the user got to the far target -- not a useful number. Diagnostic
+  /// only: does not change capture behavior.
+  ///
+  /// Timeout widened 6s -> 9s (2026-07-23): the real first test of this
+  /// stage found the guide-resize cue was silently dropped by _apply's
+  /// throttle (see the `force: true` fix at both call sites), so users had
+  /// effectively 0s of real visual cue to react to during that whole test --
+  /// 6s was never actually exercised as reaction time. Now that the resize
+  /// will really render, give real headroom on top of the existing window
+  /// rather than replacing it, without touching the coverage thresholds
+  /// themselves (measure those separately, one variable at a time).
+  Future<({bool reached, double coverageObserved})> _waitForDistanceZone(
     CameraController cam, {
     required double target,
     required _DistanceDirection direction,
   }) async {
-    const timeout = Duration(seconds: 6);
+    const timeout = Duration(seconds: 9);
     final completer = Completer<bool>();
     var streaming = false;
     var maxCoverage = 0.0;
+    var minCoverage = 1.0;
     void onFrame(CameraImage image) {
       if (completer.isCompleted) return;
       try {
         final coverage = HybridCaptureService.meanLuma(image, roi: _scoreRoi) / 255.0;
         if (coverage > maxCoverage) maxCoverage = coverage;
+        if (coverage < minCoverage) minCoverage = coverage;
         final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
         final inZone = direction == _DistanceDirection.above
             ? coverage > target
@@ -1661,13 +1698,15 @@ class FrontCaptureController extends ChangeNotifier {
         if (inZone && steady) completer.complete(true);
       } catch (_) {}
     }
+    final coverageObserved = () =>
+        direction == _DistanceDirection.above ? maxCoverage : minCoverage;
     try {
       await cam.startImageStream(onFrame);
       streaming = true;
       final reached = await completer.future.timeout(timeout, onTimeout: () => false);
-      return (reached: reached, maxCoverage: maxCoverage);
+      return (reached: reached, coverageObserved: coverageObserved());
     } catch (_) {
-      return (reached: false, maxCoverage: maxCoverage);
+      return (reached: false, coverageObserved: coverageObserved());
     } finally {
       if (streaming) {
         try {

@@ -142,8 +142,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
       backgroundColor: CaptureColors.void_,
       body: Stack(
         children: [
-          // Camera preview.
-          Positioned.fill(child: RepaintBoundary(child: _cameraLayer())),
+          // Camera preview. Skipped once uploading starts -- the controller
+          // stops the camera right before this phase (real device test,
+          // 2026-07-23: a live feed was visibly bleeding through the
+          // uploading scrim), and there is nothing left to preview by then
+          // anyway.
+          if (s.phase != FrontCapturePhase.uploading)
+            Positioned.fill(child: RepaintBoundary(child: _cameraLayer())),
 
           // Pad silhouette guide overlay.
           if (showGuide)
@@ -509,16 +514,50 @@ class _UploadingOverlay extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    // Fully opaque (was 0.92 -- let 8% of the live camera feed bleed through
+    // underneath, a real device test, 2026-07-23, showed this as a dim
+    // texture behind the icon). The controller stops the camera before this
+    // phase and the screen skips the camera layer entirely here, so opacity
+    // is now a second, independent guarantee, not the only one. The generic
+    // pulsing fingerprint icon (CaptureIntroAnimation) is replaced with the
+    // actual ClearBridge logo plus a real indeterminate spinner, per the
+    // CTO's explicit ask for a branded loading screen instead of a live
+    // camera view.
     return Container(
-      color: CaptureColors.void_.withValues(alpha: 0.92),
+      color: CaptureColors.void_,
       child: Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             SizedBox(
-              width: 160,
-              height: 160,
-              child: CaptureIntroAnimation(onComplete: () {}, loop: true),
+              width: 132,
+              height: 132,
+              child: Stack(
+                alignment: Alignment.center,
+                children: [
+                  const SizedBox(
+                    width: 132,
+                    height: 132,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 3,
+                      color: CaptureColors.cyan,
+                    ),
+                  ),
+                  ClipOval(
+                    child: Image.asset(
+                      'assets/images/app_logo.png',
+                      width: 96,
+                      height: 96,
+                      fit: BoxFit.cover,
+                      errorBuilder: (_, __, ___) => const Icon(
+                        Icons.fingerprint,
+                        size: 96,
+                        color: CaptureColors.cyan,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
             const SizedBox(height: 18),
             Text(
