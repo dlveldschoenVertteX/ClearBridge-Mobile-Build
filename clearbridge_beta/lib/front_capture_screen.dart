@@ -203,8 +203,16 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
               child: _ConfirmationBanner(text: s.confirmationText!),
             ),
 
-          // Distance hint.
-          if (s.distanceHint != null && showGuide)
+          // Distance hint. Excludes capturingExtra: that phase reuses
+          // distanceHint for status text ("Capturing with wide lens…",
+          // "Move slightly closer for a bonus capture") which this binary
+          // "Move closer"/else ternary would otherwise mangle into a
+          // nonsensical "Move phone BACK a little" shown right alongside the
+          // correct capturingExtra banner below (real device screenshot,
+          // 2026-07-23: both banners rendered at once, the top one wrong).
+          if (s.distanceHint != null &&
+              showGuide &&
+              s.phase != FrontCapturePhase.capturingExtra)
             Positioned(
               bottom: 160,
               left: 40,

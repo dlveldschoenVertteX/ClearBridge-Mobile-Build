@@ -1090,9 +1090,30 @@ class FrontCaptureController extends ChangeNotifier {
             // the ENTIRE per-camera exposure/focus/burst sequence in one
             // timeout so a hang here can only ever cost this one camera's
             // data, never the rest of the capture.
+            //
+            // Widened 12s -> 28s (2026-07-23): real Firestore data across the
+            // 3 captures since _secondaryBurstCount went 1->3 shots (plus the
+            // new exposure/focus setup + 1400ms settle preamble, all added
+            // for Item 3) shows BOTH secondary cameras timing out on every
+            // single one, always at 'shot_0_upload' or 'shot_1_upload' --
+            // whereas every capture before that change shows '2_ok'/'3_ok':
+            // true. 12s was calibrated for the OLD single-shot sequence and
+            // was never widened for the now much longer one; a real onTimeout
+            // firing this often means the loop is racing on, closing this
+            // camera's session and opening the next one, while the timed-out
+            // camera's takePicture()/upload call is very likely STILL running
+            // in the background (.timeout() cannot cancel the underlying
+            // native Future) -- i.e. two secondary camera sessions active at
+            // once, exactly the kind of camera-session contention already
+            // documented elsewhere in this file, and a strong candidate for
+            // the real-device ANR ("ClearBridge Beta isn't responding")
+            // reported the same test round. A wider budget makes it far less
+            // likely this timeout fires at all under normal (if slow) network
+            // conditions, which removes the overlap risk at its source rather
+            // than just papering over the symptom.
             final stageDebug = <String, dynamic>{'stage': 'not_started'};
             final paths = await _captureSecondaryBurst(active, desc, basePath, stageDebug)
-                .timeout(const Duration(seconds: 12), onTimeout: () {
+                .timeout(const Duration(seconds: 28), onTimeout: () {
               debugPrint(
                   '[front] secondary camera ${desc.name} timed out mid-capture '
                   '(stuck at: ${stageDebug['stage']}) -- skipping');
