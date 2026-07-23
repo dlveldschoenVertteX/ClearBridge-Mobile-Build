@@ -1635,11 +1635,14 @@ class FrontCaptureController extends ChangeNotifier {
       // fixed-focus secondary sensor -- nothing to converge, fall through to
       // the settle delay and shoot at native focus.
     }
-    // Longer settle than the main path: continuous AF on a secondary sensor
-    // that just powered on needs time to hunt and lock on the near subject
-    // (600ms was too short -- it shot mid-hunt).
+    // Real device report, 2026-07-23: some secondary cameras don't focus
+    // immediately, producing blurry captures. This used to be a blind fixed
+    // 1400ms delay with zero verification that AF actually converged --
+    // unlike the primary camera's own burst, which only fires once a real
+    // measured sharpness signal (_focusValue) clears a threshold. Replaced
+    // with an equivalent measured wait on the secondary camera's own stream.
     stageDebug['stage'] = 'settle_delay';
-    await Future<void>.delayed(const Duration(milliseconds: 1400));
+    await _waitForSecondaryFocusLock(active, stageDebug);
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
     final paths = <String>[];
     for (var i = 0; i < _secondaryBurstCount; i++) {
@@ -1670,6 +1673,73 @@ class FrontCaptureController extends ChangeNotifier {
     await active.setFlashMode(FlashMode.off);
     stageDebug['stage'] = 'done';
     return paths;
+  }
+
+  /// Waits for the secondary camera's own autofocus to actually converge,
+  /// measured via the same peak-normalized, EMA-smoothed Laplacian sharpness
+  /// signal already used for the primary camera's own `_focusValue`/`onTarget`
+  /// gating (`_onFrame`, `_hybrid.offerFrame`) -- reused here rather than
+  /// reinvented, since it's already proven portable (peak-relative, not an
+  /// absolute threshold, so it doesn't need re-tuning per lens). Replaces a
+  /// blind fixed delay that fired the burst regardless of whether AF had
+  /// actually locked (real device report, 2026-07-23: blurry secondary-camera
+  /// captures on some lenses).
+  ///
+  /// Bounded both ways: [minWaitMs] stops a lucky first frame from firing
+  /// before the lens has genuinely started moving; [maxWaitMs] guarantees
+  /// this can never hang longer than a modest safety margin over the old
+  /// fixed delay, even on a sensor whose focus never converges (e.g. a
+  /// genuinely fixed-focus secondary camera) -- same best-effort discipline
+  /// as every other secondary-camera step. Records `focusConvergedMs`/
+  /// `focusScoreAtFire` into the caller's stageDebug so the next real capture
+  /// shows whether convergence is actually happening now, and how long it
+  /// really takes per camera, instead of guessing.
+  Future<void> _waitForSecondaryFocusLock(
+    CameraController active,
+    Map<String, dynamic> stageDebug, {
+    int minWaitMs = 500,
+    int maxWaitMs = 2600,
+  }) async {
+    const roi = Rect.fromLTWH(0.3, 0.3, 0.4, 0.4);
+    const lockThreshold = 0.45; // same relative threshold as onTarget's gate.
+    var peak = 1.0;
+    var focusEma = 0.0;
+    var streaming = false;
+    final start = DateTime.now();
+    final completer = Completer<void>();
+    void onFrame(CameraImage image) {
+      if (completer.isCompleted) return;
+      try {
+        final raw = _hybrid.offerFrame(image, thumbRoi: roi);
+        if (raw > peak) peak = raw;
+        focusEma = HybridCaptureService.ema(
+          focusEma,
+          (raw / (peak + 1e-6)).clamp(0.0, 1.0),
+        );
+        final elapsedMs = DateTime.now().difference(start).inMilliseconds;
+        if (elapsedMs >= minWaitMs && focusEma > lockThreshold) {
+          completer.complete();
+        }
+      } catch (_) {}
+    }
+    try {
+      await active.startImageStream(onFrame);
+      streaming = true;
+      await completer.future.timeout(
+        Duration(milliseconds: maxWaitMs),
+        onTimeout: () {},
+      );
+    } catch (_) {
+    } finally {
+      if (streaming) {
+        try {
+          await active.stopImageStream();
+        } catch (_) {}
+      }
+      stageDebug['focusConvergedMs'] =
+          DateTime.now().difference(start).inMilliseconds;
+      stageDebug['focusScoreAtFire'] = double.parse(focusEma.toStringAsFixed(3));
+    }
   }
 
   Future<void> _uploadWithRetry(Uint8List bytes, String path) async {
