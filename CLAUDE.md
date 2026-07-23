@@ -1,5 +1,74 @@
 # ClearBridge Mobile — persistent context
 
+## Real-device test of the per-camera-state-machine build: nfiq2Score 81 (ties all-time best), guide-resize notification bug found + fixed, camera-during-upload fixed (2026-07-23)
+CTO tested the APK built from the per-camera state-machine commit (`0a11728`)
+and reported three things via 5 screenshots: the ambientClose/flashFar guide
+never visibly resized, the live camera kept running behind the "Uploading…"
+screen, and asked how the resulting real captures scored. Investigated via
+an Explore agent (exact code) plus a fresh Firestore/Storage pull of the
+exact test capture.
+
+**Real result: `dadd4ef9` scored `nfiq2Score: 81`** (createdAt
+2026-07-23T14:15:56Z, matches the screenshots), tying this project's
+all-time-best (previously `fc619fe8`'s deepFuse, also 81) — won via the
+plain "native" ambient frame (frameIndex 0, `afisEnhance: gabor`). Visually
+confirmed clean, dense whorl print via `superprint_afis.png`. Flash frames
+again scored terrible sharpness (Laplacian 17-20 vs ambient 232-245, the
+same recurring torch-blowout pattern) but self-corrected via selection.
+Secondary camera "3" succeeded (3 frames); reviewed one visually — thumb
+in-frame but loosely centered, consistent with the known camera-parallax
+finding. Secondary camera "2" **still timed out** at the 28s bound
+(`2_stuckAt: shot_2_upload`) — not blocking, flagged as still-unresolved.
+`ambientCloseDebug`/`flashFarDebug` both show `attempted: true, reachedZone:
+false` — neither bonus stage fired a burst this test (root-caused below).
+
+**Real bug found + fixed: the guide-resize cue could be silently dropped.**
+`activeGuideShape` WAS being set correctly before both waits (ambientClose
+→ enlarged shape, flashFar → shrunk shape) — but the `_apply()` call
+carrying it didn't pass `force: true`, and `_apply` throttles
+`notifyListeners()` to at most once per 80ms. For flashFar this was a
+**guaranteed** miss: its `_apply` call runs synchronously right after
+ambientClose's own cleanup `_apply`, with no `await` in between, always
+landing inside the 80ms window. The CTO's screenshot showed the "Move
+slightly back for a bonus capture" hint text (which did eventually flush on
+a later call) but never the shrunk guide — exactly consistent with this
+mechanism, not a "too subtle to notice" issue. **Fixed**: added `force:
+true` to both `_apply` calls, matching the existing pattern already used
+for the uploading-phase transition and `_fail`.
+
+**Real diagnostic bug found + fixed alongside it**: `_waitForDistanceZone`
+always tracked the MAX coverage regardless of `direction`. For flashFar's
+`below` direction (wants coverage to DROP), the informative number is the
+MINIMUM reached, not the max — the old `maxCoverageObserved: 0.613` field
+didn't actually say how close the CTO got to the 0.25 target. Now tracks
+both extremes and reports whichever matches direction under a renamed
+`coverageObserved` field, so the next real test's data is interpretable.
+Also widened the wait window 6s→9s: the resize cue effectively never
+rendered during this test (per the bug above), so 6s was never actually
+exercised as real reaction time — did NOT touch the coverage thresholds
+themselves, per this project's "measure one variable at a time" discipline.
+Real reach-rate is now 0/2 for this design (continuing the old
+`distanceStage2`'s 0/12) — worth watching whether it improves now that the
+visual cue will actually work, before considering a bigger redesign.
+
+**Camera-during-upload, fixed**: confirmed the live `CameraPreview` was the
+unconditional base layer of the screen's `Stack` in every phase, and the
+uploading scrim was only 92%-opaque (`CaptureColors.void_` alpha 0.92),
+letting 8% of the live feed bleed through — exactly the dim texture visible
+behind the icon in the screenshots. Nothing after `uploading` needs the
+camera again (`uploading` only ever transitions to `complete`/`error`).
+Fixed: the controller now disposes the camera before flipping to
+`uploading`, the screen skips the camera layer entirely during that phase
+(belt-and-suspenders), and the uploading overlay is now fully opaque with
+the actual ClearBridge logo (`app_logo.png`, already asset-registered, used
+elsewhere in `beta_thank_you_screen.dart`) plus a real `CircularProgressIndicator`
+spinner, replacing the generic pulsing `Icons.fingerprint` placeholder
+(`CaptureIntroAnimation` — left untouched since it's still used by the
+retired multi-angle flow).
+
+Committed, not yet pushed (standing process rule: batch, push only on
+explicit go-ahead) or device-tested.
+
 ## Explicit per-camera capture state machine + secondary-camera framing guidance (2026-07-23)
 CTO reported two real problems using the app, both inside `capturingExtra`
 (secondary cameras "2"/"3", then `ambientClose`/`flashFar`): no deliberate
