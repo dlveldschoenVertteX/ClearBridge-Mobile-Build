@@ -1,5 +1,49 @@
 # ClearBridge Mobile — persistent context
 
+## ambientClose/flashFar retired; camera "2"/"3" real physical-spec comparison (2026-07-23, round 6)
+CTO decision: retire ambientClose/flashFar outright (0/18 all-time real
+reach rate — see round 5). Removed cleanly from both sides: app-side the
+two bonus-stage blocks, the dead "switch back to main camera" handoff that
+only existed to serve them, `_waitForDistanceZone`/`_captureDistanceBurst`,
+the direction/illumination enums, and the shape/target constants;
+backend-side the corresponding `ambientCloseFrames`/`flashFarFrames`
+scoring loop in `main.py` (dead weight once the client stops writing those
+fields). Secondary-camera capture and the main burst are untouched.
+Committed (`0cbfdb1`), not yet pushed.
+
+**CTO hypothesis on camera "2" ("Wide Cam," believed possibly the best
+camera for ClearBridge) checked against real data, not accepted at face
+value.** Camera "2" does have the shortest focal length of all four
+cameras (2.37mm vs main's 4.15mm) — consistent with being a wider-FOV lens,
+which fits the CTO's read. But it ALSO has by far the smallest sensor
+(3.92×2.94mm vs main's 5.98×4.49mm) — consistent with a lower-spec
+auxiliary/macro sensor, not a premium wide lens. More importantly: camera
+"2" has **never once completed a successful capture** across all 4 recent
+real tests — always stalls at the exact same step (`shot_2_upload`) — so
+there is currently **zero real captured/scored print data** to evaluate its
+actual quality. The CTO's "looks like more quality" read is from the live
+preview feed, not a completed capture; recommended not trusting that over
+real captured data until camera "2" can actually finish a burst.
+
+**Camera "3" (functionally the CTO's "IR," since they attribute "wide" to
+"2") has the largest sensor of all four cameras (6.64×4.97mm, bigger than
+main) and just delivered the first real, non-proxy-fooled secondary-camera
+win this whole project (round 5, nfiq2Score 72, visually confirmed clean
+print)** — no reason to retire it; it's the strongest secondary-camera
+result to date.
+
+**Optimization suggestions given, not yet built (pending CTO go-ahead):**
+reduce camera "2"'s burst count 3→1 (it always dies on shot 2's upload
+specifically; fewer shots raises its odds of actually completing and would
+finally produce real print data to test the "wide catches more edge ridge"
+hypothesis empirically); now that ambientClose/flashFar are retired,
+there's freed time budget in `capturingExtra` that could absorb this
+without net-lengthening the whole flow; flagged that this test's main-
+camera burst was itself unusually weak (Laplacian 19-24) and camera "3"
+saved the capture — real, quantifiable evidence the multi-camera safety net
+has genuine value, an argument for investing further in camera "2"'s
+reliability rather than dropping it.
+
 ## Real device test of the focus-convergence build: first genuine secondary-camera win (nfiq2Score 72), stageDebug-merge bug found + fixed (2026-07-23, round 5)
 CTO tested the build with the focus-convergence fix (`6b6b606`). Real
 capture `03b91b6f` (2026-07-23T18:03 UTC) scored **nfiq2Score 72** via
