@@ -1,5 +1,21 @@
 # ClearBridge Mobile — persistent context
 
+## Splash duration extended 6.5s → 9.0s (2026-07-23, round 8)
+CTO real-device feedback: "it's too fast right now." Rescaled every beat
+timestamp in `splash_screen.dart` by the same uniform factor (9.0/6.5 =
+18/13) used to build the 6.5s version from the original 13.0s JSX
+reference in the first place — not a re-tuned guess, so relative
+proportions between beats stay exactly what the reference intended, just
+stretched to a slower, more readable pace. Also caught and fixed 4
+continuous (sin/modulo-driven) animations — the badge-dot pulse, the ring
+pulse, its fingerprint-icon breathing scale, and the "tap to continue"
+opacity pulse — that convert the file's own compressed `t` back to the
+JSX reference's 13.0s timeline via a hardcoded `t*2` (correct only for the
+old 6.5s duration, since 13/6.5=2); replaced with a named
+`_refTimeScale = 13.0/_totalS` constant so these stay correct
+automatically if the duration is ever rescaled again. Not yet
+device-tested.
+
 ## Handoff audit + camera "2" distance-sweep feature (2026-07-23, round 7)
 CTO sent an external "5-day sprint" handoff doc and asked it be audited
 against the real codebase before any implementation. Dispatched 3 parallel

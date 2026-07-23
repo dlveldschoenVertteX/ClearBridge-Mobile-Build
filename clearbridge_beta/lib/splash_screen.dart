@@ -50,42 +50,51 @@ class SplashScreen extends StatefulWidget {
 
 class _SplashScreenState extends State<SplashScreen>
     with SingleTickerProviderStateMixin {
-  // Every timestamp below is the JSX reference's own value * 0.5 (13.0s ->
-  // 6.5s) -- an exact uniform scale, not a re-tuned guess, so the relative
-  // proportions between beats match the reference precisely.
-  static const double _totalS = 6.5;
-  static const double _holdS = 0.4;
+  // Every timestamp below is the JSX reference's own value * (_totalS/13.0)
+  // -- an exact uniform scale, not a re-tuned guess, so the relative
+  // proportions between beats always match the reference precisely,
+  // whatever _totalS is set to. Originally 6.5s (0.5x); extended to 9.0s
+  // (CTO feedback 2026-07-23: "it's too fast right now") by rescaling every
+  // beat below by 9.0/6.5, not by padding/re-tuning individual beats.
+  static const double _totalS = 9.0;
+  static const double _holdS = 0.554;
+  // Converts this file's compressed-timeline `t` back to the original JSX
+  // reference's own 13.0s timeline -- used by the few continuous (sin-
+  // driven) animations below that are evaluated directly against the
+  // reference's own formulas rather than as discrete in/out beats. Stays
+  // correct automatically if _totalS is ever rescaled again.
+  static const double _refTimeScale = 13.0 / _totalS;
 
   static const Color _digitalBlue = Color(0xFF2E9FE0);
 
-  static const double _logoEntryStart = 0.35;
-  static const double _logoEntryDur = 0.55;
-  static const double _logoAppearDur = 0.275;
-  static const double _breatheStart = 1.0;
-  static const double _popStart = 2.425;
-  static const double _popEnd = 2.775;
+  static const double _logoEntryStart = 0.485;
+  static const double _logoEntryDur = 0.762;
+  static const double _logoAppearDur = 0.381;
+  static const double _breatheStart = 1.385;
+  static const double _popStart = 3.358;
+  static const double _popEnd = 3.842;
 
-  static const double _scanStart = 1.375;
-  static const double _scanEnd = 2.5;
+  static const double _scanStart = 1.904;
+  static const double _scanEnd = 3.462;
 
-  static const double _flashCenter = 2.56;
-  static const double _flashHalfWidth = 0.21;
-  static const double _ring1Start = 2.675;
-  static const double _ring2Start = 2.835;
-  static const double _ringDur = 0.525;
+  static const double _flashCenter = 3.545;
+  static const double _flashHalfWidth = 0.291;
+  static const double _ring1Start = 3.704;
+  static const double _ring2Start = 3.925;
+  static const double _ringDur = 0.727;
 
-  static const double _eyebrow1In = 0.2, _eyebrow1Out = 1.275;
-  static const double _eyebrow2In = 1.425, _eyebrow2Out = 2.525;
-  static const double _eyebrow3In = 2.75, _eyebrow3Out = 4.25;
+  static const double _eyebrow1In = 0.277, _eyebrow1Out = 1.765;
+  static const double _eyebrow2In = 1.973, _eyebrow2Out = 3.496;
+  static const double _eyebrow3In = 3.808, _eyebrow3Out = 5.885;
 
-  static const double _pctIn = 1.425, _pctOut = 2.625;
+  static const double _pctIn = 1.973, _pctOut = 3.635;
 
-  static const double _row1In = 2.95; // FOR THE WORKER
-  static const double _row2In = 3.075; // BETA / FAST / SECURE / DIGITAL
-  static const double _row3In = 3.225; // POLICE CLEARANCE REIMAGINED
-  static const double _row4In = 3.4; // Ready for secure capture
-  static const double _row5In = 3.625; // Tap to continue
-  static const double _rowFadeIn = 0.25;
+  static const double _row1In = 4.085; // FOR THE WORKER
+  static const double _row2In = 4.258; // BETA / FAST / SECURE / DIGITAL
+  static const double _row3In = 4.465; // POLICE CLEARANCE REIMAGINED
+  static const double _row4In = 4.708; // Ready for secure capture
+  static const double _row5In = 5.019; // Tap to continue
+  static const double _rowFadeIn = 0.346;
 
   Timer? _timer;
   bool _done = false;
@@ -556,8 +565,10 @@ class _SplashScreenState extends State<SplashScreen>
 
   Widget _badgeRow(double t) {
     // Pulsing badge dot: reference dot = 0.35+0.65*sin(t_ref*4.4);
-    // t_ref = t*2 (this file's t is already scaled 0.5x).
-    final dotOpacity = (0.35 + 0.65 * math.sin(t * 8.8)).clamp(0.0, 1.0);
+    // t_ref = t*_refTimeScale (converts back to the JSX reference's own
+    // 13.0s timeline, whatever this file's current _totalS is).
+    final dotOpacity =
+        (0.35 + 0.65 * math.sin(t * 4.4 * _refTimeScale)).clamp(0.0, 1.0);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -640,11 +651,12 @@ class _SplashScreenState extends State<SplashScreen>
       );
 
   Widget _readyRow(double t) {
-    // ringP = (t_ref % 1.8)/1.8, t_ref = t*2. fpScale sin arg: t_ref*3.6 = t*7.2.
-    final ringP = (t * 2) % 1.8 / 1.8;
+    // ringP = (t_ref % 1.8)/1.8, t_ref = t*_refTimeScale.
+    final ringP = (t * _refTimeScale) % 1.8 / 1.8;
     final ringScale = 0.7 + 1.0 * ringP;
     final ringOpacity = (0.55 * (1 - ringP)).clamp(0.0, 1.0);
-    final fpScale = 1 + 0.13 * math.sin(t * 7.2);
+    // fpScale sin arg: t_ref*3.6 = t*3.6*_refTimeScale.
+    final fpScale = 1 + 0.13 * math.sin(t * 3.6 * _refTimeScale);
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
@@ -688,8 +700,9 @@ class _SplashScreenState extends State<SplashScreen>
   }
 
   Widget _tapRow(double t) {
-    // tap = 0.3+0.55*sin(t_ref*3.0), t_ref = t*2 -> sin(t*6.0).
-    final tapOsc = (0.3 + 0.55 * math.sin(t * 6.0)).clamp(0.0, 1.0);
+    // tap = 0.3+0.55*sin(t_ref*3.0), t_ref = t*_refTimeScale.
+    final tapOsc =
+        (0.3 + 0.55 * math.sin(t * 3.0 * _refTimeScale)).clamp(0.0, 1.0);
     return Opacity(
       opacity: tapOsc,
       child: Text(
