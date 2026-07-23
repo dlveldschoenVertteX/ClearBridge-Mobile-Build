@@ -1,5 +1,109 @@
 # ClearBridge Mobile — persistent context
 
+## Third real-device test (zoom/adaptive-flash-EV/noise-reduction-probe build): ANR root-caused + fixed, first-ever good score on a "too close" capture, and a real fusion-selection miss (2026-07-23)
+CTO tested the APK built from the zoom-to-fill/adaptive-flash-EV/noise-
+reduction-probe round and hit a real Android ANR ("ClearBridge Beta isn't
+responding") during the `capturingExtra` phase, plus asked two direct
+questions: (1) can the backend reconcile "get closer for more ridge detail"
+with the established "large px = bad NFIQ2" finding, and (2) audit real
+Firestore captures toward the prime directive. Pulled the 15 most recent
+real capture docs directly (not assumed) to ground all three answers.
+
+**ANR root-caused via a real regression signal, not guessed at.**
+`secondaryCameraDebug` across the last 3 real captures (`cb684c57` 07-22
+through today's two) shows **both** secondary cameras (`2`,`3`) timing out
+on **every** attempt, always stuck at `shot_0_upload`/`shot_1_upload` --
+whereas every real capture before that (`2a85bb36`, `9b0fb988`, `b1c50ca2`,
+etc., all the way back) shows clean `'2_ok'/'3_ok': true`. The dividing line
+lines up exactly with the Item 3 change that took `_secondaryBurstCount`
+1->3 shots and added exposure/focus setup + a 1400ms settle delay per
+camera -- the 12s per-camera timeout guarding that whole sequence was
+calibrated for the OLD single-shot flow and was never widened for the new,
+much longer one, so it now fires routinely. Since `Future.timeout()` cannot
+cancel the underlying native `takePicture()`/upload call, a timeout here
+very likely leaves that camera's session still active in the background
+while the loop immediately opens the NEXT camera's session -- real
+overlapping camera-session contention, the same failure category this
+codebase has already documented elsewhere, and the most likely real trigger
+for the ANR. **Fix**: widened the timeout 12s -> 28s
+(`front_capture_controller.dart`) so it's far less likely to ever fire under
+normal conditions, removing the overlap at its source rather than papering
+over the symptom. Not yet confirmed on a real device.
+
+**Also found and fixed a real, unrelated UI bug while auditing the
+screenshot**: the CTO's screenshot showed a nonsensical "↓ Move phone BACK a
+little" banner rendered simultaneously with the correct "Capturing with
+secondary camera…" banner. Root cause: `front_capture_screen.dart`'s
+distance-hint widget mapped ANY non-null `distanceHint` that wasn't
+literally `'Move closer'` to that one fixed string -- during
+`capturingExtra`, `distanceHint` legitimately carries status text instead
+(`'Capturing with $friendly…'`), which this widget mangled. Fixed by scoping
+that widget's condition to exclude `capturingExtra` (which already has its
+own correct banner one widget down). Both fixes committed `08c06ad`, pushed.
+
+**The "closer for detail vs. large-px NFIQ2 penalty" question: no clean
+backend knob reconciles them, but today's data is the first real
+counter-example that the two aren't always in conflict.** Backend
+resampling was already tested directly for exactly this (2026-07-19 freq-
+floor relaxation, `_FREQ_SCALE_MIN` 0.7->0.15) and made real matchability
+**worse**, not better -- confirming this isn't a pixel-scale artifact a
+backend knob can fix; resampling changes pixel *spacing*, not optical
+*resolution*, so it can't invent ridge detail a too-close/badly-lit capture
+never recorded. **But today's `afe5b02c` is a genuine, real outlier**:
+`afisWavelengthPx` 18.5 (deep in the historically "catastrophic" >=15px
+zone -- every other real capture at wl>=17 scored single digits except one
+borderline wl=15 case) yet scored a real **nfiq2Score 74**, the best score
+this project has ever recorded at this wavelength. Its `zoomDebug` shows
+zoom-to-fill actually engaged (`finalZoomLevel: 1.3`, `zoomApplied: true`)
+and its `flashEvDebug` shows the adaptive EV step active (`evStep: -1.043`).
+Plausible mechanism: the "too close is catastrophic" pattern was never
+purely about wavelength/pixel-scale -- it's that getting closer usually ALSO
+risks flash blowout and framing overshoot, and this capture is the first
+real evidence that if those two specific risks are independently controlled
+(adaptive flash EV, zoom-assisted framing), a close/high-wavelength capture
+CAN still score well. **n=1, not proof, needs replication** -- but this is a
+genuinely new, positive data point worth watching on the next several real
+captures rather than the settled negative result it looked like before this
+round's fixes shipped.
+
+**Real fusion-selection miss found on `913758cf` (nfiq2Score 32, the round's
+worse capture)**: its plain ambient frame scored Laplacian **790.4** (the
+sharpest single frame across all 15 captures audited), while its flash frame
+scored only 81.3 -- a large contrast-collapse-from-overexposure gap,
+the same recurring "torch blows out an already-decently-lit pad" pattern
+documented earlier this project. Despite that, the winning variant was
+`afisFused: 'soft'` (a flash+ambient blend), and the internal proxy score
+(`nfiqAfis` 65.37) badly overestimated the real result (`nfiq2Score` 32) --
+another real instance of the already-established "the internal proxy is
+foolable, only real NFIQ2 is trustworthy" finding, this time plausibly
+costing a capture that had an excellent plain-ambient frame available. Not
+actioned this round (n=1, consistent with existing selection-heuristic
+limitations already documented, not a new bug) -- worth watching whether
+this recurs before considering whether variant selection should weight raw
+frame sharpness more directly.
+
+**Prime-directive audit, real Firestore data, no proactive backend changes
+made:**
+- **`noiseReductionOffSupport` now confirmed `true` for `noiseReductionOff`
+  AND `edgeModeOff` on all 4 cameras on this real device** (Item C's Phase-0
+  probe, shipped last round). Unlike RAW/DNG (dead on arrival --
+  `rawSensorSupport` false on every camera), this device DOES advertise the
+  capability the harder native `CaptureRequest.NOISE_REDUCTION_MODE`/
+  `EDGE_MODE=OFF` override would need -- Item C is worth pursuing now, not
+  shelved.
+- **`distanceStage2` is still 0-for-11 real attempts**, but the diagnostic
+  logging shipped specifically to answer this (`maxCoverageObserved`) now has
+  real numbers: today's two attempts topped out at **0.444** and **0.684**
+  against the required **0.90** threshold -- both meaningfully short, one by
+  more than half. This is real evidence favoring the "design tension"
+  hypothesis over "almost there, just needs more time": users aren't
+  grazing the threshold and running out of clock, they're landing well
+  short of it, consistent with the mask already having been shrunk twice to
+  push users FARTHER away for the wavelength sweet spot, leaving nowhere
+  comfortable to go closer.
+- `rawSensorSupport` still `false` on all 4 cameras, consistent with the
+  standing closed-out finding -- not revisited.
+
 ## deform_correct v3 (SD302f domain-matched + real MAC3D source): MIXED result, not a clean win over v2 (2026-07-22)
 Per the CTO's redirected idea — after multiview-fusion's phase-demodulation
 rebuild became this branch's sixth negative result on the front/side
