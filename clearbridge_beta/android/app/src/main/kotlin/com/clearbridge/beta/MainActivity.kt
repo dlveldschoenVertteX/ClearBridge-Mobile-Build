@@ -48,6 +48,11 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
                     }
+                    "getCameraLensInfo" -> try {
+                        result.success(cameraLensInfoByCameraId())
+                    } catch (e: Exception) {
+                        result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -95,6 +100,34 @@ class MainActivity : FlutterActivity() {
             )
         }
         return support
+    }
+
+    // Real-device finding, 2026-07-23: secondary camera "2" times out on
+    // upload far more often than "3" across several real captures, but
+    // camera IDs alone don't say which physical lens (IR/night-vision vs.
+    // ultrawide) each one actually is -- nothing in the app has ever
+    // distinguished them beyond the raw Android camera-id string. Read-only
+    // characteristics query (same shape as the two above, never touches a
+    // live session) so the next real capture's secondaryCameraDebug can be
+    // cross-referenced against which physical lens actually stalled,
+    // instead of guessing from an opaque id.
+    private fun cameraLensInfoByCameraId(): Map<String, Map<String, Any?>> {
+        val cameraManager = applicationContext
+            .getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val info = mutableMapOf<String, Map<String, Any?>>()
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
+            val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
+            val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            info[id] = mapOf(
+                "focalLengthMm" to focalLengths?.firstOrNull()?.toDouble(),
+                "sensorWidthMm" to sensorSize?.width?.toDouble(),
+                "sensorHeightMm" to sensorSize?.height?.toDouble(),
+                "lensFacing" to facing,
+            )
+        }
+        return info
     }
 }
 

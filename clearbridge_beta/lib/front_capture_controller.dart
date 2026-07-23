@@ -260,6 +260,35 @@ class FrontCaptureController extends ChangeNotifier {
     }
     return _noiseReductionSupportCache;
   }
+
+  // Real-device finding, 2026-07-23: secondary camera "2" times out on
+  // upload far more often than "3" across several real captures (always
+  // stuck mid-upload, at a different shot each time), but nothing in the
+  // app has ever distinguished WHICH physical lens each raw camera-id
+  // string actually is. Same read-only, no-capture, once-per-session-cached
+  // pattern as the two queries above -- lets the next real capture's
+  // secondaryCameraDebug be cross-referenced against real focal-length/
+  // sensor-size data instead of an opaque id.
+  static Map<String, Map<String, dynamic>>? _cameraLensInfoCache;
+  static bool _cameraLensInfoQueried = false;
+
+  static Future<Map<String, Map<String, dynamic>>?> _queryCameraLensInfo() async {
+    if (_cameraLensInfoQueried) return _cameraLensInfoCache;
+    _cameraLensInfoQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getCameraLensInfo');
+      if (result != null) {
+        _cameraLensInfoCache = result.map((k, v) => MapEntry(
+              k,
+              (v as Map).map((k2, v2) => MapEntry(k2 as String, v2)),
+            ));
+      }
+    } catch (e) {
+      debugPrint('[front] camera lens-info query failed (non-fatal): $e');
+    }
+    return _cameraLensInfoCache;
+  }
   static const Set<String> _uploadNonRetryableCodes = {
     'unauthorized', 'unauthenticated', 'no-default-bucket',
     'invalid-argument', 'invalid-url', 'object-not-found', 'quota-exceeded',
@@ -487,6 +516,16 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
 
     _flash = AdaptiveFlashController(camera);
+
+    // Loads the chime WAV assets into the players -- without this call,
+    // every later playAngleSuccess() plays a source-less player, which
+    // just_audio silently no-ops on (swallowed by that method's own
+    // catch), so no chime is ever audible even though every call site looks
+    // correctly wired. Real device test, 2026-07-23: confirmed missing here
+    // (the sibling oscillating_capture_controller.dart already calls this
+    // in its own setup; this call was never copied over when the chime call
+    // sites were retrofitted into this controller).
+    unawaited(_audio.init());
 
     _apply((s) => s.copyWith(phase: FrontCapturePhase.calibrating), force: true);
 
@@ -1048,6 +1087,7 @@ class FrontCaptureController extends ChangeNotifier {
 
       final rawSensorSupport = await _queryRawSensorSupport();
       final noiseReductionOffSupport = await _queryNoiseReductionSupport();
+      final cameraLensInfo = await _queryCameraLensInfo();
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
@@ -1489,6 +1529,7 @@ class FrontCaptureController extends ChangeNotifier {
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
         if (noiseReductionOffSupport != null)
           'noiseReductionOffSupport': noiseReductionOffSupport,
+        if (cameraLensInfo != null) 'cameraLensInfo': cameraLensInfo,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
         'ambientCloseDebug': ambientCloseDebug,
@@ -1603,12 +1644,23 @@ class FrontCaptureController extends ChangeNotifier {
     final paths = <String>[];
     for (var i = 0; i < _secondaryBurstCount; i++) {
       stageDebug['stage'] = 'shot_$i';
+      final shotStart = DateTime.now();
       final shot = await active.takePicture();
       stageDebug['stage'] = 'shot_${i}_readBytes';
       final bytes = await shot.readAsBytes();
+      stageDebug['shot_${i}_captureMs'] =
+          DateTime.now().difference(shotStart).inMilliseconds;
       final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
       stageDebug['stage'] = 'shot_${i}_upload';
+      // Real-device finding, 2026-07-23: camera "2" times out on upload far
+      // more often than "3" -- record real per-shot upload duration so the
+      // next real capture's data shows whether this is a consistently slow
+      // upload (this field will read high every time) vs. a genuine
+      // occasional hang (the timeout fires before this ever gets recorded).
+      final uploadStart = DateTime.now();
       await _uploadWithRetry(bytes, path);
+      stageDebug['shot_${i}_uploadMs'] =
+          DateTime.now().difference(uploadStart).inMilliseconds;
       paths.add(path);
       if (i < _secondaryBurstCount - 1) {
         await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
