@@ -1,5 +1,82 @@
 # ClearBridge Mobile — persistent context
 
+## Audio silently never worked (missing init()), camera-2 diagnostics added, full-fidelity splash rebuild (2026-07-23, round 3)
+CTO reported no audio/haptics anywhere in the capture flow, said the splash
+screen was missing most of the reference zip's content and wanted the whole
+thing translated as-is (duration is the only allowed change), and asked to
+scope everything from the prior optimizations report before pushing.
+Investigated via two Explore agents (audio wiring, splash reference diff)
+plus direct code checks; scoped in Plan Mode, approved, then built.
+
+**Audio root-caused: `front_capture_controller.dart` never calls
+`CaptureAudioService.init()`.** `init()` is the only place that loads the
+WAV assets into the `just_audio` players (`setAsset`) — every
+`playAngleSuccess()` call since (main-burst chime, per-camera
+`capturingExtra` chime) played a source-less player, silently swallowed by
+that method's own `catch`. The sibling `oscillating_capture_controller.dart`
+already calls `init()` in its own setup — a copy-paste gap from when the
+chime call sites were retrofitted into this controller. Fixed with one
+`unawaited(_audio.init())` call in `start()`. Considered also adding
+explicit Android `AudioAttributes`/`audio_session` config for robustness,
+but skipped it — it would need a new pub dependency this sandbox has no way
+to verify resolves (no Flutter toolchain, no cached pub registry), and
+unlike the `init()` call it isn't the actual bug. Haptics themselves look
+correctly wired (`HapticFeedback.lightImpact`/`heavyImpact` at the right
+call sites, `VIBRATE` permission declared) — if still silent after this
+fix, it's most likely the device's own "Touch vibration" system setting,
+which gates `HapticFeedback.*` with no way for the app to detect it.
+
+**Camera "2" timeout pattern — added diagnostics, not a guess-fix.** Real
+data: camera "2" timed out on upload in 3 of the last 4 real captures with
+secondary-camera data (different `shot_N_upload` step each time), while
+camera "3" succeeds consistently — but nothing in the app has ever
+distinguished which physical lens each opaque camera-id actually is.
+Extended the existing read-only `cameraCapabilities` MethodChannel
+(`MainActivity.kt`) with `getCameraLensInfo` (focal length, sensor size,
+lens facing per camera id — same read-only, no-capture pattern as the
+existing `rawSensorSupport`/`noiseReductionOffSupport` queries), attached to
+the capture doc as `cameraLensInfo`. Added per-shot upload-duration
+timestamps (`shot_N_captureMs`/`shot_N_uploadMs`) to `_captureSecondaryBurst`'s
+`stageDebug` so the next real capture shows whether camera "2" is
+consistently slow to upload vs. genuinely hanging.
+
+**Also corrected an item from the prior optimizations report**: the "live
+too-close hint during the primary hold" I'd proposed as a gap already
+exists — `_onFrame` already sets `distanceHint = 'Move back slightly'`
+whenever coverage exceeds `_coverageMax` during the hold, rendered as "↓
+Move phone BACK a little". No work needed there; flagged so it isn't
+mistakenly re-built later.
+
+**Splash screen: full-fidelity rebuild, 13.0s reference scaled to 6.5s.**
+Read the actual `ClearBridgeReveal.jsx` reference beat-by-beat (not prior
+session notes, which contained at least one wrong quote — the reference's
+real tagline is "POLICE CLEARANCE REIMAGINED", not "Police clearance in
+2-5 hours"). The 2026-07-20/22 pass condensed this to 4.7s and dropped the
+entire under-logo marketing stack (5 rows) plus several smaller beats,
+believing only the scan/reveal mechanic mattered — the CTO wanted
+everything back, shorter duration only. Rebuilt scaling every one of the
+reference's own timestamps by exactly 0.5 (preserves true proportions,
+including its own settled tail, rather than re-tuning by feel). Restored:
+the second (gold) ambient halo + blur on both, a separate medallion
+under-glow, the capture "pop" scale bump, a green drop-shadow glow that
+follows the fingerprint's own revealed silhouette (blurred `srcIn`-tinted
+copy under the crisp one, not a bounding-box glow), the scan line's soft
+trailing gradient band, the verification rings' outer glow, the
+radial-gradient stage background, the full-screen vignette, JetBrains Mono
+(was Roboto Mono) on eyebrow/percentage text, and the full 5-row marketing
+stack (FOR THE WORKER / BETA+FAST+SECURE+DIGITAL badge row / POLICE
+CLEARANCE REIMAGINED / Ready for secure capture / Tap to continue). Reused
+the blur/badge/dash-line/pulsing-icon widget *techniques* already proven in
+the unrelated legacy root `lib/splash_screen.dart`, but every beat's actual
+timing/content came from the JSX, not that file. One accepted
+approximation: the reference's `mixBlendMode: screen` capture flash has no
+direct Flutter sibling-blend-mode widget without a custom `CustomPainter`
+— left as plain alpha compositing (minor visual difference against a
+near-black background).
+
+Committed (`e2a6ffa`, `7171aeb`), not yet pushed (standing process rule) or
+device-tested.
+
 ## Real-device test of the per-camera-state-machine build: nfiq2Score 81 (ties all-time best), guide-resize notification bug found + fixed, camera-during-upload fixed (2026-07-23)
 CTO tested the APK built from the per-camera state-machine commit (`0a11728`)
 and reported three things via 5 screenshots: the ambientClose/flashFar guide
