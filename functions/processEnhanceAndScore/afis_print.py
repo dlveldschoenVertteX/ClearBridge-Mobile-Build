@@ -76,6 +76,22 @@ _MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUT
 # conservative choice honouring the explicit "cover the pad" ask with limited downside --
 # confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
 
+_FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0  # below this, treat the flash frame as
+# blown-out and don't trust it for flash-diff segmentation (2026-07-23: real capture
+# dadd4ef9 -- nfiq2Score 81, but a visibly jagged/notched superprint boundary with a
+# real hole in the ridge-bearing area -- had EVERY flash frame in its burst score
+# Laplacian 17-20 (vs ambient's 232-245), the same recurring torch-blowout pattern
+# documented throughout this project. A severely overexposed/clipped flash frame has
+# little local brightness gradient left in the near-camera region, which is exactly
+# the cue _segment_via_flash_diff's torch-falloff differencing depends on -- so it
+# produces a noisy, patchy diff mask instead of a clean pad-shaped blob. That noise
+# passed straight through the existing area-only accept-gate below and became a real,
+# literal hole in the final print (afis_print.py hard-masks everything outside the
+# mask to white -- see `binimg[mask == 0] = 255`), not just a cosmetic boundary
+# artifact. 50.0 sits comfortably above every confirmed-blown-out real flash score
+# seen this project (17-90 range) and comfortably below legitimately sharp captures
+# (hundreds+), so this can only skip pairs already known unreliable.
+
 # Ridge-continuity tuning (2026-07-15, round 2): CTO reported ridges not
 # connecting/flowing smoothly on real device captures. Tried morphological
 # closing/opening directly on the binarized print first -- REJECTED, actively
@@ -584,6 +600,25 @@ def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
         return None
 
 
+def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    """Fills fully-enclosed holes/notches in a binary 0/255 mask -- belt-and-
+    suspenders alongside the blown-out-flash-frame guard above: even a decent
+    flash frame can produce a small noisy gap in the diff mask, and a hole
+    anywhere in the mask becomes a literal hole in the final print (generate()
+    hard-masks outside the mask to white). Flood-fills the background from a
+    corner (the mask is always a roughly-centred blob well inside the frame,
+    so a corner is reliably background), then anything NOT reached by that
+    flood is either real foreground or an enclosed hole -- both get kept. Can
+    only ADD area back inside already-enclosed gaps, never remove real
+    foreground, so this can't regress an already-clean mask."""
+    h, w = mask.shape[:2]
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    filled = mask.copy()
+    cv2.floodFill(filled, flood_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(filled)
+    return cv2.bitwise_or(mask, holes)
+
+
 def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
                       flash_burst: Optional[List[np.ndarray]],
                       shape: Tuple[int, int]) -> Optional[np.ndarray]:
@@ -606,6 +641,16 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
             a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
             f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
             if a_gray.shape != shape or f_gray.shape != shape:
+                continue
+            # Blown-out flash frame guard -- see _FLASH_DIFF_MIN_FLASH_LAPLACIAN's
+            # own comment. A saturated/clipped flash frame has too little local
+            # gradient left for the torch-falloff cue to work, and produces a
+            # noisy mask rather than failing cleanly -- skip this pair (try the
+            # next burst pair, if any) rather than trust it.
+            f_lap = float(cv2.Laplacian(f_gray, cv2.CV_64F).var())
+            if f_lap < _FLASH_DIFF_MIN_FLASH_LAPLACIAN:
+                logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
+                            f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
                 continue
             result = sfm_pipeline._segment_via_flash_diff(a_gray, f_gray, ksize=7)
             if result is not None:
@@ -1477,6 +1522,14 @@ def generate(
             pad_mask = _unet_mask(gray)
             refine_tag = 'unet'
         if pad_mask is not None:
+            # Real bug found 2026-07-23 (capture dadd4ef9): a noisy detector
+            # can leave an enclosed hole/notch in an otherwise-plausible pad
+            # mask, which becomes a literal white hole in the final print
+            # (mask==0 is hard-forced to white below) even though the guide's
+            # own area-only accept-gate has no way to catch it. Fill enclosed
+            # holes before that gate runs -- can only recover area already
+            # inside the detected pad, never grow past it.
+            pad_mask = _fill_mask_holes(pad_mask)
             if _MASK_COVER_DILATE > 1.0:
                 bound = _superellipse_mask(gray.shape[:2], {
                     **guide_region,

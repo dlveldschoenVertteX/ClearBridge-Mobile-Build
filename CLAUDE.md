@@ -1,5 +1,90 @@
 # ClearBridge Mobile — persistent context
 
+## Real segmentation bug found + fixed: blown-out flash frame corrupts the flash-diff mask, punches a real hole in the print (2026-07-23, round 9)
+CTO flagged a visible segmentation defect in the `dadd4ef9` (nfiq2Score 81)
+superprint sent last round — a jagged, "toothed" boundary plus a real
+squarish hole/notch bitten out of the ridge area — and separately said
+ridge continuity looked worse than usual, attaching a comparison image
+with a smooth boundary and no such defect. Investigated by pulling
+`dadd4ef9`'s real Firestore doc rather than guessing.
+
+**Root cause, confirmed from the doc's own data**: `superprintParams.afisMask
+= "guide+flashdiff"` — this capture's mask came from `_flash_diff_mask()`
+(flash-minus-ambient differencing, `afis_print.py`), intersected with a
+1.3x-dilated guide bound. But `dadd4ef9`'s ENTIRE flash burst was severely
+blown out — Laplacian 17.2-19.8 across all 4 flash frames vs 232-245 on the
+matching ambient frames, the same recurring torch-blowout pattern documented
+repeatedly throughout this project. `_flash_diff_mask` always used the
+first ambient/flash pair with zero exposure check. A saturated/clipped
+flash frame has almost no local brightness gradient left in the near-camera
+region — exactly the cue the torch-falloff differencing depends on — so it
+produced a noisy, patchy diff mask instead of a clean pad-shaped blob. That
+noise passed straight through the existing accept-gate (which only checks
+overall AREA, 0.35-0.92 of bound, never smoothness/holes) and became a
+literal, permanent hole in the final print: `afis_print.py` hard-masks
+everything outside the mask to white (`binimg[mask == 0] = 255`), so a false
+"not pad" region isn't just a boundary artifact — it's real ridge-bearing
+pad area that got thrown away entirely. **This is very likely the same root
+cause as the "ridge continuity looks worse" complaint, not a separate
+issue** — a hole punched straight through real ridge structure, plus the
+jagged boundary breaking ridge strokes wherever it crosses them, reads
+exactly like a continuity problem even though the underlying ridges
+themselves were probably fine.
+
+**Fixed, two layers** (`afis_print.py`):
+1. **Blowout guard in `_flash_diff_mask`**: computes the flash frame's own
+   Laplacian variance before trusting it for differencing; skips any pair
+   below `_FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0` (comfortably above every
+   confirmed-blown-out real flash score this project has seen — 17-90 range
+   — and comfortably below legitimately sharp captures, hundreds+), trying
+   the next burst pair if any. If every pair is blown out (as in
+   `dadd4ef9`), returns `None` and falls through to the U-Net mask (or bare
+   guide) — both smooth, both already-safe existing paths.
+2. **`_fill_mask_holes()`**: a new belt-and-suspenders helper, applied to
+   `pad_mask` right after it's obtained (both the flashdiff and U-Net
+   paths) — flood-fills from a corner to find true background, then fills
+   anything NOT reached (real foreground OR an enclosed hole) back in. Can
+   only recover area already inside the detected pad shape, never grow past
+   it or remove real foreground — can't regress an already-clean mask,
+   catches the same failure mode even from a non-blowout noise source.
+
+Verified the hole-fill logic standalone (synthetic mask with a punched
+rectangle: 4584px -> 5025px after fill, hole recovered). Not yet re-run
+against a real capture — same standing discipline as everywhere else in
+this pipeline, needs a real device test with a similarly blown-out burst to
+confirm. The already-scored `dadd4ef9` doc itself can't be retroactively
+fixed by this change; the benefit is on the next real capture that hits the
+same blowout condition.
+
+**TAR on the `dadd4ef9` print, asked directly**: no honest TAR percentage
+exists for this print, or for anything in this project's real history (the
+round-7 handoff audit already confirmed zero "TAR%" figure appears anywhere
+in CLAUDE.md/docs). TAR is a population-level metric requiring many real
+genuine AND impostor comparisons at a fixed decision threshold — it cannot
+be computed from one print. What IS real: ran the actual SourceAFIS
+matcher (the project's own established fidelity gate) between `dadd4ef9`'s
+superprint and the CTO's ink scan directly (`scratchpad/sourceafis`,
+locally built, `.m2` cached) — **score 0.00** (mirrored orientation: 0.00
+one direction, 2.19 the other) — far below SourceAFIS's own practical
+match threshold (~40). Contextualized against the same ink scan's
+established noise floor: the CTO's own previously-confirmed genuine
+captures (`3e54236a`/`c34911b5`/`382cc4b2`/`722ae3b0`) score 0.00-10.60
+against this same scan, and unrelated impostor captures score in a
+similar 0-10.6 range — this single low-quality ink scan has never been able
+to separate genuine from impostor (the project's own long-standing
+"noise floor" finding, unrelated to this specific print). **A 0.00 score
+here does not mean this print doesn't match the real finger** — it means
+the whole measurement is underpowered given the current ground truth, same
+caveat as every other real match number in this project's history. A real
+TAR needs a proper paired dataset (RidgeBase) or a real ≥500-DPI reference
+scan — both still-standing, CTO-side blockers, not something computable
+from what exists today. Separately, the segmentation hole found above is a
+plausible real contributor to this specific 0.00 (real minutiae structure
+was destroyed in that hole region) — but the noise-floor caveat likely
+dominates regardless.
+
+Committed, not yet pushed (standing process rule).
+
 ## Splash duration extended 6.5s → 9.0s (2026-07-23, round 8)
 CTO real-device feedback: "it's too fast right now." Rescaled every beat
 timestamp in `splash_screen.dart` by the same uniform factor (9.0/6.5 =
