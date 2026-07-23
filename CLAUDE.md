@@ -1,5 +1,46 @@
 # ClearBridge Mobile — persistent context
 
+## Explicit per-camera capture state machine + secondary-camera framing guidance (2026-07-23)
+CTO reported two real problems using the app, both inside `capturingExtra`
+(secondary cameras "2"/"3", then `ambientClose`/`flashFar`): no deliberate
+stop between cameras (the loop just moved straight to the next one), and
+"Uploading…" appearing while a camera could still be capturing in the
+background. Root-caused in code: the secondary-camera loop never explicitly
+disposed a camera controller after its own turn — it relied entirely on the
+SIDE EFFECT of the NEXT camera's `svc.initializeCamera()` internally calling
+`CameraService.disposeCamera()` first. Combined with the per-camera 28s
+timeout (which can't cancel the underlying native call — the established ANR
+hypothesis), this meant a timeout could fire and the loop would race on to
+the next camera while the previous one's native work was still running, with
+no `await`ed "this camera has fully stopped" checkpoint anywhere.
+
+**Fix**: every camera turn inside `capturingExtra` (each secondary camera,
+then `ambientClose`, then `flashFar`) now goes through the same explicit
+5-step sequence: (1) switch in + generic centered guide shown on that
+camera's own live feed (already displayed automatically —
+`_cameraLayer()` reads the live `CameraService` controller — just never had
+a guide overlay before), (2) `"3…"`/`"2…"`/`"1…"` countdown with haptic
+pulses (~700ms apart, real time to use the guide before the shutter fires),
+(3) capturing, (4) an explicit, **awaited** `svc.disposeCamera()` before the
+turn is allowed to end (secondary cameras only — `ambientClose`/`flashFar`
+reuse the same live main-camera session throughout, so there's nothing to
+dispose there, but they get the same visible sequence for consistency), (5)
+a real `"✓ $friendly captured"` / `"$friendly skipped"` confirmation banner
++ chime. Two new shared helpers (`_showCountdown`, `_showStopConfirmation`)
+reused across all 4 turns instead of duplicating this logic. New generic
+`_secondaryCameraGuideShape` (reuses `PadSilhouetteShape.defaultShape` —
+deliberately NOT calibrated to each lens's real FOV offset yet, since no
+measured offset data exists; this is the first cut that gives the user SOME
+framing target instead of none, following directly from this session's
+camera-comparison finding that secondary cameras have real, sometimes-
+excellent ridge detail but fire completely blind today).
+
+**Real, deliberate cost**: adds ~3.5-4s per camera turn × 4 turns ≈ 14-16s to
+`capturingExtra`'s total length — the direct, unavoidable price of a
+countdown + confirmation on every camera, not a surprise. Committed, not yet
+pushed (standing process rule: batch, push only on explicit go-ahead) or
+device-tested.
+
 ## Post-device-test optimization round: fusion-selection guard, illumination-decoupled distance capture, noise-reduction research spike (2026-07-23)
 Following the ANR/prime-directive audit above, scoped and built the next
 round in Plan Mode (approved), with a new standing process rule: commit

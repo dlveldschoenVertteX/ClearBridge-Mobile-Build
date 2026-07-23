@@ -355,6 +355,18 @@ class FrontCaptureController extends ChangeNotifier {
       PadSilhouetteShape.defaultShape.scaled(_ambientCloseShapeScale);
   static final PadSilhouetteShape _flashFarShape =
       PadSilhouetteShape.defaultShape.scaled(_flashFarShapeScale);
+  // Generic centered guide shown during each secondary camera's (IR/wide)
+  // own live feed (2026-07-23) -- NOT calibrated to that lens's real FOV
+  // offset from the main camera (no measured data exists yet; the
+  // camera-comparison investigation this session found the thumb is
+  // completely absent from the secondary lens's frame in ~3/8 real
+  // captures, and off-center/uncontrolled in the rest). Reusing the
+  // default shape is a deliberate first cut -- it gives the user SOME
+  // framing target instead of none, and the countdown below gives them
+  // real time to use it, before ever investing in precise per-lens
+  // calibration.
+  static const PadSilhouetteShape _secondaryCameraGuideShape =
+      PadSilhouetteShape.defaultShape;
   // Near-zone threshold reused verbatim from the old distanceStage2 (already
   // real-world-tested, if never yet reached: 0/12 real attempts, see
   // CLAUDE.md). Far-zone threshold is the new, symmetric ask -- below
@@ -725,6 +737,44 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
+  // Explicit per-camera-turn UI (2026-07-23) -- shared by every camera turn
+  // inside capturingExtra (each secondary camera, then ambientClose, then
+  // flashFar) so the whole phase reads as one consistent sequence: guide
+  // shown -> countdown -> capturing -> explicit stop -> confirmation.
+  // Directly answers the CTO's real-device report that cameras fired with
+  // no dead stop between them and no warning before the shutter.
+
+  /// "3…" -> "2…" -> "1…", ~700ms apart with a light haptic pulse each, then
+  /// hands off to "Capturing…". Real time for the user to react to
+  /// whatever guide is currently shown, not just a label change.
+  Future<void> _showCountdown() async {
+    for (final n in const ['3…', '2…', '1…']) {
+      if (_disposed) return;
+      _apply((s) => s.copyWith(distanceHint: n));
+      HapticFeedback.lightImpact();
+      await Future<void>.delayed(const Duration(milliseconds: 700));
+    }
+    if (_disposed) return;
+    _apply((s) => s.copyWith(distanceHint: 'Capturing…'));
+  }
+
+  /// Real, visible confirmation that a camera turn has ended -- shown only
+  /// AFTER the caller has already awaited that camera's explicit stop (e.g.
+  /// `svc.disposeCamera()`), so "this camera stopped" is a fact by the time
+  /// this banner appears, not an assumption. Clears the guide shape so the
+  /// next turn (or the real uploading transition) starts from a clean slate.
+  Future<void> _showStopConfirmation(String friendly, {required bool success}) async {
+    if (_disposed) return;
+    _apply((s) => s.copyWith(
+          distanceHint: success ? '✓ $friendly captured' : '$friendly skipped',
+          activeGuideShape: null,
+        ));
+    if (success) {
+      unawaited(_audio.playAngleSuccess(isFinal: false));
+    }
+    await Future<void>.delayed(const Duration(milliseconds: 600));
+  }
+
   void _maybeAdjustExposure() {
     if (_evChangeInFlight) return;
     final cam = _camera;
@@ -1093,6 +1143,13 @@ class FrontCaptureController extends ChangeNotifier {
         // below, which always run (best-effort) after this loop.
         extraTotal = others.length + 2;
         for (final desc in others) {
+          final labelName = desc.name.toLowerCase();
+          final friendly = labelName.contains('ir') || labelName.contains('night')
+              ? 'IR camera'
+              : labelName.contains('wide')
+                  ? 'wide lens'
+                  : 'secondary camera';
+          var succeeded = false;
           try {
             CameraController active;
             if (svc != null) {
@@ -1104,7 +1161,7 @@ class FrontCaptureController extends ChangeNotifier {
                   )
                   .timeout(const Duration(seconds: 8));
               active = svc.controller!;
-              _camera = active; // resync so distance-stage-2/UI see the current controller
+              _camera = active; // resync so ambientClose/flashFar/UI see the current controller
             } else {
               // Defensive fallback if no CameraService was supplied (should
               // not happen via the real screen, which always passes one) --
@@ -1113,54 +1170,43 @@ class FrontCaptureController extends ChangeNotifier {
               active = CameraController(desc, ResolutionPreset.max, enableAudio: false);
               await active.initialize().timeout(const Duration(seconds: 8));
             }
-            final labelName = desc.name.toLowerCase();
-            final friendly = labelName.contains('ir') || labelName.contains('night')
-                ? 'IR camera'
-                : labelName.contains('wide')
-                    ? 'wide lens'
-                    : 'secondary camera';
+
+            // Explicit per-camera-turn sequence (2026-07-23), per the CTO's
+            // real-device report: "no dead stop for any camera... it goes
+            // ahead to the next camera" and "Uploading... but camera is
+            // still live in the background". Step 1+2: switch in, show a
+            // generic centered guide on THIS camera's own live feed (already
+            // shown automatically -- _cameraLayer() reads the live
+            // CameraService controller). Not precisely calibrated per-lens
+            // yet (real per-lens FOV-offset data doesn't exist) -- a
+            // deliberate first cut, per the camera-comparison investigation
+            // this same session: secondary cameras have real, sometimes-
+            // excellent ridge detail but fire blind with no framing cue at
+            // all today.
             _apply((s) => s.copyWith(
-                  distanceHint: 'Capturing with $friendly…',
+                  distanceHint: 'Now using $friendly — center your thumb pad',
+                  activeGuideShape: _secondaryCameraGuideShape,
                   extraProgress: extraCompleted / extraTotal,
                 ));
-            // Real device test (2026-07-22): capture got permanently stuck
-            // on the wide-angle camera, never progressing past that phase --
-            // the whole flow (including secondary cameras/distance-stage-2
-            // that come after, and the real Firestore write + upload) blocks
-            // forever with it. Root cause: `initializeCamera` above already
-            // has an 8s timeout, but NOTHING after it did -- setFlashMode/
-            // exposure/focus calls and, most importantly, `takePicture()`
-            // itself are raw awaits with no bound. If a secondary sensor's
-            // native capture session hangs (plausible on a wide-angle lens
-            // with different AF/AE convergence behaviour than the already-
-            // exercised IR sensor, especially given the extensive camera-
-            // session-contention history already documented above), the
-            // await never resolves and this loop -- and everything after it
-            // -- stalls indefinitely with zero user-visible progress. Bound
-            // the ENTIRE per-camera exposure/focus/burst sequence in one
-            // timeout so a hang here can only ever cost this one camera's
-            // data, never the rest of the capture.
+            await Future<void>.delayed(const Duration(milliseconds: 1200));
+            // Step 3: countdown -- real time to use the guide above before
+            // the shutter fires, not just a label change.
+            await _showCountdown();
+
+            // Step 4: capture. Real device test (2026-07-22): capture got
+            // permanently stuck on the wide-angle camera, never progressing
+            // past this phase -- root cause: initializeCamera above already
+            // has an 8s timeout, but NOTHING after it did. takePicture()
+            // itself is a raw await with no bound, so a hung native capture
+            // session stalled the whole rest of the flow with zero
+            // user-visible progress. Bound the ENTIRE per-camera
+            // exposure/focus/burst sequence in one timeout so a hang here
+            // can only ever cost this one camera's data.
             //
-            // Widened 12s -> 28s (2026-07-23): real Firestore data across the
-            // 3 captures since _secondaryBurstCount went 1->3 shots (plus the
-            // new exposure/focus setup + 1400ms settle preamble, all added
-            // for Item 3) shows BOTH secondary cameras timing out on every
-            // single one, always at 'shot_0_upload' or 'shot_1_upload' --
-            // whereas every capture before that change shows '2_ok'/'3_ok':
-            // true. 12s was calibrated for the OLD single-shot sequence and
-            // was never widened for the now much longer one; a real onTimeout
-            // firing this often means the loop is racing on, closing this
-            // camera's session and opening the next one, while the timed-out
-            // camera's takePicture()/upload call is very likely STILL running
-            // in the background (.timeout() cannot cancel the underlying
-            // native Future) -- i.e. two secondary camera sessions active at
-            // once, exactly the kind of camera-session contention already
-            // documented elsewhere in this file, and a strong candidate for
-            // the real-device ANR ("ClearBridge Beta isn't responding")
-            // reported the same test round. A wider budget makes it far less
-            // likely this timeout fires at all under normal (if slow) network
-            // conditions, which removes the overlap risk at its source rather
-            // than just papering over the symptom.
+            // Widened 12s -> 28s (2026-07-23): real Firestore data across 3
+            // captures after the burst upgrade (1->3 shots) showed BOTH
+            // secondary cameras timing out on every one, always mid-upload
+            // -- 12s was calibrated for the old single-shot flow.
             final stageDebug = <String, dynamic>{'stage': 'not_started'};
             final paths = await _captureSecondaryBurst(active, desc, basePath, stageDebug)
                 .timeout(const Duration(seconds: 28), onTimeout: () {
@@ -1171,46 +1217,70 @@ class FrontCaptureController extends ChangeNotifier {
               // Last stage entered before the timeout fired -- e.g.
               // 'settle_delay'/'focus_setup' points at AF convergence never
               // completing, 'shot_N' points at takePicture() itself hanging.
-              // See _captureSecondaryBurst's docstring for why this survives
-              // even though the underlying Future never resolves.
               secondaryDebug['${desc.name}_stuckAt'] = stageDebug['stage'];
               return <String>[];
             });
-            if (paths.isNotEmpty) {
-              secondaryMeta.add({'name': desc.name, 'paths': paths});
-              secondaryDebug['${desc.name}_ok'] = true;
-              // Audio confirmation per camera -- CTO real-device feedback
-              // 2026-07-20: only the main burst had a success chime
-              // (playAngleSuccess above in _fireBurst), so a user had no
-              // feedback that each secondary camera's own capture actually
-              // completed during the silent "capturingExtra" phase.
-              unawaited(_audio.playAngleSuccess(isFinal: false));
-            }
-            extraCompleted++;
-            _apply((s) => s.copyWith(extraProgress: extraCompleted / extraTotal));
-            if (svc == null) {
+
+            // Step 5: explicit, AWAITED stop -- regardless of success or
+            // timeout -- before this iteration ends. Previously this loop
+            // relied entirely on the NEXT camera's own initializeCamera()
+            // call to dispose this one as a side effect (internally,
+            // CameraService._initializeCameraAttempt calls disposeCamera()
+            // first) -- meaning there was never an await'd "this camera has
+            // fully stopped" checkpoint owned by the turn that just
+            // finished. A timeout firing meant the loop raced on to open
+            // the NEXT camera while the timed-out camera's takePicture()/
+            // upload call was very likely STILL running in the background
+            // (.timeout() cannot cancel the underlying native Future) --
+            // the leading real ANR ("ClearBridge Beta isn't responding")
+            // hypothesis this session. Disposing HERE, awaited, closes that
+            // gap at its source: the native session is actively torn down
+            // (which should fail any still-pending call against it) before
+            // we ever consider this turn done.
+            if (svc != null) {
+              await svc.disposeCamera();
+            } else {
               try {
                 await active.dispose();
               } catch (_) {}
             }
+
+            if (paths.isNotEmpty) {
+              secondaryMeta.add({'name': desc.name, 'paths': paths});
+              secondaryDebug['${desc.name}_ok'] = true;
+              succeeded = true;
+            }
+            await _showStopConfirmation(friendly, success: succeeded);
+            extraCompleted++;
+            _apply((s) => s.copyWith(
+                  distanceHint: null,
+                  extraProgress: extraCompleted / extraTotal,
+                ));
           } catch (e) {
             debugPrint('[front] secondary camera ${desc.name} skipped: $e');
             secondaryDebug['${desc.name}_error'] = e.toString();
+            await _showStopConfirmation(friendly, success: false);
             extraCompleted++;
-            _apply((s) => s.copyWith(extraProgress: extraCompleted / extraTotal));
+            _apply((s) => s.copyWith(
+                  distanceHint: null,
+                  extraProgress: extraCompleted / extraTotal,
+                ));
           }
         }
       } catch (e) {
         debugPrint('[front] secondary camera capture skipped entirely: $e');
         secondaryDebug['fatalError'] = e.toString();
       } finally {
-        _apply((s) => s.copyWith(distanceHint: null));
+        _apply((s) => s.copyWith(distanceHint: null, activeGuideShape: null));
       }
 
       // Switch back to the main camera now that the secondary-camera loop is
-      // done -- distance-stage-2 right below reuses `_camera` and needs the
-      // main sensor active again (same clean dispose-then-open handoff as
-      // each secondary-camera switch above, not a resume of a paused one).
+      // done -- ambientClose/flashFar right below reuse `_camera` and need
+      // the main sensor active again (same clean dispose-then-open handoff
+      // as each secondary-camera switch above -- by this point the LAST
+      // secondary camera has already been explicitly disposed in step 5
+      // above, so this is always opening fresh, never racing a still-open
+      // session).
       if (svc != null && mainCameraDescription != null &&
           svc.controller?.description.name != mainCameraDescription.name) {
         try {
@@ -1225,16 +1295,17 @@ class FrontCaptureController extends ChangeNotifier {
           // AdaptiveFlashController binds permanently to the CameraController
           // instance passed at construction (final field, no update method) --
           // the old `_flash` still points at the now-disposed pre-switch main
-          // controller. Rebuild it against the fresh one so distance-stage-2's
-          // _flash!.activate()/deactivate() calls below don't operate on a
-          // disposed controller.
+          // controller. Rebuild it against the fresh one so ambientClose/
+          // flashFar's _flash!.activate()/deactivate() calls below don't
+          // operate on a disposed controller.
           if (_camera != null) {
             _flash = AdaptiveFlashController(_camera!);
           }
         } catch (e) {
           debugPrint('[front] failed to switch back to main camera: $e');
-          // distance-stage-2 below checks `_camera` is non-null/initialized
-          // and just skips itself (non-fatal) if this didn't work.
+          // ambientClose/flashFar below check `_camera` is non-null/
+          // initialized and just skip themselves (non-fatal) if this didn't
+          // work.
         }
       }
 
@@ -1249,7 +1320,11 @@ class FrontCaptureController extends ChangeNotifier {
       // capturingExtra: best-effort, bounded, any failure just skips silently.
       // Must land in the Firestore payload below before the
       // processEnhanceAndScore trigger so the backend's one-time doc read
-      // sees it.
+      // sees it. Both stages reuse the SAME live main-camera session
+      // throughout (no controller swap), so unlike the secondary-camera loop
+      // there is no separate camera to dispose in step 5 -- but each still
+      // gets the same visible guide/countdown/confirmation sequence for a
+      // consistent mental model across the whole capturingExtra phase.
       final ambientCloseFrames = <Map<String, dynamic>>[];
       final ambientCloseDebug = <String, dynamic>{'attempted': false};
       final flashFarFrames = <Map<String, dynamic>>[];
@@ -1281,6 +1356,7 @@ class FrontCaptureController extends ChangeNotifier {
               double.parse(nearResult.maxCoverage.toStringAsFixed(3));
           if (nearResult.reached) {
             await _refocus();
+            await _showCountdown();
             final frames = await _captureDistanceBurst(
               cam2,
               zone: 'ambientClose',
@@ -1291,9 +1367,12 @@ class FrontCaptureController extends ChangeNotifier {
             ambientCloseFrames.addAll(frames);
           }
         }
+        await _showStopConfirmation('ambient-close capture',
+            success: ambientCloseFrames.isNotEmpty);
       } catch (e) {
         debugPrint('[front] ambientClose capture skipped (non-fatal): $e');
         ambientCloseDebug['error'] = e.toString();
+        await _showStopConfirmation('ambient-close capture', success: false);
       } finally {
         extraCompleted++;
         _apply((s) => s.copyWith(
@@ -1324,6 +1403,7 @@ class FrontCaptureController extends ChangeNotifier {
               double.parse(farResult.maxCoverage.toStringAsFixed(3));
           if (farResult.reached) {
             await _refocus();
+            await _showCountdown();
             final frames = await _captureDistanceBurst(
               cam3,
               zone: 'flashFar',
@@ -1334,9 +1414,12 @@ class FrontCaptureController extends ChangeNotifier {
             flashFarFrames.addAll(frames);
           }
         }
+        await _showStopConfirmation('flash-far capture',
+            success: flashFarFrames.isNotEmpty);
       } catch (e) {
         debugPrint('[front] flashFar capture skipped (non-fatal): $e');
         flashFarDebug['error'] = e.toString();
+        await _showStopConfirmation('flash-far capture', success: false);
       } finally {
         extraCompleted++;
         _apply((s) => s.copyWith(
