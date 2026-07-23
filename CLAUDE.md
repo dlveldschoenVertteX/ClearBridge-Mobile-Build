@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## Secondary-camera focus now actually measured, not guessed; ridge-continuity/TAR status recap (2026-07-23, round 4)
+CTO tested the round-3 build (audio fix + camera diagnostics + splash
+rebuild, run `30027872912`, confirmed successful) and raised two points:
+"ridge continuity is a big issue, it will have a really low TAR" despite
+visually impressive prints, and "some cameras do not focus on fingerprint
+immediately, it's blurry captures."
+
+**Focus fix, real root cause.** `_captureSecondaryBurst` fired its burst
+after a **blind fixed 1400ms delay** with zero verification that AF had
+actually converged — unlike the PRIMARY camera's own burst, which only
+fires once a real measured sharpness signal (`_focusValue`, peak-
+normalized/EMA-smoothed Laplacian variance via `_hybrid.offerFrame`) clears
+a 0.45 relative threshold during the hold. The secondary-camera path had no
+equivalent at all. Added `_waitForSecondaryFocusLock()`, reusing that exact
+same signal on the secondary camera's own image stream: resolves as soon as
+the smoothed, peak-normalized sharpness exceeds the same 0.45 threshold
+(portable across lenses with very different absolute sharpness ranges,
+same as the primary path), bounded 500ms min / 2600ms max (never fires on
+a lucky first frame, never hangs longer than a modest margin over the old
+delay even on a sensor that never converges). Records
+`focusConvergedMs`/`focusScoreAtFire` per camera into `secondaryCameraDebug`
+so the next real test's data shows whether convergence is actually
+happening now and how long it really takes.
+
+**Ridge-continuity/TAR: recapped the real status, did not write new
+enhancement code blind.** This is the project's own standing Prime
+Directive, already the subject of massive prior investigation this whole
+project (SourceAFIS gate, `ml/deform_correct` v1-v3, `ml/multiview_fusion`
+Phase 0/1, pyfing/pyfingHybrid/coherenceDiff/nnsHybrid) — every one of
+those either measured negative or only narrowly, inconsistently positive.
+The two real structural blockers are unchanged: no real ≥500-DPI reference
+scan of the CTO's own finger exists (the one ink scan can't distinguish
+genuine from impostor — noise floor), and RidgeBase/a public paired dataset
+was never actually acquired despite being flagged since 2026-07-17. The one
+real, free, still-untried lever is cross-polarization (physical film over
+flash+lens, kills specular reflection at the source) — flagged as the
+highest value-per-effort item in `docs/RIDGE_CONTINUITY_OPTIMIZATION_SCOPE.md`
+since 2026-07-16/17 and still never tried. Recommended against another
+speculative enhancement-code pass given the track record above; the real
+unlocks here are CTO-side (reference scan, paired dataset) or free
+(cross-polarization), not new capture-pipeline code.
+
+Committed (`730e66c`), not yet pushed (standing process rule) or
+device-tested.
+
 ## Audio silently never worked (missing init()), camera-2 diagnostics added, full-fidelity splash rebuild (2026-07-23, round 3)
 CTO reported no audio/haptics anywhere in the capture flow, said the splash
 screen was missing most of the reference zip's content and wanted the whole
