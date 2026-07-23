@@ -190,6 +190,24 @@ class FrontCaptureController extends ChangeNotifier {
   // pattern already used for the main burst), same rationale as the main
   // burst's own frame-count bump above.
   static const int _secondaryBurstCount = 3;
+  // Camera "2" distance-sweep: two guide scales spanning closer->farther,
+  // one shown per shot in its own burst. CTO ask 2026-07-23 round 6: "use
+  // the mask opening to gauge user distance so it can go from closer to
+  // further away", scoped to camera "2" only (their "Wide Cam" hypothesis --
+  // still 0/4 real completions to date, so no real print data exists yet to
+  // test it). Reuses the same "bigger guide = closer, smaller guide =
+  // farther" mechanism already established for the retired ambientClose/
+  // flashFar work (PadSilhouetteShape.scaled). >1.0 pulls the user closer;
+  // <1.0 pushes them farther. Two shots, not three: camera "2" has died on
+  // shot index 2 (the 3rd shot) in every real test to date, so dropping to
+  // two shots also sidesteps that exact failure point rather than fighting
+  // it, as a side benefit of the sweep itself.
+  static const List<double> _camera2DistanceSweepScales = [1.15, 0.85];
+  // Real time for the user to physically move their thumb between the two
+  // distance-sweep shots above -- _burstShotDelayMs (50ms) is tuned for a
+  // STATIC thumb during the main/other secondary bursts and is nowhere near
+  // enough time to actually reposition.
+  static const int _camera2SweepMoveDelayMs = 1600;
   static const int _burstFlashSettleMs = 70;
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
@@ -1205,8 +1223,19 @@ class FrontCaptureController extends ChangeNotifier {
             // secondary cameras timing out on every one, always mid-upload
             // -- 12s was calibrated for the old single-shot flow.
             final stageDebug = <String, dynamic>{'stage': 'not_started'};
-            final paths = await _captureSecondaryBurst(active, desc, basePath, stageDebug)
-                .timeout(const Duration(seconds: 28), onTimeout: () {
+            // Camera "2" only: distance-sweep the guide across its own
+            // burst instead of firing at one static distance (see
+            // _camera2DistanceSweepScales). Real, deliberate side benefit:
+            // this drops its burst 3->2 shots, sidestepping the shot-index-2
+            // upload hang camera "2" has hit in every real test to date.
+            final isCamera2 = desc.name == '2';
+            final paths = await _captureSecondaryBurst(
+              active,
+              desc,
+              basePath,
+              stageDebug,
+              distanceSweepScales: isCamera2 ? _camera2DistanceSweepScales : null,
+            ).timeout(const Duration(seconds: 28), onTimeout: () {
               debugPrint(
                   '[front] secondary camera ${desc.name} timed out mid-capture '
                   '(stuck at: ${stageDebug['stage']}) -- skipping');
@@ -1395,8 +1424,9 @@ class FrontCaptureController extends ChangeNotifier {
     CameraController active,
     CameraDescription desc,
     String basePath,
-    Map<String, dynamic> stageDebug,
-  ) async {
+    Map<String, dynamic> stageDebug, {
+    List<double>? distanceSweepScales,
+  }) async {
     stageDebug['stage'] = 'flash_on';
     await active.setFlashMode(FlashMode.torch);
     // Anti-blowout EV step -- the same -1.0 offset already validated for the
@@ -1438,8 +1468,32 @@ class FrontCaptureController extends ChangeNotifier {
     stageDebug['stage'] = 'settle_delay';
     await _waitForSecondaryFocusLock(active, stageDebug);
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    final burstCount = distanceSweepScales?.length ?? _secondaryBurstCount;
     final paths = <String>[];
-    for (var i = 0; i < _secondaryBurstCount; i++) {
+    for (var i = 0; i < burstCount; i++) {
+      if (distanceSweepScales != null) {
+        // Distance-sweep shot (camera "2" only, see the constant's own
+        // comment): resize the guide to instruct the user where to move
+        // before firing this specific shot, instead of firing the whole
+        // burst at one static distance. force:true -- the 2026-07-23
+        // ambientClose/flashFar visibility bug (a guide resize silently
+        // dropped by _apply's 80ms notify throttle) already proved a plain
+        // notifyListeners() call here isn't reliable.
+        final scale = distanceSweepScales[i];
+        stageDebug['shot_${i}_guideScale'] = scale;
+        stageDebug['stage'] = 'shot_${i}_reposition';
+        HapticFeedback.lightImpact();
+        _apply(
+          (s) => s.copyWith(
+            activeGuideShape: PadSilhouetteShape.defaultShape.scaled(scale),
+            distanceHint: scale > 1.0 ? 'Move closer' : 'Move back slightly',
+          ),
+          force: true,
+        );
+        await Future<void>.delayed(
+          const Duration(milliseconds: _camera2SweepMoveDelayMs),
+        );
+      }
       stageDebug['stage'] = 'shot_$i';
       final shotStart = DateTime.now();
       final shot = await active.takePicture();
@@ -1459,7 +1513,9 @@ class FrontCaptureController extends ChangeNotifier {
       stageDebug['shot_${i}_uploadMs'] =
           DateTime.now().difference(uploadStart).inMilliseconds;
       paths.add(path);
-      if (i < _secondaryBurstCount - 1) {
+      // Sweep shots already got their real move-time delay above, up front
+      // of the NEXT shot -- no separate tail delay needed here for them.
+      if (i < burstCount - 1 && distanceSweepScales == null) {
         await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
       }
     }

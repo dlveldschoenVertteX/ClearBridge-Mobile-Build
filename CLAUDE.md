@@ -1,5 +1,98 @@
 # ClearBridge Mobile — persistent context
 
+## Handoff audit + camera "2" distance-sweep feature (2026-07-23, round 7)
+CTO sent an external "5-day sprint" handoff doc and asked it be audited
+against the real codebase before any implementation. Dispatched 3 parallel
+Explore agents to verify every specific technical claim rather than trust
+or blindly implement it. **Result: several factual premises did not match
+the real codebase, though the underlying mechanisms it pointed at do exist
+under different names:**
+- `augmentedCircleService.dart` does not exist — real file is
+  `packages/mac_capture/lib/src/capture_pad_silhouette_overlay.dart`,
+  class `PadSilhouetteShape` (`defaultShape`: cx=0.5, cy=0.37,
+  rx=0.166175, ry=0.137275, taper=0.20 — already tuned twice, 2026-07-18
+  and 2026-07-20/22). `_scoreRoi` in `front_capture_controller.dart:296`
+  is a **manually-kept-in-sync copy**, not computed at runtime — any future
+  guide re-tuning must update both or they'll silently drift apart.
+- `ContinuousCaptureProvider` does not exist — real class is
+  `FrontCaptureController`. The `0.45` focus threshold exists in **two**
+  places: the primary hold-phase gate (`front_capture_controller.dart:647`)
+  and the just-built secondary-camera `_waitForSecondaryFocusLock`
+  (`:1498`) — two independent thresholds, not one.
+- `CameraService.initializeCamera()` has **no exposure logic at all** —
+  adding EV there would be new work, not an extension. The real, already-
+  validated adaptive-EV mechanism is `_adaptiveFlashEvStep()` in
+  `front_capture_controller.dart`, using `setExposureOffset()` (safe),
+  interpolating -0.3 to -1.6 by torch intensity (shipped as an unvalidated
+  "first-cut curve"). Also surfaced a real discrepancy worth a future look:
+  `setExposureMode()` (the documented torch-blocking Camera2-interop
+  landmine) **is** called once, in `oscillating_capture_controller.dart:611`
+  — contradicting CLAUDE.md's prior "never called" note, though that path
+  isn't part of the active front-only flow.
+- Current burst is **8 frames (4 ambient + 4 flash, alternating)**, not the
+  handoff's "5-frame (current)" claim (`_burstFrameCount = 8`,
+  `front_capture_controller.dart:169`).
+  Any future burst-count experiment must also account for this project's
+  own ANR history: bumping the secondary-camera burst 1→3 shots previously
+  caused real timeout/ANR failures until the per-camera timeout was widened
+  12s→28s — a burst-count increase is not free.
+- No "50% TAR on 26-capture set" baseline figure exists anywhere in this
+  project's real documented history (grepped CLAUDE.md + all 4 docs/*_SCOPE
+  files — zero matches). Every real 26-capture result uses mean-score /
+  "X of 4 genuine beat impostor max" framing instead — any future TAR
+  re-measurement should be framed the same way to be comparable to history.
+- No manual, ruler-measured, fixed-physical-distance testing protocol
+  exists anywhere in project history — every prior "capture distance"
+  effort was the in-app live-guide feature (`distanceStage2` →
+  `ambientClose`/`flashFar`, the one just retired this session at 0/18
+  all-time real reach rate).
+
+**CTO's actual ask, once the audit surfaced this**: narrower than the full
+handoff — build a distance-varying guide for **camera "2" only** ("use the
+mask opening to gauge user distance so it can go from closer to further
+away"), not the whole 5-day sprint. Built exactly that, not the handoff's
+generic multi-distance feature: `_camera2DistanceSweepScales = [1.15,
+0.85]` (bigger guide first = closer, per this project's own established
+"bigger guide pulls user closer" finding; smaller guide second = farther),
+threaded into `_captureSecondaryBurst` via a new optional
+`distanceSweepScales` param — only camera "2" (`desc.name == '2'`) passes
+it; every other camera's behavior is byte-for-byte unchanged. Reuses
+`PadSilhouetteShape.scaled(factor)` (already existed, survived the round-6
+ambientClose/flashFar removal since it's a general-purpose shape helper,
+not feature-specific) and the `force: true` fix already proven necessary
+this session for guide-resize visibility (`_apply`'s 80ms throttle
+otherwise silently drops a resize mid-burst). Each sweep shot gets a real
+1600ms move-delay (`_camera2SweepMoveDelayMs`) with a haptic pulse and a
+`distanceHint` banner ("Move closer" / "Move back slightly") — genuine
+time to reposition, unlike the other cameras' 50ms inter-shot gap, which
+is tuned for a static thumb.
+
+**Deliberate, real side benefit**: dropped camera "2"'s burst from 3 shots
+to exactly 2 (one per sweep position) — camera "2" has died at shot index
+2 (the 3rd shot's upload) in every real test to date (round 3-6 notes), so
+this also sidesteps that exact failure point, directly addressing the
+round-6 pending "cut camera 2's burst 3→1 to raise completion odds"
+suggestion, just landing at 2 instead of 1 so the sweep still has two real
+distance points to compare.
+
+**Backend diagnostic added** (`main.py`, secondary-camera scoring loop):
+when a camera-2 sweep frame wins that camera's own internal Laplacian
+comparison, the winning shot's filename (`secondary_2_torch_N.jpg`) is
+matched back to `secondaryCameraDebug['2_stageDebug']['shot_N_guideScale']`
+already on the capture doc, and recorded as `secondaryDistanceScale` in
+`afis_params` — so once camera "2" actually completes a real capture, the
+next real Firestore doc will show which distance (closer vs. farther) the
+sharpest secondary frame was captured at, giving the CTO's "wide catches
+more edge ridge" hypothesis its first real per-distance data point instead
+of none.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. The rest of the original handoff (input-
+resolution validation, general guide re-tuning, EV sweep, focus-threshold
+sweep, general burst-count sweep, end-of-week TAR re-measurement) was
+**not** built — the CTO's actual ask this round was scoped specifically to
+the camera-2 distance-sweep feature above, not the full 5-day sprint.
+
 ## ambientClose/flashFar retired; camera "2"/"3" real physical-spec comparison (2026-07-23, round 6)
 CTO decision: retire ambientClose/flashFar outright (0/18 all-time real
 reach rate — see round 5). Removed cleanly from both sides: app-side the

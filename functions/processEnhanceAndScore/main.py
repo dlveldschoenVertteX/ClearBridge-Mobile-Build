@@ -12,6 +12,7 @@ import io
 import json
 import logging
 import os
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -851,6 +852,23 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         afis_nfiq = _ss
                         best_afis_img = _simg_res
                         afis_params = {**_sp, 'afisNfiq': round(_ss, 2), 'afisSource': _sname}
+                        # Camera "2" distance-sweep diagnostic (2026-07-23):
+                        # its burst shows a progressively resized guide per
+                        # shot (closer -> farther), filenames encode the
+                        # shot index (secondary_2_torch_N.jpg). If THIS
+                        # winning frame came from a multi-shot sweep burst,
+                        # look up which guide scale it was captured at (from
+                        # secondaryCameraDebug, already on the capture doc)
+                        # so the CTO's "gauge distance" ask produces real
+                        # winning-distance data, not just a pass/fail.
+                        if len(_spaths) > 1 and _spath:
+                            _shot_m = re.search(r'_torch_(\d+)\.jpg$', _spath)
+                            if _shot_m:
+                                _stage = (_cap_doc.get('secondaryCameraDebug') or {}).get(
+                                    f"{_cam.get('name')}_stageDebug") or {}
+                                _scale = _stage.get(f'shot_{_shot_m.group(1)}_guideScale')
+                                if _scale is not None:
+                                    afis_params['secondaryDistanceScale'] = _scale
                 except Exception as _sec_exc:   # noqa: BLE001 — never block the pipeline
                     logger.warning('secondary camera %s scoring failed (non-critical): %s', _spath, _sec_exc)
 
