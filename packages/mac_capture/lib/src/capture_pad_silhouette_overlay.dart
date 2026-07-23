@@ -144,6 +144,23 @@ class PadSilhouetteShape {
     taper: 0.20,
   );
 
+  /// Returns a copy scaled by [factor] around the same centre — same
+  /// mechanism as every prior guide resize this project has made (rx/ry are
+  /// the only fields that change; taper/n/core-target fractions are already
+  /// expressed relative to rx/ry so they scale correctly for free). Per this
+  /// shape's own established finding, a BIGGER guide pulls the user CLOSER
+  /// (factor > 1) and a SMALLER guide pushes them FARTHER (factor < 1).
+  PadSilhouetteShape scaled(double factor) => PadSilhouetteShape(
+        cx: cx,
+        cy: cy,
+        rx: rx * factor,
+        ry: ry * factor,
+        n: n,
+        taper: taper,
+        coreTargetDyFrac: coreTargetDyFrac,
+        coreTargetDxFrac: coreTargetDxFrac,
+      );
+
   /// Max half-width (at the base).
   double get rxMax => rx * (1.0 + taper);
 

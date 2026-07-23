@@ -153,6 +153,10 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen> {
                   state: silhouetteState,
                   hint: silhouetteHint,
                   progress: silhouetteProgress,
+                  // ambientClose/flashFar (capturingExtra) show an enlarged/
+                  // shrunk guide to pull the user closer/farther; every other
+                  // phase falls back to the tuned default, unchanged.
+                  shape: s.activeGuideShape ?? PadSilhouetteShape.defaultShape,
                 ),
               ),
             )
