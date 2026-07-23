@@ -854,42 +854,6 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 except Exception as _sec_exc:   # noqa: BLE001 — never block the pipeline
                     logger.warning('secondary camera %s scoring failed (non-critical): %s', _spath, _sec_exc)
 
-            # docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0, illumination-decoupled
-            # (2026-07-23): two best-effort bonus distance stages
-            # (front_capture_controller.dart's ambientClose/flashFar), each
-            # scored as ONE MORE independent single-frame candidate -- no
-            # fusion math yet, same max-variant guarantee as the secondary-
-            # camera loop above. Supersedes the old single `distanceStage2`
-            # field. Each is a list of {path, distanceZone, flashOn} frame
-            # dicts; pick the sharpest by Laplacian variance if more than one
-            # landed.
-            for _stage_field, _stage_name in (
-                ('ambientCloseFrames', 'ambientClose'),
-                ('flashFarFrames', 'flashFar'),
-            ):
-                _dist_frames = _cap_doc.get(_stage_field, []) or []
-                _dist_paths = [f['path'] for f in _dist_frames if f.get('path')]
-                if not _dist_paths:
-                    continue
-                try:
-                    if len(_dist_paths) > 1:
-                        _dimg, _dlap, _dpath = _best_frame_from_paths(_dist_paths)
-                    else:
-                        _dpath = _dist_paths[0]
-                        _dimg = _decode_image(_download_storage_file(_dpath))
-                    if _dimg is not None:
-                        _dimg_res, _dp = afis_print.generate([_dimg], [0.0], [None])
-                        if _dimg_res is not None:
-                            _dres = _score_nfiq(_dimg_res, sfm_coverage=1.0)
-                            _ds = _dres.get('nfiq_score', 0.0) if not _dres.get('error') else 0.0
-                            logger.info('AFIS variant %s nfiq=%.1f', _stage_name, _ds)
-                            if _ds > afis_nfiq:
-                                afis_nfiq = _ds
-                                best_afis_img = _dimg_res
-                                afis_params = {**_dp, 'afisNfiq': round(_ds, 2), 'afisSource': _stage_name}
-                except Exception as _dist_exc:   # noqa: BLE001 — never block the pipeline
-                    logger.warning('%s scoring failed (non-critical): %s', _stage_name, _dist_exc)
-
             if best_afis_img is not None:
                 afis_path = _save_afis_print(best_afis_img, user_id, capture_id)
         except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline

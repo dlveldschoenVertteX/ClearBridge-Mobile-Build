@@ -34,16 +34,6 @@ enum FrontCapturePhase {
   error,
 }
 
-/// Which way `_waitForDistanceZone` waits for coverage to move --
-/// `above` = closer (the old distanceStage2's exact mechanic, reused for
-/// ambientClose); `below` = farther (new, for flashFar).
-enum _DistanceDirection { above, below }
-
-/// Which illumination `_captureDistanceBurst` fires for its WHOLE burst --
-/// never alternates, unlike the primary burst, since decoupling illumination
-/// from distance is the entire point of these two stages.
-enum _DistanceIllumination { ambientOnly, flashOnly }
-
 class FrontCaptureState {
   const FrontCaptureState({
     this.phase = FrontCapturePhase.idle,
@@ -91,9 +81,9 @@ class FrontCaptureState {
   // Normalised 0..1 brightness read from the ROI (torch-off samples only),
   // for the lighting meter alongside the focus meter.
   final double lightingValue;
-  // Overrides the on-screen guide shape during capturingExtra's ambientClose/
-  // flashFar sub-stages (see docs/MULTI_DISTANCE_MESH_SCOPE.md) -- null means
-  // "use PadSilhouetteShape.defaultShape", same as before these stages existed.
+  // Overrides the on-screen guide shape during capturingExtra's secondary-
+  // camera turns (see _secondaryCameraGuideShape) -- null means "use
+  // PadSilhouetteShape.defaultShape".
   final PadSilhouetteShape? activeGuideShape;
 
   FrontCaptureState copyWith({
@@ -360,30 +350,6 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _coverageMin = 0.35;
   static const double _coverageMax = 0.85;
 
-  // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0, illumination-decoupled variant
-  // (2026-07-23): the flash torch's intensity falls off with distance^2, so
-  // it overpowers ridge contrast at close range regardless of EV tuning
-  // (reproduced again this week: capture 913758cf's ambient frame scored
-  // Laplacian 790 vs its flash frame's 81 at the SAME distance) -- while
-  // native ridge wavelength (tied to closeness) is this project's own
-  // strongest real NFIQ2 predictor, closer is optically richer. Decoupling
-  // distance by illumination lets each half get its own best distance
-  // instead of compromising on one for both: ambientClose asks the user
-  // CLOSER (no torch, so no blowout risk exists regardless of distance);
-  // flashFar asks them FARTHER than today's already-tuned default (on top
-  // of the existing adaptive-EV step, not instead of it). Per
-  // PadSilhouetteShape's own established finding, a BIGGER guide pulls the
-  // user closer and a SMALLER one pushes them farther -- factors below are a
-  // first cut, NOT fit to real data, same standing caveat as every prior
-  // guide resize in this project. Supersedes the old single-distance
-  // `distanceStage2` (which asked "get closer" then still fired flash shots
-  // at that close range -- exactly the exposure risk this redesign removes).
-  static const double _ambientCloseShapeScale = 1.20;
-  static const double _flashFarShapeScale = 0.80;
-  static final PadSilhouetteShape _ambientCloseShape =
-      PadSilhouetteShape.defaultShape.scaled(_ambientCloseShapeScale);
-  static final PadSilhouetteShape _flashFarShape =
-      PadSilhouetteShape.defaultShape.scaled(_flashFarShapeScale);
   // Generic centered guide shown during each secondary camera's (IR/wide)
   // own live feed (2026-07-23) -- NOT calibrated to that lens's real FOV
   // offset from the main camera (no measured data exists yet; the
@@ -396,12 +362,6 @@ class FrontCaptureController extends ChangeNotifier {
   // calibration.
   static const PadSilhouetteShape _secondaryCameraGuideShape =
       PadSilhouetteShape.defaultShape;
-  // Near-zone threshold reused verbatim from the old distanceStage2 (already
-  // real-world-tested, if never yet reached: 0/12 real attempts, see
-  // CLAUDE.md). Far-zone threshold is the new, symmetric ask -- below
-  // _coverageMin instead of above _coverageMax -- similarly a first cut.
-  static const double _ambientCloseCoverageTarget = _coverageMax + 0.05;
-  static const double _flashFarCoverageTarget = _coverageMin - 0.10;
 
   // Device must be this still (gyroscope magnitude, deg/s) before the hold
   // timer counts and the burst can fire. Real captures showed motion-blur
@@ -776,10 +736,10 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
-  // Explicit per-camera-turn UI (2026-07-23) -- shared by every camera turn
-  // inside capturingExtra (each secondary camera, then ambientClose, then
-  // flashFar) so the whole phase reads as one consistent sequence: guide
-  // shown -> countdown -> capturing -> explicit stop -> confirmation.
+  // Explicit per-camera-turn UI (2026-07-23) -- shared by every secondary-
+  // camera turn inside capturingExtra so the whole phase reads as one
+  // consistent sequence: guide shown -> countdown -> capturing -> explicit
+  // stop -> confirmation.
   // Directly answers the CTO's real-device report that cameras fired with
   // no dead stop between them and no warning before the shutter.
 
@@ -1160,11 +1120,10 @@ class FrontCaptureController extends ChangeNotifier {
       final secondaryMeta = <Map<String, dynamic>>[];
       final mainCameraDescription = _camera?.description;
       final svc = _cameraService;
-      // Total/completed "extra capture" steps (secondary cameras + the
-      // ambientClose/flashFar attempts below) -- drives extraProgress.
-      // Defaults to 2 (ambientClose + flashFar only) in case
-      // availableCameras() itself throws before the real count is known.
-      var extraTotal = 2;
+      // Total/completed "extra capture" steps (secondary cameras) -- drives
+      // extraProgress. Defaults to 0 in case availableCameras() itself
+      // throws before the real count is known.
+      var extraTotal = 0;
       var extraCompleted = 0;
       try {
         final allCams = await availableCameras();
@@ -1178,10 +1137,8 @@ class FrontCaptureController extends ChangeNotifier {
         // Drives the guide's fill-ring during capturingExtra (see
         // extraProgress on FrontCaptureState) -- CTO real-device feedback
         // 2026-07-20/22: only the main burst had a progress cue; secondary
-        // cameras (wide/IR) and the distance stages left the guide static
-        // the whole time. +2 accounts for the ambientClose/flashFar attempts
-        // below, which always run (best-effort) after this loop.
-        extraTotal = others.length + 2;
+        // cameras (wide/IR) left the guide static the whole time.
+        extraTotal = others.length;
         for (final desc in others) {
           final labelName = desc.name.toLowerCase();
           final friendly = labelName.contains('ir') || labelName.contains('night')
@@ -1201,7 +1158,7 @@ class FrontCaptureController extends ChangeNotifier {
                   )
                   .timeout(const Duration(seconds: 8));
               active = svc.controller!;
-              _camera = active; // resync so ambientClose/flashFar/UI see the current controller
+              _camera = active; // resync so the UI's live preview sees the current controller
             } else {
               // Defensive fallback if no CameraService was supplied (should
               // not happen via the real screen, which always passes one) --
@@ -1323,174 +1280,6 @@ class FrontCaptureController extends ChangeNotifier {
         _apply((s) => s.copyWith(distanceHint: null, activeGuideShape: null));
       }
 
-      // Switch back to the main camera now that the secondary-camera loop is
-      // done -- ambientClose/flashFar right below reuse `_camera` and need
-      // the main sensor active again (same clean dispose-then-open handoff
-      // as each secondary-camera switch above -- by this point the LAST
-      // secondary camera has already been explicitly disposed in step 5
-      // above, so this is always opening fresh, never racing a still-open
-      // session).
-      if (svc != null && mainCameraDescription != null &&
-          svc.controller?.description.name != mainCameraDescription.name) {
-        try {
-          await svc
-              .initializeCamera(
-                lensDirection: CameraLensDirection.back,
-                resolution: ResolutionPreset.max,
-                cameraDescription: mainCameraDescription,
-              )
-              .timeout(const Duration(seconds: 8));
-          _camera = svc.controller;
-          // AdaptiveFlashController binds permanently to the CameraController
-          // instance passed at construction (final field, no update method) --
-          // the old `_flash` still points at the now-disposed pre-switch main
-          // controller. Rebuild it against the fresh one so ambientClose/
-          // flashFar's _flash!.activate()/deactivate() calls below don't
-          // operate on a disposed controller.
-          if (_camera != null) {
-            _flash = AdaptiveFlashController(_camera!);
-          }
-        } catch (e) {
-          debugPrint('[front] failed to switch back to main camera: $e');
-          // ambientClose/flashFar below check `_camera` is non-null/
-          // initialized and just skip themselves (non-fatal) if this didn't
-          // work.
-        }
-      }
-
-      // docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0, illumination-decoupled
-      // (2026-07-23): two best-effort bonus stages, each an independent
-      // single-frame candidate (no fusion math yet -- the backend scores
-      // each alongside best_afis_img and keeps whichever wins). Supersedes
-      // the old single "get closer" distanceStage2, whose bonus burst still
-      // fired flash shots at close range -- exactly the exposure risk this
-      // redesign removes. Runs AFTER secondary-camera capture, same
-      // "can't regress the primary result" discipline as everything else in
-      // capturingExtra: best-effort, bounded, any failure just skips silently.
-      // Must land in the Firestore payload below before the
-      // processEnhanceAndScore trigger so the backend's one-time doc read
-      // sees it. Both stages reuse the SAME live main-camera session
-      // throughout (no controller swap), so unlike the secondary-camera loop
-      // there is no separate camera to dispose in step 5 -- but each still
-      // gets the same visible guide/countdown/confirmation sequence for a
-      // consistent mental model across the whole capturingExtra phase.
-      final ambientCloseFrames = <Map<String, dynamic>>[];
-      final ambientCloseDebug = <String, dynamic>{'attempted': false};
-      final flashFarFrames = <Map<String, dynamic>>[];
-      final flashFarDebug = <String, dynamic>{'attempted': false};
-      try {
-        final cam2 = _camera;
-        if (cam2 != null && !_disposed) {
-          // ambientClose: bigger guide pulls the user closer; torch never
-          // engages this whole stage, so there is no blowout risk regardless
-          // of how close the user actually gets.
-          ambientCloseDebug['attempted'] = true;
-          // force:true -- without it, _apply's 80ms notification throttle can
-          // (and in a real device test, did) silently drop this update, since
-          // nothing else touches the UI during _waitForDistanceZone's own
-          // wait. Same must-not-drop treatment as the uploading transition
-          // below and _fail.
-          _apply((s) => s.copyWith(
-                distanceHint: 'Move slightly closer for a bonus capture',
-                activeGuideShape: _ambientCloseShape,
-              ), force: true);
-          final nearResult = await _waitForDistanceZone(
-            cam2,
-            target: _ambientCloseCoverageTarget,
-            direction: _DistanceDirection.above,
-          );
-          ambientCloseDebug['reachedZone'] = nearResult.reached;
-          // Diagnostic-first, same discipline the old distanceStage2 shipped
-          // with (2026-07-22): real Firestore data showed THAT stage never
-          // once succeeded across 12 real attempts, always landing well
-          // short of its own threshold (0.444/0.684 vs 0.90) -- record the
-          // same signal here so the next real round tells us directly
-          // whether this stage's ask is reachable, rather than guessing.
-          // direction-appropriate extreme (above wants the max reached).
-          ambientCloseDebug['coverageObserved'] =
-              double.parse(nearResult.coverageObserved.toStringAsFixed(3));
-          if (nearResult.reached) {
-            await _refocus();
-            await _showCountdown();
-            final frames = await _captureDistanceBurst(
-              cam2,
-              zone: 'ambientClose',
-              basePath: basePath,
-              count: 3,
-              illumination: _DistanceIllumination.ambientOnly,
-            );
-            ambientCloseFrames.addAll(frames);
-          }
-        }
-        await _showStopConfirmation('ambient-close capture',
-            success: ambientCloseFrames.isNotEmpty);
-      } catch (e) {
-        debugPrint('[front] ambientClose capture skipped (non-fatal): $e');
-        ambientCloseDebug['error'] = e.toString();
-        await _showStopConfirmation('ambient-close capture', success: false);
-      } finally {
-        extraCompleted++;
-        _apply((s) => s.copyWith(
-              distanceHint: null,
-              activeGuideShape: null,
-              extraProgress: extraCompleted / extraTotal,
-            ));
-      }
-
-      try {
-        final cam3 = _camera;
-        if (cam3 != null && !_disposed) {
-          // flashFar: smaller guide pushes the user farther than today's
-          // already-tuned default, on top of (not instead of) the existing
-          // adaptive-EV step, to further cut flash-blowout risk.
-          flashFarDebug['attempted'] = true;
-          // force:true -- this call runs synchronously right after
-          // ambientClose's own cleanup _apply above with no await in
-          // between, so without force it always lands inside the 80ms
-          // throttle window and gets silently dropped (confirmed via a real
-          // device test: the CTO saw this stage's hint text but never the
-          // shrunk guide).
-          _apply((s) => s.copyWith(
-                distanceHint: 'Move slightly back for a bonus capture',
-                activeGuideShape: _flashFarShape,
-              ), force: true);
-          final farResult = await _waitForDistanceZone(
-            cam3,
-            target: _flashFarCoverageTarget,
-            direction: _DistanceDirection.below,
-          );
-          flashFarDebug['reachedZone'] = farResult.reached;
-          // direction-appropriate extreme (below wants the min reached).
-          flashFarDebug['coverageObserved'] =
-              double.parse(farResult.coverageObserved.toStringAsFixed(3));
-          if (farResult.reached) {
-            await _refocus();
-            await _showCountdown();
-            final frames = await _captureDistanceBurst(
-              cam3,
-              zone: 'flashFar',
-              basePath: basePath,
-              count: 3,
-              illumination: _DistanceIllumination.flashOnly,
-            );
-            flashFarFrames.addAll(frames);
-          }
-        }
-        await _showStopConfirmation('flash-far capture',
-            success: flashFarFrames.isNotEmpty);
-      } catch (e) {
-        debugPrint('[front] flashFar capture skipped (non-fatal): $e');
-        flashFarDebug['error'] = e.toString();
-        await _showStopConfirmation('flash-far capture', success: false);
-      } finally {
-        extraCompleted++;
-        _apply((s) => s.copyWith(
-              distanceHint: null,
-              activeGuideShape: null,
-              extraProgress: extraCompleted / extraTotal,
-            ));
-      }
-
       // Real upload begins here -- the actual Firestore write + main burst
       // upload below, not the best-effort extra-camera work above. This is
       // the honest point to switch the UI to "Uploading…". Stop the camera
@@ -1541,10 +1330,6 @@ class FrontCaptureController extends ChangeNotifier {
         if (cameraLensInfo != null) 'cameraLensInfo': cameraLensInfo,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
-        'ambientCloseDebug': ambientCloseDebug,
-        if (ambientCloseFrames.isNotEmpty) 'ambientCloseFrames': ambientCloseFrames,
-        'flashFarDebug': flashFarDebug,
-        if (flashFarFrames.isNotEmpty) 'flashFarFrames': flashFarFrames,
       }, SetOptions(merge: true));
 
       var completed = 0;
@@ -1766,158 +1551,6 @@ class FrontCaptureController extends ChangeNotifier {
         await Future.delayed(Duration(milliseconds: _uploadRetryDelaysMs[attempt]));
       }
     }
-  }
-
-  /// docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0, illumination-decoupled
-  /// (2026-07-23): best-effort wait for the user to move to a meaningfully
-  /// different distance zone than the main capture, using the same coverage
-  /// signal _onFrame already computes (`HybridCaptureService.meanLuma` over
-  /// `_scoreRoi`) -- just a fresh, short-lived stream since the main stream
-  /// is already stopped by the time this runs (inside _finishAndUpload,
-  /// after _fireBurst's _stopStream() call). [direction] == above waits for
-  /// coverage to RISE past [target] (closer, the old distanceStage2's exact
-  /// mechanic); below waits for it to DROP past [target] (farther, new).
-  /// No focus/exposure control here -- that happens in _refocus() once this
-  /// returns true. Never throws; a bounded timeout (or any stream error)
-  /// resolves false so this stage can never hang or block the primary
-  /// capture result already sitting in Firestore.
-  ///
-  /// Returns (reached, coverageObserved) rather than a bare bool -- real
-  /// Firestore data showed the old single "closer" stage NEVER once
-  /// succeeded across 12 real attempts (2026-07-22/23 analysis), always
-  /// landing well short of its own threshold. `coverageObserved` is the
-  /// direction-appropriate extreme actually observed during the window --
-  /// the highest reached for `above` (ambientClose wants coverage to RISE),
-  /// the lowest reached for `below` (flashFar wants coverage to FALL) --
-  /// recorded into the caller's debug map regardless of outcome, so the NEXT
-  /// real capture tells us whether users are landing well short of the
-  /// target (miscalibrated threshold / unclear prompt) or right at its edge
-  /// but running out of time (window too short) -- rather than continuing to
-  /// guess. Fixed 2026-07-23: this used to always report the MAX regardless
-  /// of direction, which for `below` reported the starting coverage, not how
-  /// close the user got to the far target -- not a useful number. Diagnostic
-  /// only: does not change capture behavior.
-  ///
-  /// Timeout widened 6s -> 9s (2026-07-23): the real first test of this
-  /// stage found the guide-resize cue was silently dropped by _apply's
-  /// throttle (see the `force: true` fix at both call sites), so users had
-  /// effectively 0s of real visual cue to react to during that whole test --
-  /// 6s was never actually exercised as reaction time. Now that the resize
-  /// will really render, give real headroom on top of the existing window
-  /// rather than replacing it, without touching the coverage thresholds
-  /// themselves (measure those separately, one variable at a time).
-  Future<({bool reached, double coverageObserved})> _waitForDistanceZone(
-    CameraController cam, {
-    required double target,
-    required _DistanceDirection direction,
-  }) async {
-    const timeout = Duration(seconds: 9);
-    final completer = Completer<bool>();
-    var streaming = false;
-    var maxCoverage = 0.0;
-    var minCoverage = 1.0;
-    void onFrame(CameraImage image) {
-      if (completer.isCompleted) return;
-      try {
-        final coverage = HybridCaptureService.meanLuma(image, roi: _scoreRoi) / 255.0;
-        if (coverage > maxCoverage) maxCoverage = coverage;
-        if (coverage < minCoverage) minCoverage = coverage;
-        final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
-        final inZone = direction == _DistanceDirection.above
-            ? coverage > target
-            : coverage < target;
-        if (inZone && steady) completer.complete(true);
-      } catch (_) {}
-    }
-    final coverageObserved = () =>
-        direction == _DistanceDirection.above ? maxCoverage : minCoverage;
-    try {
-      await cam.startImageStream(onFrame);
-      streaming = true;
-      final reached = await completer.future.timeout(timeout, onTimeout: () => false);
-      return (reached: reached, coverageObserved: coverageObserved());
-    } catch (_) {
-      return (reached: false, coverageObserved: coverageObserved());
-    } finally {
-      if (streaming) {
-        try {
-          await cam.stopImageStream();
-        } catch (_) {}
-      }
-    }
-  }
-
-  /// docs/MULTI_DISTANCE_MESH_SCOPE.md Phase 0, illumination-decoupled
-  /// (2026-07-23): fires a small burst at the CURRENT (already-refocused)
-  /// distance, using a SINGLE illumination for the whole burst (never
-  /// alternating) -- ambientOnly never engages the torch at all (removing
-  /// flash-blowout risk regardless of distance); flashOnly uses it for
-  /// every shot, still via the existing adaptive-EV step. Uploads each
-  /// frame tagged with `distanceZone`. Deliberately NOT a full re-entry into
-  /// the main hold/burst state machine (_onFrame/_fireBurst) -- this is a
-  /// best-effort bonus stage scored as one more independent candidate by
-  /// the backend, not part of the primary deliverable.
-  Future<List<Map<String, dynamic>>> _captureDistanceBurst(
-    CameraController cam, {
-    required String zone,
-    required String basePath,
-    required int count,
-    required _DistanceIllumination illumination,
-  }) async {
-    final out = <Map<String, dynamic>>[];
-    final torchCapable =
-        (_flash?.isNeeded ?? false) && illumination == _DistanceIllumination.flashOnly;
-    double? minEv, maxEv;
-    if (torchCapable) {
-      try {
-        minEv = await cam.getMinExposureOffset();
-        maxEv = await cam.getMaxExposureOffset();
-      } catch (_) {}
-    }
-    for (var i = 0; i < count; i++) {
-      final wantFlash = torchCapable;
-      try {
-        if (wantFlash) {
-          await _flash!.activate();
-          if (minEv != null && maxEv != null) {
-            await cam.setExposureOffset((_appliedEvOffset + _adaptiveFlashEvStep()).clamp(minEv, maxEv));
-          }
-          await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
-        } else {
-          await _flash?.deactivate();
-          if (minEv != null && maxEv != null) {
-            await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
-          }
-        }
-        // Same defensive bound as the secondary-camera burst (see
-        // _captureSecondaryBurst's docstring) -- takePicture() is a raw
-        // platform-channel await with no bound of its own; a hang here
-        // shouldn't be able to block the rest of this best-effort stage.
-        final xfile = await cam.takePicture().timeout(const Duration(seconds: 6));
-        final jpeg = await xfile.readAsBytes();
-        final decoded = await decodeStillJpegToLuma(
-          jpeg, _sensorOrientation,
-          targetWidth: _stillDecodeTargetWidth,
-        );
-        if (decoded == null) continue;
-        final encoded = await compute(
-          _encodeBurstIsolate,
-          _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
-        );
-        final path = '$basePath/distance_${zone}_$i.jpg';
-        await _uploadWithRetry(encoded, path);
-        out.add({'path': path, 'distanceZone': zone, 'flashOn': wantFlash});
-      } catch (e) {
-        debugPrint('[front] distance burst shot $i ($zone) failed (non-fatal): $e');
-      }
-      if (i < count - 1) {
-        await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
-      }
-    }
-    try {
-      await _flash?.deactivate();
-    } catch (_) {}
-    return out;
   }
 
   Future<void> _stopStream() async {
