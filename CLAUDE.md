@@ -1,5 +1,81 @@
 # ClearBridge Mobile — persistent context
 
+## Post-device-test optimization round: fusion-selection guard, illumination-decoupled distance capture, noise-reduction research spike (2026-07-23)
+Following the ANR/prime-directive audit above, scoped and built the next
+round in Plan Mode (approved), with a new standing process rule: commit
+locally per item but hold `git push` (which is what actually triggers
+`build.yml`) until the CTO explicitly says to push/build, rather than
+pushing after every individual fix as in prior rounds.
+
+**Illumination-decoupled distance capture, Phase 0 — the CTO's own idea
+this round.** The flash torch's intensity falls off with distance², so it
+overpowers ridge contrast at close range regardless of EV tuning (real,
+reproduced pattern: `913758cf`'s ambient frame scored Laplacian 790 vs its
+flash frame's 81 at the SAME distance) — while native ridge wavelength
+(tied to closeness) is this project's strongest real NFIQ2 predictor, and
+closer is optically richer. Decoupling distance by illumination lets each
+half get its own best distance instead of compromising on one for both.
+Replaced the old single-distance `distanceStage2` (which asked "get closer"
+then still fired flash shots at that close range — exactly the exposure
+risk this removes) with two best-effort bonus stages in `capturingExtra`:
+**`ambientClose`** (guide enlarges — per `PadSilhouetteShape`'s own
+established finding, a bigger guide pulls the user closer — torch never
+engages this whole stage, so blowout risk is removed regardless of
+distance) and **`flashFar`** (guide shrinks, pushing the user farther than
+today's already-tuned default, on top of the existing adaptive-EV flash).
+Both feed the backend's existing max-of-variants selection as independent
+single-frame candidates — no fusion math yet (Phase 1, gated on this
+showing real gain, per `docs/MULTI_DISTANCE_MESH_SCOPE.md`). Both ship with
+`maxCoverageObserved` diagnostic logging from day one, same discipline the
+old `distanceStage2` shipped with after its own 12/12 real-world failure
+record (now known more precisely: 0.444/0.684 vs a 0.90 threshold — landing
+well short, not grazing it). Added `PadSilhouetteShape.scaled(factor)` as a
+reusable helper. Not yet device-tested.
+
+**Fusion-selection sharpness guard, backend-only.** Directly targets the
+real miss found in the same audit: `913758cf` had a plain ambient frame at
+Laplacian 790.4 (sharpest of 15 real captures audited) but the variant loop
+picked a flash+ambient fusion anyway, and the internal proxy overestimated
+it badly (65.37 predicted vs 32 real). Added a guard in `main.py`'s variant
+loop: when the ambient frame is drastically sharper than the flash frame
+feeding a fusion variant (Laplacian ratio ≥ 4x), that fusion variant must
+beat the plain `native` variant's own proxy score by a real margin (+3 NFIQ)
+to win, rather than merely edging it out. Purely a guard on an existing
+max-of-variants loop — can only withhold a variant from winning, never
+produce a worse result than what earlier variants already found. **Offline
+validation** (17 real captures — the original 14 plus `afe5b02c`/
+`913758cf`/`cb684c57` newly downloaded for this test, harness-style sweep
+reproducing `main.py`'s proxy-driven selection, not committed): changed
+selection on 2/17 captures (`c34911b5`: fuseAvg 77→freqNorm 76, -1;
+`f2fa606b`: fuseAvg 43→freqNorm 64, +21) and was inert on the rest — net
++20 across the two it touched, never observed to regress a capture that
+didn't trigger it. **Honest caveat**: the offline harness does not exactly
+reproduce `main.py`'s real per-variant input wiring (confirmed: on
+`913758cf` itself, the harness's proxy-driven baseline already picked
+`native` even without the guard, whereas real production picked `fuseSoft`
+— a plumbing difference between the standalone script and the real
+pipeline, not evidence the guard is wrong, but a reason this still needs
+real-device confirmation, same as always). Not yet deployed.
+
+**Research spike: native noise-reduction override (Item C) — do not pursue
+right now.** `noiseReductionOffSupport` came back `true` on all 4 cameras
+this device (a real, positive Phase-0 result, unlike RAW/DNG), but
+researching the actual `camera_android_camerax` v0.11.4 plugin source
+(confirmed via `pubspec.lock`) found the real Camera2 interop machinery
+(`Camera2CameraControlProxyApi`/`CaptureRequestOptionsProxyApi`) exists only
+as an INTERNAL implementation detail — the public `CameraController` Dart
+API (confirmed via the package's own published docs) exposes no method that
+reaches Camera2 capture-request options, noise reduction, or edge mode at
+all. Reaching it would require either forking the plugin or opening a fully
+separate, independent native Camera2 session bypassing CameraX entirely (two
+sessions can't normally hold one physical camera at once) — a native lift
+comparable in size to the RAW/DNG path already declined, not a small
+interop tweak as originally scoped. Given this would add yet another native
+camera-session open/close cycle during `capturingExtra` — the exact
+category of risk this session's own ANR investigation just traced to
+camera-session churn in that same window — **recommending against pursuing
+this further right now.** No code shipped for this item.
+
 ## Third real-device test (zoom/adaptive-flash-EV/noise-reduction-probe build): ANR root-caused + fixed, first-ever good score on a "too close" capture, and a real fusion-selection miss (2026-07-23)
 CTO tested the APK built from the zoom-to-fill/adaptive-flash-EV/noise-
 reduction-probe round and hit a real Android ANR ("ClearBridge Beta isn't

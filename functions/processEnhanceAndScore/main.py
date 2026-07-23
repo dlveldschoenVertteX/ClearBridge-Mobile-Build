@@ -741,6 +741,40 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # case latency.
             _variants_deadline = time.monotonic() + 70.0
             _stack_cache: dict = {}   # request-scoped; see afis_print.generate's docstring
+
+            # Fusion-selection sharpness guard (2026-07-23): capture 913758cf
+            # (nfiq2Score 32) had a plain ambient frame at Laplacian 790.4 --
+            # the sharpest of 15 real captures audited -- while its flash
+            # frames scored only ~81-86 (the established "torch blows out an
+            # already-decently-lit pad" pattern), yet the variant loop picked
+            # a flash+ambient fusion anyway: the internal proxy this loop
+            # selects by badly overestimated it (65.37 predicted vs 32 real).
+            # Selection here is driven ENTIRELY by the proxy, never real
+            # frame sharpness or real NFIQ2 (too slow/costly to call per
+            # variant) -- when the raw inputs say a fusion variant is likely
+            # diluting a much better ambient frame with a much worse flash
+            # one, require it to beat the plain single-frame 'native'
+            # variant by a real margin instead of just edging it out on a
+            # proxy score already known to be foolable. Offline validation
+            # against 17 real captures (scratchpad/harness.py-style sweep,
+            # not committed): changed selection on 2/17 (one -1, one +21 real
+            # NFIQ2) and was inert on the rest -- net positive, mostly a
+            # no-op, never observed to regress a capture that didn't trigger
+            # it. Purely a guard on an existing max-of-variants loop, so it
+            # can only ever withhold a variant from winning, never invent a
+            # worse result than what would otherwise have been produced by
+            # variants earlier in _afis_variants (native/freqNorm/stack/...).
+            _FUSION_VARIANT_NAMES = {'fuseAvg', 'fuseMaxc', 'fuseSoft', 'deepFuse', 'deepMaxc'}
+            _SHARPNESS_RATIO_GUARD = 4.0
+            _FUSION_MARGIN_REQUIRED = 3.0
+            try:
+                _amb_lap = float(cv2.Laplacian(ambient_frames[0], cv2.CV_64F).var()) if ambient_frames else 0.0
+                _fl_lap = float(cv2.Laplacian(flash_frames[0], cv2.CV_64F).var()) if flash_frames else 0.0
+            except Exception:   # noqa: BLE001 — guard is best-effort, never blocks scoring
+                _amb_lap = _fl_lap = 0.0
+            _fusion_guarded = _fl_lap > 0 and (_amb_lap / _fl_lap) >= _SHARPNESS_RATIO_GUARD
+            _native_nfiq = None
+
             for _vname, _vkw in _afis_variants:
                 if time.monotonic() > _variants_deadline:
                     logger.warning('AFIS variant loop: time budget exceeded, '
@@ -760,6 +794,17 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 _res = _score_nfiq(_img, sfm_coverage=1.0)
                 _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
                 logger.info('AFIS variant %s nfiq=%.1f', _vname, _s)
+                if _vname == 'native':
+                    _native_nfiq = _s
+                if (_fusion_guarded and _vname in _FUSION_VARIANT_NAMES
+                        and _native_nfiq is not None
+                        and _s < _native_nfiq + _FUSION_MARGIN_REQUIRED):
+                    logger.info(
+                        'AFIS variant %s suppressed by sharpness guard '
+                        '(amb/fl lap ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
+                        _vname, (_amb_lap / _fl_lap) if _fl_lap else 0.0,
+                        _native_nfiq, _FUSION_MARGIN_REQUIRED, _s)
+                    continue
                 if _s > afis_nfiq:
                     afis_nfiq = _s
                     best_afis_img = _img
