@@ -1514,6 +1514,26 @@ class FrontCaptureController extends ChangeNotifier {
         await Future<void>.delayed(
           const Duration(milliseconds: _camera2SweepMoveDelayMs),
         );
+        // The pre-loop _waitForSecondaryFocusLock call above only verifies
+        // convergence at whatever distance the user was at when the burst
+        // STARTED -- but this shot just asked them to move to a new distance
+        // (closer/farther per the sweep). Continuous AF (FocusMode.auto) is
+        // presumed to reconverge during the move delay, but unlike every
+        // other focus-dependent step in this file, that was never actually
+        // measured for the post-move position -- same class of gap as the
+        // round-12 flash-settle-delay fix (a wait mechanism applied once at
+        // the start of a sequence that has more than one real state
+        // transition). Re-check here, bounded short since the move delay
+        // already gave real settle time -- this only adds real verification,
+        // never removes the existing move delay's own settle time.
+        stageDebug['stage'] = 'shot_${i}_refocus';
+        await _waitForSecondaryFocusLock(
+          active,
+          stageDebug,
+          minWaitMs: 150,
+          maxWaitMs: 900,
+          keyPrefix: 'shot_${i}_',
+        );
       }
       stageDebug['stage'] = 'shot_$i';
       final shotStart = DateTime.now();
@@ -1570,6 +1590,7 @@ class FrontCaptureController extends ChangeNotifier {
     Map<String, dynamic> stageDebug, {
     int minWaitMs = 500,
     int maxWaitMs = 2600,
+    String keyPrefix = '',
   }) async {
     const roi = Rect.fromLTWH(0.3, 0.3, 0.4, 0.4);
     const lockThreshold = 0.45; // same relative threshold as onTarget's gate.
@@ -1607,9 +1628,10 @@ class FrontCaptureController extends ChangeNotifier {
           await active.stopImageStream();
         } catch (_) {}
       }
-      stageDebug['focusConvergedMs'] =
+      stageDebug['${keyPrefix}focusConvergedMs'] =
           DateTime.now().difference(start).inMilliseconds;
-      stageDebug['focusScoreAtFire'] = double.parse(focusEma.toStringAsFixed(3));
+      stageDebug['${keyPrefix}focusScoreAtFire'] =
+          double.parse(focusEma.toStringAsFixed(3));
     }
   }
 

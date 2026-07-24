@@ -1,5 +1,63 @@
 # ClearBridge Mobile — persistent context
 
+## Fifth real bug found + fixed: camera-2 distance-sweep shots never re-verify focus after repositioning (2026-07-24, round 15)
+With the specular-suppression line closed out (both combine-swap variants
+measured negative, see below), switched back to targeted code review rather
+than more blind parameter tuning, this time auditing the round-7 camera-2
+distance-sweep feature's backend + capture-side wiring — not yet reviewed
+since it was built.
+
+Backend side (`main.py`'s `secondaryDistanceScale` lookup) checked out
+correctly: the `_torch_(\d+)\.jpg$` filename regex matches the client's
+`secondary_${safeName}_torch_$i.jpg` naming, and `shot_{n}_guideScale`
+lookup keys line up with what `_captureSecondaryBurst` actually writes — no
+bug there.
+
+**Real bug found in `_captureSecondaryBurst`
+(`front_capture_controller.dart`)**: `_waitForSecondaryFocusLock` — the
+real, measured focus-convergence wait built in round 4 specifically because
+this device's secondary cameras are documented to focus slowly/unreliably —
+is only ever called **once, before the sweep loop starts**, verifying
+convergence at whatever distance the user happened to be at when the burst
+began. But the camera-2 sweep then resizes the guide and asks the user to
+move to a NEW distance (closer for shot 0, farther for shot 1) before each
+shot fires — and that repositioning got only a flat 1600ms delay
+(`_camera2SweepMoveDelayMs`) with zero re-verification that focus actually
+reconverged at the new distance. Every other focus-dependent step in this
+file gets a real measured check; this one relied purely on presumed
+continuous autofocus (`FocusMode.auto`) reconverging in time, unconfirmed —
+structurally the same class of gap as the round-12 flash-settle-delay bug
+(an existing, already-proven wait mechanism applied only at the first state
+transition of a sequence that has more than one).
+
+**Fixed**: added an optional `keyPrefix` param to
+`_waitForSecondaryFocusLock` (defaults to `''`, so the existing pre-loop
+call is unaffected) so its `focusConvergedMs`/`focusScoreAtFire` diagnostic
+fields can be written per-shot instead of being overwritten on each call.
+Each sweep shot now gets its own bounded re-check
+(`minWaitMs: 150, maxWaitMs: 900, keyPrefix: 'shot_${i}_'`) right after the
+reposition delay, before the shutter fires — real, measured confirmation
+that focus reconverged at the NEW distance, not just a longer blind delay.
+Bounded short (900ms max) since the 1600ms move delay already provides real
+settle time; this only adds verification on top of it, never replaces or
+shortens the existing move delay. Non-sweep secondary-camera cameras (the
+`distanceSweepScales == null` path — every camera except "2") are
+completely untouched.
+
+**Real, deliberate cost**: up to +900ms per sweep shot (2 shots) if focus
+is slow to reconverge — modest against this camera's already-heavier
+per-shot budget (1600ms reposition delay already, vs 50ms for other
+cameras' fixed-position shots). Cannot regress: if focus reconverges fast
+(likely, since continuous AF already had 1600ms), the wait resolves almost
+immediately and costs nothing extra in practice.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project; needs a real APK build + real capture on
+a device where camera "2" actually completes its burst (still an open,
+separate reliability problem — see round 6) to confirm the new
+`shot_0_focusConvergedMs`/`shot_1_focusConvergedMs` diagnostics show real
+convergence data.
+
 ## Specular-suppression idea 1 — median instead of mean stacking: tested, real net negative, NOT shipped (2026-07-24, round 14)
 Per the CTO's direct ask ("are there some specular suppression optimizations
 we can implement right now?"), first confirmed the backend never receives
