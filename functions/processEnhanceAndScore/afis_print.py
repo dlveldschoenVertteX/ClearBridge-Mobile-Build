@@ -1433,6 +1433,32 @@ def generate(
                 params['afisFusedAngle'] = float(round(float(angles_deg[i]), 1))
                 break
         if fused is None:
+            # Real gap found 2026-07-24 (same root cause as stack/focusStack
+            # above): for front_only_v1, ambient_frames/flash_frames are
+            # each length 1 (the single pre-selected pair), so when THAT one
+            # pair fails to register/fuse (real captures observed: 847fa2d3,
+            # 5aa18155 -- all of fuseAvg/fuseMaxc/fuseSoft returned None),
+            # the variant has no other pair to fall back to and dies
+            # entirely. Try additional same-pose pairs from the raw
+            # preserved burst (ambient_burst/flash_burst, already
+            # downloaded for deepFuse) ONLY once the primary pair has
+            # already failed -- the primary pair is still tried FIRST and
+            # stops the loop on success exactly as before, so this can only
+            # ever promote an already-guaranteed-None result to a real one.
+            _burst_amb = [g for g in (ambient_burst or []) if g is not None]
+            _burst_fla = [g for g in (flash_burst or []) if g is not None]
+            _n = min(len(_burst_amb), len(_burst_fla))
+            _burst_pairs = sorted(
+                range(_n),
+                key=lambda i: -min(_ridge_energy(_burst_amb[i]), _ridge_energy(_burst_fla[i])))
+            for i in _burst_pairs:
+                fused = _fuse_flash_ambient(_burst_amb[i], _burst_fla[i], mode=fuse)
+                if fused is not None:
+                    gray = fused
+                    params['afisFused'] = fuse
+                    params['afisFusedBin'] = f'burst_{i}'
+                    break
+        if fused is None:
             return None, params
 
     # Front-anchored minimal-yaw reconstruction. Anchor on the sharpest face-on

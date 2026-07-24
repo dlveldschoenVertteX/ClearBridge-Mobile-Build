@@ -1,5 +1,36 @@
 # ClearBridge Mobile — persistent context
 
+## Second real bug found + fixed same round: `fuseAvg`/`fuseMaxc`/`fuseSoft` can also go fully dead on a single failed pair (2026-07-24, round 11 cont.)
+Same root cause as `stack`/`focusStack` above, different symptom: for
+front_only_v1, `ambient_frames`/`flash_frames` are each length 1 (the one
+client-laplacian-selected pair), so when THAT one pair fails to register/
+fuse (`_fuse_flash_ambient`'s ECC step failing, or the correlation guard
+rejecting it), `fuseAvg`/`fuseMaxc`/`fuseSoft` have no other pair to try
+and return `None` entirely — confirmed on 2 real captures this round
+(`847fa2d3`, `5aa18155`, both showed all three fuse variants as `None`
+under real production single-pair selection).
+
+**Fixed the same way, additive-only**: the ORIGINAL single pair is still
+tried FIRST, exactly as before — only if it fails does the code now try
+additional same-pose pairs built from the raw preserved burst
+(`ambient_burst`/`flash_burst`, already downloaded, ranked by ridge
+energy). Since the primary pair always wins when it works, this can only
+ever recover an already-guaranteed-`None` result, never change a
+currently-succeeding one.
+
+**Validated on 12/18 real library captures** (another container restart
+cut it short, not needed — already unambiguous): of the 10 with a known
+pre-fix baseline, **9/10 match their old value exactly (zero regressions
+confirmed)**, and **1/10 (`5aa18155`) went from `None`/`None`/`None` to
+real 58/59/72** — `fuseSoft`'s 72 is the best real score seen for that
+specific capture across every test this session. The other 2 fresh
+captures checked: `cb684c57` got real values (50/64/48), `ccb9c85a`
+correctly stayed `None` (no pair registers at all — a genuine content
+limitation on that capture, not a bug).
+
+Committed alongside the stack/focusStack fix, not yet pushed (standing
+process rule).
+
 ## Real bug found + fixed: `stack`/`focusStack` were structurally dead for front_only_v1, this project's own active capture mode (2026-07-24, round 11)
 Per the CTO's ask to keep hunting for backend bugs/optimizations using the
 real capture library, code-reviewed `afis_print.py`/`main.py`'s frame-
