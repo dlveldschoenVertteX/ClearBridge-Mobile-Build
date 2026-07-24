@@ -1,5 +1,57 @@
 # ClearBridge Mobile — persistent context
 
+## Camera "2" completes its full burst for the first time ever; camera "3" confirmed NOT a true IR/mono sensor (2026-07-24, round 18)
+Real device test of the round-17 build (commit `020e813`, sweep timeout
+28s->34s + the round-16 color-filter-arrangement/flash diagnostics).
+Capture `3f8fd075` (2026-07-24T05:09 UTC).
+
+**Camera "2" fully completed its burst for the first time in this
+project's entire real-device history.** `secondaryCameraDebug` shows
+`2_ok: true` alongside `3_ok: true` — no timeout, no stuck stage. Real
+per-shot data confirms both round-15/17 fixes are working together as
+intended: `shot_0_focusConvergedMs: 292`, `shot_1_focusConvergedMs: 342`
+(fast, genuine reconvergence, same as the previous test), and total
+elapsed time for the sweep landed around ~23.7s — comfortably inside the
+34s budget where it would have blown the old flat 28s bound purely on
+upload time alone. Every prior real test (rounds 3 through 17) had camera
+"2" fail at some upload step; this is the first real, clean, complete
+success.
+
+**The camera-3 "IR" question from round 16 is now definitively settled,
+and the answer is not what the CTO's naming assumed.** Real
+`SENSOR_INFO_COLOR_FILTER_ARRANGEMENT` data for all 4 cameras:
+
+| camera | colorFilterArrangement | hasOwnFlash |
+|---|---|---|
+| "0" (main) | GBRG | true |
+| "1" (front) | RGGB | false |
+| "2" | GBRG | true |
+| "3" ("IR") | BGGR | **false** |
+
+**Camera "3" is a standard Bayer RGB sensor (BGGR), not a true
+near-infrared/mono sensor** — same class as every other camera on this
+device. The CTO's observed "less flash bleed" is therefore real but NOT a
+spectral/NIR effect; it's consistent with the other already-established
+explanation (largest sensor of the four, 6.64x4.97mm, more dynamic range,
+clips less easily under torch). Going forward this camera should be
+thought of as "the big-sensor camera," not "the IR camera" — the naming
+was a reasonable guess from the live-preview look, but the real Camera2
+data doesn't support it.
+
+**One more real, unexplained-but-benign wrinkle**: camera "3" reports
+`hasOwnFlash: false`, yet every real capture shows it clearly torch-lit
+(median brightness 117-128/255 in round-16's paired comparison). This
+device's torch is evidently a system-level LED control not gated by the
+specific active camera's own reported flash capability — not an app bug,
+since the illumination demonstrably works in every real capture; just a
+device quirk worth knowing if a future diagnostic ever trusts
+`hasOwnFlash` as the sole signal for whether a camera can be torch-lit.
+
+Real NFIQ2 score for this capture not yet available at time of writing
+(status was still `enhancing`, consistent with this pipeline's own
+established 130-180s typical processing time, not a stall) — will follow
+up once scored.
+
 ## Real device test of the round-15 focus-recheck fix: confirmed working, but exposed camera-2's real upload-time bottleneck — timeout widened for the sweep path (2026-07-24, round 17)
 CTO tested the build from round 15 (commit `bf10fa2`, the camera-2 sweep
 focus-recheck fix). Real capture `f4a05838` (2026-07-24T04:32 UTC) landed
