@@ -1250,13 +1250,32 @@ class FrontCaptureController extends ChangeNotifier {
             // this drops its burst 3->2 shots, sidestepping the shot-index-2
             // upload hang camera "2" has hit in every real test to date.
             final isCamera2 = desc.name == '2';
+            // Real device data, 2026-07-24 (capture f4a05838): the round-15
+            // per-shot refocus re-check is confirmed working (real fast
+            // convergence, ~300-340ms both shots -- not the bottleneck) --
+            // but camera "2"'s OWN already-established slow upload (10.9s
+            // for a single shot in this same capture, vs. camera "3"'s
+            // 6.4-6.8s) left only ~11s of the flat 28s budget by the time
+            // the second shot's upload started, after the sweep's own real,
+            // deliberate extra time (2 reposition delays + 2 refocus
+            // checks) was spent. That's an extremely tight margin against
+            // an upload that itself plausibly needs ~11s+ -- real variance
+            // can (and did) time the whole camera out with nothing actually
+            // hung. Widen the budget for the sweep path specifically by the
+            // sweep's own real added time, rather than blindly raising it
+            // for every camera (which would dilute the ANR-prevention
+            // rationale the flat 28s bound exists for on non-sweep
+            // cameras).
+            final secondaryCameraTimeout = isCamera2
+                ? const Duration(seconds: 34)
+                : const Duration(seconds: 28);
             final paths = await _captureSecondaryBurst(
               active,
               desc,
               basePath,
               stageDebug,
               distanceSweepScales: isCamera2 ? _camera2DistanceSweepScales : null,
-            ).timeout(const Duration(seconds: 28), onTimeout: () {
+            ).timeout(secondaryCameraTimeout, onTimeout: () {
               debugPrint(
                   '[front] secondary camera ${desc.name} timed out mid-capture '
                   '(stuck at: ${stageDebug['stage']}) -- skipping');

@@ -1,5 +1,42 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the round-15 focus-recheck fix: confirmed working, but exposed camera-2's real upload-time bottleneck — timeout widened for the sweep path (2026-07-24, round 17)
+CTO tested the build from round 15 (commit `bf10fa2`, the camera-2 sweep
+focus-recheck fix). Real capture `f4a05838` (2026-07-24T04:32 UTC) landed
+`status: scored`, `nfiq2Score: 9` (main-camera ambient frame won selection;
+flash frames again scored Laplacian ~15 vs ambient's ~237-249, the
+recurring torch-blowout pattern; `afisWavelengthPx` pegged at the 20px
+measurement ceiling, consistent with the established "held too close"
+correlation — not a new finding, no action taken on this axis this round).
+
+**The round-15 fix itself is confirmed real and working**:
+`secondaryCameraDebug['2_stageDebug']` shows `shot_0_focusConvergedMs: 304`
+and `shot_1_focusConvergedMs: 334` — both real, fast, genuine
+reconvergence after each sweep reposition, both comfortably inside the
+150-900ms bound. Not the bottleneck.
+
+**But camera "2" still failed** — this time at `shot_1_upload`
+(`2_timeout: true`, `2_stuckAt: "shot_1_upload"`), not focus. Real
+per-step accounting: pre-loop focus wait (592ms) + shot0 reposition
+(1600ms) + shot0 refocus recheck (304ms) + shot0 capture (904ms) +
+**shot0 upload (10,936ms)** + shot1 reposition (1600ms) + shot1 refocus
+(334ms) + shot1 capture (569ms) = **16,839ms elapsed before shot1's
+upload even starts**, leaving only ~11.2s of the flat 28s per-camera
+timeout for an upload that, going by shot0's own real number, plausibly
+needs ~11s+. Camera "3" uploaded its 3 shots in 6.4-6.8s each on this
+same capture — camera "2"'s chronically slow upload (established since
+round 3) is the real, dominant cost here, not anything newly broken. The
+sweep's own legitimate extra work (2 reposition delays + 2 refocus
+checks, ~3.8-5s combined) — all real, deliberate, and each individually
+justified — left almost no margin against it.
+
+**Fixed**: widened the per-camera timeout specifically for the sweep path
+(camera "2" only) from 28s to 34s — a real, evidence-based number (28s +
+the sweep's own added ~5s worst case), not a guess. Every other camera
+(including camera "2" on any future non-sweep path, and camera "3") keeps
+the original 28s bound untouched, so the ANR-prevention rationale that
+bound exists for isn't diluted anywhere it doesn't need to be.
+
 ## Camera "3" ("IR") sensor-type diagnostic added — is it real NIR or just a bigger RGB sensor? (2026-07-24, round 16)
 CTO observed less flash bleed/specular glare on camera "3" in the live
 preview than the main camera. Checked the real, already-established data
