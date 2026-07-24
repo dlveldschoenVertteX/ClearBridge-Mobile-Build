@@ -1,5 +1,44 @@
 # ClearBridge Mobile — persistent context
 
+## Real deployment-gap bug found + fixed: `processEnhanceAndScore` hadn't been redeployed since 2026-07-16 — 14 real backend commits went live at once (2026-07-24, round 19)
+Investigating the round-18 capture's impossible `nfiq2Score: 586` (the
+same class of bug as the already-fixed `898` case) led to a much bigger
+finding: the fix for THAT exact bug (commit `cbc10fe`, 2026-07-17T11:54
+UTC) was already correct and already committed — it just had never been
+deployed. Confirmed directly via the Cloud Functions v2 API (not
+assumed): `processEnhanceAndScore`'s real `updateTime` was
+`2026-07-16T21:10:31Z` — matching the stack_cache/70s-budget/300s-timeout
+production-hang fix from that day, and predating every backend commit
+since. `git log --since` against that exact timestamp showed **14 real
+backend commits** sitting undeployed: the nfiq2Score range-validation fix
+itself, the segmentation hole-fill fix, the `enhanced_flat.jpg` crop fix,
+the stack/focusStack revival, the fuse-pair fallback, the fusion-selection
+sharpness guard, and more — essentially this entire session's backend
+optimization track. Every real device test since 2026-07-16 evening had
+been scored by the OLD backend; the client-side (APK) fixes tested
+alongside them were real and live, but none of the backend half was.
+
+**Deployed** (`firebase deploy --only functions:python-pipeline --project
+clearbridge-dc699`, CTO's explicit go-ahead) — confirmed via the same
+Cloud Functions API that `updateTime` is now `2026-07-24T05:32:38Z`, well
+after every pending commit. All 14 backend fixes are live in production
+as of this timestamp. **Not yet confirmed against a fresh real capture**
+— the next real test will be the first one actually scored by this
+session's backend work, including things like the segmentation hole-fill
+and stack/focusStack fixes that were previously only validated locally
+against the offline harness, never in the real production path.
+
+**Process lesson**: this project's standing discipline has always been
+"commit, hold `git push`/deploy until explicit go-ahead" — that worked
+correctly for git pushes (confirmed via `git log`/`git status` at every
+step), but there was no equivalent real-data check for the BACKEND deploy
+side specifically, and it silently drifted 14 commits / 8 days out of
+sync without anyone noticing until a real capture's impossible score
+forced the investigation. Worth periodically cross-checking
+`processEnhanceAndScore`'s real `updateTime` against `git log` when in
+doubt, rather than assuming a "Deployed" note in this file's history is
+still current.
+
 ## Camera "2" completes its full burst for the first time ever; camera "3" confirmed NOT a true IR/mono sensor (2026-07-24, round 18)
 Real device test of the round-17 build (commit `020e813`, sweep timeout
 28s->34s + the round-16 color-filter-arrangement/flash diagnostics).
