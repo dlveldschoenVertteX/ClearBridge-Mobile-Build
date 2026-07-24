@@ -369,7 +369,17 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _flashEvMaxCut = -1.1; // intensity=0.3 (near the bright-mode
                                               // threshold: torch adds on top of
                                               // substantial ambient, needs the most cut)
+  // When ambient mean luma is below this threshold the torch is already the
+  // ONLY meaningful light source.  Dimming it with a negative EV offset is
+  // counterproductive — the EV curve was calibrated on the overexposure
+  // case (bright ambient + flash on top), not on a pitch-dark room.
+  static const double _flashEvDarkRoomThreshold = 30.0; // /255
+
   double _adaptiveFlashEvStep() {
+    // Skip the correction entirely in a dark room: ambient mean < ~12%
+    // brightness means the torch is already the sole light source and any
+    // negative EV step only makes an already-underexposed frame worse.
+    if (_lastStableBrightness < _flashEvDarkRoomThreshold) return 0.0;
     final intensity = (_flash?.intensity ?? 0.6).clamp(0.3, 1.0);
     final t = (1.0 - intensity) / 0.7; // 0 at intensity=1.0, 1 at intensity=0.3
     return _flashEvMinCut + (_flashEvMaxCut - _flashEvMinCut) * t;
