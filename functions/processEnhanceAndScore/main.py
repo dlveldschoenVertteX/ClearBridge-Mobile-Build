@@ -836,10 +836,19 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # the 'native' variant above, and only replaces best_afis_img if it
             # scores higher -- purely additive, same max-variant guarantee.
             # Reuse the capture doc already fetched above for guideRegion.
-            # Secondary cameras stay on the segmentation path (no guide_region):
-            # they're different physical sensors, not center-square-cropped, and
-            # don't share the main preview's framing the silhouette was shown in.
+            # Secondary cameras: score each burst's sharpest frame as its own
+            # single-frame candidate, same max-variant pattern as above.
+            # Derive a focal-ratio-scaled guide region when cameraLensInfo is
+            # available: secondary sensors have wider or narrower FOV than the
+            # main camera, so the fingerprint appears proportionally smaller or
+            # larger in their frame. Scaling the main guide's rx/ry by
+            # (secondary_fl / main_fl) extracts the equivalent physical pad
+            # region from the secondary frame. cx/cy default to 0.5/0.5 since
+            # the main camera's BoxFit.cover-corrected cx is specific to that
+            # sensor's framing and doesn't transfer to other lenses.
             _cap_doc = _guide_doc
+            _lens_info = _cap_doc.get('cameraLensInfo') or {}
+            _fl_main = (_lens_info.get('0') or {}).get('focalLengthMm')
             for _cam in _cap_doc.get('secondaryCameras', []) or []:
                 # 'paths' (a short per-camera burst, ranked by Laplacian
                 # variance below) is the current schema; 'path' (a single
@@ -858,7 +867,28 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _sbytes = _download_storage_file(_spath)
                         _simg = _decode_image(_sbytes)
                     _sname = f"secondary_{_cam.get('name', 'cam')}"
-                    _simg_res, _sp = afis_print.generate([_simg], [0.0], [None])
+                    # Focal-ratio-scaled guide: gives generate() the right
+                    # extraction region for this lens's FOV. Falls back to
+                    # None (UNet/flash-diff segmentation path) if any input
+                    # is missing -- purely additive, never blocks.
+                    _sec_guide = None
+                    _fl_sec = (_lens_info.get(_cam.get('name', '')) or {}).get('focalLengthMm')
+                    if _fl_main and _fl_sec and _guide_region and _fl_main > 0:
+                        _fl_ratio = _fl_sec / _fl_main
+                        _sec_guide = {
+                            'cx': 0.5,
+                            'cy': 0.5,
+                            'rx': _guide_region['rx'] * _fl_ratio,
+                            'ry': _guide_region['ry'] * _fl_ratio,
+                            'tipAngleDeg': 0.0,
+                            'n': _guide_region.get('n', 2.5),
+                        }
+                    _simg_res, _sp = afis_print.generate(
+                        [_simg], [0.0], [None],
+                        guide_region=_sec_guide,
+                        freq_normalize=True,
+                        stack_cache={},
+                    )
                     if _simg_res is None:
                         continue
                     _sres = _score_nfiq(_simg_res, sfm_coverage=1.0)
