@@ -139,8 +139,8 @@ class PadSilhouetteShape {
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.166175,
-    ry: 0.137275,
+    rx: 0.14956,
+    ry: 0.12355,
     taper: 0.20,
   );
 

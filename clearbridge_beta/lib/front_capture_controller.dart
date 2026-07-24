@@ -309,9 +309,9 @@ class FrontCaptureController extends ChangeNotifier {
   // afisMaskCoverPx on that capture, resolution-adjusted, sits between the
   // established "good" and "too-close" reference clusters -- see
   // defaultShape's own docstring for the full derivation):
-  //   cx=0.5, cy=0.37, rx=0.166175*(1+0.20)=0.19941, ry=0.137275
-  //   -> [0.30059,0.232725,0.69941,0.507275]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.3006, 0.2327, 0.6994, 0.5073);
+  //   cx=0.5, cy=0.37, rx=0.14956*(1+0.20)=0.17947, ry=0.12355
+  //   -> [0.32053,0.24645,0.67947,0.49355]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.3205, 0.2464, 0.6795, 0.4936);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1516,7 +1516,8 @@ class FrontCaptureController extends ChangeNotifier {
     // measured sharpness signal (_focusValue) clears a threshold. Replaced
     // with an equivalent measured wait on the secondary camera's own stream.
     stageDebug['stage'] = 'settle_delay';
-    await _waitForSecondaryFocusLock(active, stageDebug);
+    await _waitForSecondaryFocusLock(active, stageDebug,
+        maxWaitMs: desc.name == '3' ? 4000 : 2600);
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
     final burstCount = distanceSweepScales?.length ?? _secondaryBurstCount;
     final paths = <String>[];

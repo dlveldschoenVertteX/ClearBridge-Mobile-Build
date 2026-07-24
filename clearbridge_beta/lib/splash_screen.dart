@@ -522,7 +522,9 @@ class _SplashScreenState extends State<SplashScreen>
 
   Widget _marketingRow(double t, double inS, Widget child) {
     final a = _alphaIO(t, inS, null, fadeIn: _rowFadeIn);
-    if (a <= 0) return const SizedBox.shrink();
+    // Always occupy layout space so the Column doesn't reflow (and push
+    // earlier rows upward) as each row materialises. Opacity(0) is invisible
+    // but still contributes its height, eliminating the "squash" effect.
     return Opacity(
       opacity: a,
       child: Transform.translate(
