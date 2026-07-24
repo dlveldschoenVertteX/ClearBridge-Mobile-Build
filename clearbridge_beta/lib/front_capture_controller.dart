@@ -448,6 +448,11 @@ class FrontCaptureController extends ChangeNotifier {
       // a single noisy reading -- same hysteresis rationale as
       // _maxSteadyDegPerSec's gyro smoothing.
   static const double _zoomStep = 0.15;
+  // Cap digital zoom at 1.3x: afe5b02c (round 3) scored nfiq2=74 at 1.3x,
+  // and native wavelength ~9.75px × 1.3 = ~12.7px stays in the 9-14px sweet
+  // spot.  Beyond 1.3x the pixel wavelength hits the 20px ceiling and NFIQ2
+  // collapses (real captures: nfiq2=10, nfiq2=6 at 2.05x).
+  static const double _maxZoomFill = 1.3;
 
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   double _gyroMagnitudeDegPerSec = 0.0;
@@ -500,7 +505,7 @@ class FrontCaptureController extends ChangeNotifier {
     _underfillStreak = 0;
     _zoomEverApplied = false;
     try {
-      _maxZoomLevel = await camera.getMaxZoomLevel();
+      _maxZoomLevel = (await camera.getMaxZoomLevel()).clamp(1.0, _maxZoomFill);
     } catch (_) {}
 
     _flash = AdaptiveFlashController(camera);
@@ -1627,10 +1632,14 @@ class FrontCaptureController extends ChangeNotifier {
     var peak = 1.0;
     var focusEma = 0.0;
     var streaming = false;
+    var processingFrame = false; // re-entrancy guard: offerFrame can take
+        // >33ms, so at 30fps the event queue backs up and starves the UI
+        // thread → ANR.  Skip any frame that arrives while one is in flight.
     final start = DateTime.now();
     final completer = Completer<void>();
     void onFrame(CameraImage image) {
-      if (completer.isCompleted) return;
+      if (completer.isCompleted || processingFrame) return;
+      processingFrame = true;
       try {
         final raw = _hybrid.offerFrame(image, thumbRoi: roi);
         if (raw > peak) peak = raw;
@@ -1642,7 +1651,9 @@ class FrontCaptureController extends ChangeNotifier {
         if (elapsedMs >= minWaitMs && focusEma > lockThreshold) {
           completer.complete();
         }
-      } catch (_) {}
+      } catch (_) {} finally {
+        processingFrame = false;
+      }
     }
     try {
       await active.startImageStream(onFrame);
