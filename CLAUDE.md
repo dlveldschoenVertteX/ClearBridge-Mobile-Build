@@ -1,5 +1,20 @@
 # ClearBridge Mobile — persistent context
 
+## _STACK_MAX sweep (4 vs 8): tested, no real gain, left as-is (2026-07-24, round 13 cont.)
+Quick follow-up to the `stack`/`focusStack` revival: those variants cap at
+`_STACK_MAX=4` same-pose frames even when the burst-fallback can supply up
+to 8. Tested raising the cap to 8 across all 18 real library captures
+(real production single-frame selection + burst fallback, matching the
+revival fix's own validation setup). **Net negative**: mean delta (max8 -
+max4) = -1.33; 5 captures regressed, 3 improved, 10 unaffected (bursts
+with <=4 usable frames don't reach the cap either way). Left
+`_STACK_MAX` at 4 — no change made. Fourth "plausible-sounding tuning
+idea, measured, refuted" result this session (after the ambient-vs-flash
+frame-priority swap, the deepFocus fusion variant, and now this) — a real,
+consistent signal that backend NFIQ2-side tuning has hit diminishing
+returns for now, distinct from the four real structural bugs fixed
+earlier this same round.
+
 ## deepFocus* variant (focus-stacked deep fusion): built, measured, NOT wired into production (2026-07-24, round 13)
 CTO asked whether same-pose fusion (the biggest existing NFIQ lever —
 `deepFuse`/`deepMaxc`/`deepSoft`) could be optimized further. Found one
