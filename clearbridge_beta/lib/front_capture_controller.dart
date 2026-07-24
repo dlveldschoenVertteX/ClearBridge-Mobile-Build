@@ -198,21 +198,17 @@ class FrontCaptureController extends ChangeNotifier {
   // test it). Reuses the same "bigger guide = closer, smaller guide =
   // farther" mechanism already established for the retired ambientClose/
   // flashFar work (PadSilhouetteShape.scaled). >1.0 pulls the user closer;
-  // <1.0 pushes them farther. Two shots, not three: camera "2" has died on
-  // shot index 2 (the 3rd shot) in every real test to date, so dropping to
-  // two shots also sidesteps that exact failure point rather than fighting
-  // it, as a side benefit of the sweep itself.
-  // Widened from [1.15, 0.85]: real measurement on the previous build showed
-  // BOTH positions yielded afisWavelengthPx 19-20px (user too close throughout
-  // the entire sweep). 1.30 pulls the user ~13% closer (larger guide) for the
-  // close shot; 0.70 pushes them ~17% farther (smaller guide) for the far shot
-  // -- at the established ~9.75px native wavelength, 0.70 targets ~14px, the
-  // sweet-spot ceiling, where the previous 0.85 target was still at ~17px.
-  static const List<double> _camera2DistanceSweepScales = [1.30, 0.70];
-  // Real time for the user to physically move their thumb between the two
-  // distance-sweep shots above -- _burstShotDelayMs (50ms) is tuned for a
-  // STATIC thumb during the main/other secondary bursts and is nowhere near
-  // enough time to actually reposition.
+  // <1.0 pushes them farther. Single far shot only: real measurement on the
+  // [1.30, 0.70] build showed the close shot (1.30) never helped -- BOTH
+  // positions still landed at afisWavelengthPx=20px (user too close). The
+  // far shot alone (0.70) is sharper (Laplacian ~807 vs ~346 for close) and
+  // scores better. Camera "2" is single-shot only; it has died at shot index
+  // 2 in every prior test, so this also eliminates that failure point.
+  static const List<double> _camera2DistanceSweepScales = [0.70];
+  // Settle delay after the guide shrinks to 0.70 before the shutter fires.
+  // No longer a movement delay (single shot, no repositioning between shots),
+  // but kept at 1600ms to give the user time to react to the guide shrinking
+  // and move their thumb slightly back before capture.
   static const int _camera2SweepMoveDelayMs = 1600;
   static const int _burstFlashSettleMs = 70;
   static const int _holdDurationMs = 1500;
