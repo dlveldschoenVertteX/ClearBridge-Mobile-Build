@@ -1,5 +1,38 @@
 # ClearBridge Mobile — persistent context
 
+## deepFocus* variant (focus-stacked deep fusion): built, measured, NOT wired into production (2026-07-24, round 13)
+CTO asked whether same-pose fusion (the biggest existing NFIQ lever —
+`deepFuse`/`deepMaxc`/`deepSoft`) could be optimized further. Found one
+real, previously-untried combination: `deep*` always flat-averages each
+illumination's burst (`_stack_face_on`) before fusing ambient+flash,
+never the sharpness-weighted `_focus_stack_face_on` (already proven
+separately — see the earlier `stack`/`focusStack` revival — to recover
+detail a flat average smooths over). Built `deepFocusAvg`/`deepFocusMaxc`/
+`deepFocusSoft` in `afis_print.py`: identical to `deep`/`deepMaxc`/
+`deepSoft` except the per-illumination stack uses focus-stacking instead
+of flat averaging (own separate `stack_cache` key, since it needs a
+different intermediate result).
+
+**Measured honestly on all 17 real library captures — net NEGATIVE, not
+a win.** `deep*` mean best = 63.9, `deepFocus*` mean best = 62.2; 11/17
+captures regressed, only 6 improved (a few real individual wins:
+`382cc4b2` +20, `c34911b5` +5, but the average moved the wrong way).
+Same lesson as `nnsHybrid`/`coherenceDiff` underperforming despite each
+combining independently-proven pieces — two good techniques don't
+automatically compose.
+
+**Deliberately NOT wired into `main.py`'s production `_afis_variants`**,
+for two independent reasons: the negative average result, and a real
+compute-cost concern -- `deepFocus*` needs its own separate ECC-alignment
+stacking pass (can't share the `deep*` family's cache, since it needs the
+sharpness-weighted intermediate, not the flat-averaged one), which would
+roughly double the exact expensive step that once caused a real production
+outage (a capture stuck at `status: enhancing` forever, fixed 2026-07-16 by
+caching `_stack_face_on` across the `deep*` family specifically to avoid
+redoing it 3x). Code stays in `afis_print.py`, self-contained and unused
+unless explicitly called — same "measured, kept as an available scaffold,
+not shipped" treatment as `gaborVarFreq`/`fidelity`/`gaborPyfingField`.
+
 ## Capture-side: asymmetric flash-transition settle delay (2026-07-24, round 12)
 CTO asked whether there were more iterations to make on the capture side
 specifically (app, not backend). Line-by-line review of `_fireBurst`

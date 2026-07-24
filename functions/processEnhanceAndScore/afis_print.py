@@ -1347,7 +1347,7 @@ def generate(
     # geometric distortion and is the single biggest superprint lever found:
     # +5–7 NFIQ on the hardest captures. Emits None (variant skipped) when no
     # fusable pair exists, so single-source renderings still stand.
-    if fuse in ('deep', 'deepMaxc', 'deepSoft'):
+    if fuse in ('deep', 'deepMaxc', 'deepSoft', 'deepFocusAvg', 'deepFocusMaxc', 'deepFocusSoft'):
         # Deep raw-burst fusion: denoise each illumination by aligning+averaging
         # ALL its preserved near-face-on burst shots, THEN fuse the two clean
         # stacks. Strengthens both fusion inputs before combining — worth
@@ -1365,34 +1365,52 @@ def generate(
         # with the centre smudge gone, vs. avg's washed centre (real NFIQ2
         # 57->81, bozorth 4->6). All three are scored as separate max-variants
         # in main.py, so the coherence modes can only ever raise the result.
-        _deep_mode = {'deep': 'avg', 'deepMaxc': 'maxc', 'deepSoft': 'soft'}[fuse]
+        _deep_mode = {
+            'deep': 'avg', 'deepMaxc': 'maxc', 'deepSoft': 'soft',
+            'deepFocusAvg': 'avg', 'deepFocusMaxc': 'maxc', 'deepFocusSoft': 'soft',
+        }[fuse]
+        # deepFocus* variants (2026-07-24): combine two techniques already
+        # separately validated but never together -- per-illumination
+        # SHARPNESS-WEIGHTED stacking (_focus_stack_face_on, targets the
+        # pad's curved edges going soft under a single frame's shallow
+        # macro depth-of-field) feeding the SAME coherence-based ambient/
+        # flash fusion (maxc/soft, already proven to win back the flash
+        # specular-blown centre) that plain deep/deepMaxc/deepSoft use with
+        # a flat average instead. Max-of-variants, so this can only ever
+        # add a candidate.
+        _use_focus_stack = fuse.startswith('deepFocus')
+        _stack_fn = _focus_stack_face_on if _use_focus_stack else _stack_face_on
+        _cache_key = ('da_focus', 'df_focus') if _use_focus_stack else ('da', 'df')
         ab = [g for g in (ambient_burst or []) if g is not None]
         fb = [g for g in (flash_burst or []) if g is not None]
         if not ab and not fb:
             return None, params
-        # _stack_face_on does ECC-affine registration across the WHOLE burst --
-        # expensive, and identical for 'deep'/'deepMaxc'/'deepSoft' (they share
-        # the same ab/fb, differing only in the cheap final fusion mode below).
-        # Found 2026-07-16 (real device capture 9efb7d1e): on a burst with
-        # poorly-correlated flash frames, redoing this 3x (once per fuse-mode
-        # variant) took 15+ minutes for a single variant, blowing the Cloud
-        # Run request timeout and leaving the capture stuck forever. Cache
-        # across the family via the caller-supplied, request-scoped
-        # `stack_cache` dict (main.py creates one fresh dict per request and
-        # passes it to every variant call) -- never a module-level/global
-        # cache, so there's no risk of stale reuse across different requests.
-        if stack_cache is not None and 'da' in stack_cache:
-            da = stack_cache['da']
+        # _stack_face_on/_focus_stack_face_on do ECC-affine registration
+        # across the WHOLE burst -- expensive, and identical within each
+        # family (deep/deepMaxc/deepSoft share one cache slot;
+        # deepFocusAvg/deepFocusMaxc/deepFocusSoft share a SEPARATE one,
+        # since they need the sharpness-weighted stack, not the flat-
+        # averaged one). Found 2026-07-16 (real device capture 9efb7d1e):
+        # on a burst with poorly-correlated flash frames, redoing this 3x
+        # (once per fuse-mode variant) took 15+ minutes for a single
+        # variant, blowing the Cloud Run request timeout and leaving the
+        # capture stuck forever. Cache across the family via the caller-
+        # supplied, request-scoped `stack_cache` dict (main.py creates one
+        # fresh dict per request and passes it to every variant call) --
+        # never a module-level/global cache, so there's no risk of stale
+        # reuse across different requests.
+        if stack_cache is not None and _cache_key[0] in stack_cache:
+            da = stack_cache[_cache_key[0]]
         else:
-            da = _stack_face_on(ab) if len(ab) >= 2 else (ab[0] if ab else None)
+            da = _stack_fn(ab) if len(ab) >= 2 else (ab[0] if ab else None)
             if stack_cache is not None:
-                stack_cache['da'] = da
-        if stack_cache is not None and 'df' in stack_cache:
-            df = stack_cache['df']
+                stack_cache[_cache_key[0]] = da
+        if stack_cache is not None and _cache_key[1] in stack_cache:
+            df = stack_cache[_cache_key[1]]
         else:
-            df = _stack_face_on(fb) if len(fb) >= 2 else (fb[0] if fb else None)
+            df = _stack_fn(fb) if len(fb) >= 2 else (fb[0] if fb else None)
             if stack_cache is not None:
-                stack_cache['df'] = df
+                stack_cache[_cache_key[1]] = df
         if da is not None and da.ndim != 2:
             da = cv2.cvtColor(da, cv2.COLOR_BGR2GRAY)
         if df is not None and df.ndim != 2:
@@ -1404,7 +1422,10 @@ def generate(
             gray = da if da is not None else df
         else:
             return None, params
-        params['afisDeepFuse'] = {'nAmb': len(ab), 'nFla': len(fb), 'mode': _deep_mode}
+        params['afisDeepFuse'] = {
+            'nAmb': len(ab), 'nFla': len(fb), 'mode': _deep_mode,
+            'stack': 'focus' if _use_focus_stack else 'mean',
+        }
     elif fuse:
         if ambient_frames is None or flash_frames is None:
             return None, params
