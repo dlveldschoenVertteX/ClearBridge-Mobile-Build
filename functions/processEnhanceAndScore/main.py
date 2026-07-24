@@ -849,6 +849,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _cap_doc = _guide_doc
             _lens_info = _cap_doc.get('cameraLensInfo') or {}
             _fl_main = (_lens_info.get('0') or {}).get('focalLengthMm')
+            _secondary_cam_scores = {}
             for _cam in _cap_doc.get('secondaryCameras', []) or []:
                 # 'paths' (a short per-camera burst, ranked by Laplacian
                 # variance below) is the current schema; 'path' (a single
@@ -859,13 +860,44 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     continue
                 try:
                     if len(_spaths) > 1:
-                        _simg, _slap, _spath = _best_frame_from_paths(_spaths)
-                        if _simg is None:
+                        # Download all burst frames in parallel so stack/
+                        # focusStack variants have multiple same-pose images
+                        # to align — the same fix applied to the main-camera
+                        # path in round 11, now extended to secondary cameras.
+                        def _fetch_sec_frame(p):
+                            b = _download_storage_file(p)
+                            a = _decode_image(b)
+                            s = float(cv2.Laplacian(
+                                cv2.cvtColor(a, cv2.COLOR_BGR2GRAY),
+                                cv2.CV_64F).var())
+                            return p, a, s
+                        _sframes = []
+                        with ThreadPoolExecutor(
+                                max_workers=min(len(_spaths), 6)) as _sex:
+                            _sfuts = {_sex.submit(_fetch_sec_frame, p): p
+                                      for p in _spaths}
+                            for _sfut in as_completed(_sfuts):
+                                try:
+                                    _sframes.append(_sfut.result())
+                                except Exception as _sfe:
+                                    logger.warning(
+                                        'secondary frame download failed: %s',
+                                        _sfe)
+                        if not _sframes:
                             continue
+                        _sframes.sort(key=lambda x: x[2], reverse=True)
+                        _spath = _sframes[0][0]
+                        _simg = _sframes[0][1]
+                        _all_simgs = [f[1] for f in _sframes]
+                        _all_gyros = [0.0] * len(_all_simgs)
+                        _all_illums = [None] * len(_all_simgs)
                     else:
                         _spath = _spaths[0]
                         _sbytes = _download_storage_file(_spath)
                         _simg = _decode_image(_sbytes)
+                        _all_simgs = [_simg]
+                        _all_gyros = [0.0]
+                        _all_illums = [None]
                     _sname = f"secondary_{_cam.get('name', 'cam')}"
                     # Focal-ratio-scaled guide: gives generate() the right
                     # extraction region for this lens's FOV. Falls back to
@@ -884,7 +916,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             'n': _guide_region.get('n', 2.5),
                         }
                     _simg_res, _sp = afis_print.generate(
-                        [_simg], [0.0], [None],
+                        _all_simgs, _all_gyros, _all_illums,
                         guide_region=_sec_guide,
                         freq_normalize=True,
                         stack_cache={},
@@ -893,6 +925,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         continue
                     _sres = _score_nfiq(_simg_res, sfm_coverage=1.0)
                     _ss = _sres.get('nfiq_score', 0.0) if not _sres.get('error') else 0.0
+                    _secondary_cam_scores[_cam.get('name', '?')] = round(_ss, 2)
                     logger.info('AFIS variant %s nfiq=%.1f', _sname, _ss)
                     if _ss > afis_nfiq:
                         afis_nfiq = _ss
@@ -1013,6 +1046,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             'enhancedImagePath': enhanced_path,
             'superprintPath':    afis_path,
             'superprintParams':  afis_params or None,
+            # Per-camera proxy NFIQ scores for all secondary cameras that
+            # completed scoring this run -- diagnostic for comparing cameras
+            # without relying solely on which one happened to win the max.
+            'secondaryCamScores': _secondary_cam_scores or None,
         }, critical=True)
 
         # POPIA data minimization: raw frames served their purpose (pipeline input).

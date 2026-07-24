@@ -1662,6 +1662,9 @@ class FrontCaptureController extends ChangeNotifier {
           DateTime.now().difference(start).inMilliseconds;
       stageDebug['${keyPrefix}focusScoreAtFire'] =
           double.parse(focusEma.toStringAsFixed(3));
+      // true = AF never actually converged; burst fired at the maxWaitMs
+      // bound. Distinguishes "fast lock" from "gave up and fired anyway".
+      stageDebug['${keyPrefix}focusTimedOut'] = !completer.isCompleted;
     }
   }
 
