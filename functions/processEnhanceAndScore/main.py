@@ -810,25 +810,50 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _fusion_guarded = _fl_lap > 0 and (_amb_lap / _fl_lap) >= _SHARPNESS_RATIO_GUARD
             _native_nfiq = None
 
+            # fuseAvg/fuseMaxc/fuseSoft each pair a single flash_frames[0] with
+            # ambient_frames[0]. Now that the EV bracket gives 4 distinct flash
+            # exposures in flash_burst, multi-pair fuse tries each frame as the
+            # partner and keeps the one with the best proxy score. deep* variants
+            # already consume flash_burst for internal stacking, so they don't
+            # need this inner sweep.
+            _FUSE_PAIR_NAMES = {'fuseAvg', 'fuseMaxc', 'fuseSoft'}
+
             for _vname, _vkw in _afis_variants:
                 if time.monotonic() > _variants_deadline:
                     logger.warning('AFIS variant loop: time budget exceeded, '
                                     'skipping remaining variants from %s onward', _vname)
                     break
-                _img, _p = afis_print.generate(
-                    frames, angles_for_sfm, _laps,
-                    ambient_frames=ambient_frames, flash_frames=flash_frames,
-                    ambient_burst=ambient_burst, flash_burst=flash_burst,
-                    guide_region=_guide_region,
-                    stack_cache=_stack_cache,
-                    **_vkw)
+                _fuse_fl_list = (
+                    [[f] for f in flash_burst]
+                    if _vname in _FUSE_PAIR_NAMES and len(flash_burst) > 1
+                    else [flash_frames]
+                )
+                _img, _p, _s = None, None, 0.0
+                for _fl_frames in _fuse_fl_list:
+                    if time.monotonic() > _variants_deadline:
+                        break
+                    _ci, _cp = afis_print.generate(
+                        frames, angles_for_sfm, _laps,
+                        ambient_frames=ambient_frames, flash_frames=_fl_frames,
+                        ambient_burst=ambient_burst, flash_burst=flash_burst,
+                        guide_region=_guide_region,
+                        stack_cache=_stack_cache,
+                        **_vkw)
+                    if _ci is None:
+                        continue
+                    _cr = _score_nfiq(_ci, sfm_coverage=1.0)
+                    _cs = _cr.get('nfiq_score', 0.0) if not _cr.get('error') else 0.0
+                    if _cs > _s:
+                        _img, _p, _s = _ci, _cp, _cs
                 if _img is None:
                     continue
                 if _vname == 'freqNorm':
                     freqnorm_img = _img
-                _res = _score_nfiq(_img, sfm_coverage=1.0)
-                _s = _res.get('nfiq_score', 0.0) if not _res.get('error') else 0.0
-                logger.info('AFIS variant %s nfiq=%.1f', _vname, _s)
+                if len(_fuse_fl_list) > 1:
+                    logger.info('AFIS variant %s nfiq=%.1f (best of %d flash pair candidates)',
+                                _vname, _s, len(_fuse_fl_list))
+                else:
+                    logger.info('AFIS variant %s nfiq=%.1f', _vname, _s)
                 if _vname == 'native':
                     _native_nfiq = _s
                 if (_fusion_guarded and _vname in _FUSION_VARIANT_NAMES

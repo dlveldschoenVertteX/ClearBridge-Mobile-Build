@@ -167,7 +167,7 @@ class FrontCaptureController extends ChangeNotifier {
   // wired in for front_only_v1) a real multi-frame stack per illumination
   // instead of the bare 2-frame minimum.
   static const int _burstFrameCount = 8;
-  static const int _burstShotDelayMs = 50;
+  static const int _burstShotDelayMs = 0;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -1515,17 +1515,17 @@ class FrontCaptureController extends ChangeNotifier {
   }) async {
     stageDebug['stage'] = 'flash_on';
     await active.setFlashMode(FlashMode.torch);
-    // Anti-blowout EV step -- the same -1.0 offset already validated for the
-    // main camera's flash burst (see the alternating ambient/flash burst
-    // above: an earlier all-flash burst blew out the pad centre at ~10cm).
-    // setExposureOffset() does not engage the Camera2 interop that
-    // setExposureMode() does, so this is safe to call without risking the
-    // torch (see CameraService comments on that conflict).
+    // Adaptive EV step -- same curve as the main burst (_adaptiveFlashEvStep),
+    // so the secondary camera's flash exposure responds to ambient brightness
+    // the same way the main burst does. Ambient luma reading is scene-level
+    // (doesn't change by active camera), so the value is valid here.
+    // setExposureOffset() is safe; setExposureMode() is the Camera2-interop
+    // landmine, never called here.
     stageDebug['stage'] = 'exposure_setup';
     try {
       final minEv = await active.getMinExposureOffset();
       final maxEv = await active.getMaxExposureOffset();
-      await active.setExposureOffset((-1.0).clamp(minEv, maxEv));
+      await active.setExposureOffset(_adaptiveFlashEvStep().clamp(minEv, maxEv));
     } catch (_) {
       // Some secondary sensors may not support exposure offset -- non-fatal,
       // the burst still fires at default exposure.
