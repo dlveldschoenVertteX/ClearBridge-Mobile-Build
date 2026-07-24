@@ -1453,6 +1453,16 @@ def _download_front_only_frames(capture_id: str, base_path: str):
         raise CaptureQualityError('No usable frames in front_only capture')
 
     # Best single frame (sharpest ambient preferred, else sharpest flash).
+    # TESTED 2026-07-24 and REJECTED: tried comparing the sharpest ambient
+    # against the sharpest flash by client laplacianScore and picking
+    # whichever reads higher, instead of always preferring ambient. Real
+    # data refuted it -- of the 5 real library captures where this would
+    # have flipped the selection, only 1 improved (+18 real NFIQ2) and 4
+    # REGRESSED (-2, -4, -12, -13). The client laplacianScore is a known-
+    # unreliable whole-preview-frame proxy (see afis_print.py's own
+    # _ridge_energy comment) -- reading "sharper" for flash doesn't mean
+    # it's genuinely better raw material, and ambient-preferred stays the
+    # right default. Do not re-attempt this exact swap without new data.
     best_arr = amb_frames_list[0] if amb_frames_list else fl_frames_list[0]
 
     frames     = [best_arr]

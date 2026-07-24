@@ -1,5 +1,31 @@
 # ClearBridge Mobile — persistent context
 
+## Tested and REJECTED: ambient-vs-flash frame priority in `_download_front_only_frames` (2026-07-24, round 11 cont.)
+Same round's code review turned up a third candidate: `_download_front_only_frames`
+always prefers the sharpest AMBIENT frame over any flash frame whenever
+one exists, never actually comparing their client `laplacianScore`s. This
+looked like the same class of bug as the two fixes above (an unconditional
+priority silently discarding better raw material). Checked real Firestore
+per-frame `laplacianScore` data across the library: **5 of 18 real
+captures would have their selection flipped** by comparing scores directly
+instead of defaulting to ambient (`7d7d0162`, `9bdc9f85`, `f382a03a`,
+`fc619fe8`, `fcfa2e93`).
+
+**Built the fix, then measured it on those exact 5 captures before
+trusting it — and the real data refuted it**: only 1/5 improved (`7d7d0162`:
++18 real NFIQ2), the other 4 REGRESSED (`9bdc9f85`: -2, `f382a03a`: -12,
+`fc619fe8`: -13, `fcfa2e93`: -4). Net negative. Consistent with this
+project's own already-documented finding that the CLIENT laplacianScore is
+an unreliable whole-preview-frame proxy (`afis_print.py`'s own
+`_ridge_energy` comment: "observed identical across a burst... can't
+distinguish the sharp still from a soft one") — reading numerically higher
+for flash on these captures didn't mean the flash frame was genuinely
+better material. **Reverted** — ambient-preferred stays the correct
+default, left a comment documenting the real numbers so this exact swap
+isn't re-attempted blind by a future session. This is the discipline this
+whole project runs on: a plausible-sounding fix still needs a real-data
+check before it ships, and this round is the case where that check said no.
+
 ## Second real bug found + fixed same round: `fuseAvg`/`fuseMaxc`/`fuseSoft` can also go fully dead on a single failed pair (2026-07-24, round 11 cont.)
 Same root cause as `stack`/`focusStack` above, different symptom: for
 front_only_v1, `ambient_frames`/`flash_frames` are each length 1 (the one
