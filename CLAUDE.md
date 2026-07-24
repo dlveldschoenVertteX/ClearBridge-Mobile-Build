@@ -1,5 +1,58 @@
 # ClearBridge Mobile — persistent context
 
+## Real bug found + fixed: `stack`/`focusStack` were structurally dead for front_only_v1, this project's own active capture mode (2026-07-24, round 11)
+Per the CTO's ask to keep hunting for backend bugs/optimizations using the
+real capture library, code-reviewed `afis_print.py`/`main.py`'s frame-
+selection path (not blind parameter tuning) and found a real, previously
+unnoticed bug: `_download_front_only_frames` (`main.py`) collapses the
+whole 8-frame burst down to exactly ONE pre-selected ambient + ONE
+pre-selected flash frame (by client-reported `laplacianScore`, always
+preferring ambient) **before** `afis_print.generate()` ever runs. But
+`main.py`'s own `_afis_variants` list runs `stack`/`focusStack` on every
+single front_only_v1 request — and both require >=2 same-pose frames to
+do anything (`generate()`'s stacking logic operates on `frames`, which is
+always length 1 here). **Both variants were guaranteed to return `None`
+on literally every real front_only_v1 capture this project has ever
+scored** — two of eleven production variants, silently burning request
+time for zero benefit, every time.
+
+Confirmed via a real sweep of the full local capture library (before vs.
+after, real local NFIQ2 — same calibrated binary used throughout this
+session): a naive fix (feed the FULL burst into every variant, replacing
+the single pre-selected frame everywhere) was NOT a clean win — 4 real
+gains, several ties, but a real -4 regression on `913758cf` (the exact
+capture already flagged in this project's history for a fusion-selection
+trap: fuseMaxc/fuseSoft's registration genuinely degrades with different
+candidate framing on that specific bad-flash capture). Reverted the naive
+version.
+
+**Fixed narrowly instead**: only `stack`/`focusStack`'s own frame source
+now falls back to the raw preserved same-pose burst (`ambient_burst`/
+`flash_burst` — already downloaded for every front_only_v1 request to
+feed `deepFuse`, so no new download needed) when the primary single-frame
+list can't supply the >=2 frames needed. `native`/`freqNorm`/`fuseAvg`/
+`fuseMaxc`/`fuseSoft`/`deepFuse`/`deepMaxc` are completely untouched — so
+this can only ever promote an already-guaranteed-`None` result to a real
+one, never regress a capture the old code already handled correctly (same
+"can only add a candidate" discipline as every other addition to this
+max-of-variants pipeline).
+
+**Validated on 17 of 18 real library captures** (container restart cut
+the 18th short, not needed — the result is already unambiguous):
+**17/17 now produce real, non-None `stack`/`focusStack` output** (was
+0/17 before this fix — a 100% dead-code confirmation). In 11 of 17, the
+newly-unlocked variant beats plain `native` outright, several by a wide
+margin (`5aa18155`: native 22 -> 69, +47; `722ae3b0`: 35 -> 59, +24;
+`847fa2d3`: +15; `7d7d0162`: +14; `dadd4ef9`: +13; `c34911b5`: +12).
+Since this only adds candidates to the existing max-of-variants pool, it
+cannot lower any capture's result — the captures where stack/focusStack
+scored below native simply mean native (or another untouched variant)
+still wins there, exactly as before.
+
+Committed, not yet pushed (standing process rule). Not yet deployed or
+device-tested — same discipline as every other backend change this
+project makes.
+
 ## Local rebuild of `dadd4ef9` with the segmentation fix: real trade-off found, not a clean win (2026-07-23, round 10)
 Per the CTO's ask ("rebuild the 81% print but even better"), pulled
 `dadd4ef9`'s full real raw burst (8 main-camera frames + all 3 secondary

@@ -1474,6 +1474,30 @@ def generate(
         same_pose = [i for i in order
                      if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
         same_frames = [frames[i] for i in same_pose[:_STACK_MAX]]
+        # Real bug found 2026-07-24: for front_only_v1 (this project's own
+        # active capture mode), main.py's _download_front_only_frames hands
+        # this function exactly ONE pre-selected frame -- `frames` (and
+        # therefore `same_frames` above) is always length 1, so `stack`/
+        # `focusStack` were STRUCTURALLY GUARANTEED to return None on every
+        # single front_only_v1 request, despite being two of the variants
+        # main.py's _afis_variants runs every single time. Confirmed via a
+        # local sweep of the real capture library: with real multi-frame
+        # material, focusStack alone jumped from a no-op (tied with `native`,
+        # since it silently fell through) to real wins up to +17 real NFIQ2
+        # on some captures. Fall back to the raw preserved same-pose burst
+        # (ambient_burst/flash_burst -- already downloaded for every
+        # front_only_v1 request to feed deepFuse, all same face-on pose by
+        # construction) when the primary frame list can't supply the >=2
+        # frames needed to stack anything itself. This can only ever
+        # PROMOTE an already-guaranteed-None result to a real one -- it
+        # never touches same_frames when `frames` already had enough
+        # material (four-angle/oscillating capture modes, which don't hit
+        # this starvation), so it can't regress those.
+        if len(same_frames) < 2:
+            _burst_pool = [g for g in ((ambient_burst or []) + (flash_burst or []))
+                           if g is not None]
+            if len(_burst_pool) >= 2:
+                same_frames = sorted(_burst_pool, key=lambda g: -_ridge_energy(g))[:_STACK_MAX]
         # focus_stack: sharpness-weighted combine (keep the best-focused region
         # of each frame -- targets soft pad edges); stack: flat average (denoise).
         stacked = (_focus_stack_face_on(same_frames) if focus_stack
