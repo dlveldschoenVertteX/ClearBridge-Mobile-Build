@@ -111,6 +111,32 @@ class MainActivity : FlutterActivity() {
     // live session) so the next real capture's secondaryCameraDebug can be
     // cross-referenced against which physical lens actually stalled,
     // instead of guessing from an opaque id.
+    //
+    // 2026-07-24: CTO reported camera "3" ("IR" by their naming) shows less
+    // flash bleed/specular glare in the live preview than the main camera.
+    // Two very different physical explanations fit that observation -- a
+    // genuine near-infrared-sensitive sensor (weak/missing IR-cut filter,
+    // common on rugged-phone "night vision" cameras) vs. just a bigger,
+    // better-tuned RGB sensor that clips less easily -- and they call for
+    // different optimizations. SENSOR_INFO_COLOR_FILTER_ARRANGEMENT is the
+    // one Camera2 field that settles this: a true mono/NIR sensor reports
+    // MONO/NIR here, a standard sensor reports one of the RGGB/GRBG/GBRG/
+    // BGGR Bayer patterns (or RGB). Also added FLASH_INFO_AVAILABLE per
+    // camera id -- if camera "3" has its own flash unit distinct from the
+    // main camera's, that's a second real candidate explanation (a
+    // different illuminant, not just a different sensor) worth telling
+    // apart from the sensor-type question.
+    private fun colorFilterArrangementName(value: Int?): String? = when (value) {
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB -> "RGGB"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GRBG -> "GRBG"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_GBRG -> "GBRG"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_BGGR -> "BGGR"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGB -> "RGB"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_MONO -> "MONO"
+        CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_NIR -> "NIR"
+        else -> null
+    }
+
     private fun cameraLensInfoByCameraId(): Map<String, Map<String, Any?>> {
         val cameraManager = applicationContext
             .getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -120,11 +146,15 @@ class MainActivity : FlutterActivity() {
             val focalLengths = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
             val sensorSize = chars.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE)
             val facing = chars.get(CameraCharacteristics.LENS_FACING)
+            val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+            val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
             info[id] = mapOf(
                 "focalLengthMm" to focalLengths?.firstOrNull()?.toDouble(),
                 "sensorWidthMm" to sensorSize?.width?.toDouble(),
                 "sensorHeightMm" to sensorSize?.height?.toDouble(),
                 "lensFacing" to facing,
+                "colorFilterArrangement" to colorFilterArrangementName(cfa),
+                "hasOwnFlash" to hasFlash,
             )
         }
         return info

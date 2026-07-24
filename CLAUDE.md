@@ -1,5 +1,44 @@
 # ClearBridge Mobile — persistent context
 
+## Camera "3" ("IR") sensor-type diagnostic added — is it real NIR or just a bigger RGB sensor? (2026-07-24, round 16)
+CTO observed less flash bleed/specular glare on camera "3" in the live
+preview than the main camera. Checked the real, already-established data
+first: camera "3" has the largest sensor of all 4 cameras (6.64x4.97mm)
+and is already the best-performing, most-reliable secondary camera
+(nfiq2Score 72 real win, round 5) — but nothing in the app has ever
+queried whether it's a genuine near-infrared-sensitive sensor (weak/no
+IR-cut filter, common on rugged-phone "night vision" cameras) vs. just a
+bigger, better-tuned RGB sensor that happens to clip less. These two
+explanations point at very different follow-up optimizations, so this
+needed a real answer, not a guess.
+
+Pulled real paired images (main-camera flash frame + camera-3 torch frame,
+same capture) for the two real captures where camera "3" has ever
+succeeded (`03b91b6f`, `70d69867`) and ran real pixel stats. Inconclusive
+on the "bleed" question specifically: in BOTH real samples, the MAIN
+camera's flash frame was actually underexposed (median 30-43/255, zero
+clipped pixels) rather than blown out — so there was no real specular-
+clipping case in either sample to compare camera "3" against. What IS real:
+camera "3" came out meaningfully better-exposed and higher-contrast in
+both (median 117-128/255, std 38-59 vs main's std 11-22) — consistent with
+either a real sensor advantage (bigger chip, more dynamic range) or a
+spectral one (true NIR), not distinguishable from exposure stats alone.
+
+**Fixed the actual gap**: added `SENSOR_INFO_COLOR_FILTER_ARRANGEMENT` (the
+one Camera2 field that definitively answers RGB-Bayer vs. MONO/NIR sensor
+type) and `FLASH_INFO_AVAILABLE` (whether camera "3" has its own flash
+unit, a second real candidate explanation — a different illuminant, not
+just a different sensor) to the existing read-only `cameraLensInfoByCameraId()`
+query in `MainActivity.kt` — same safe, non-invasive pattern as the two
+diagnostics already there (focal length/sensor size/facing), no live
+session touched, flows straight through to the capture doc's existing
+`cameraLensInfo` field with zero Dart-side changes needed (that map is
+already generically deserialized). The next real capture with a working
+camera "3" will show definitively whether it's a true NIR sensor (the
+bigger, physically-real lever this session's backend specular-suppression
+work — both median and trimmed-mean combine swaps — failed to find) or
+just a bigger RGB chip.
+
 ## Fifth real bug found + fixed: camera-2 distance-sweep shots never re-verify focus after repositioning (2026-07-24, round 15)
 With the specular-suppression line closed out (both combine-swap variants
 measured negative, see below), switched back to targeted code review rather
