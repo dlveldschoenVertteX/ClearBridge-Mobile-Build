@@ -349,14 +349,24 @@ class FrontCaptureController extends ChangeNotifier {
   // itself contributes, derived from the session's one-time ambient
   // calibration) instead of guessing a second fixed constant.
   //
-  // Endpoints are a first-cut, physically-reasoned curve, NOT fit to real
-  // data (n=1 real overexposure case is not enough to calibrate a curve
-  // from) — same "needs its own dedicated real-data test" caveat this
-  // item carried before being built. Needs a real device round to confirm
-  // before tuning further.
-  static const double _flashEvMinCut = -0.3; // intensity=1.0 (pitch dark: torch is
+  // Endpoints were a first-cut, physically-reasoned curve, calibrated
+  // against n=1 real overexposure case (cb684c57) — the caveat this item
+  // carried from the start ("needs its own dedicated real-data test").
+  // 2026-07-24 (round 19/20): two independent real captures since then
+  // (03b91b6f/70d69867's paired IR-camera comparison, and 3f8fd075 — real
+  // flash-frame pixel stats: mean=28.3/255, max=78/255, at evStep=-1.043,
+  // intensity=0.6) now show the OPPOSITE failure mode — the main camera's
+  // flash frame coming out badly UNDERexposed, not blown out. A single
+  // overexposure data point drove the original curve; the accumulated
+  // real evidence now points the other way. Scaled both endpoints down by
+  // the same ~30% the CTO asked for (-1.0 -> -0.7 equivalent at a typical
+  // mid-intensity torch): at intensity=0.6 this curve now yields evStep
+  // ~-0.71 instead of -1.043. Still a real device test needed to confirm
+  // this doesn't reopen the original cb684c57-style blowout risk — same
+  // "one variable at a time" discipline as the rest of this file.
+  static const double _flashEvMinCut = -0.2; // intensity=1.0 (pitch dark: torch is
                                               // the sole light source, minimal cut needed)
-  static const double _flashEvMaxCut = -1.6; // intensity=0.3 (near the bright-mode
+  static const double _flashEvMaxCut = -1.1; // intensity=0.3 (near the bright-mode
                                               // threshold: torch adds on top of
                                               // substantial ambient, needs the most cut)
   double _adaptiveFlashEvStep() {

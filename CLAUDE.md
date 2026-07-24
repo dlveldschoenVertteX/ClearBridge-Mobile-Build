@@ -1,5 +1,52 @@
 # ClearBridge Mobile — persistent context
 
+## Deep-dive on why the re-verified capture scored lower + adaptive flash EV curve softened (2026-07-24, round 20)
+CTO asked why the manually re-verified `3f8fd075` capture (real NFIQ2 64)
+scored lower than recent captures like `dadd4ef9` (81) or `03b91b6f` (72),
+wanted the full picture (all real sources, not just the winning number),
+and asked to keep iterating.
+
+**Root-caused, not assumed.** Real flash-frame pixel stats:
+`min=0, max=78, mean=28.3, std=14.1` — a badly UNDERexposed frame (max
+brightness only 78/255), not the blown-out-white failure this project's
+`_FLASH_DIFF_MIN_FLASH_LAPLACIAN` blowout guard (round 9) was built to
+catch. **Confirmed via direct counterfactual**: disabling that guard
+entirely and re-running `afis_print.generate()` on this exact real capture
+produced the IDENTICAL result (64, still `guide+unet`) — proving the mask
+fallback isn't over-cautious here; flash-diff's own accept-gate rejects it
+independently, because there's genuinely no usable brightness differential
+in near-black flash frames. The lower score is a real content limitation
+of this specific capture, not a backend regression from anything shipped
+this session.
+
+**Full real layout for this capture** (all sources, not just the winner):
+main-camera variants ranged 26-64 (native 64 winning; freqNorm 62; fuseSoft
+61; fuseAvg 55; deepMaxc 45; stack 47; deepFuse 41; focusStack 38; fuseMaxc
+26). Secondary camera "3" (the "IR" cam): real NFIQ2 39 — worse than main,
+did not win. Secondary camera "2": **self-rejected** (`mask covers 67% of
+frame — segmentation failed`) — genuinely new information, since this is
+the FIRST real content camera "2" has ever produced (see round 18). Its
+exposure is fine (mean=84, std=58, healthy dynamic range) — the failure is
+framing/segmentation, consistent with the already-documented, never-fixed
+gap that camera "2"'s guide was never calibrated to its own (much wider,
+2.37mm focal length) field of view.
+
+**Real capture-side fix**: the underexposed flash frame here (evStep
+-1.043 applied at intensity=0.6) plus round-16's independent paired
+IR-camera finding (main-camera flash frames underexposed at median 30-43
+in both real samples checked there) are now TWO real data points showing
+the adaptive flash EV curve (`_flashEvMinCut`/`_flashEvMaxCut`, built
+2026-07-22 off a single real overexposure case, `cb684c57`) may be
+over-correcting toward underexposure. Scaled both endpoints down ~30%
+(`_flashEvMinCut` -0.3->-0.2, `_flashEvMaxCut` -1.6->-1.1) — at
+intensity=0.6 this now yields evStep ~-0.71 instead of -1.043. **Honest
+open risk, stated plainly**: `cb684c57` is the exact real capture that
+justified the AGGRESSIVE end of the original curve (Laplacian 15-19 flash
+vs 343-395 ambient — real blowout) — softening the curve could reopen
+that failure mode on a similarly bright-ambient capture. Needs a real
+device test to confirm this doesn't regress, same "one variable at a
+time" discipline as every other capture-side change this project.
+
 ## Manual post-deploy verification: real capture re-run through the current backend confirms the fix (2026-07-24, round 19 cont.)
 Per the CTO's explicit ask to verify the deploy manually rather than wait
 for a new physical capture: attempted the strongest possible check first —
