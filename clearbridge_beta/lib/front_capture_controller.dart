@@ -909,6 +909,7 @@ class FrontCaptureController extends ChangeNotifier {
       // NFIQ2=9). Alternating gives the backend both lighting conditions;
       // _download_front_only_frames already splits frames into ambient_frames
       // and flash_frames so AFIS can pick the best-exposed set.
+      var wasFlashLastShot = false;
       for (var i = 0; i < _burstFrameCount; i++) {
         final wantFlash = torchCapable && i.isOdd;
         try {
@@ -924,8 +925,28 @@ class FrontCaptureController extends ChangeNotifier {
             if (minEv != null && maxEv != null) {
               await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
             }
+            // Real asymmetry found 2026-07-24: the flash-ON transition above
+            // gets an explicit settle delay before its shot fires, but the
+            // flash-OFF transition (torch physically switching off AND the EV
+            // offset dropping back from flashEvStep to base) went straight
+            // into takePicture() with zero settle time -- only when this shot
+            // actually FOLLOWS a real flash shot (`wasFlashLastShot`, not
+            // just "this is an ambient slot" -- torch-incapable/bright-mode
+            // bursts never fire flash at all, so they must NOT pick up this
+            // delay on every single shot). If the sensor needs real time to
+            // re-converge exposure after either change -- which is exactly
+            // why the activate() side already waits -- every other "ambient"
+            // shot in a normal-mode burst could be captured mid-transition,
+            // still influenced by the prior flash frame's EV state.
+            // Symmetric fix: same settle window on the way back down. Not
+            // yet device-tested -- same standing discipline as every other
+            // capture-side change this project.
+            if (wasFlashLastShot) {
+              await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+            }
           }
         } catch (_) {}
+        wasFlashLastShot = wantFlash;
         try {
           final xfile = await cam.takePicture();
           final jpeg = await xfile.readAsBytes();

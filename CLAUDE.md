@@ -1,5 +1,41 @@
 # ClearBridge Mobile — persistent context
 
+## Capture-side: asymmetric flash-transition settle delay (2026-07-24, round 12)
+CTO asked whether there were more iterations to make on the capture side
+specifically (app, not backend). Line-by-line review of `_fireBurst`
+(`front_capture_controller.dart`) — the main 8-shot alternating burst,
+not deeply audited this session even though several nearby pieces were
+touched — found a real timing asymmetry: the flash-ON transition
+(`_flash!.activate()` + raising the EV offset) gets an explicit
+`_burstFlashSettleMs` (70ms) delay before its shot fires, but the
+flash-OFF transition (`_flash?.deactivate()` + EV dropping back to base)
+went straight into `takePicture()` with zero settle time. In **normal
+mode** (the common case — `AdaptiveFlashController`'s docstring confirms
+pitch-dark keeps the torch on continuously with `deactivate()` a no-op,
+and bright mode skips the torch entirely, so this only matters for the
+in-between "normal" ambient luma range most real captures fall into), the
+torch genuinely toggles on/off every other shot across the whole burst —
+if the sensor needs real settle time to re-converge exposure after either
+direction of that change (which is exactly why the activate side already
+waits), every other "ambient" shot in the burst could be captured while
+still influenced by the prior flash frame's EV state.
+
+**Fixed**: same `_burstFlashSettleMs` delay now applies on the way back
+down too — but only when the immediately preceding shot in the loop
+actually fired the flash (`wasFlashLastShot`), not just "this slot is
+nominally ambient". Needed care here: a naive `i > 0` gate would have
+added the delay to EVERY shot in bright/torch-incapable mode (where flash
+never activates at all, so there's nothing to settle from) — tracked the
+real previous-shot state explicitly instead. Real, deliberate cost: ~3
+extra 70ms delays per 8-shot burst in normal mode (~210ms total).
+
+**Not device-tested** — this is a live-camera-hardware timing question
+(does the sensor genuinely need settle time on the flash-off transition,
+and does 70ms cover it), which can't be validated against static
+downloaded JPEGs the way the backend fixes this session were — needs a
+real APK build + real capture to confirm, same standing discipline as
+every other capture-side change this project.
+
 ## Fourth real bug found + fixed: `enhanced_flat.jpg` unnecessarily cropped 75% on every front_only_v1 capture (2026-07-24, round 11 cont.)
 Dispatched an Explore agent for a fresh code-review pass (my own manual
 review had already covered `afis_print.py` heavily this round) over
