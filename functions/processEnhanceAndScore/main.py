@@ -82,6 +82,14 @@ _PASS_THRESHOLD = _PASS_THRESHOLD_BETA
 # main-camera result. 50.0 sits well above every confirmed-blurry secondary
 # frame (19-22) and well below sharp frames (558 for camera 2 far shot).
 _SECONDARY_MIN_LAPLACIAN = 50.0
+# Native ridge wavelength ceiling from afis_print._ridge_wavelength's own clip.
+# A secondary frame that reports exactly 19.5+ px hit the measurement ceiling --
+# the actual wavelength is >=19.5px, meaning the user is too close for the sweet
+# spot (9-14px). Block the secondary from winning in this case: it cannot beat
+# a main-camera frame already in the sweet spot, and Gabor synthesis on a
+# too-close secondary frame produces plausible-looking but non-AFIS-matchable
+# output, exactly the same failure mode as the blurry-frame problem above.
+_SECONDARY_MAX_WAVELENGTH_PX = 19.5
 _TARGET_SIZE    = (500, 500)
 _SCORE_PRESCALE_PX = 700   # two-step downscale waypoint before the 500x500 LANCZOS
 _RATE_LIMIT_SEC = 60   # minimum seconds between pipeline calls per user
@@ -925,9 +933,16 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     _fl_sec = (_lens_info.get(_cam.get('name', '')) or {}).get('focalLengthMm')
                     if _fl_main and _fl_sec and _guide_region and _fl_main > 0:
                         _fl_ratio = _fl_sec / _fl_main
+                        # Camera "3" (largest sensor, most similar angle to
+                        # main) uses cy=0.37 -- matching the main guide's own
+                        # top-half-of-pad default (PadSilhouetteShape.cy).
+                        # Camera "2" (wide, very different FOV) keeps cy=0.5
+                        # (centred) since its framing offset is unknown without
+                        # dedicated calibration data.
+                        _sec_cy = (0.37 if _cam.get('name') == '3' else 0.5)
                         _sec_guide = {
                             'cx': 0.5,
-                            'cy': 0.5,
+                            'cy': _sec_cy,
                             'rx': _guide_region['rx'] * _fl_ratio,
                             'ry': _guide_region['ry'] * _fl_ratio,
                             'tipAngleDeg': 0.0,
@@ -952,10 +967,16 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # secondary camera WIN only if its sharpest frame clears the
                     # minimum raw sharpness threshold. The score is still logged
                     # in secondaryCamScores for diagnostics regardless.
+                    _sec_wl = _sp.get('afisWavelengthPx') or 0.0
                     if _best_lap < _SECONDARY_MIN_LAPLACIAN:
                         logger.info(
                             'secondary cam %s blocked from winning: lap=%.1f < %.1f',
                             _sname, _best_lap, _SECONDARY_MIN_LAPLACIAN)
+                    elif _sec_wl >= _SECONDARY_MAX_WAVELENGTH_PX:
+                        logger.info(
+                            'secondary cam %s blocked from winning: wavelength %.1fpx'
+                            ' >= %.1fpx ceiling (user too close)',
+                            _sname, _sec_wl, _SECONDARY_MAX_WAVELENGTH_PX)
                     elif _ss > afis_nfiq:
                         afis_nfiq = _ss
                         best_afis_img = _simg_res
