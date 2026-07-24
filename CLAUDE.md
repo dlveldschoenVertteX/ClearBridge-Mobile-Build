@@ -1,5 +1,55 @@
 # ClearBridge Mobile — persistent context
 
+## Specular-suppression idea 1 — median instead of mean stacking: tested, real net negative, NOT shipped (2026-07-24, round 14)
+Per the CTO's direct ask ("are there some specular suppression optimizations
+we can implement right now?"), first confirmed the backend never receives
+color data at all — the client uploads **luma-only**
+(`decodeStillJpegToLuma`/`DecodedStillLuma`,
+`packages/mac_capture/lib/src/still_jpeg_downscaler.dart`) — ruling out any
+classic chromaticity/dichromatic-reflection-model specular removal without a
+capture-side change. Two grayscale-domain candidates remained: (1) swap
+`_stack_face_on`'s final combine from mean to median (a per-pixel outlier-
+rejecting combine — a genuine flash specular highlight should be an
+above-baseline outlier at that pixel across the aligned stack), (2) an
+explicit specular-highlight detector (bright + locally-smooth pixels
+blanked, not inpainted).
+
+**Tested idea 1 first** (monkey-patched `_median_stack_face_on`, same
+`_align_face_on_stack` alignment, only the final `np.mean`→`np.median` swap,
+run through the `deep`/`deepMaxc`/`deepSoft` variant family across all 17
+real captures with usable bursts — same harness pattern as every other
+validation this session):
+
+| capture | mean | median | delta |
+|---|---|---|---|
+| 382cc4b2 | 53 | 50 | -3 |
+| 3e54236a | 83 | 72 | -11 |
+| 5aa18155 | 69 | 56 | -13 |
+| 722ae3b0 | 63 | 79 | +16 |
+| 7d7d0162 | 66 | 66 | 0 |
+| 913758cf | 60 | 49 | -11 |
+| 9bdc9f85 | 66 | 68 | +2 |
+| afe5b02c | 58 | 60 | +2 |
+| c34911b5 | 73 | 57 | -16 |
+| cb684c57 | 51 | 49 | -2 |
+| ccb9c85a | 62 | 46 | -16 |
+| dadd4ef9 | 51 | 51 | 0 |
+| e5cb52fc | 50 | 50 | 0 |
+| f2fa606b | 76 | 69 | -7 |
+| f382a03a | 64 | 64 | 0 |
+| fc619fe8 | 67 | 67 | 0 |
+| fcfa2e93 | 75 | 73 | -2 |
+
+**Real net negative: mean delta -3.59, 9/17 regressed vs 3/17 improved, 5
+ties.** Not shipped — `_stack_face_on` stays mean-combine, no code change.
+**Why, mechanistically**: median across a small stack (n=2-4 same-pose
+frames, this pipeline's real burst depth) is a much weaker noise-averaging
+combine than mean — it only wins on a capture with a genuine per-frame
+specular outlier, and loses the broader noise-reduction benefit mean
+provides on every capture that DOESN'T have one. Most of this project's
+real bursts apparently don't have a strong enough specular outlier for the
+trade to pay off net.
+
 ## _STACK_MAX sweep (4 vs 8): tested, no real gain, left as-is (2026-07-24, round 13 cont.)
 Quick follow-up to the `stack`/`focusStack` revival: those variants cap at
 `_STACK_MAX=4` same-pose frames even when the burst-fallback can supply up
