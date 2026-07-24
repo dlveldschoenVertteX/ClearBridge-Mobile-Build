@@ -202,7 +202,13 @@ class FrontCaptureController extends ChangeNotifier {
   // shot index 2 (the 3rd shot) in every real test to date, so dropping to
   // two shots also sidesteps that exact failure point rather than fighting
   // it, as a side benefit of the sweep itself.
-  static const List<double> _camera2DistanceSweepScales = [1.15, 0.85];
+  // Widened from [1.15, 0.85]: real measurement on the previous build showed
+  // BOTH positions yielded afisWavelengthPx 19-20px (user too close throughout
+  // the entire sweep). 1.30 pulls the user ~13% closer (larger guide) for the
+  // close shot; 0.70 pushes them ~17% farther (smaller guide) for the far shot
+  // -- at the established ~9.75px native wavelength, 0.70 targets ~14px, the
+  // sweet-spot ceiling, where the previous 0.85 target was still at ~17px.
+  static const List<double> _camera2DistanceSweepScales = [1.30, 0.70];
   // Real time for the user to physically move their thumb between the two
   // distance-sweep shots above -- _burstShotDelayMs (50ms) is tuned for a
   // STATIC thumb during the main/other secondary bursts and is nowhere near

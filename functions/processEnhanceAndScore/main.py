@@ -72,6 +72,16 @@ _THUMB_SEG_PATH = '/tmp/thumb_seg_unet.onnx'   # bootstrap segmentation fallback
 _PASS_THRESHOLD_BETA       = 35.0   # collect all prints for training
 _PASS_THRESHOLD_PRODUCTION = 80.0   # API quality gate — switch when going live
 _PASS_THRESHOLD = _PASS_THRESHOLD_BETA
+# Minimum raw Laplacian variance a secondary camera's best frame must have to
+# be allowed to BEAT the main-camera result. Below this threshold the frame is
+# too blurry for the proxy to be trusted (Gabor synthesis creates plausible
+# ridge texture from a blurry input, fooling the proxy — confirmed: camera 3
+# scored proxy 74.81 / real NFIQ2 5 on frames with Laplacian 19-22). The
+# secondary camera is still scored and its proxy score still appears in
+# secondaryCamScores for diagnostics; it simply cannot displace a better
+# main-camera result. 50.0 sits well above every confirmed-blurry secondary
+# frame (19-22) and well below sharp frames (558 for camera 2 far shot).
+_SECONDARY_MIN_LAPLACIAN = 50.0
 _TARGET_SIZE    = (500, 500)
 _SCORE_PRESCALE_PX = 700   # two-step downscale waypoint before the 500x500 LANCZOS
 _RATE_LIMIT_SEC = 60   # minimum seconds between pipeline calls per user
@@ -898,6 +908,14 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _all_simgs = [_simg]
                         _all_gyros = [0.0]
                         _all_illums = [None]
+                    # Laplacian of the best frame — already computed for multi-
+                    # path bursts; compute on demand for single-path captures.
+                    _best_lap = (
+                        _sframes[0][2] if len(_spaths) > 1
+                        else float(cv2.Laplacian(
+                            cv2.cvtColor(_simg, cv2.COLOR_BGR2GRAY),
+                            cv2.CV_64F).var())
+                    )
                     _sname = f"secondary_{_cam.get('name', 'cam')}"
                     # Focal-ratio-scaled guide: gives generate() the right
                     # extraction region for this lens's FOV. Falls back to
@@ -926,8 +944,19 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     _sres = _score_nfiq(_simg_res, sfm_coverage=1.0)
                     _ss = _sres.get('nfiq_score', 0.0) if not _sres.get('error') else 0.0
                     _secondary_cam_scores[_cam.get('name', '?')] = round(_ss, 2)
-                    logger.info('AFIS variant %s nfiq=%.1f', _sname, _ss)
-                    if _ss > afis_nfiq:
+                    logger.info('AFIS variant %s nfiq=%.1f lap=%.1f', _sname, _ss, _best_lap)
+                    # Laplacian gate: a blurry secondary frame (Gabor synthesis
+                    # can give a plausible-looking but non-identity print from
+                    # soft input, fooling the proxy — confirmed: cam 3 scored
+                    # proxy 74.81 / real NFIQ2 5 at Laplacian 19-22). Let the
+                    # secondary camera WIN only if its sharpest frame clears the
+                    # minimum raw sharpness threshold. The score is still logged
+                    # in secondaryCamScores for diagnostics regardless.
+                    if _best_lap < _SECONDARY_MIN_LAPLACIAN:
+                        logger.info(
+                            'secondary cam %s blocked from winning: lap=%.1f < %.1f',
+                            _sname, _best_lap, _SECONDARY_MIN_LAPLACIAN)
+                    elif _ss > afis_nfiq:
                         afis_nfiq = _ss
                         best_afis_img = _simg_res
                         afis_params = {**_sp, 'afisNfiq': round(_ss, 2), 'afisSource': _sname}
