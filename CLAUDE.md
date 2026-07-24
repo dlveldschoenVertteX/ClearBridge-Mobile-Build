@@ -1,5 +1,56 @@
 # ClearBridge Mobile — persistent context
 
+## Fourth real bug found + fixed: `enhanced_flat.jpg` unnecessarily cropped 75% on every front_only_v1 capture (2026-07-24, round 11 cont.)
+Dispatched an Explore agent for a fresh code-review pass (my own manual
+review had already covered `afis_print.py` heavily this round) over
+`sfm_pipeline.py`'s flash-diff segmentation and `main.py`'s proxy-scoring
+path, looking for the same class of bug as the three above. It surfaced
+3 candidates; checked each against whether it's actually reachable by
+front_only_v1 (this project's only active capture mode) before spending
+any validation effort:
+
+- **`sfm_pipeline._segment_via_flash_diff` never got the blown-out-flash
+  guard I added to `afis_print.py`'s copy of this check** — real bug, but
+  confirmed via direct trace (`main.py:470-520`) that front_only_v1
+  explicitly raises `CaptureQualityError` before `reconstruct_and_unwrap`
+  (and its failure-fallback's own `_segment_and_locate` call) is ever
+  reached — both call sites are structurally unreachable from the active
+  capture mode. Real, worth porting if arc_sweep/oscillating_8phase are
+  ever revived (both currently discontinued/dropped per this project's own
+  standing decisions) — not actioned now, no real captures from those
+  modes locally to validate against.
+- A related `NORM_MINMAX`-stretch gap inside the same function — same
+  unreachability, same disposition (documented, not actioned).
+- **`_score_nfiq`'s coverage-aware crop (`main.py:1845`,
+  `crop_frac = max(0.75, sfm_coverage**0.5 + 0.05)`) fires unconditionally
+  on every front_only_v1 capture** — confirmed real and reachable: this
+  project's own front_only_v1 code passes a HARDCODED sentinel
+  `sfm_coverage = 0.35` ("non-zero so downstream quality gates pass" —
+  never a real coverage measurement, since front_only_v1 skips SfM
+  reconstruction entirely), which always lands below the crop function's
+  0.75 floor. The crop's own stated purpose — stripping gap-filled KDTree
+  periphery noise from a real SfM reconstruction — cannot apply to
+  front_only_v1 at all, since `enhanced` there is just a plain center-crop
+  of the raw frame with zero gap-filling. Net effect: `enhanced_flat.jpg`
+  (a real saved artifact) and the Henry-classification input were losing
+  ~44% of their area on every single front_only_v1 capture, for a reason
+  that never applied to this capture mode.
+
+**Fixed at the one real call site** (`main.py`, the "4. NFIQ Scoring"
+stage): pass `sfm_coverage=1.0` for `is_front_only` instead of the
+misleading 0.35 sentinel — matching how every AFIS-path `_score_nfiq` call
+already passes 1.0. **Not numerically re-validated locally**: real NFIQ2
+rejects raw/unenhanced frames outright ("Fingerprint area is too small" —
+confirmed directly, tried scoring a raw center-square frame), so testing
+this would require reproducing the full NNS enhancement pipeline first,
+which isn't worth the effort for a fix to a SECONDARY artifact (AFIS
+already wins the primary `nfiqScore`/`nfiqPass` decision on effectively
+every real front_only_v1 capture seen this whole project — this fix can't
+change that). Shipped on the strength of the logical argument instead: the
+crop's own stated premise is provably inapplicable here, so this can only
+recover real content that was being needlessly discarded, never truncate
+something that should stay cropped.
+
 ## Tested and REJECTED: ambient-vs-flash frame priority in `_download_front_only_frames` (2026-07-24, round 11 cont.)
 Same round's code review turned up a third candidate: `_download_front_only_frames`
 always prefers the sharpest AMBIENT frame over any flash frame whenever

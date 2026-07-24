@@ -602,7 +602,23 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
 
         # ── 4. NFIQ Scoring ────────────────────────────────────────────────────
         logger.info('stage=nfiq_start     elapsed=%.1fs', time.monotonic() - t_start)
-        nfiq_result = _score_nfiq(enhanced, sfm_coverage=sfm_coverage)
+        # Real bug found 2026-07-24: _score_nfiq's coverage-aware crop exists to
+        # strip gap-filled KDTree periphery noise from a real SfM reconstruction
+        # before scoring -- but front_only_v1 never runs reconstruct_and_unwrap
+        # at all (single-frame AFIS only, no SfM; see the is_front_only branch
+        # above), so `enhanced` here is just a plain center-crop of the raw
+        # frame with no gap-filled periphery to strip. front_only_v1's own
+        # sfm_coverage is a HARDCODED SENTINEL (0.35, "non-zero so downstream
+        # quality gates pass" -- never a real coverage measurement), which
+        # always falls below the crop function's 0.75 floor -- so the crop
+        # fired unconditionally on every single front_only_v1 capture, cropping
+        # ~44% of area off the SAVED enhanced_flat.jpg deliverable and the
+        # Henry-classification input for a reason that never applied to this
+        # capture mode. Pass the real sfm_coverage only for modes that actually
+        # ran SfM reconstruction (arc/oscillating/four-angle); front_only_v1
+        # scores/saves the full frame, matching how every AFIS-path _score_nfiq
+        # call already passes sfm_coverage=1.0.
+        nfiq_result = _score_nfiq(enhanced, sfm_coverage=(1.0 if is_front_only else sfm_coverage))
         t_nfiq = time.monotonic()
         logger.info('stage=nfiq_done      elapsed=%.1fs', t_nfiq - t_start)
         if nfiq_result.get('error'):
