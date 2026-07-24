@@ -50,6 +50,59 @@ provides on every capture that DOESN'T have one. Most of this project's
 real bursts apparently don't have a strong enough specular outlier for the
 trade to pay off net.
 
+**Tried a softer compromise — trimmed mean** (drop only the single highest
+per-pixel value, then mean the rest; falls back to plain mean for n<3),
+reasoning it should keep most of mean's noise-averaging benefit while still
+rejecting one genuine specular spike. Same 17-capture harness:
+
+| capture | mean | trimmed | delta |
+|---|---|---|---|
+| 382cc4b2 | 53 | 46 | -7 |
+| 3e54236a | 83 | 70 | -13 |
+| 5aa18155 | 69 | 71 | +2 |
+| 722ae3b0 | 63 | 68 | +5 |
+| 7d7d0162 | 66 | 66 | 0 |
+| 913758cf | 60 | 35 | -25 |
+| 9bdc9f85 | 66 | 68 | +2 |
+| afe5b02c | 58 | 64 | +6 |
+| c34911b5 | 73 | 70 | -3 |
+| cb684c57 | 51 | 54 | +3 |
+| ccb9c85a | 62 | 58 | -4 |
+| dadd4ef9 | 51 | 51 | 0 |
+| e5cb52fc | 50 | 50 | 0 |
+| f2fa606b | 76 | 77 | +1 |
+| f382a03a | 64 | 64 | 0 |
+| fc619fe8 | 67 | 67 | 0 |
+| fcfa2e93 | 75 | 72 | -3 |
+
+**Also net negative (mean delta -2.12), though far more balanced (6/17
+improved, 6/17 regressed, 5 ties) than pure median.** Almost the entire
+negative average is one outlier: `913758cf` (-25) — the exact capture
+already flagged elsewhere in this project's history as a fusion-selection
+trap (blown-out flash burst, unstable registration; see "Real bug found +
+fixed: stack/focusStack..."). Excluding that one capture, the remaining 16
+net to roughly a wash (sum -11, mean ≈ -0.7) — trimming still isn't a clean
+win even there, just no longer clearly harmful. Not shipped — same
+`_stack_face_on` stays mean-combine, no code change.
+
+**Conclusion on the combine-swap approach overall (median + trimmed mean,
+both tested)**: neither is a viable specular-suppression lever at this
+pipeline's real burst depth (2-4 same-pose frames). Any per-pixel outlier-
+rejecting combine trades away too much of mean's noise-reduction benefit
+on the majority of captures that don't have a strong specular artifact, and
+the one recurring capture that's genuinely hard (`913758cf`, already a
+known fusion trap) gets WORSE under both variants, not better — its
+problem is unstable registration/alignment, not a specular outlier a
+combine-level fix can address. Not pursuing an explicit specular-highlight
+detector (candidate idea 2, bright+locally-smooth pixel blanking) further
+right now either — it would face the same fundamental small-n problem
+(rejecting a frame's contribution at a pixel still costs noise-averaging
+benefit there) plus real tuning risk on this project's own already-
+documented "don't tune blind on a handful of noisy captures" lesson. The
+capture-side flash-transition settle-delay fix (round 12, attacks specular
+risk at its root by giving the sensor time to re-converge exposure) remains
+the higher-value real lever for this problem, not a backend combine change.
+
 ## _STACK_MAX sweep (4 vs 8): tested, no real gain, left as-is (2026-07-24, round 13 cont.)
 Quick follow-up to the `stack`/`focusStack` revival: those variants cap at
 `_STACK_MAX=4` same-pose frames even when the burst-fallback can supply up
