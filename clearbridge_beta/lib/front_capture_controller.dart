@@ -211,6 +211,18 @@ class FrontCaptureController extends ChangeNotifier {
   // and move their thumb slightly back before capture.
   static const int _camera2SweepMoveDelayMs = 1600;
   static const int _burstFlashSettleMs = 70;
+  // EV multipliers applied to flashEvStep across the 4 flash shots in the
+  // main burst. flashEvStep is negative (reduces exposure to guard against
+  // torch blowout), so:
+  //   0.5× = lighter reduction = brighter effective flash (catches dark scenes)
+  //   1.0× = standard (the adaptive curve's own recommendation)
+  //   1.5× = heavier reduction = darker flash (hard blowout guard)
+  //   0.75× = intermediate
+  // The backend picks the sharpest frame via Laplacian ranking; the bracket
+  // gives it 4 real exposure candidates instead of 4 identical ones.
+  // Works via setExposureOffset() -- no hardware variable-intensity flash
+  // needed, same safe API already proven for the adaptive EV step itself.
+  static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 1.5, 0.75];
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
@@ -912,6 +924,9 @@ class FrontCaptureController extends ChangeNotifier {
     final flashEvStep = _adaptiveFlashEvStep();
     _flashEvDebug = {
       'evStep': double.parse(flashEvStep.toStringAsFixed(3)),
+      'evBracket': _flashEvBracketMultipliers
+          .map((m) => double.parse((flashEvStep * m).toStringAsFixed(3)))
+          .toList(),
       'flashIntensity': _flash?.intensity,
       'flashMode': _flash?.modeName,
     };
@@ -937,13 +952,16 @@ class FrontCaptureController extends ChangeNotifier {
       // _download_front_only_frames already splits frames into ambient_frames
       // and flash_frames so AFIS can pick the best-exposed set.
       var wasFlashLastShot = false;
+      var flashShotIndex = 0;
       for (var i = 0; i < _burstFrameCount; i++) {
         final wantFlash = torchCapable && i.isOdd;
         try {
           if (wantFlash) {
             await _flash!.activate();
             if (minEv != null && maxEv != null) {
-              final target = _appliedEvOffset + flashEvStep;
+              final multiplier = _flashEvBracketMultipliers[
+                  flashShotIndex % _flashEvBracketMultipliers.length];
+              final target = _appliedEvOffset + flashEvStep * multiplier;
               await cam.setExposureOffset(target.clamp(minEv, maxEv));
             }
             await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
@@ -973,6 +991,7 @@ class FrontCaptureController extends ChangeNotifier {
             }
           }
         } catch (_) {}
+        if (wantFlash) flashShotIndex++;
         wasFlashLastShot = wantFlash;
         try {
           final xfile = await cam.takePicture();
