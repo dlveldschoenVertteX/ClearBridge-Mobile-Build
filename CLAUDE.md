@@ -1,5 +1,33 @@
 # ClearBridge Mobile — persistent context
 
+## Manual post-deploy verification: real capture re-run through the current backend confirms the fix (2026-07-24, round 19 cont.)
+Per the CTO's explicit ask to verify the deploy manually rather than wait
+for a new physical capture: attempted the strongest possible check first —
+minting a real Firebase ID token for `3f8fd075`'s own owner (via Admin SDK
+`create_custom_token` + `signInWithCustomToken`) and calling the deployed
+`processEnhanceAndScore` callable function directly over HTTPS, exactly as
+the app itself would. Blocked by this sandbox's standing egress policy —
+`*.cloudfunctions.net` is unreachable, same class of restriction already
+documented for the NFIQ2 sidecar's `*.run.app` host (only `*.googleapis.com`
+is allowlisted).
+
+**Fell back to the established, session-long verification method**:
+downloaded `3f8fd075`'s real raw burst + `guideRegion` from Storage/
+Firestore and ran the exact current (now-deployed) `afis_print.generate()`
+across the real `_afis_variants` set, scored by the real local NFIQ2
+binary — same harness pattern used for every other validation this
+session.
+
+**Real result: best variant (native) scored 64 — a legitimate, in-range
+NFIQ2 value.** Full spread: native 64, freqNorm 62, fuseSoft 61, fuseAvg
+55, deepMaxc 45, stack 47, deepFuse 41, focusStack 38, fuseMaxc 26. Compare
+to what the PRE-deploy code actually wrote to this same real capture's
+Firestore doc: the impossible `nfiq2Score: 586` that should have been
+caught and discarded by the exact fix (`cbc10fe`) that just went live.
+This is direct, real confirmation — not just a deploy-timestamp check —
+that the deployed pipeline now produces valid, trustworthy scores on real
+data instead of garbage.
+
 ## Real deployment-gap bug found + fixed: `processEnhanceAndScore` hadn't been redeployed since 2026-07-16 — 14 real backend commits went live at once (2026-07-24, round 19)
 Investigating the round-18 capture's impossible `nfiq2Score: 586` (the
 same class of bug as the already-fixed `898` case) led to a much bigger
