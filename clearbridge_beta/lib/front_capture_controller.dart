@@ -1571,35 +1571,43 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
     final secondarySensorOrientation = desc.sensorOrientation;
-    // Capture all shots while the user holds still, then upload in parallel.
-    // Serial capture→upload→capture→upload meant the user had to stay still
-    // for the full upload time (6-7s × 3 shots ≈ 21s). With burst-first /
-    // parallel-upload the user holds for ~1.5s (capture phase only) then
-    // relaxes while all 3 uploads run concurrently.
-    final captured = List<(String, Uint8List)>.filled(
-      _secondaryBurstCount,
-      ('', Uint8List(0)),
-    );
+    // Capture RAW shots only while the user holds still, then decode/encode/
+    // upload ALL of them afterward -- mirrors the main burst's own
+    // _finishAndUpload pattern. Real device regression found 2026-07-25:
+    // doing the grayscale decode+encode INLINE per shot (as first shipped)
+    // pushed captureMs from ~600ms to ~7100-7800ms per shot on a real
+    // device -- moving the expensive work back into the "hold still" phase
+    // it was built to avoid, and blowing the 28s per-camera timeout
+    // (secondaryCameraDebug showed '3_timeout: true', stuck at
+    // 'flash_off'). Capture stays fast; the expensive work now happens
+    // after, in parallel, same as the upload step already does.
+    final rawShots = List<Uint8List>.filled(_secondaryBurstCount, Uint8List(0));
     for (var i = 0; i < _secondaryBurstCount; i++) {
       stageDebug['stage'] = 'shot_$i';
       final shotStart = DateTime.now();
       final shot = await active.takePicture();
       stageDebug['stage'] = 'shot_${i}_readBytes';
-      final rawJpeg = await shot.readAsBytes();
-      // Downscale + convert to grayscale before upload -- same convention
-      // the main burst already uses (decodeStillJpegToLuma/
-      // encodeGrayscaleJpeg). takePicture() on a secondary sensor returns a
-      // full native-ISP-resolution COLOR JPEG (often much larger than the
-      // main burst's 3200px grayscale frames); real device data from the
-      // first parallel-upload test showed 12-20s per shot even with 3
-      // concurrent uploads, well above the main burst's 6-7s -- this is the
-      // direct fix, not just more parallelism. Falls back to the raw JPEG on
-      // any decode/encode failure so this can never block a capture.
-      stageDebug['stage'] = 'shot_${i}_encode';
-      var bytes = rawJpeg;
+      rawShots[i] = await shot.readAsBytes();
+      stageDebug['shot_${i}_captureMs'] =
+          DateTime.now().difference(shotStart).inMilliseconds;
+    }
+    stageDebug['stage'] = 'flash_off';
+    await active.setFlashMode(FlashMode.off);
+
+    // Downscale + convert to grayscale before upload -- same convention the
+    // main burst already uses (decodeStillJpegToLuma/encodeGrayscaleJpeg).
+    // takePicture() on a secondary sensor returns a full native-ISP-
+    // resolution COLOR JPEG; without this, uploads were 12-20s per shot
+    // even in parallel. Falls back to the raw JPEG on any decode/encode
+    // failure so this can never block a capture. Run via Future.wait (not
+    // a sequential loop) so the underlying platform decoder can overlap
+    // work across shots, same as the main burst's own decode/encode block.
+    final encoded = await Future.wait(List.generate(_secondaryBurstCount, (i) async {
+      stageDebug['shot_${i}_encodeStage'] = 'encoding';
+      var bytes = rawShots[i];
       try {
         final decoded = await decodeStillJpegToLuma(
-          rawJpeg, secondarySensorOrientation,
+          rawShots[i], secondarySensorOrientation,
           targetWidth: _stillDecodeTargetWidth,
         );
         if (decoded != null) {
@@ -1609,20 +1617,17 @@ class FrontCaptureController extends ChangeNotifier {
           );
         }
       } catch (_) {}
-      stageDebug['shot_${i}_captureMs'] =
-          DateTime.now().difference(shotStart).inMilliseconds;
-      captured[i] = ('$basePath/secondary_${safeName}_torch_$i.jpg', bytes);
-    }
-    stageDebug['stage'] = 'flash_off';
-    await active.setFlashMode(FlashMode.off);
+      return bytes;
+    }));
+
     // Upload all shots in parallel now that the user no longer needs to hold.
     final paths = List<String>.filled(_secondaryBurstCount, '');
     await Future.wait(
       List.generate(_secondaryBurstCount, (i) async {
-        final (path, bytes) = captured[i];
+        final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
         stageDebug['shot_${i}_uploadStage'] = 'uploading';
         final uploadStart = DateTime.now();
-        await _uploadWithRetry(bytes, path);
+        await _uploadWithRetry(encoded[i], path);
         stageDebug['shot_${i}_uploadMs'] =
             DateTime.now().difference(uploadStart).inMilliseconds;
         paths[i] = path;
