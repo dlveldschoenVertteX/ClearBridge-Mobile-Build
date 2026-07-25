@@ -75,12 +75,38 @@ Future<DecodedStillLuma?> decodeStillJpegToLuma(
 /// Encodes a single-channel luma buffer as a grayscale JPEG. Pure Dart (the
 /// `image` package) -- unlike [decodeStillJpegToLuma], safe to call inline
 /// or inside a `compute()` isolate.
+///
+/// Real bug found + fixed 2026-07-25: constructing this via
+/// `Image.fromBytes(numChannels: 1)` does NOT produce a true grayscale
+/// JPEG. Confirmed against the actual published `image` v4.8.0 source
+/// (pub.dev tarball): `PixelUint8.g`/`.b` return 0 for a numChannels==1
+/// image instead of replicating the single channel (only `.r` returns the
+/// real value), and `JpegEncoder._writeSOF0` always writes a 3-component
+/// JPEG regardless of input channel count. So the encoder was computing
+/// Y/Cb/Cr from (R=luma, G=0, B=0) per pixel instead of (R=G=B=luma) --
+/// non-neutral, luma-correlated chroma, not a neutral-grayscale JPEG.
+/// Measured on a real captured frame: 70% real contrast (std) loss and
+/// ~3x brightness compression on decode -- not a cosmetic tint, a real
+/// data-destroying bug that has been silently degrading every uploaded
+/// grayscale frame (main burst AND secondary-camera) since this encode
+/// path was introduced. Fix: manually replicate luma into all 3 channels
+/// before handing off to the encoder, so the resulting Cb/Cr planes are
+/// genuinely neutral regardless of this library's single-channel handling
+/// -- verified against real capture data to exactly recover the original
+/// mean/std (no residual loss beyond normal JPEG quantization).
 Uint8List encodeGrayscaleJpeg(Uint8List gray, int width, int height, {int quality = 90}) {
+  final rgb = Uint8List(gray.length * 3);
+  for (var i = 0, p = 0; i < gray.length; i++, p += 3) {
+    final v = gray[i];
+    rgb[p] = v;
+    rgb[p + 1] = v;
+    rgb[p + 2] = v;
+  }
   final image = imglib.Image.fromBytes(
     width: width,
     height: height,
-    bytes: gray.buffer,
-    numChannels: 1,
+    bytes: rgb.buffer,
+    numChannels: 3,
   );
   return Uint8List.fromList(imglib.encodeJpg(image, quality: quality));
 }
