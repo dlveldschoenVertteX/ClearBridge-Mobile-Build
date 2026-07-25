@@ -136,11 +136,33 @@ class PadSilhouetteShape {
   // magnitude (not the full ~18% the area ratio would imply -- this is a
   // single real data point, not enough to trust an exact target per this
   // project's own "don't overfit to one sample" discipline).
+  //
+  // Shrunk a further -10% (2026-07-25, CTO audit after two real captures on
+  // the cam-3-only build both landed afisWavelengthPx=20 -- still-too-close,
+  // same signal as every prior shrink round). CTO explicitly asked WHY the
+  // final mask is so much bigger than this on-screen shape implies. Real
+  // answer, audited in afis_print.py rather than assumed: this on-screen
+  // shape is NOT what actually gets scored. `_MASK_COVER_DILATE = 1.3`
+  // (added round 11, "whole-pad coverage" fix) dilates this guide by 1.3x
+  // linearly (1.69x by AREA) to form the OUTER bound the content-aware
+  // detector (flash-diff/U-Net) is allowed to fill, and accepts anything up
+  // to 92% of that dilated bound. So the guide the user sees on-screen
+  // understates the true scored mask by up to ~1.7x in area -- confirmed
+  // against real Firestore data from the two post-cam-3-cut captures:
+  // afisMaskCoverPx 422875-522074px (afisMask: 'guide+unet' both times, i.e.
+  // the dilate path was live). This dilate factor is a MULTIPLIER on
+  // guide_region['rx']/['ry'], so it scales proportionally with this shape
+  // -- shrinking the base guide still shrinks the final mask by the same
+  // percentage, it just doesn't look like it from the on-screen size alone.
+  // _MASK_COVER_DILATE itself is left untouched (round 11 already found 1.6
+  // measurably hurts a well-placed capture; 1.3 is real-data-calibrated, not
+  // a guess) -- the lever here is still the guide's own base size, same as
+  // every prior round.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
     cy: 0.37,
-    rx: 0.14956,
-    ry: 0.12355,
+    rx: 0.134604,
+    ry: 0.111195,
     taper: 0.20,
   );
 

@@ -299,13 +299,14 @@ class FrontCaptureController extends ChangeNotifier {
   // ROI the focus/exposure meters score on — aligned to the pad silhouette
   // bounding box so framing, metering and the superprint crop all agree.
   // Kept 1:1 with PadSilhouetteShape.defaultShape.boundingRect + taper.
-  // Updated 2026-07-22 for the second -15% mask shrink (real device test:
-  // afisMaskCoverPx on that capture, resolution-adjusted, sits between the
-  // established "good" and "too-close" reference clusters -- see
-  // defaultShape's own docstring for the full derivation):
-  //   cx=0.5, cy=0.37, rx=0.14956*(1+0.20)=0.17947, ry=0.12355
-  //   -> [0.32053,0.24645,0.67947,0.49355]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.3205, 0.2464, 0.6795, 0.4936);
+  // Updated 2026-07-25 for the third -10% mask shrink (CTO audit after two
+  // afisWavelengthPx=20 captures on the cam-3-only build -- see
+  // defaultShape's own docstring for the full derivation, including the
+  // real _MASK_COVER_DILATE finding on why the scored mask reads bigger
+  // than this on-screen shape implies):
+  //   cx=0.5, cy=0.37, rx=0.134604*(1+0.20)=0.161525, ry=0.111195
+  //   -> [0.338475,0.258805,0.661525,0.481195]
+  static const Rect _scoreRoi = Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1569,11 +1570,12 @@ class FrontCaptureController extends ChangeNotifier {
       await active.setFocusMode(FocusMode.locked);
     } catch (_) {}
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
+    final secondarySensorOrientation = desc.sensorOrientation;
     // Capture all shots while the user holds still, then upload in parallel.
     // Serial capture→upload→capture→upload meant the user had to stay still
     // for the full upload time (6-7s × 3 shots ≈ 21s). With burst-first /
     // parallel-upload the user holds for ~1.5s (capture phase only) then
-    // relaxes while all 3 uploads run concurrently (~7s wall clock, not 21s).
+    // relaxes while all 3 uploads run concurrently.
     final captured = List<(String, Uint8List)>.filled(
       _secondaryBurstCount,
       ('', Uint8List(0)),
@@ -1583,7 +1585,30 @@ class FrontCaptureController extends ChangeNotifier {
       final shotStart = DateTime.now();
       final shot = await active.takePicture();
       stageDebug['stage'] = 'shot_${i}_readBytes';
-      final bytes = await shot.readAsBytes();
+      final rawJpeg = await shot.readAsBytes();
+      // Downscale + convert to grayscale before upload -- same convention
+      // the main burst already uses (decodeStillJpegToLuma/
+      // encodeGrayscaleJpeg). takePicture() on a secondary sensor returns a
+      // full native-ISP-resolution COLOR JPEG (often much larger than the
+      // main burst's 3200px grayscale frames); real device data from the
+      // first parallel-upload test showed 12-20s per shot even with 3
+      // concurrent uploads, well above the main burst's 6-7s -- this is the
+      // direct fix, not just more parallelism. Falls back to the raw JPEG on
+      // any decode/encode failure so this can never block a capture.
+      stageDebug['stage'] = 'shot_${i}_encode';
+      var bytes = rawJpeg;
+      try {
+        final decoded = await decodeStillJpegToLuma(
+          rawJpeg, secondarySensorOrientation,
+          targetWidth: _stillDecodeTargetWidth,
+        );
+        if (decoded != null) {
+          bytes = await compute(
+            _encodeBurstIsolate,
+            _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+          );
+        }
+      } catch (_) {}
       stageDebug['shot_${i}_captureMs'] =
           DateTime.now().difference(shotStart).inMilliseconds;
       captured[i] = ('$basePath/secondary_${safeName}_torch_$i.jpg', bytes);
