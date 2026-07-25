@@ -449,6 +449,9 @@ class FrontCaptureController extends ChangeNotifier {
   // near the lens, which was locking onto empty background) -- it's
   // re-acquired fresh the moment the thumb is first confirmed on-target.
   bool _refocusedThisHold = false;
+  // Tracks whether the thumb was in coverage range on the previous frame so
+  // we can detect the entry transition and immediately point AF at the thumb.
+  bool _wasInCoverageRange = false;
 
   double _appliedEvOffset = 0.0;
   bool _evChangeInFlight = false;
@@ -523,6 +526,7 @@ class FrontCaptureController extends ChangeNotifier {
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
     _refocusedThisHold = false;
+    _wasInCoverageRange = false;
     _gyroMagnitudeDegPerSec = 0.0;
     _zoomLevel = 1.0;
     _maxZoomLevel = 1.0;
@@ -659,14 +663,32 @@ class FrontCaptureController extends ChangeNotifier {
 
     // Focus tracking: offerFrame returns raw Laplacian variance; normalise by
     // running peak so the meter reads 0→1 relative to the sharpest frame seen.
+    //
+    // Peak is only updated when the thumb is in coverage range. Without this
+    // gate, sharp background frames before the thumb arrives set _focusPeak
+    // far above anything the (initially blurry) thumb can achieve, preventing
+    // the focus meter from ever clearing the 0.45 on-target threshold.
+    //
+    // On thumb ENTRY we immediately point AF at the thumb ROI and reset the
+    // peak to the current (low) raw value, giving focus tracking a fresh
+    // baseline calibrated to the thumb — not leftover background sharpness.
+    final inCoverageRange = coverage != null && !tooFar && !tooClose;
     try {
       final rawFocus = _hybrid.offerFrame(image, thumbRoi: roi);
-      if (rawFocus > _focusPeak) _focusPeak = rawFocus;
+      if (inCoverageRange && !_wasInCoverageRange) {
+        // Thumb just entered range: reset peak and immediately direct AF.
+        _focusPeak = rawFocus + 1e-6;
+        _focusValue = 0;
+        unawaited(_beginAutofocus());
+      } else if (inCoverageRange && rawFocus > _focusPeak) {
+        _focusPeak = rawFocus;
+      }
       _focusValue = HybridCaptureService.ema(
         _focusValue,
         (rawFocus / (_focusPeak + 1e-6)).clamp(0.0, 1.0),
       );
     } catch (_) {}
+    _wasInCoverageRange = inCoverageRange;
 
     // Brightness tracking for exposure.
     if (!(_flash?.isFlashOn ?? false)) {
