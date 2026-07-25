@@ -677,9 +677,12 @@ class FrontCaptureController extends ChangeNotifier {
       final rawFocus = _hybrid.offerFrame(image, thumbRoi: roi);
       if (inCoverageRange && !_wasInCoverageRange) {
         // Thumb just entered range: reset peak and immediately direct AF.
+        // Skip if a full refocus cycle is already running — it will redirect
+        // AF itself and calling _beginAutofocus() concurrently would race
+        // with its 600ms settle timer.
         _focusPeak = rawFocus + 1e-6;
         _focusValue = 0;
-        unawaited(_beginAutofocus());
+        if (!_refocusing) unawaited(_beginAutofocus());
       } else if (inCoverageRange && rawFocus > _focusPeak) {
         _focusPeak = rawFocus;
       }
@@ -753,7 +756,15 @@ class FrontCaptureController extends ChangeNotifier {
       }
     } else {
       _holdStart = null;
-      _refocusedThisHold = false;
+      // Only restart the focus-acquire cycle when the thumb genuinely leaves
+      // coverage range (real distance change — AF may need to re-acquire at a
+      // new distance). Gyro spikes and transient focus dips while the thumb
+      // stays in frame don't stale the locked focus; resetting here would
+      // trigger a fresh 600ms refocus wait the moment the score recovers,
+      // multiplying unnecessary waits when the user is just slightly unsteady.
+      if (tooFar || tooClose || coverage == null) {
+        _refocusedThisHold = false;
+      }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
     }
   }
