@@ -1562,8 +1562,22 @@ class FrontCaptureController extends ChangeNotifier {
     // with an equivalent measured wait on the secondary camera's own stream.
     stageDebug['stage'] = 'settle_delay';
     await _waitForSecondaryFocusLock(active, stageDebug);
+    // Lock focus at the converged position so AF can't drift between shots.
+    // Same as the primary camera's _lockFocusOnly() before its own burst.
+    stageDebug['stage'] = 'focus_lock';
+    try {
+      await active.setFocusMode(FocusMode.locked);
+    } catch (_) {}
     final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-    final paths = <String>[];
+    // Capture all shots while the user holds still, then upload in parallel.
+    // Serial capture→upload→capture→upload meant the user had to stay still
+    // for the full upload time (6-7s × 3 shots ≈ 21s). With burst-first /
+    // parallel-upload the user holds for ~1.5s (capture phase only) then
+    // relaxes while all 3 uploads run concurrently (~7s wall clock, not 21s).
+    final captured = List<(String, Uint8List)>.filled(
+      _secondaryBurstCount,
+      ('', Uint8List(0)),
+    );
     for (var i = 0; i < _secondaryBurstCount; i++) {
       stageDebug['stage'] = 'shot_$i';
       final shotStart = DateTime.now();
@@ -1572,24 +1586,23 @@ class FrontCaptureController extends ChangeNotifier {
       final bytes = await shot.readAsBytes();
       stageDebug['shot_${i}_captureMs'] =
           DateTime.now().difference(shotStart).inMilliseconds;
-      final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
-      stageDebug['stage'] = 'shot_${i}_upload';
-      // Real-device finding, 2026-07-23: camera "2" times out on upload far
-      // more often than "3" -- record real per-shot upload duration so the
-      // next real capture's data shows whether this is a consistently slow
-      // upload (this field will read high every time) vs. a genuine
-      // occasional hang (the timeout fires before this ever gets recorded).
-      final uploadStart = DateTime.now();
-      await _uploadWithRetry(bytes, path);
-      stageDebug['shot_${i}_uploadMs'] =
-          DateTime.now().difference(uploadStart).inMilliseconds;
-      paths.add(path);
-      if (i < _secondaryBurstCount - 1) {
-        await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
-      }
+      captured[i] = ('$basePath/secondary_${safeName}_torch_$i.jpg', bytes);
     }
     stageDebug['stage'] = 'flash_off';
     await active.setFlashMode(FlashMode.off);
+    // Upload all shots in parallel now that the user no longer needs to hold.
+    final paths = List<String>.filled(_secondaryBurstCount, '');
+    await Future.wait(
+      List.generate(_secondaryBurstCount, (i) async {
+        final (path, bytes) = captured[i];
+        stageDebug['shot_${i}_uploadStage'] = 'uploading';
+        final uploadStart = DateTime.now();
+        await _uploadWithRetry(bytes, path);
+        stageDebug['shot_${i}_uploadMs'] =
+            DateTime.now().difference(uploadStart).inMilliseconds;
+        paths[i] = path;
+      }),
+    );
     stageDebug['stage'] = 'done';
     return paths;
   }
