@@ -462,6 +462,22 @@ class FrontCaptureController extends ChangeNotifier {
   // collapses (real captures: nfiq2=10, nfiq2=6 at 2.05x).
   static const double _maxZoomFill = 1.3;
 
+  // Live ridge-wavelength estimate (2026-07-26, Phase 0 -- diagnostic-only,
+  // does NOT drive distanceHint yet). Reconciling "closer for detail" with
+  // "far enough for good pixel wavelength" (see _maxZoomFill's own comment
+  // above) has so far relied entirely on the brightness/fill proxy
+  // (coverage) below -- this measures the thing that actually matters
+  // (native ridge wavelength) directly from the live preview, so the next
+  // several real captures can confirm it tracks the backend's own
+  // afisWavelengthPx before it's ever trusted to change user-facing text.
+  double? _liveWavelengthPx;
+  double? _liveWavelengthStillPx;
+  int _wavelengthSampleCount = 0;
+  String? _wavelengthAxis;
+  DateTime? _lastWavelengthEstimateAt;
+  static const int _wavelengthEstimateIntervalMs = 250;
+  Map<String, dynamic> _wavelengthDebug = {};
+
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   double _gyroMagnitudeDegPerSec = 0.0;
 
@@ -615,6 +631,27 @@ class FrontCaptureController extends ChangeNotifier {
     _guideRy = (ys.reduce(math.max) - ys.reduce(math.min)) / 2;
   }
 
+  /// Converts a raw-live-preview-pixel wavelength estimate into the same
+  /// still-space pixel units the backend's own `afisWavelengthPx` uses
+  /// (measured directly on the still decoded to _stillDecodeTargetWidth,
+  /// no further resize before _ridge_wavelength runs).
+  ///
+  /// `_guideRx` is the guide's half-width already in still-normalized,
+  /// crop-and-rotation-corrected coordinates (_computeGuideRegion above);
+  /// `_scoreRoi` is the same ROI already feeding meanLuma/the wavelength
+  /// estimator, in raw-CameraImage-normalized coordinates. These are two
+  /// INDEPENDENTLY derived approximations of "the same" guide region
+  /// (_scoreRoi's own comment says it's only "kept 1:1" with the guide
+  /// shape, not identical to the crop-corrected _guideRx) -- fine for a
+  /// coarse scale factor, but exactly why liveWavelengthStillPx must be
+  /// checked against real backend afisWavelengthPx data (not trusted
+  /// because it looks reasonable) before this ever drives distanceHint.
+  double? _wavelengthScaleToStill(CameraImage image) {
+    final roiWidthPx = _scoreRoi.width * image.width;
+    if (roiWidthPx <= 0 || _guideRx <= 0) return null;
+    return (2 * _guideRx * _stillDecodeTargetWidth) / roiWidthPx;
+  }
+
   void _onFrame(CameraImage image) {
     if (_disposed) return;
 
@@ -627,6 +664,11 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
     final tooFar = coverage != null && coverage < _coverageMin;
     final tooClose = coverage != null && coverage > _coverageMax;
+    // Hoisted here (was previously computed further down, just before the
+    // focus-tracking block) so the live wavelength estimator below can also
+    // gate on it -- no point running autocorrelation on a background frame
+    // before the thumb is plausibly present.
+    final inCoverageRange = coverage != null && !tooFar && !tooClose;
     // Try zoom-to-fill before ever telling the user to physically move
     // closer -- zooming preserves the guided working distance (and the
     // native ridge wavelength it was tuned for); physically moving closer
@@ -642,6 +684,36 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(distanceHint: hint));
     }
 
+    // Live ridge-wavelength estimate (Phase 0, diagnostic-only -- see the
+    // field docs above _gyroSub). Throttled to a wall-clock interval (mirrors
+    // this file's one existing throttling convention, _emitThrottleMs/
+    // _calibDurationMs) and gated on inCoverageRange, since the autocorrelation
+    // pass is real work and there's no point running it on a background
+    // frame. Wrapped in try/catch -- must never be able to break the hold.
+    if (inCoverageRange) {
+      final now = DateTime.now();
+      if (_lastWavelengthEstimateAt == null ||
+          now.difference(_lastWavelengthEstimateAt!).inMilliseconds >=
+              _wavelengthEstimateIntervalMs) {
+        _lastWavelengthEstimateAt = now;
+        try {
+          final est =
+              HybridCaptureService.estimateRidgeWavelengthPx(image, roi: roi);
+          if (est != null) {
+            _liveWavelengthPx = HybridCaptureService.ema(
+              _liveWavelengthPx ?? est.medianLagPx,
+              est.medianLagPx,
+            );
+            final scale = _wavelengthScaleToStill(image);
+            _liveWavelengthStillPx =
+                scale != null ? _liveWavelengthPx! * scale : null;
+            _wavelengthAxis = est.axis;
+            _wavelengthSampleCount++;
+          }
+        } catch (_) {}
+      }
+    }
+
     // Focus tracking: offerFrame returns raw Laplacian variance; normalise by
     // running peak so the meter reads 0→1 relative to the sharpest frame seen.
     //
@@ -653,7 +725,6 @@ class FrontCaptureController extends ChangeNotifier {
     // On thumb ENTRY we immediately point AF at the thumb ROI and reset the
     // peak to the current (low) raw value, giving focus tracking a fresh
     // baseline calibrated to the thumb — not leftover background sharpness.
-    final inCoverageRange = coverage != null && !tooFar && !tooClose;
     try {
       final rawFocus = _hybrid.offerFrame(image, thumbRoi: roi);
       if (inCoverageRange && !_wasInCoverageRange) {
@@ -943,6 +1014,18 @@ class FrontCaptureController extends ChangeNotifier {
           .toList(),
       'flashIntensity': _flash?.intensity,
       'flashMode': _flash?.modeName,
+    };
+    // Snapshot the running live-wavelength estimate at the moment the burst
+    // actually fires (same convention as _flashEvDebug above), not at
+    // doc-write time -- the hold could end slightly before upload.
+    _wavelengthDebug = {
+      'liveWavelengthPx': _liveWavelengthPx,
+      'liveWavelengthStillPx': _liveWavelengthStillPx,
+      'scaleToStill': _liveWavelengthPx != null && _liveWavelengthPx! > 0
+          ? (_liveWavelengthStillPx ?? 0) / _liveWavelengthPx!
+          : null,
+      'sampleCount': _wavelengthSampleCount,
+      'axis': _wavelengthAxis,
     };
 
     double? minEv, maxEv;
@@ -1443,6 +1526,7 @@ class FrontCaptureController extends ChangeNotifier {
         },
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
         'flashEvDebug': _flashEvDebug,
+        'liveWavelengthDebug': _wavelengthDebug,
         'zoomDebug': {
           'zoomApplied': _zoomEverApplied,
           'finalZoomLevel': double.parse(_zoomLevel.toStringAsFixed(3)),
