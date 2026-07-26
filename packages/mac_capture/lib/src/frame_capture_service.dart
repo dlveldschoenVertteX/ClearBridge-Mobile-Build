@@ -437,6 +437,14 @@ class HybridCaptureService {
     int stripThicknessPx = 4,
     double minStripStd = 6.0,
     int minLagPx = 2,
+    // Hard ceiling on the autocorrelation search window (raw preview pixels).
+    // Ridge periods > 40px live-preview correspond to > ~55px still-space via
+    // the ~1.4x scale factor -- well above any range that produces usable NFIQ2
+    // scores. Without this cap, low-frequency torch-gradient trends in the
+    // signal dominate the autocorrelation envelope at longer lags and cause
+    // a spurious "first local max" to be found at ~89px rather than the true
+    // ~12-14px ridge period.
+    int maxLagRawPx = 40,
     int maxSignalSamples = 300,
   }) {
     if (image.planes.isEmpty) return null;
@@ -530,12 +538,26 @@ class HybridCaptureService {
       variance /= sig.length;
       if (math.sqrt(variance) < minStripStd) continue;
 
-      // Mean-centered, non-negative-lag autocorrelation -- O(sigLen^2), cheap
-      // at this bounded length (<=maxSignalSamples).
+      // Mean-center then linear-detrend to suppress torch-gradient trends that
+      // would otherwise produce spurious autocorrelation peaks at long lags.
+      // Linear detrend: fit a line through the mean-centered signal and subtract
+      // it. This is O(sigLen) and keeps the ridge-period component intact while
+      // removing the slow brightness ramp from uneven torch illumination across
+      // the pad.
       final centered = List<double>.generate(sig.length, (i) => sig[i] - mean);
-      final maxLag = centered.length - 1;
-      final ac = List<double>.filled(maxLag + 1, 0.0);
-      for (var lag = 0; lag <= maxLag; lag++) {
+      final slope = centered.isNotEmpty
+          ? (centered.last - centered.first) / math.max(1, centered.length - 1)
+          : 0.0;
+      for (var i = 0; i < centered.length; i++) {
+        centered[i] -= slope * i;
+      }
+      // Only compute the autocorrelation up to the max-lag ceiling. Beyond
+      // ~40 raw px there is no plausible ridge period worth measuring; computing
+      // beyond it would be wasted O(L) work and risks finding spurious peaks.
+      final maxLagSubsampled =
+          math.min(centered.length - 1, (maxLagRawPx / sampleStride).ceil() + 1);
+      final ac = List<double>.filled(maxLagSubsampled + 1, 0.0);
+      for (var lag = 0; lag <= maxLagSubsampled; lag++) {
         var sum = 0.0;
         for (var i = 0; i < centered.length - lag; i++) {
           sum += centered[i] * centered[i + lag];
@@ -546,7 +568,8 @@ class HybridCaptureService {
       // First local maximum via sign-change in the discrete derivative,
       // rejecting lag <= minLagPx (mirrors afis_print.py's peaks[peaks>3],
       // scaled down since live-preview pixels are coarser than still pixels
-      // -- see class docs).
+      // -- see class docs). The search is bounded to maxLagSubsampled to
+      // prevent spurious peaks from low-frequency lighting gradients.
       int? peakLag;
       for (var lag = 1; lag < ac.length - 1; lag++) {
         if (lag <= minLagPx) continue;

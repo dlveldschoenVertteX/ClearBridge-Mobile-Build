@@ -1409,13 +1409,20 @@ class FrontCaptureController extends ChangeNotifier {
             // captures after the burst upgrade (1->3 shots) showed BOTH
             // secondary cameras timing out on every one, always mid-upload
             // -- 12s was calibrated for the old single-shot flow.
+            //
+            // Widened 28s -> 38s (2026-07-26): 3/4 consecutive real captures
+            // showed cam-3 timing out at flash_off with shot_2 upload still
+            // running. Real burst timeline: ~4-8s setup+capture, then 3
+            // parallel uploads each taking ~9-20s (bandwidth contention).
+            // shot_2 consistently arrives last, taking ~20s from upload start.
+            // Worst-case 8s init + 25s shot_2 upload = 33s; 38s gives real margin.
             final stageDebug = <String, dynamic>{'stage': 'not_started'};
             final paths = await _captureSecondaryBurst(
               active,
               desc,
               basePath,
               stageDebug,
-            ).timeout(const Duration(seconds: 28), onTimeout: () {
+            ).timeout(const Duration(seconds: 38), onTimeout: () {
               debugPrint(
                   '[front] secondary camera ${desc.name} timed out mid-capture '
                   '(stuck at: ${stageDebug['stage']}) -- skipping');
