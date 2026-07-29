@@ -263,6 +263,26 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
     t_start = time.monotonic()
     db, _ = _get_firebase()   # initialise db + bucket on first request
 
+    # ── Ownership check ────────────────────────────────────────────────────────
+    # The only prior authorization check (req.auth.uid != user_id) verifies the
+    # caller's token matches a userId the CALLER supplied, not that captureId
+    # actually belongs to them -- an authenticated caller could otherwise pass
+    # their own userId alongside an arbitrary other user's real captureId +
+    # basePath (e.g. leaked via a screenshot, log, or shared link) and have this
+    # function read/re-process/overwrite that other user's capture document via
+    # the Admin SDK, which bypasses Firestore rules entirely. captureId is a
+    # random client-generated v4 UUID (see front_capture_controller.dart), so
+    # this isn't trivially guessable in bulk, but relying on UUID entropy as the
+    # only barrier is not a real authorization control. Reject early, before
+    # consuming the per-user rate limit or any compute, if the capture doc
+    # doesn't exist or its recorded userId doesn't match the caller.
+    _owner_snap = db.collection('captures').document(capture_id).get()
+    if not _owner_snap.exists or (_owner_snap.to_dict() or {}).get('userId') != user_id:
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='captureId does not belong to the authenticated user',
+        )
+
     # ── Rate limit: 60 s per user ─────────────────────────────────────────────
     # Prevents cost-bomb abuse — each invocation runs a 4 GB / 4 vCPU pipeline.
     # Transaction ensures the check+write is atomic so concurrent requests
