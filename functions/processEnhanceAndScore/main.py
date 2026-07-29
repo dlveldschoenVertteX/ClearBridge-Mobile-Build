@@ -823,8 +823,14 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _SHARPNESS_RATIO_GUARD = 4.0
             _FUSION_MARGIN_REQUIRED = 3.0
             try:
-                _amb_lap = float(cv2.Laplacian(ambient_frames[0], cv2.CV_64F).var()) if ambient_frames else 0.0
-                _fl_lap = float(cv2.Laplacian(flash_frames[0], cv2.CV_64F).var()) if flash_frames else 0.0
+                # front_only_v1 can supply [None] (no ambient/flash frame was
+                # uploaded) -- a one-element list is still truthy, so `if
+                # ambient_frames` alone doesn't catch it; check the actual
+                # first element too.
+                _amb_lap = (float(cv2.Laplacian(ambient_frames[0], cv2.CV_64F).var())
+                            if ambient_frames and ambient_frames[0] is not None else 0.0)
+                _fl_lap = (float(cv2.Laplacian(flash_frames[0], cv2.CV_64F).var())
+                           if flash_frames and flash_frames[0] is not None else 0.0)
             except Exception:   # noqa: BLE001 — guard is best-effort, never blocks scoring
                 _amb_lap = _fl_lap = 0.0
             _fusion_guarded = _fl_lap > 0 and (_amb_lap / _fl_lap) >= _SHARPNESS_RATIO_GUARD
@@ -843,9 +849,20 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     logger.warning('AFIS variant loop: time budget exceeded, '
                                     'skipping remaining variants from %s onward', _vname)
                     break
+                # flash_burst is None for arc_sweep and the discontinued
+                # four-angle flow (only front_only_v1/oscillating_8phase ever
+                # populate it -- see the download-stage branches above), so
+                # this must short-circuit before len() rather than assume a
+                # list. Without the `flash_burst and` guard this raised
+                # TypeError on 'fuseAvg' for those capture modes, aborting the
+                # entire AFIS variant loop (everything from fuseAvg onward,
+                # plus secondary-camera scoring and _save_afis_print, silently
+                # never ran) -- caught only by the outer non-critical except,
+                # so nfiqAfis/nfiqSource could be reported with no
+                # corresponding superprintPath ever written.
                 _fuse_fl_list = (
                     [[f] for f in flash_burst]
-                    if _vname in _FUSE_PAIR_NAMES and len(flash_burst) > 1
+                    if _vname in _FUSE_PAIR_NAMES and flash_burst and len(flash_burst) > 1
                     else [flash_frames]
                 )
                 _img, _p, _s = None, None, 0.0
