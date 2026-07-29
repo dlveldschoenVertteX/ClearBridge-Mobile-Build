@@ -950,14 +950,43 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             cv2.CV_64F).var())
                     )
                     _sname = f"secondary_{_cam.get('name', 'cam')}"
-                    # Focal-ratio-scaled guide: gives generate() the right
-                    # extraction region for this lens's FOV. Falls back to
-                    # None (UNet/flash-diff segmentation path) if any input
+                    # Sensor-corrected FOV-scaled guide: gives generate() the
+                    # right extraction region for this lens's FOV. Falls back
+                    # to None (UNet/flash-diff segmentation path) if any input
                     # is missing -- purely additive, never blocks.
+                    #
+                    # Real bug found + fixed 2026-07-29: this used to scale by
+                    # focal-length ratio alone (fl_sec/fl_main). Angular FOV --
+                    # and thus how large a fixed physical object appears in a
+                    # lens's own normalized frame -- depends on BOTH focal
+                    # length AND sensor size (FOV ~ sensorSize/focalLength), not
+                    # focal length alone. Confirmed via this device's own real
+                    # cameraLensInfo (capture 3f8fd075): camera "2" has both a
+                    # much shorter focal length (2.37mm vs main's 4.15mm) AND a
+                    # much smaller sensor (3.92x2.94mm vs main's 5.98x4.49mm) --
+                    # the two partly cancel. fl-only gives a ratio of 0.571
+                    # (guide scaled to 57% of main -- more than 2x too small in
+                    # AREA), while the sensor-corrected ratio is 0.871 (camera
+                    # "2"'s real angular FOV is close to main's, not dramatically
+                    # wider). Camera "3" is a smaller but still real correction
+                    # (0.954 fl-only vs 0.859 corrected). An undersized guide
+                    # directly explains the round-20 "mask covers 67% of frame"
+                    # self-rejection on camera "2": the dilated bound the real
+                    # pad detector gets clipped against was far smaller than
+                    # that lens's actual field of view, so a correctly-sized
+                    # detection blows past it and gets rejected.
                     _sec_guide = None
-                    _fl_sec = (_lens_info.get(_cam.get('name', '')) or {}).get('focalLengthMm')
-                    if _fl_main and _fl_sec and _guide_region and _fl_main > 0:
-                        _fl_ratio = _fl_sec / _fl_main
+                    _main_lens = _lens_info.get('0') or {}
+                    _sec_lens = _lens_info.get(_cam.get('name', '')) or {}
+                    _fl_sec = _sec_lens.get('focalLengthMm')
+                    _sw_main = _main_lens.get('sensorWidthMm')
+                    _sh_main = _main_lens.get('sensorHeightMm')
+                    _sw_sec = _sec_lens.get('sensorWidthMm')
+                    _sh_sec = _sec_lens.get('sensorHeightMm')
+                    if (_fl_main and _fl_sec and _guide_region and _fl_main > 0
+                            and _sw_main and _sh_main and _sw_sec and _sh_sec):
+                        _rx_ratio = (_fl_sec / _sw_sec) / (_fl_main / _sw_main)
+                        _ry_ratio = (_fl_sec / _sh_sec) / (_fl_main / _sh_main)
                         # Camera "3" (largest sensor, most similar angle to
                         # main) uses cy=0.37 -- matching the main guide's own
                         # top-half-of-pad default (PadSilhouetteShape.cy).
@@ -968,8 +997,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _sec_guide = {
                             'cx': 0.5,
                             'cy': _sec_cy,
-                            'rx': _guide_region['rx'] * _fl_ratio,
-                            'ry': _guide_region['ry'] * _fl_ratio,
+                            'rx': _guide_region['rx'] * _rx_ratio,
+                            'ry': _guide_region['ry'] * _ry_ratio,
                             'tipAngleDeg': 0.0,
                             'n': _guide_region.get('n', 2.5),
                         }

@@ -610,13 +610,26 @@ def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     so a corner is reliably background), then anything NOT reached by that
     flood is either real foreground or an enclosed hole -- both get kept. Can
     only ADD area back inside already-enclosed gaps, never remove real
-    foreground, so this can't regress an already-clean mask."""
-    h, w = mask.shape[:2]
+    foreground, so this can't regress an already-clean mask.
+
+    Pads with a guaranteed-background 1px ring before flooding, rather than
+    seeding from the bare (0,0) corner directly. If the mask's own
+    foreground happens to touch the frame edge (a tight/zoomed capture, or
+    a noisy detector that over-reaches to the border), a single bare-corner
+    seed can get walled off from a real background pocket on the far side
+    of the frame -- that pocket would then be indistinguishable from an
+    enclosed hole and get wrongly merged into the foreground. The padding
+    ring connects every edge of the frame to the (0,0) seed regardless of
+    what the foreground does inside it, so this can only ever correctly
+    identify MORE real background, never mistake foreground for a hole."""
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    h, w = padded.shape[:2]
     flood_mask = np.zeros((h + 2, w + 2), np.uint8)
-    filled = mask.copy()
+    filled = padded.copy()
     cv2.floodFill(filled, flood_mask, (0, 0), 255)
     holes = cv2.bitwise_not(filled)
-    return cv2.bitwise_or(mask, holes)
+    combined = cv2.bitwise_or(padded, holes)
+    return combined[1:-1, 1:-1]
 
 
 def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
