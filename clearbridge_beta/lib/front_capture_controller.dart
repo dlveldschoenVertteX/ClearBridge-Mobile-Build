@@ -327,7 +327,20 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _guideN = 2.5;
 
   static const double _glareHighLuma = 205.0;
+  // Hysteresis gap below _glareHighLuma before walking the EV offset back
+  // toward 0 -- a real gap (not right at 205) so a scene sitting near the
+  // trigger threshold can't oscillate step-down/step-up every other frame.
+  static const double _glareLowLuma = 150.0;
   static const double _glareEvStep = -0.7;
+  // Minimum time between successive glare EV steps. Every other exposure/
+  // focus-changing mechanism in this file (flash-transition settle, refocus
+  // settle, secondary-camera focus-lock wait) has a real settle delay because
+  // this project's own history repeatedly found the sensor needs time to
+  // converge before the next reading can be trusted -- this one previously
+  // had none, so several -0.7 steps could ratchet through in well under a
+  // second on a bright scene, before _lastStableBrightness had a chance to
+  // reflect the prior correction.
+  static const int _glareEvSettleMs = 500;
   // Adaptive flash EV step (2026-07-22): the fixed -1.0 this replaces was
   // sized off the FIRST real overexposure capture, then never revisited —
   // but a later real capture (cb684c57) showed the opposite failure at a
@@ -437,6 +450,7 @@ class FrontCaptureController extends ChangeNotifier {
   double _appliedEvOffset = 0.0;
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0;
+  DateTime? _lastGlareEvAdjustAt;
 
   // Zoom-to-fill (2026-07-22): compensates for the pad under-filling the
   // guide at the ALREADY-correct working distance, WITHOUT asking the user
@@ -916,20 +930,45 @@ class FrontCaptureController extends ChangeNotifier {
     await Future<void>.delayed(const Duration(milliseconds: 600));
   }
 
+  // Real bug found + fixed 2026-07-29: this previously had no settle delay
+  // (could ratchet several -0.7 steps within under a second on a bright
+  // scene, well before _lastStableBrightness reflected the prior
+  // correction) and never reversed (_appliedEvOffset was only ever
+  // decremented, so a brief glint during calibration permanently depressed
+  // the exposure baseline -- including the main burst's ambient/flash EV,
+  // which both use _appliedEvOffset as their base -- for the rest of that
+  // capture session even if brightness later returned to normal). The old
+  // "already converged" check also compared target against _appliedEvOffset
+  // itself (always exactly _glareEvStep apart, so it could never actually
+  // trip) instead of against the real hardware-clamped value, letting the
+  // internal accounting value run away past what the camera actually
+  // applied. Now: settled by _glareEvSettleMs, reconciled against the real
+  // hardware min/max every adjustment (so _appliedEvOffset can't diverge
+  // from what the sensor actually has), and walks back toward 0 with a
+  // hysteresis gap (_glareLowLuma) once the glare clears.
   void _maybeAdjustExposure() {
     if (_evChangeInFlight) return;
     final cam = _camera;
     if (cam == null) return;
-    if (_lastStableBrightness > _glareHighLuma) {
-      final target = _appliedEvOffset + _glareEvStep;
+    final now = DateTime.now();
+    if (_lastGlareEvAdjustAt != null &&
+        now.difference(_lastGlareEvAdjustAt!).inMilliseconds < _glareEvSettleMs) {
+      return;
+    }
+    final wantsDarker = _lastStableBrightness > _glareHighLuma;
+    final wantsBrighter =
+        _lastStableBrightness < _glareLowLuma && _appliedEvOffset < 0.0;
+    if (!wantsDarker && !wantsBrighter) return;
+    final step = wantsDarker ? _glareEvStep : -_glareEvStep;
+    _evChangeInFlight = true;
+    _lastGlareEvAdjustAt = now;
+    cam.getMinExposureOffset().then((min) async {
+      final max = await cam.getMaxExposureOffset();
+      final target = (_appliedEvOffset + step).clamp(min, max);
       if ((target - _appliedEvOffset).abs() < 0.05) return;
       _appliedEvOffset = target;
-      _evChangeInFlight = true;
-      cam.getMinExposureOffset().then((min) async {
-        final max = await cam.getMaxExposureOffset();
-        await cam.setExposureOffset(_appliedEvOffset.clamp(min, max));
-      }).catchError((_) {}).whenComplete(() => _evChangeInFlight = false);
-    }
+      await cam.setExposureOffset(_appliedEvOffset);
+    }).catchError((_) {}).whenComplete(() => _evChangeInFlight = false);
   }
 
   /// Zoom-to-fill: called every frame with the current under-fill reading.
@@ -1466,6 +1505,23 @@ class FrontCaptureController extends ChangeNotifier {
                 await active.dispose();
               } catch (_) {}
             }
+            // Real gap found 2026-07-29: a timeout above means
+            // _captureSecondaryBurst's underlying Future is very likely
+            // still running in the background (.timeout() doesn't cancel
+            // it -- e.g. still inside takePicture()/an upload call against
+            // the controller just disposed). Android's native camera
+            // teardown is itself asynchronous at the HAL level, so this
+            // awaited dispose() resolving doesn't guarantee the native
+            // session has fully closed before the NEXT camera's
+            // initializeCamera() opens below -- the same "two native camera
+            // sessions contending" hazard this project's own ANR history
+            // already root-caused once (see the 28s->38s/12s->28s timeout
+            // widening notes above). Only pay this on the timeout path (not
+            // every successful turn, which has no orphaned Future to wait
+            // out) -- real, deliberate cost only where there's real risk.
+            if (secondaryDebug['${desc.name}_timeout'] == true) {
+              await Future<void>.delayed(const Duration(milliseconds: 500));
+            }
 
             if (paths.isNotEmpty) {
               secondaryMeta.add({'name': desc.name, 'paths': paths});
@@ -1672,18 +1728,38 @@ class FrontCaptureController extends ChangeNotifier {
     // (secondaryCameraDebug showed '3_timeout: true', stuck at
     // 'flash_off'). Capture stays fast; the expensive work now happens
     // after, in parallel, same as the upload step already does.
-    final rawShots = List<Uint8List>.filled(_secondaryBurstCount, Uint8List(0));
+    // Real bug found + fixed 2026-07-29: unlike the main burst's own per-shot
+    // loop (_fireBurst), which wraps each takePicture() in its own try/catch
+    // so one bad shot just yields fewer frames, this loop had no per-shot
+    // guard at all -- any single transient CameraException on shot 1 of 3
+    // threw out of the whole function, discarding shots 0 (and any after)
+    // even if they'd already succeeded. The outer per-camera catch in
+    // _finishAndUpload still keeps this from crashing the capture, but it
+    // meant an avoidable total loss of that camera's already-good data on a
+    // transient glitch. Now: each shot is individually guarded; a failure
+    // stops the burst early (rather than leaving a gap mid-sequence, which
+    // the encode/upload loops below assume don't exist) but keeps whatever
+    // was already captured.
+    final rawShots = <Uint8List>[];
     for (var i = 0; i < _secondaryBurstCount; i++) {
       stageDebug['stage'] = 'shot_$i';
       final shotStart = DateTime.now();
-      final shot = await active.takePicture();
-      stageDebug['stage'] = 'shot_${i}_readBytes';
-      rawShots[i] = await shot.readAsBytes();
-      stageDebug['shot_${i}_captureMs'] =
-          DateTime.now().difference(shotStart).inMilliseconds;
+      try {
+        final shot = await active.takePicture();
+        stageDebug['stage'] = 'shot_${i}_readBytes';
+        rawShots.add(await shot.readAsBytes());
+        stageDebug['shot_${i}_captureMs'] =
+            DateTime.now().difference(shotStart).inMilliseconds;
+      } catch (e) {
+        stageDebug['shot_${i}_error'] = e.toString();
+        debugPrint('[front] secondary camera shot $i failed (non-blocking): $e');
+        break;
+      }
     }
     stageDebug['stage'] = 'flash_off';
     await active.setFlashMode(FlashMode.off);
+    if (rawShots.isEmpty) return const <String>[];
+    final shotCount = rawShots.length;
 
     // Downscale + convert to grayscale before upload -- same convention the
     // main burst already uses (decodeStillJpegToLuma/encodeGrayscaleJpeg).
@@ -1693,7 +1769,7 @@ class FrontCaptureController extends ChangeNotifier {
     // failure so this can never block a capture. Run via Future.wait (not
     // a sequential loop) so the underlying platform decoder can overlap
     // work across shots, same as the main burst's own decode/encode block.
-    final encoded = await Future.wait(List.generate(_secondaryBurstCount, (i) async {
+    final encoded = await Future.wait(List.generate(shotCount, (i) async {
       stageDebug['shot_${i}_encodeStage'] = 'encoding';
       var bytes = rawShots[i];
       try {
@@ -1712,9 +1788,9 @@ class FrontCaptureController extends ChangeNotifier {
     }));
 
     // Upload all shots in parallel now that the user no longer needs to hold.
-    final paths = List<String>.filled(_secondaryBurstCount, '');
+    final paths = List<String>.filled(shotCount, '');
     await Future.wait(
-      List.generate(_secondaryBurstCount, (i) async {
+      List.generate(shotCount, (i) async {
         final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
         stageDebug['shot_${i}_uploadStage'] = 'uploading';
         final uploadStart = DateTime.now();

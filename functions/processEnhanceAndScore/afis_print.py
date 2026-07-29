@@ -134,7 +134,22 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
             if blk.std() < 8:
                 continue
             ang = orient[y + bsize // 2, x + bsize // 2]
-            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            # Real bug found + fixed 2026-07-29: rotating by `ang` alone
+            # rotates ridges TO the orientation direction, not TO vertical --
+            # the opposite of what's needed before collapsing axis 0 (rows)
+            # into a profile over x. Confirmed by direct execution: a block
+            # of perfectly vertical stripes (orient == 90 deg, already
+            # correctly aligned, needing ZERO rotation) got rotated a full
+            # 90 degrees by the old `np.degrees(ang)` call, turning it into
+            # HORIZONTAL stripes -- averaging over rows then averages
+            # straight along the periodic direction, producing a dead-flat
+            # signal (std=0.0) and silently contributing no frequency sample
+            # at all. `_upright_rotate` (this same file) does the analogous
+            # "bring a computed direction to vertical" operation and already
+            # correctly subtracts 90 -- this and the two sibling functions
+            # below (_ridge_frequency_map, _ridge_texture_strength) had
+            # copy-pasted the idiom without it.
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
             rot = cv2.warpAffine(blk, M, (bsize, bsize))
             sig = rot.mean(axis=0)
             sig = sig - sig.mean()
@@ -201,7 +216,10 @@ def _ridge_frequency_map(img: np.ndarray, orient: np.ndarray, mask: np.ndarray,
             if blk.std() < 8:
                 continue
             ang = orient[y + bsize // 2, x + bsize // 2]
-            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            # Same rotation-direction fix as _ridge_wavelength above (see its
+            # comment) -- must bring the block TO vertical (ang - 90), not
+            # rotate BY the orientation angle itself.
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
             rot = cv2.warpAffine(blk, M, (bsize, bsize))
             sig = rot.mean(axis=0)
             sig = sig - sig.mean()
@@ -721,7 +739,9 @@ def _ridge_texture_strength(img: np.ndarray, orient: np.ndarray, bsize: int = 48
             if blk.shape != (bsize, bsize) or blk.std() < 8:
                 continue
             ang = orient[min(y + bsize // 2, h - 1), min(x + bsize // 2, w - 1)]
-            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang), 1.0)
+            # Same rotation-direction fix as _ridge_wavelength (see its
+            # comment) -- must bring the block TO vertical (ang - 90).
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
             rot = cv2.warpAffine(blk, M, (bsize, bsize))
             sig = rot.mean(axis=0)
             sig = sig - sig.mean()
