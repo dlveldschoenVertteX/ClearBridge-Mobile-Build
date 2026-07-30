@@ -139,6 +139,14 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     if (s.phase == FrontCapturePhase.capturingExtra) {
       return (s.extraProgress, CaptureColors.gold);
     }
+    if (s.phase == FrontCapturePhase.sweepActive) {
+      // Orange while too blurry to fire (mirrors the tracking highlight
+      // below), green once the current frame clears the sharpness gate.
+      return (
+        s.sweepProgress,
+        s.sweepFastWarning ? CaptureColors.warning : CaptureColors.success,
+      );
+    }
     if (s.phase == FrontCapturePhase.complete) return (1.0, CaptureColors.success);
     if (s.phase == FrontCapturePhase.holding && s.onTarget) {
       return (s.holdProgress, CaptureColors.cyan);
@@ -154,6 +162,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       if (!s.isSteady) return 'Hold the phone steady…';
       return 'Align your thumb';
     }
+    if (s.phase == FrontCapturePhase.sweepPositioning) {
+      return 'Place thumb at the left edge of the guide';
+    }
+    if (s.phase == FrontCapturePhase.sweepActive) {
+      return s.sweepFastWarning ? 'Slow down a little…' : 'Slowly sweep right →';
+    }
     if (s.phase == FrontCapturePhase.capturing) return 'Scanning fingerprint…';
     if (s.phase == FrontCapturePhase.capturingExtra) {
       return s.distanceHint ?? 'Capturing extra detail…';
@@ -164,6 +178,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   Color _headlineColor(FrontCaptureState s) {
     if (s.phase == FrontCapturePhase.holding && s.onTarget) {
       return CaptureColors.success;
+    }
+    if (s.phase == FrontCapturePhase.sweepActive) {
+      return s.sweepFastWarning ? CaptureColors.warning : CaptureColors.success;
+    }
+    if (s.phase == FrontCapturePhase.sweepPositioning) {
+      return CaptureColors.cyan;
     }
     return CaptureColors.silverBright;
   }
@@ -187,15 +207,18 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     final showGuide = s.phase == FrontCapturePhase.idle ||
         s.phase == FrontCapturePhase.calibrating ||
         s.phase == FrontCapturePhase.holding ||
+        s.phase == FrontCapturePhase.sweepPositioning ||
+        s.phase == FrontCapturePhase.sweepActive ||
         s.phase == FrontCapturePhase.capturing ||
         s.phase == FrontCapturePhase.capturingExtra;
 
-    final silhouetteState =
-        (s.isCapturingBurst || s.phase == FrontCapturePhase.capturingExtra)
-            ? PadSilhouetteState.capturing
-            : (s.onTarget
-                ? PadSilhouetteState.locked
-                : PadSilhouetteState.aligning);
+    final silhouetteState = (s.isCapturingBurst ||
+            s.phase == FrontCapturePhase.capturingExtra ||
+            s.phase == FrontCapturePhase.sweepActive)
+        ? PadSilhouetteState.capturing
+        : (s.onTarget || s.phase == FrontCapturePhase.sweepPositioning
+            ? PadSilhouetteState.locked
+            : PadSilhouetteState.aligning);
 
     final (ringProgress, ringColor) = _ringState(s);
 
@@ -270,6 +293,40 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               left: ringLeft,
               top: ringTop,
               child: _CaptureProgressRing(progress: ringProgress, color: ringColor),
+            ),
+
+          // Sweep Step 1: soft band over the guide's left portion, showing
+          // where to position the thumb before the sweep starts. Cleared
+          // the moment sweepActive begins.
+          if (s.phase == FrontCapturePhase.sweepPositioning)
+            Positioned(
+              left: ringLeft,
+              top: ringTop,
+              width: ringD * 0.3,
+              height: ringD,
+              child: IgnorePointer(
+                child: Container(
+                  decoration: BoxDecoration(
+                    borderRadius: BorderRadius.horizontal(left: Radius.circular(ringD / 2)),
+                    border: Border.all(color: CaptureColors.cyan.withValues(alpha: 0.55), width: 2),
+                    color: CaptureColors.cyan.withValues(alpha: 0.10),
+                  ),
+                ),
+              ),
+            ),
+
+          // Sweep Step 2: horizontal progress bar + moving centroid-tracking
+          // highlight beneath the guide. Replaces the need for mid-sweep text
+          // instruction — the user watches this fill left-to-right instead.
+          if (s.phase == FrontCapturePhase.sweepActive)
+            Positioned(
+              left: ringLeft,
+              top: ringTop + ringD + 10,
+              width: ringD,
+              child: _SweepProgressBar(
+                progress: s.sweepProgress,
+                fastWarning: s.sweepFastWarning,
+              ),
             ),
 
           // Brightness meter — left of ring.
@@ -350,13 +407,18 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               ),
             ),
 
-          // Per-camera confirmation banners (e.g. "✓ IR captured").
+          // Per-camera confirmation banners (e.g. "✓ IR captured"), and the
+          // sweep-retry prompt ("Try again — sweep a little slower") shown
+          // via the same mechanism while briefly back in sweepPositioning.
           if (s.confirmationText != null)
             Positioned(
               top: topPad + 64,
               left: 40,
               right: 40,
-              child: _ConfirmationBanner(text: s.confirmationText!),
+              child: _ConfirmationBanner(
+                text: s.confirmationText!,
+                isWarning: s.phase == FrontCapturePhase.sweepPositioning,
+              ),
             ),
 
           // Header: back | "FRONT CAPTURE" | status pill.
@@ -816,28 +878,91 @@ class _WarningRow extends StatelessWidget {
 // ── Confirmation banner ───────────────────────────────────────────────────────
 
 class _ConfirmationBanner extends StatelessWidget {
-  const _ConfirmationBanner({required this.text});
+  const _ConfirmationBanner({required this.text, this.isWarning = false});
   final String text;
+  // True for the sweep-retry prompt ("Try again — sweep a little slower")
+  // -- same banner shape/mechanism as the success confirmations, but a
+  // warning tone rather than green so a failed sweep doesn't read as success.
+  final bool isWarning;
 
   @override
   Widget build(BuildContext context) {
+    final color = isWarning ? CaptureColors.warning : CaptureColors.success;
     return Center(
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
         decoration: BoxDecoration(
-          color: CaptureColors.success.withValues(alpha: 0.16),
+          color: color.withValues(alpha: 0.16),
           borderRadius: BorderRadius.circular(100),
-          border:
-              Border.all(color: CaptureColors.success.withValues(alpha: 0.50)),
+          border: Border.all(color: color.withValues(alpha: 0.50)),
         ),
         child: Text(
           text,
-          style: CaptureTypography.h3
-              .copyWith(color: CaptureColors.success, fontSize: 15),
+          style: CaptureTypography.h3.copyWith(color: color, fontSize: 15),
         ),
       ),
     );
   }
+}
+
+// ── Sweep progress bar ────────────────────────────────────────────────────────
+
+/// Horizontal left-to-right fill bar shown during sweepActive, beneath the
+/// guide. Replaces the need for mid-sweep text instruction (per the UX
+/// spec) — the user watches this fill instead of reading copy. Green while
+/// the current frame is sharp enough to fire, orange while moving too fast.
+class _SweepProgressBar extends StatelessWidget {
+  const _SweepProgressBar({required this.progress, required this.fastWarning});
+  final double progress;
+  final bool fastWarning;
+
+  @override
+  Widget build(BuildContext context) {
+    final color = fastWarning ? CaptureColors.warning : CaptureColors.success;
+    return SizedBox(
+      height: 10,
+      child: CustomPaint(
+        painter: _SweepBarPainter(progress: progress.clamp(0.0, 1.0), color: color),
+      ),
+    );
+  }
+}
+
+class _SweepBarPainter extends CustomPainter {
+  const _SweepBarPainter({required this.progress, required this.color});
+  final double progress;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final track = RRect.fromRectAndRadius(
+      Offset.zero & size,
+      Radius.circular(size.height / 2),
+    );
+    canvas.drawRRect(track, Paint()..color = CaptureColors.cardBg);
+
+    final fillW = size.width * progress;
+    if (fillW > 0) {
+      final fillRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(0, 0, fillW, size.height),
+        Radius.circular(size.height / 2),
+      );
+      canvas.drawRRect(fillRect, Paint()..color = color.withValues(alpha: 0.55));
+    }
+
+    // Marker dot at the current leading edge -- the moving "tracking" cue
+    // the UX spec calls for, distinct from the fill itself.
+    final markerX = fillW.clamp(size.height / 2, size.width - size.height / 2);
+    canvas.drawCircle(
+      Offset(markerX, size.height / 2),
+      size.height / 2 + 2,
+      Paint()..color = color,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_SweepBarPainter old) =>
+      old.progress != progress || old.color != color;
 }
 
 // ── Upload overlay ────────────────────────────────────────────────────────────

@@ -609,6 +609,53 @@ class HybridCaptureService {
   static double ema(double previous, double incoming, {double alpha = 0.3}) =>
       alpha * incoming + (1 - alpha) * previous;
 
+  /// Intensity-weighted horizontal centroid of whatever's in [roi], for the
+  /// guided left-right thumb-sweep capture (diagnostic-first -- see
+  /// FrontCaptureController's sweepPositioning/sweepActive phases). No
+  /// optical flow, no tracker state carried between calls -- per the sweep
+  /// spec's own explicit design choice, a simple per-frame brightness-
+  /// weighted centroid within the existing guide bounds is sufficient,
+  /// since under torch/ambient light the thumb pad reads meaningfully
+  /// brighter than the background it sweeps across. Same stride-safe,
+  /// subsampled-scan pattern as [meanLuma]/[_measureBrightness] above.
+  ///
+  /// Returns the brightness-weighted mean X position within [roi],
+  /// normalized 0.0 ([roi]'s left edge) to 1.0 ([roi]'s right edge). Returns
+  /// null when the ROI has no usable signal (zero total brightness) rather
+  /// than a fabricated fallback -- same "null over a wrong-but-plausible
+  /// number" discipline as [estimateRidgeWavelengthPx].
+  static double? estimateThumbCentroidX(CameraImage image, {required Rect roi}) {
+    if (image.planes.isEmpty) return null;
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    final w = image.width;
+    final h = image.height;
+    if (w < 8 || h < 8) return null;
+    final stride =
+        h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+
+    final x0 = (roi.left * w).clamp(0, w - 1).toInt();
+    final y0 = (roi.top * h).clamp(0, h - 1).toInt();
+    final x1 = (roi.right * w).clamp(0, w - 1).toInt();
+    final y1 = (roi.bottom * h).clamp(0, h - 1).toInt();
+    if (x1 <= x0 + 1 || y1 <= y0 + 1) return null;
+
+    const step = 4; // subsample -- same cost-control convention as meanLuma (step 8)
+    var weightedSum = 0.0;
+    var totalWeight = 0.0;
+    for (var yy = y0; yy < y1; yy += step) {
+      final row = yy * stride;
+      for (var xx = x0; xx < x1; xx += step) {
+        final v = bytes[row + xx].toDouble();
+        weightedSum += v * xx;
+        totalWeight += v;
+      }
+    }
+    if (totalWeight <= 0) return null;
+    final centroidXPx = weightedSum / totalWeight;
+    return ((centroidXPx - x0) / (x1 - x0)).clamp(0.0, 1.0);
+  }
+
   /// Mean luminance of the Y plane, optionally restricted to [roi] (normalized
   /// 0-1 Rect). Shared brightness helper for controllers without their own ROI
   /// tracking (see MultiAngleCaptureController._meanLuma for the ROI variant).

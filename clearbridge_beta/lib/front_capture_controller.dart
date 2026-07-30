@@ -20,6 +20,15 @@ enum FrontCapturePhase {
   idle,
   calibrating,
   holding,
+  // Guided thumb-sweep capture (2026-07-30, diagnostic-first): two phases
+  // inserted between the existing on-target focus-lock (end of `holding`)
+  // and the burst actually firing. Replaces "hold still -> fire
+  // immediately" with "sweep left-to-right -> fire as qualifying frames
+  // pass" -- the burst mechanics themselves (8 shots, Laplacian gate, flash
+  // alternation, encode/upload) are unchanged, only the trigger/pacing is
+  // new. See FrontCaptureController's _beginSweepPositioning/_beginSweepActive.
+  sweepPositioning,
+  sweepActive,
   capturing,
   // Primary burst is done and already scored well enough to keep — now
   // grabbing best-effort secondary-camera (IR/ultrawide) and distance-stage-2
@@ -50,12 +59,27 @@ class FrontCaptureState {
     this.isSteady = true,
     this.lightingValue = 0.5,
     this.activeGuideShape,
+    this.sweepProgress = 0.0,
+    this.sweepCentroidX,
+    this.sweepFastWarning = false,
   });
 
   final FrontCapturePhase phase;
   final bool onTarget;
   final double holdProgress;
   final bool isCapturingBurst;
+  // Guided thumb-sweep (sweepPositioning/sweepActive phases): the thumb's
+  // last-known intensity-weighted centroid X position, normalized 0.0 (left
+  // edge of the guide ROI) to 1.0 (right edge) -- drives both the moving
+  // highlight on the horizontal band overlay and the fill of the sweep
+  // progress bar (sweepProgress mirrors it 1:1; kept as a separate field so
+  // the UI can read "progress" without knowing it's just the raw centroid).
+  final double sweepProgress;
+  final double? sweepCentroidX;
+  // True when the current frame's sharpness is below the fire-gate
+  // threshold during sweepActive -- drives the highlight's orange
+  // "moving too fast" state (green otherwise).
+  final bool sweepFastWarning;
   // Fraction of the main burst fired so far (0..1) -- drives the pad-guide
   // fill animation during FrontCapturePhase.capturing, same "fills up as
   // capture progresses" cue the oscillating dial's scan-fill arc already
@@ -101,6 +125,9 @@ class FrontCaptureState {
     bool? isSteady,
     double? lightingValue,
     Object? activeGuideShape = _sentinel,
+    double? sweepProgress,
+    Object? sweepCentroidX = _sentinel,
+    bool? sweepFastWarning,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -122,6 +149,11 @@ class FrontCaptureState {
         activeGuideShape: identical(activeGuideShape, _sentinel)
             ? this.activeGuideShape
             : activeGuideShape as PadSilhouetteShape?,
+        sweepProgress: sweepProgress ?? this.sweepProgress,
+        sweepCentroidX: identical(sweepCentroidX, _sentinel)
+            ? this.sweepCentroidX
+            : sweepCentroidX as double?,
+        sweepFastWarning: sweepFastWarning ?? this.sweepFastWarning,
       );
 }
 
@@ -203,6 +235,32 @@ class FrontCaptureController extends ChangeNotifier {
   // Works via setExposureOffset() -- no hardware variable-intensity flash
   // needed, same safe API already proven for the adaptive EV step itself.
   static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 1.5, 0.75];
+
+  // Guided thumb-sweep capture (2026-07-30, diagnostic-first): replaces the
+  // static "hold still -> fire immediately" trigger with two phases inserted
+  // between the existing on-target focus-lock and the burst firing --
+  // sweepPositioning (wait for the thumb to reach + dwell at the guide's
+  // left edge) then sweepActive (fire the same 8 shots as the user sweeps
+  // right, gated on sharpness same as before). Burst mechanics themselves
+  // (_burstFrameCount, the 0.45 sharpness gate, flash alternation, encode/
+  // upload) are UNCHANGED -- only the trigger/pacing of individual shots is
+  // new. See _beginSweepPositioning/_handleSweepPositioningFrame/
+  // _beginSweepActive/_handleSweepActiveFrame/_fireSweepShot/_completeSweep.
+  static const double _sweepLeftZoneMax = 0.25;
+  static const double _sweepRightZoneMin = 0.75;
+  static const int _sweepLeftDwellMs = 400;
+  // Hard bound on the whole sweepActive window -- the UX target pace is
+  // 2.5-4s (fast enough to feel natural, slow enough that 8 qualifying
+  // frames can clear the sharpness gate), so this timeout sits comfortably
+  // above that ceiling rather than cutting off a merely-slightly-slow sweep.
+  static const int _sweepTimeoutMs = 6000;
+  static const int _sweepMinValidShots = 4;
+  // Minimum spacing between fired shots -- without this, a frame run that
+  // sustains above the sharpness gate would otherwise fire on every single
+  // camera frame (15-30/sec). ~300ms spacing against an 8-shot quota targets
+  // roughly the 2.5-4s sweep window called out in the UX spec.
+  static const int _sweepMinShotIntervalMs = 300;
+
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
@@ -516,6 +574,27 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _wavelengthEstimateIntervalMs = 250;
   Map<String, dynamic> _wavelengthDebug = {};
 
+  // Guided thumb-sweep state (see the constants block above for the
+  // phase-timing constants). _sweepRawShots/_sweepCentroids are parallel
+  // lists built in fire order -- index i of one corresponds to index i of
+  // the other, which _finishAndUpload relies on to attach centroidX to the
+  // right frame's metadata.
+  bool _sweepActivating = false;
+  bool _sweepShotInFlight = false;
+  DateTime? _lastSweepShotAt;
+  int _sweepFlashShotIndex = 0;
+  bool _sweepWasFlashLastShot = false;
+  final List<_RawShot> _sweepRawShots = [];
+  final List<double?> _sweepCentroids = [];
+  DateTime? _sweepActiveStart;
+  DateTime? _sweepLeftDwellStart;
+  double? _lastCentroidX;
+  bool _sweepTorchCapable = false;
+  double _sweepFlashEvStep = 0.0;
+  double? _sweepMinEv;
+  double? _sweepMaxEv;
+  Map<String, dynamic> _sweepDebug = {};
+
   StreamSubscription<GyroscopeEvent>? _gyroSub;
   double _gyroMagnitudeDegPerSec = 0.0;
 
@@ -571,6 +650,17 @@ class FrontCaptureController extends ChangeNotifier {
     _detailFramesFlash.clear();
     _detailBurstFired = false;
     _detailZoomAppliedLevel = null;
+    _sweepActivating = false;
+    _sweepShotInFlight = false;
+    _lastSweepShotAt = null;
+    _sweepFlashShotIndex = 0;
+    _sweepWasFlashLastShot = false;
+    _sweepRawShots.clear();
+    _sweepCentroids.clear();
+    _sweepActiveStart = null;
+    _sweepLeftDwellStart = null;
+    _lastCentroidX = null;
+    _sweepDebug = {};
     try {
       _maxZoomLevel = (await camera.getMaxZoomLevel()).clamp(1.0, _maxZoomFill);
     } catch (_) {}
@@ -811,8 +901,22 @@ class FrontCaptureController extends ChangeNotifier {
       return;
     }
 
-    if (_state.phase != FrontCapturePhase.holding) return;
     if (_burstInFlight) return;
+
+    // Guided thumb-sweep phases -- inserted between the existing on-target
+    // focus-lock (below) and the burst firing. Each has its own per-frame
+    // handler; both return early so the holding-phase logic below never
+    // runs concurrently with the sweep.
+    if (_state.phase == FrontCapturePhase.sweepPositioning) {
+      _handleSweepPositioningFrame(image);
+      return;
+    }
+    if (_state.phase == FrontCapturePhase.sweepActive) {
+      _handleSweepActiveFrame(image);
+      return;
+    }
+
+    if (_state.phase != FrontCapturePhase.holding) return;
 
     // On-target: focus score crosses threshold, distance is right, AND the
     // device is objectively still (gyroscope-derived). Real captures showed
@@ -846,7 +950,7 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
       if (heldMs >= _holdDurationMs) {
         _holdStart = null;
-        unawaited(_fireBurst());
+        unawaited(_beginSweepPositioning());
       }
     } else {
       _holdStart = null;
@@ -861,6 +965,290 @@ class FrontCaptureController extends ChangeNotifier {
       }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
     }
+  }
+
+  // ── Guided thumb-sweep capture ──────────────────────────────────────────
+  //
+  // Phase 1 (sweepPositioning): wait for the thumb's centroid to reach the
+  // guide's left zone and dwell there briefly, so the sweep always starts
+  // from a known, consistent position rather than wherever the thumb
+  // happened to be when the hold-still timer completed.
+  //
+  // Phase 2 (sweepActive): fire the same 8-shot alternating-flash burst as
+  // before, but gated per-frame on sharpness as the user sweeps right,
+  // instead of firing all 8 back-to-back the instant a static hold
+  // completes. Ends on quota (8 shots), an early right-zone exit once the
+  // minimum valid-shot count is already met, or a hard timeout.
+
+  Future<void> _beginSweepPositioning() async {
+    _sweepActivating = false;
+    _sweepShotInFlight = false;
+    _lastSweepShotAt = null;
+    _sweepFlashShotIndex = 0;
+    _sweepWasFlashLastShot = false;
+    _sweepRawShots.clear();
+    _sweepCentroids.clear();
+    _sweepLeftDwellStart = null;
+    _lastCentroidX = null;
+    _apply(
+      (s) => s.copyWith(
+        phase: FrontCapturePhase.sweepPositioning,
+        sweepProgress: 0.0,
+        sweepCentroidX: null,
+        sweepFastWarning: false,
+      ),
+      force: true,
+    );
+  }
+
+  void _handleSweepPositioningFrame(CameraImage image) {
+    // Already transitioning to sweepActive (re-aiming focus, an async
+    // sequence spanning several frames) -- avoid re-triggering it on every
+    // subsequent frame while that's in flight.
+    if (_sweepActivating) return;
+
+    double? centroid;
+    try {
+      centroid = HybridCaptureService.estimateThumbCentroidX(image, roi: _scoreRoi);
+    } catch (_) {}
+    _lastCentroidX = centroid ?? _lastCentroidX;
+
+    final inLeftZone = centroid != null && centroid <= _sweepLeftZoneMax;
+    if (inLeftZone) {
+      _sweepLeftDwellStart ??= DateTime.now();
+      final dwelledMs = DateTime.now().difference(_sweepLeftDwellStart!).inMilliseconds;
+      if (dwelledMs >= _sweepLeftDwellMs) {
+        _sweepActivating = true;
+        unawaited(_beginSweepActive(centroid!));
+        return;
+      }
+    } else {
+      _sweepLeftDwellStart = null;
+    }
+    _apply((s) => s.copyWith(sweepCentroidX: centroid, sweepProgress: 0.0));
+  }
+
+  /// Re-aims focus to the centroid's current X position (centre Y fixed),
+  /// waits for it to settle, locks it, then transitions to sweepActive.
+  /// Deliberately does this ONCE at sweep start, not continuously during the
+  /// sweep itself -- focus-chase latency mid-sweep would introduce exactly
+  /// the motion blur the sharpness gate is trying to avoid.
+  Future<void> _beginSweepActive(double startCentroidX) async {
+    final cam = _camera;
+    if (cam == null) {
+      _sweepActivating = false;
+      return;
+    }
+
+    final fullX = (_scoreRoi.left + startCentroidX * _scoreRoi.width).clamp(0.0, 1.0);
+    final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
+    final pt = Offset(fullX, cy);
+    try {
+      await cam.setFocusMode(FocusMode.auto);
+      await cam.setFocusPoint(pt);
+      await cam.setExposurePoint(pt);
+      // Same 600ms auto->settle->lock convention as _refocus() -- this
+      // device's proven AF convergence timing elsewhere in this file.
+      await Future<void>.delayed(const Duration(milliseconds: 600));
+      await cam.setFocusMode(FocusMode.locked);
+    } catch (_) {}
+
+    if (_disposed || _state.phase != FrontCapturePhase.sweepPositioning) {
+      _sweepActivating = false;
+      return;
+    }
+
+    _sweepTorchCapable = _flash?.isNeeded ?? false;
+    _sweepFlashEvStep = _adaptiveFlashEvStep();
+    _sweepMinEv = null;
+    _sweepMaxEv = null;
+    if (_sweepTorchCapable) {
+      try {
+        _sweepMinEv = await cam.getMinExposureOffset();
+        _sweepMaxEv = await cam.getMaxExposureOffset();
+      } catch (_) {}
+    }
+    _sweepActiveStart = DateTime.now();
+    _sweepActivating = false;
+    _apply(
+      (s) => s.copyWith(
+        phase: FrontCapturePhase.sweepActive,
+        sweepProgress: startCentroidX.clamp(0.0, 1.0),
+        sweepCentroidX: startCentroidX,
+        sweepFastWarning: false,
+      ),
+      force: true,
+    );
+  }
+
+  void _handleSweepActiveFrame(CameraImage image) {
+    double? centroid;
+    try {
+      centroid = HybridCaptureService.estimateThumbCentroidX(image, roi: _scoreRoi);
+    } catch (_) {}
+    if (centroid != null) _lastCentroidX = centroid;
+    final effectiveCentroid = centroid ?? _lastCentroidX;
+
+    // Same 0.45 threshold as the existing on-target gate above -- reused,
+    // not a second independent value, per "must not change the existing
+    // Laplacian gate threshold".
+    final sharpnessOk = _focusValue > 0.45;
+    _apply((s) => s.copyWith(
+          sweepCentroidX: effectiveCentroid,
+          sweepProgress: (effectiveCentroid ?? s.sweepProgress).clamp(0.0, 1.0),
+          sweepFastWarning: !sharpnessOk,
+        ));
+
+    final capturedCount = _sweepRawShots.length;
+    final elapsedMs = _sweepActiveStart == null
+        ? 0
+        : DateTime.now().difference(_sweepActiveStart!).inMilliseconds;
+
+    // Completion checks run before the fire gate so a frame that both
+    // qualifies to fire AND crosses a completion boundary doesn't squeeze
+    // in one extra shot past where the sweep should already have ended.
+    if (capturedCount >= _burstFrameCount) {
+      unawaited(_completeSweep(success: true));
+      return;
+    }
+    if (effectiveCentroid != null &&
+        effectiveCentroid >= _sweepRightZoneMin &&
+        capturedCount >= _sweepMinValidShots) {
+      unawaited(_completeSweep(success: true));
+      return;
+    }
+    if (elapsedMs >= _sweepTimeoutMs) {
+      unawaited(_completeSweep(success: capturedCount >= _sweepMinValidShots));
+      return;
+    }
+
+    // Fire gate: only capture when sharp, not already mid-shot, and enough
+    // time has passed since the last shot -- natural pacing across the
+    // sweep window rather than pile-firing every frame once sharp.
+    if (!_sweepShotInFlight) {
+      final now = DateTime.now();
+      final sinceLastShot = _lastSweepShotAt == null
+          ? _sweepMinShotIntervalMs
+          : now.difference(_lastSweepShotAt!).inMilliseconds;
+      if (sharpnessOk && sinceLastShot >= _sweepMinShotIntervalMs) {
+        unawaited(_fireSweepShot(effectiveCentroid));
+      }
+    }
+  }
+
+  /// Captures one sweep shot. Unlike the static burst (which stops the image
+  /// stream before firing all 8 back-to-back), the sweep deliberately keeps
+  /// `startImageStream` running throughout sweepActive so centroid/sharpness
+  /// tracking continues between shots -- `takePicture()` is called directly
+  /// against the still-streaming controller. The camera plugin's CameraX
+  /// backend is documented to support concurrent ImageAnalysis (stream) +
+  /// ImageCapture (still) use cases, but this specific interleaving (stream
+  /// never stopped across several takePicture() calls spread over a few
+  /// seconds) has not been confirmed on this project's real test devices --
+  /// flagged for the first real-device sweep test, same "not yet
+  /// device-tested" discipline as every other capture-side change here.
+  Future<void> _fireSweepShot(double? centroidAtFire) async {
+    final cam = _camera;
+    if (cam == null || _sweepShotInFlight) return;
+    _sweepShotInFlight = true;
+    _lastSweepShotAt = DateTime.now();
+    try {
+      final i = _sweepRawShots.length;
+      // Same alternation convention as the static burst: even index =
+      // ambient (torch off), odd = flash (torch on with negative EV).
+      final wantFlash = _sweepTorchCapable && i.isOdd;
+      try {
+        if (wantFlash) {
+          await _flash!.activate();
+          if (_sweepMinEv != null && _sweepMaxEv != null) {
+            final multiplier = _flashEvBracketMultipliers[
+                _sweepFlashShotIndex % _flashEvBracketMultipliers.length];
+            final target = _appliedEvOffset + _sweepFlashEvStep * multiplier;
+            await cam.setExposureOffset(target.clamp(_sweepMinEv!, _sweepMaxEv!));
+          }
+          await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+        } else {
+          await _flash?.deactivate();
+          if (_sweepMinEv != null && _sweepMaxEv != null) {
+            await cam.setExposureOffset(_appliedEvOffset.clamp(_sweepMinEv!, _sweepMaxEv!));
+          }
+          // Same flash-off settle delay as the static burst -- only applied
+          // when the immediately preceding shot actually fired the flash.
+          if (_sweepWasFlashLastShot) {
+            await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+          }
+        }
+      } catch (_) {}
+      if (wantFlash) _sweepFlashShotIndex++;
+      _sweepWasFlashLastShot = wantFlash;
+
+      final xfile = await cam.takePicture();
+      final jpeg = await xfile.readAsBytes();
+      _sweepRawShots.add(_RawShot(
+        jpeg: jpeg,
+        flashOn: _flash?.isFlashOn ?? false,
+        laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
+        timestamp: DateTime.now(),
+      ));
+      _sweepCentroids.add(centroidAtFire);
+    } catch (e) {
+      debugPrint('[front] sweep shot failed (non-fatal): $e');
+    } finally {
+      _sweepShotInFlight = false;
+    }
+  }
+
+  Future<void> _completeSweep({required bool success}) async {
+    // Guard against double-invocation -- _handleSweepActiveFrame can fire
+    // again on the next camera frame before the phase transition below
+    // actually lands (async gap between the completion check and here).
+    if (_state.phase != FrontCapturePhase.sweepActive) return;
+    // Immediately move off sweepActive so a concurrent frame callback can't
+    // re-enter this same completion path a second time.
+    _apply((s) => s.copyWith(phase: FrontCapturePhase.capturing), force: true);
+
+    final capturedCount = _sweepRawShots.length;
+    final elapsedMs = _sweepActiveStart == null
+        ? 0
+        : DateTime.now().difference(_sweepActiveStart!).inMilliseconds;
+
+    try {
+      await _flash?.deactivate();
+    } catch (_) {}
+
+    _sweepDebug = {
+      'centroids': List<double?>.from(_sweepCentroids),
+      'capturedCount': capturedCount,
+      'sweepDurationMs': elapsedMs,
+      'timedOut': elapsedMs >= _sweepTimeoutMs,
+      'leftDwellMs': _sweepLeftDwellMs,
+    };
+
+    if (!success) {
+      HapticFeedback.mediumImpact(); // distinct from the success heavyImpact below
+      _apply(
+        (s) => s.copyWith(
+          phase: FrontCapturePhase.sweepPositioning,
+          confirmationText: 'Try again — sweep a little slower',
+          sweepProgress: 0.0,
+        ),
+        force: true,
+      );
+      await Future<void>.delayed(const Duration(milliseconds: _confirmationDisplayMs));
+      if (_disposed) return;
+      _apply((s) => s.copyWith(confirmationText: null), force: true);
+      unawaited(_beginSweepPositioning());
+      return;
+    }
+
+    final rawShots = List<_RawShot>.from(_sweepRawShots);
+    final centroids = List<double?>.from(_sweepCentroids);
+    final gyroAtCapture = _gyroMagnitudeDegPerSec;
+    unawaited(_fireBurst(
+      preCollectedShots: rawShots,
+      preCollectedCentroids: centroids,
+      gyroAtCapture: gyroAtCapture,
+    ));
   }
 
   Future<void> _finalizeCalibration() async {
@@ -1159,25 +1547,39 @@ class FrontCaptureController extends ChangeNotifier {
     return sumSq / n - mean * mean;
   }
 
-  Future<void> _fireBurst() async {
+  /// Fires (or finishes processing) the main 8-shot burst. When
+  /// [preCollectedShots] is supplied (the guided-sweep path -- see
+  /// _completeSweep), the shots are already captured; this skips straight to
+  /// the shared post-collection work (torch-off restore, decode/encode,
+  /// detail-zoom burst, success feedback, upload). When null, falls back to
+  /// the original static collection loop (stream stopped, all 8 shots fired
+  /// back-to-back) -- kept for structural completeness, though the only
+  /// active caller is now _completeSweep.
+  Future<void> _fireBurst({
+    List<_RawShot>? preCollectedShots,
+    List<double?>? preCollectedCentroids,
+    double? gyroAtCapture,
+  }) async {
     if (_burstInFlight || _disposed) return;
     _burstInFlight = true;
     // Snapshot device stillness at the moment the burst fires -- diagnostic
     // only (stored alongside laplacianScore below), for tuning
     // _maxSteadyDegPerSec against real capture outcomes.
-    final gyroAtCapture = _gyroMagnitudeDegPerSec;
+    final gyro = gyroAtCapture ?? _gyroMagnitudeDegPerSec;
     _apply(
       (s) => s.copyWith(
         isCapturingBurst: true,
-        burstProgress: 0.0,
+        burstProgress: preCollectedShots != null ? 1.0 : 0.0,
         phase: FrontCapturePhase.capturing,
       ),
       force: true,
     );
 
     final cam = _camera;
-    final torchCapable = _flash?.isNeeded ?? false;
-    final flashEvStep = _adaptiveFlashEvStep();
+    final torchCapable =
+        preCollectedShots != null ? _sweepTorchCapable : (_flash?.isNeeded ?? false);
+    final flashEvStep =
+        preCollectedShots != null ? _sweepFlashEvStep : _adaptiveFlashEvStep();
     _flashEvDebug = {
       'evStep': double.parse(flashEvStep.toStringAsFixed(3)),
       'evBracket': _flashEvBracketMultipliers
@@ -1200,7 +1602,10 @@ class FrontCaptureController extends ChangeNotifier {
     };
 
     double? minEv, maxEv;
-    if (torchCapable) {
+    if (preCollectedShots != null) {
+      minEv = _sweepMinEv;
+      maxEv = _sweepMaxEv;
+    } else if (torchCapable) {
       try {
         minEv = await cam?.getMinExposureOffset();
         maxEv = await cam?.getMaxExposureOffset();
@@ -1211,74 +1616,79 @@ class FrontCaptureController extends ChangeNotifier {
 
     try {
       if (cam == null) return;
-      await _stopStream();
 
-      // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
-      // flash (torch ON with negative EV). At 10cm the torch at full ambient EV
-      // blows out the pad centre completely (confirmed on first real capture:
-      // NFIQ2=9). Alternating gives the backend both lighting conditions;
-      // _download_front_only_frames already splits frames into ambient_frames
-      // and flash_frames so AFIS can pick the best-exposed set.
-      var wasFlashLastShot = false;
-      var flashShotIndex = 0;
-      for (var i = 0; i < _burstFrameCount; i++) {
-        final wantFlash = torchCapable && i.isOdd;
-        try {
-          if (wantFlash) {
-            await _flash!.activate();
-            if (minEv != null && maxEv != null) {
-              final multiplier = _flashEvBracketMultipliers[
-                  flashShotIndex % _flashEvBracketMultipliers.length];
-              final target = _appliedEvOffset + flashEvStep * multiplier;
-              await cam.setExposureOffset(target.clamp(minEv, maxEv));
-            }
-            await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
-          } else {
-            await _flash?.deactivate();
-            if (minEv != null && maxEv != null) {
-              await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
-            }
-            // Real asymmetry found 2026-07-24: the flash-ON transition above
-            // gets an explicit settle delay before its shot fires, but the
-            // flash-OFF transition (torch physically switching off AND the EV
-            // offset dropping back from flashEvStep to base) went straight
-            // into takePicture() with zero settle time -- only when this shot
-            // actually FOLLOWS a real flash shot (`wasFlashLastShot`, not
-            // just "this is an ambient slot" -- torch-incapable/bright-mode
-            // bursts never fire flash at all, so they must NOT pick up this
-            // delay on every single shot). If the sensor needs real time to
-            // re-converge exposure after either change -- which is exactly
-            // why the activate() side already waits -- every other "ambient"
-            // shot in a normal-mode burst could be captured mid-transition,
-            // still influenced by the prior flash frame's EV state.
-            // Symmetric fix: same settle window on the way back down. Not
-            // yet device-tested -- same standing discipline as every other
-            // capture-side change this project.
-            if (wasFlashLastShot) {
+      if (preCollectedShots != null) {
+        rawShots.addAll(preCollectedShots);
+      } else {
+        await _stopStream();
+
+        // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
+        // flash (torch ON with negative EV). At 10cm the torch at full ambient EV
+        // blows out the pad centre completely (confirmed on first real capture:
+        // NFIQ2=9). Alternating gives the backend both lighting conditions;
+        // _download_front_only_frames already splits frames into ambient_frames
+        // and flash_frames so AFIS can pick the best-exposed set.
+        var wasFlashLastShot = false;
+        var flashShotIndex = 0;
+        for (var i = 0; i < _burstFrameCount; i++) {
+          final wantFlash = torchCapable && i.isOdd;
+          try {
+            if (wantFlash) {
+              await _flash!.activate();
+              if (minEv != null && maxEv != null) {
+                final multiplier = _flashEvBracketMultipliers[
+                    flashShotIndex % _flashEvBracketMultipliers.length];
+                final target = _appliedEvOffset + flashEvStep * multiplier;
+                await cam.setExposureOffset(target.clamp(minEv, maxEv));
+              }
               await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+            } else {
+              await _flash?.deactivate();
+              if (minEv != null && maxEv != null) {
+                await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+              }
+              // Real asymmetry found 2026-07-24: the flash-ON transition above
+              // gets an explicit settle delay before its shot fires, but the
+              // flash-OFF transition (torch physically switching off AND the EV
+              // offset dropping back from flashEvStep to base) went straight
+              // into takePicture() with zero settle time -- only when this shot
+              // actually FOLLOWS a real flash shot (`wasFlashLastShot`, not
+              // just "this is an ambient slot" -- torch-incapable/bright-mode
+              // bursts never fire flash at all, so they must NOT pick up this
+              // delay on every single shot). If the sensor needs real time to
+              // re-converge exposure after either change -- which is exactly
+              // why the activate() side already waits -- every other "ambient"
+              // shot in a normal-mode burst could be captured mid-transition,
+              // still influenced by the prior flash frame's EV state.
+              // Symmetric fix: same settle window on the way back down. Not
+              // yet device-tested -- same standing discipline as every other
+              // capture-side change this project.
+              if (wasFlashLastShot) {
+                await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+              }
             }
+          } catch (_) {}
+          if (wantFlash) flashShotIndex++;
+          wasFlashLastShot = wantFlash;
+          try {
+            final xfile = await cam.takePicture();
+            final jpeg = await xfile.readAsBytes();
+            rawShots.add(_RawShot(
+              jpeg: jpeg,
+              flashOn: _flash?.isFlashOn ?? false,
+              laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
+              timestamp: DateTime.now(),
+            ));
+          } catch (e) {
+            debugPrint('[front] burst shot $i failed (non-fatal): $e');
           }
-        } catch (_) {}
-        if (wantFlash) flashShotIndex++;
-        wasFlashLastShot = wantFlash;
-        try {
-          final xfile = await cam.takePicture();
-          final jpeg = await xfile.readAsBytes();
-          rawShots.add(_RawShot(
-            jpeg: jpeg,
-            flashOn: _flash?.isFlashOn ?? false,
-            laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
-            timestamp: DateTime.now(),
-          ));
-        } catch (e) {
-          debugPrint('[front] burst shot $i failed (non-fatal): $e');
-        }
-        _apply(
-          (s) => s.copyWith(burstProgress: (i + 1) / _burstFrameCount),
-          force: true,
-        );
-        if (i < _burstFrameCount - 1) {
-          await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
+          _apply(
+            (s) => s.copyWith(burstProgress: (i + 1) / _burstFrameCount),
+            force: true,
+          );
+          if (i < _burstFrameCount - 1) {
+            await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
+          }
         }
       }
       // Always restore torch-off and base EV when done.
@@ -1323,6 +1733,14 @@ class FrontCaptureController extends ChangeNotifier {
       final results = await Future.wait(futures.map((f) => f.catchError((_) =>
           (bytes: Uint8List(0), flashOn: false, lap: null as double?, ts: DateTime.now()))));
 
+      // The sweep path never stops the image stream (it needs live frames
+      // for centroid/sharpness tracking throughout sweepActive) -- stop it
+      // now, before any further still captures, matching the invariant the
+      // static path already established via _stopStream() above.
+      if (preCollectedShots != null) {
+        await _stopStream();
+      }
+
       // Two-tier adaptive zoom (Phase 0, diagnostic-only backend-side): the
       // main burst above is now safely captured and encoded, so a
       // supplementary higher-zoom detail pass on the pad center can only
@@ -1350,7 +1768,12 @@ class FrontCaptureController extends ChangeNotifier {
       );
       await Future<void>.delayed(const Duration(milliseconds: _confirmationDisplayMs));
 
-      await _finishAndUpload(results, gyroAtCapture);
+      await _finishAndUpload(
+        results,
+        gyro,
+        sweepCentroids: preCollectedCentroids,
+        sweepDebugData: preCollectedShots != null ? _sweepDebug : null,
+      );
     } catch (e) {
       _fail('Capture failed: $e');
     } finally {
@@ -1363,8 +1786,10 @@ class FrontCaptureController extends ChangeNotifier {
 
   Future<void> _finishAndUpload(
     List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})> shots,
-    double gyroAtCapture,
-  ) async {
+    double gyroAtCapture, {
+    List<double?>? sweepCentroids,
+    Map<String, dynamic>? sweepDebugData,
+  }) async {
     _audio.silence();
     // NOT `uploading` yet -- the secondary-camera + distance-stage-2 blocks
     // below still need the thumb held in place (same physical placement, a
@@ -1398,12 +1823,21 @@ class FrontCaptureController extends ChangeNotifier {
       final framesMeta = <Map<String, dynamic>>[];
       var ambIdx = 0, flIdx = 0;
 
-      for (final s in shots) {
+      for (var frameIdx = 0; frameIdx < shots.length; frameIdx++) {
+        final s = shots[frameIdx];
         if (s.bytes.isEmpty) continue;
         final type = s.flashOn ? 'fl' : 'amb';
         final idx = s.flashOn ? flIdx++ : ambIdx++;
         final path = '$basePath/front_burst_${type}_$idx.jpg';
         uploadTasks.add((s.bytes, path));
+        // centroidX (diagnostic-only, guided-sweep capture): the thumb's
+        // intensity-weighted centroid X position at the moment THIS frame
+        // fired, normalized 0.0-1.0 within the guide width. sweepCentroids is
+        // parallel (by index) to the raw-shot list _fireBurst built `shots`
+        // from -- null/absent for the non-sweep static-burst path.
+        final centroidX = (sweepCentroids != null && frameIdx < sweepCentroids.length)
+            ? sweepCentroids[frameIdx]
+            : null;
         framesMeta.add({
           'path': path,
           'angleDeg': 0.0,
@@ -1411,6 +1845,7 @@ class FrontCaptureController extends ChangeNotifier {
           'type': 'burst',
           if (s.lap != null) 'laplacianScore': double.parse(s.lap!.toStringAsFixed(1)),
           'timestamp': s.ts.toIso8601String(),
+          if (centroidX != null) 'centroidX': double.parse(centroidX.toStringAsFixed(3)),
         });
       }
 
@@ -1748,6 +2183,7 @@ class FrontCaptureController extends ChangeNotifier {
         'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
+        if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
         'zoomDebug': {
           'zoomApplied': _zoomEverApplied,
           'finalZoomLevel': double.parse(_zoomLevel.toStringAsFixed(3)),
