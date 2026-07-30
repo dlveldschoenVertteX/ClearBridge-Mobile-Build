@@ -38,6 +38,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   bool _navigated = false;
   String? _initError;
 
+  // Locked at the moment the main burst begins so the focus meter stays
+  // stable during shot-taking (flash alternation causes the peak-normalised
+  // _focusValue to oscillate during the burst itself — cosmetically confusing
+  // since the burst already started because focus was good). Cleared once
+  // isCapturingBurst goes false.
+  double? _lockedFocusValue;
+
   CameraController? get _camera => _cameraService.controller;
 
   @override
@@ -45,10 +52,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     super.initState();
     _ctrl = FrontCaptureController();
     _ctrl.addListener(_onState);
+    // Not started here — driven by _onState so it only runs during active
+    // shot-taking (not during the Processing… decode window, which is where
+    // the 8× concurrent decodes happen and CPU headroom matters most).
     _scanAnim = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 2000),
-    )..repeat(reverse: true);
+    );
     _init();
   }
 
@@ -67,8 +77,29 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
 
   void _onState() {
     if (!mounted) return;
-    setState(() {});
     final s = _ctrl.state;
+
+    // Scan animation: run only while shots are actively being taken.
+    // Stops before the Processing… decode phase so the 8× concurrent
+    // ui.instantiateImageCodec calls don't compete with 60 fps repaints.
+    final shouldScan = s.isCapturingBurst && s.confirmationText == null;
+    if (shouldScan && !_scanAnim.isAnimating) {
+      _scanAnim.repeat(reverse: true);
+    } else if (!shouldScan && _scanAnim.isAnimating) {
+      _scanAnim.stop();
+      _scanAnim.value = 0;
+    }
+
+    // Focus meter: lock at burst-start value to avoid the
+    // peak-normalisation oscillation that flash-vs-ambient alternation causes.
+    if (s.isCapturingBurst && _lockedFocusValue == null) {
+      _lockedFocusValue = _ctrl.focusValue;
+    } else if (!s.isCapturingBurst && _lockedFocusValue != null) {
+      _lockedFocusValue = null;
+    }
+
+    setState(() {});
+
     if (!_navigated &&
         s.phase == FrontCapturePhase.complete &&
         s.captureId != null) {
@@ -253,13 +284,14 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               ),
             ),
 
-          // Focus meter — right of ring.
+          // Focus meter — right of ring. Uses the value locked at burst-start
+          // while shooting so flash/ambient alternation doesn't make it flicker.
           if (showGuide)
             Positioned(
               left: focusLeft,
               top: meterTop,
               child: _VerticalMeter(
-                value: _ctrl.focusValue,
+                value: _lockedFocusValue ?? _ctrl.focusValue,
                 color: CaptureColors.cyan,
                 icon: Icons.center_focus_strong_outlined,
               ),
@@ -336,7 +368,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
           ),
 
           // Headline + idle caption, anchored just below the ring.
-          if (headline != null && s.phase != FrontCapturePhase.uploading)
+          // Suppressed when the confirmationText banner is active so the two
+          // don't render simultaneously (e.g. "Processing…" pill + "Scanning
+          // fingerprint…" text both visible during the post-burst decode phase).
+          if (headline != null &&
+              s.confirmationText == null &&
+              s.phase != FrontCapturePhase.uploading)
             Positioned(
               left: 24,
               right: 24,
