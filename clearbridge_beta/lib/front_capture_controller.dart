@@ -261,6 +261,18 @@ class FrontCaptureController extends ChangeNotifier {
   // roughly the 2.5-4s sweep window called out in the UX spec.
   static const int _sweepMinShotIntervalMs = 300;
 
+  // Real device-test feedback (2026-07-30): a static guide oval plus an
+  // internal highlight band wasn't enough -- the user reported not seeing
+  // their finger inside the mask and being asked to move, and asked for the
+  // mask itself to move to the side the UX points it to, so the whole
+  // finger stays framed as it sweeps. Fixed by shifting the guide's own
+  // centre (cx) left during sweepPositioning and interpolating it left-to-
+  // right in sync with sweepProgress during sweepActive -- see
+  // _sweepGuideShapeForProgress. 0.10 keeps the guide comfortably on-screen
+  // at both extremes (0.5 ± 0.10, well clear of the guide's own rx=0.1346
+  // half-width from either screen edge).
+  static const double _sweepGuideShiftFrac = 0.10;
+
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
@@ -980,6 +992,29 @@ class FrontCaptureController extends ChangeNotifier {
   // completes. Ends on quota (8 shots), an early right-zone exit once the
   // minimum valid-shot count is already met, or a hard timeout.
 
+  /// The on-screen guide shape for a given sweep progress (0.0 = fully
+  /// left-shifted, 1.0 = fully right-shifted) -- interpolates `cx` linearly,
+  /// everything else copied from `PadSilhouetteShape.defaultShape`. This IS
+  /// "the mask" the 2026-07-30 device-test feedback asked to move: rather
+  /// than a static guide the user's thumb sweeps across (with a separate,
+  /// easy-to-miss highlight band), the guide itself translates across the
+  /// screen so the whole finger stays inside it throughout the sweep.
+  PadSilhouetteShape _sweepGuideShapeForProgress(double progress) {
+    const base = PadSilhouetteShape.defaultShape;
+    final cx = (0.5 - _sweepGuideShiftFrac) +
+        (2 * _sweepGuideShiftFrac) * progress.clamp(0.0, 1.0);
+    return PadSilhouetteShape(
+      cx: cx,
+      cy: base.cy,
+      rx: base.rx,
+      ry: base.ry,
+      n: base.n,
+      taper: base.taper,
+      coreTargetDyFrac: base.coreTargetDyFrac,
+      coreTargetDxFrac: base.coreTargetDxFrac,
+    );
+  }
+
   Future<void> _beginSweepPositioning() async {
     _sweepActivating = false;
     _sweepShotInFlight = false;
@@ -996,9 +1031,44 @@ class FrontCaptureController extends ChangeNotifier {
         sweepProgress: 0.0,
         sweepCentroidX: null,
         sweepFastWarning: false,
+        // Guide shifted fully left -- this IS the "place thumb at the left
+        // edge" target now, not a separate highlight overlay on a static
+        // guide (see _sweepGuideShapeForProgress).
+        activeGuideShape: _sweepGuideShapeForProgress(0.0),
       ),
       force: true,
     );
+  }
+
+  /// Maps the raw CameraImage buffer's own axes into an on-screen
+  /// left(0.0)-to-right(1.0) fraction, for the guided thumb-sweep. Given
+  /// this project's real, already-confirmed `sensorOrientation=90`
+  /// convention (see `_computeGuideRegion`'s "90°-CW rotation" derivation --
+  /// the same class of screen-vs-buffer coordinate fix that took NFIQ2 from
+  /// single digits to 72 for the guideRegion mask), a 90°CW rotation from
+  /// raw sensor space to upright portrait maps the raw buffer's ROW axis to
+  /// the upright image's HORIZONTAL axis, inverted (screen-left = a large
+  /// raw-row fraction, screen-right = a small one) -- NOT the buffer's
+  /// column axis.
+  ///
+  /// Real bug found via a real device test (2026-07-30): the sweep asked
+  /// the user to move their thumb toward an on-screen "left zone"/"sweep
+  /// right" cue, but the original centroid tracking measured the buffer's
+  /// COLUMN axis -- which this rotation actually maps to on-screen VERTICAL
+  /// position, not horizontal. The positioning/sweep gates could never
+  /// reliably resolve against real left-right thumb motion, matching the
+  /// report ("did not see my finger in mask", capture never firing). Same
+  /// standing discipline as everywhere else in this file: reasoned from
+  /// this project's own already-confirmed rotation convention, not device-
+  /// tested yet -- the next real capture's `sweepDebug.centroids` trend
+  /// (now recorded in already-correct screen-space fractions) is the actual
+  /// go/no-go check.
+  double? _sweepScreenXFraction(CameraImage image) {
+    final rowFrac = HybridCaptureService.estimateThumbCentroidX(
+      image, roi: _scoreRoi, alongRows: true,
+    );
+    if (rowFrac == null) return null;
+    return (1.0 - rowFrac).clamp(0.0, 1.0);
   }
 
   void _handleSweepPositioningFrame(CameraImage image) {
@@ -1009,7 +1079,7 @@ class FrontCaptureController extends ChangeNotifier {
 
     double? centroid;
     try {
-      centroid = HybridCaptureService.estimateThumbCentroidX(image, roi: _scoreRoi);
+      centroid = _sweepScreenXFraction(image);
     } catch (_) {}
     _lastCentroidX = centroid ?? _lastCentroidX;
 
@@ -1040,9 +1110,18 @@ class FrontCaptureController extends ChangeNotifier {
       return;
     }
 
-    final fullX = (_scoreRoi.left + startCentroidX * _scoreRoi.width).clamp(0.0, 1.0);
-    final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
-    final pt = Offset(fullX, cy);
+    // startCentroidX is a SCREEN-space left(0)-right(1) fraction (see
+    // _sweepScreenXFraction). setFocusPoint/setExposurePoint expect
+    // coordinates in the raw CameraImage buffer's own space, same
+    // convention _beginAutofocus already uses for _scoreRoi's centre --
+    // convert back through the same 90°CW rotation relationship, landing on
+    // the buffer's ROW axis (inverted), not its column axis. The buffer's
+    // column axis maps to on-screen Y, which the sweep deliberately keeps
+    // fixed at the ROI's own centre ("centre Y fixed" per the sweep spec).
+    final rawBufferX = (_scoreRoi.left + _scoreRoi.right) / 2;
+    final rawBufferY =
+        (_scoreRoi.top + (1.0 - startCentroidX) * _scoreRoi.height).clamp(0.0, 1.0);
+    final pt = Offset(rawBufferX, rawBufferY);
     try {
       await cam.setFocusMode(FocusMode.auto);
       await cam.setFocusPoint(pt);
@@ -1073,9 +1152,13 @@ class FrontCaptureController extends ChangeNotifier {
     _apply(
       (s) => s.copyWith(
         phase: FrontCapturePhase.sweepActive,
-        sweepProgress: startCentroidX.clamp(0.0, 1.0),
+        // Continuous with sweepPositioning's own progress/guide position
+        // (both 0.0, left-shifted) rather than jumping to startCentroidX --
+        // _handleSweepActiveFrame takes over from here on every live frame.
+        sweepProgress: 0.0,
         sweepCentroidX: startCentroidX,
         sweepFastWarning: false,
+        activeGuideShape: _sweepGuideShapeForProgress(0.0),
       ),
       force: true,
     );
@@ -1084,7 +1167,7 @@ class FrontCaptureController extends ChangeNotifier {
   void _handleSweepActiveFrame(CameraImage image) {
     double? centroid;
     try {
-      centroid = HybridCaptureService.estimateThumbCentroidX(image, roi: _scoreRoi);
+      centroid = _sweepScreenXFraction(image);
     } catch (_) {}
     if (centroid != null) _lastCentroidX = centroid;
     final effectiveCentroid = centroid ?? _lastCentroidX;
@@ -1093,10 +1176,15 @@ class FrontCaptureController extends ChangeNotifier {
     // not a second independent value, per "must not change the existing
     // Laplacian gate threshold".
     final sharpnessOk = _focusValue > 0.45;
+    final progress = (effectiveCentroid ?? _state.sweepProgress).clamp(0.0, 1.0);
     _apply((s) => s.copyWith(
           sweepCentroidX: effectiveCentroid,
-          sweepProgress: (effectiveCentroid ?? s.sweepProgress).clamp(0.0, 1.0),
+          sweepProgress: progress,
           sweepFastWarning: !sharpnessOk,
+          // The guide itself tracks the sweep (see _sweepGuideShapeForProgress)
+          // so the whole finger stays framed as it moves, instead of a
+          // static oval the thumb sweeps across.
+          activeGuideShape: _sweepGuideShapeForProgress(progress),
         ));
 
     final capturedCount = _sweepRawShots.length;
@@ -1136,23 +1224,34 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
-  /// Captures one sweep shot. Unlike the static burst (which stops the image
-  /// stream before firing all 8 back-to-back), the sweep deliberately keeps
-  /// `startImageStream` running throughout sweepActive so centroid/sharpness
-  /// tracking continues between shots -- `takePicture()` is called directly
-  /// against the still-streaming controller. The camera plugin's CameraX
-  /// backend is documented to support concurrent ImageAnalysis (stream) +
-  /// ImageCapture (still) use cases, but this specific interleaving (stream
-  /// never stopped across several takePicture() calls spread over a few
-  /// seconds) has not been confirmed on this project's real test devices --
-  /// flagged for the first real-device sweep test, same "not yet
-  /// device-tested" discipline as every other capture-side change here.
+  /// Captures one sweep shot. Stops the image stream before the still
+  /// capture and restarts it immediately after, matching the SAME pattern
+  /// every other still-capture path in this file already uses (the static
+  /// burst, secondary cameras, the detail-zoom burst) -- unlike an earlier
+  /// version of this method, which kept `startImageStream` running
+  /// continuously across every sweep shot so centroid/sharpness tracking
+  /// wouldn't have to pause. That was a real, explicitly-flagged unverified
+  /// assumption (concurrent ImageAnalysis + ImageCapture use), and a real
+  /// device test (2026-07-30) hit an Android ANR ("app isn't responding:
+  /// Close/Wait") consistent with it not being safe on this hardware/plugin
+  /// combination -- this project's own history has repeatedly traced ANRs
+  /// to exactly this class of camera-session contention. Restarting per
+  /// shot costs real, bounded latency (a stream stop/start cycle, up to
+  /// _sweepMinShotIntervalMs's worth of tracking gap) but removes the ANR
+  /// risk category entirely, at the cost of a NEW, also-unverified
+  /// assumption -- that 8 rapid stop/restart cycles are themselves safe on
+  /// real hardware. Flagged for the next real device test same as
+  /// everywhere else in this file; if THIS turns out to be a problem too,
+  /// the next lever is spacing shots further apart, not going back to a
+  /// continuously-running stream.
   Future<void> _fireSweepShot(double? centroidAtFire) async {
     final cam = _camera;
     if (cam == null || _sweepShotInFlight) return;
     _sweepShotInFlight = true;
     _lastSweepShotAt = DateTime.now();
     try {
+      await _stopStream();
+
       final i = _sweepRawShots.length;
       // Same alternation convention as the static burst: even index =
       // ambient (torch off), odd = flash (torch on with negative EV).
@@ -1194,6 +1293,14 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (e) {
       debugPrint('[front] sweep shot failed (non-fatal): $e');
     } finally {
+      if (!_disposed && !_streamRunning) {
+        try {
+          await cam.startImageStream(_onFrame);
+          _streamRunning = true;
+        } catch (e) {
+          debugPrint('[front] sweep stream restart failed (non-fatal): $e');
+        }
+      }
       _sweepShotInFlight = false;
     }
   }
@@ -1204,8 +1311,14 @@ class FrontCaptureController extends ChangeNotifier {
     // actually lands (async gap between the completion check and here).
     if (_state.phase != FrontCapturePhase.sweepActive) return;
     // Immediately move off sweepActive so a concurrent frame callback can't
-    // re-enter this same completion path a second time.
-    _apply((s) => s.copyWith(phase: FrontCapturePhase.capturing), force: true);
+    // re-enter this same completion path a second time. Also resets the
+    // guide back to centered/default -- the rest of the flow (detail-zoom,
+    // secondary cameras) expects the same centered guide the static burst
+    // always used, not wherever the sweep's moving guide last landed.
+    _apply(
+      (s) => s.copyWith(phase: FrontCapturePhase.capturing, activeGuideShape: null),
+      force: true,
+    );
 
     final capturedCount = _sweepRawShots.length;
     final elapsedMs = _sweepActiveStart == null
@@ -1733,10 +1846,11 @@ class FrontCaptureController extends ChangeNotifier {
       final results = await Future.wait(futures.map((f) => f.catchError((_) =>
           (bytes: Uint8List(0), flashOn: false, lap: null as double?, ts: DateTime.now()))));
 
-      // The sweep path never stops the image stream (it needs live frames
-      // for centroid/sharpness tracking throughout sweepActive) -- stop it
-      // now, before any further still captures, matching the invariant the
-      // static path already established via _stopStream() above.
+      // Each sweep shot (_fireSweepShot) already stops/restarts the stream
+      // around its own takePicture() call, so by now it's running again --
+      // stop it here before any further still captures (the detail-zoom
+      // burst below), matching the invariant the static path already
+      // established via _stopStream() above.
       if (preCollectedShots != null) {
         await _stopStream();
       }

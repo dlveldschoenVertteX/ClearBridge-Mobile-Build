@@ -609,22 +609,41 @@ class HybridCaptureService {
   static double ema(double previous, double incoming, {double alpha = 0.3}) =>
       alpha * incoming + (1 - alpha) * previous;
 
-  /// Intensity-weighted horizontal centroid of whatever's in [roi], for the
-  /// guided left-right thumb-sweep capture (diagnostic-first -- see
-  /// FrontCaptureController's sweepPositioning/sweepActive phases). No
-  /// optical flow, no tracker state carried between calls -- per the sweep
-  /// spec's own explicit design choice, a simple per-frame brightness-
-  /// weighted centroid within the existing guide bounds is sufficient,
-  /// since under torch/ambient light the thumb pad reads meaningfully
-  /// brighter than the background it sweeps across. Same stride-safe,
-  /// subsampled-scan pattern as [meanLuma]/[_measureBrightness] above.
+  /// Intensity-weighted centroid of whatever's in [roi], along either the
+  /// raw buffer's column axis ([alongRows] false, the default) or its row
+  /// axis ([alongRows] true), for the guided left-right thumb-sweep capture
+  /// (diagnostic-first -- see FrontCaptureController's sweepPositioning/
+  /// sweepActive phases). No optical flow, no tracker state carried between
+  /// calls -- per the sweep spec's own explicit design choice, a simple
+  /// per-frame brightness-weighted centroid within the existing guide
+  /// bounds is sufficient, since under torch/ambient light the thumb pad
+  /// reads meaningfully brighter than the background it sweeps across. Same
+  /// stride-safe, subsampled-scan pattern as [meanLuma]/[_measureBrightness]
+  /// above.
   ///
-  /// Returns the brightness-weighted mean X position within [roi],
-  /// normalized 0.0 ([roi]'s left edge) to 1.0 ([roi]'s right edge). Returns
-  /// null when the ROI has no usable signal (zero total brightness) rather
-  /// than a fabricated fallback -- same "null over a wrong-but-plausible
-  /// number" discipline as [estimateRidgeWavelengthPx].
-  static double? estimateThumbCentroidX(CameraImage image, {required Rect roi}) {
+  /// [alongRows] exists because this raw CameraImage buffer is delivered in
+  /// the sensor's native (unrotated) orientation -- unlike the still-JPEG
+  /// path (`decodeStillJpegToLuma`) or the live preview widget
+  /// (`CameraPreview`), which both apply their own rotation before this
+  /// buffer's axes would visually match on-screen left/right. For a typical
+  /// back camera with `sensorOrientation=90` (this project's real, already-
+  /// confirmed convention -- see `_computeGuideRegion`'s "90°-CW rotation"),
+  /// the raw buffer's ROW axis is the one that ends up mapped to on-screen
+  /// HORIZONTAL after that rotation, not its column axis. The caller is
+  /// responsible for both picking the right axis for what it's trying to
+  /// measure on screen, and for any sign flip the rotation direction
+  /// implies (see FrontCaptureController's `_sweepScreenXFraction`).
+  ///
+  /// Returns the brightness-weighted mean position along the selected axis
+  /// within [roi], normalized 0.0 (the axis's start edge) to 1.0 (its end
+  /// edge). Returns null when the ROI has no usable signal (zero total
+  /// brightness) rather than a fabricated fallback -- same "null over a
+  /// wrong-but-plausible number" discipline as [estimateRidgeWavelengthPx].
+  static double? estimateThumbCentroidX(
+    CameraImage image, {
+    required Rect roi,
+    bool alongRows = false,
+  }) {
     if (image.planes.isEmpty) return null;
     final plane = image.planes[0];
     final bytes = plane.bytes;
@@ -643,6 +662,19 @@ class HybridCaptureService {
     const step = 4; // subsample -- same cost-control convention as meanLuma (step 8)
     var weightedSum = 0.0;
     var totalWeight = 0.0;
+    if (alongRows) {
+      for (var yy = y0; yy < y1; yy += step) {
+        final row = yy * stride;
+        for (var xx = x0; xx < x1; xx += step) {
+          final v = bytes[row + xx].toDouble();
+          weightedSum += v * yy;
+          totalWeight += v;
+        }
+      }
+      if (totalWeight <= 0) return null;
+      final centroidYPx = weightedSum / totalWeight;
+      return ((centroidYPx - y0) / (y1 - y0)).clamp(0.0, 1.0);
+    }
     for (var yy = y0; yy < y1; yy += step) {
       final row = yy * stride;
       for (var xx = x0; xx < x1; xx += step) {

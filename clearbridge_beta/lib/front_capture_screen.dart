@@ -295,25 +295,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               child: _CaptureProgressRing(progress: ringProgress, color: ringColor),
             ),
 
-          // Sweep Step 1: soft band over the guide's left portion, showing
-          // where to position the thumb before the sweep starts. Cleared
-          // the moment sweepActive begins.
-          if (s.phase == FrontCapturePhase.sweepPositioning)
-            Positioned(
-              left: ringLeft,
-              top: ringTop,
-              width: ringD * 0.3,
-              height: ringD,
-              child: IgnorePointer(
-                child: Container(
-                  decoration: BoxDecoration(
-                    borderRadius: BorderRadius.horizontal(left: Radius.circular(ringD / 2)),
-                    border: Border.all(color: CaptureColors.cyan.withValues(alpha: 0.55), width: 2),
-                    color: CaptureColors.cyan.withValues(alpha: 0.10),
-                  ),
-                ),
-              ),
-            ),
+          // Sweep Step 1 (positioning) needs no separate highlight overlay --
+          // the guide silhouette itself shifts left via activeGuideShape
+          // (see FrontCaptureController._sweepGuideShapeForProgress), a real
+          // fix from 2026-07-30 device-test feedback that a static guide +
+          // internal highlight band left the user unable to tell where
+          // their thumb actually needed to be.
 
           // Sweep Step 2: horizontal progress bar + moving centroid-tracking
           // highlight beneath the guide. Replaces the need for mid-sweep text
