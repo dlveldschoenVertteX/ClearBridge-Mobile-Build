@@ -164,15 +164,20 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
     return float(np.clip(np.median(freqs), 5, 20))
 
 
-def _gabor_enhance(img: np.ndarray, orient: np.ndarray, wavelength: float) -> np.ndarray:
+def _gabor_enhance(
+    img: np.ndarray, orient: np.ndarray, wavelength: float,
+    *,
+    sigma_ratio: float = _GABOR_SIGMA_RATIO,
+    gamma: float = _GABOR_GAMMA,
+) -> np.ndarray:
     h, w = img.shape
-    sigma = _GABOR_SIGMA_RATIO * wavelength
+    sigma = sigma_ratio * wavelength
     ksize = int(2 * np.ceil(3 * sigma) + 1)
     outs = np.zeros((_N_ORIENT, h, w), np.float32)
     for i in range(_N_ORIENT):
         th = np.pi * i / _N_ORIENT
         k = cv2.getGaborKernel((ksize, ksize), sigma, th + np.pi / 2,
-                               wavelength, _GABOR_GAMMA, 0, cv2.CV_32F)
+                               wavelength, gamma, 0, cv2.CV_32F)
         k -= k.mean()
         outs[i] = cv2.filter2D(img, cv2.CV_32F, k)
     idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
@@ -1267,6 +1272,8 @@ def generate(
     enhance: str = 'gabor',
     stack_cache: Optional[dict] = None,
     geom: Optional[str] = None,
+    gabor_sigma_ratio: Optional[float] = None,
+    gabor_gamma: Optional[float] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -1830,7 +1837,12 @@ def generate(
         # fail).
         norm = _normalize(g8)
         orient = _orientation_field(norm)
-        enh = _gabor_enhance(norm, orient, wl)
+        enh = _gabor_enhance(
+            norm, orient, wl,
+            sigma_ratio=(gabor_sigma_ratio if gabor_sigma_ratio is not None
+                         else _GABOR_SIGMA_RATIO),
+            gamma=(gabor_gamma if gabor_gamma is not None else _GABOR_GAMMA),
+        )
         binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
         params.setdefault('afisEnhance', 'gabor')
 

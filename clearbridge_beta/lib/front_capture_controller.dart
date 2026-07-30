@@ -476,6 +476,30 @@ class FrontCaptureController extends ChangeNotifier {
   // collapses (real captures: nfiq2=10, nfiq2=6 at 2.05x).
   static const double _maxZoomFill = 1.3;
 
+  // Two-tier adaptive zoom burst (2026-07-30, Phase 0 -- diagnostic-only on
+  // the backend side). After the main 8-shot burst is safely captured and
+  // encoded, fires a short SECOND burst at a fixed higher zoom targeting the
+  // pad's CENTER -- the whorl core, typically the highest-topology and
+  // hardest-to-reconstruct region of the superprint. Deliberately different
+  // from zoom-to-fill above: that only ever compensates for under-framing at
+  // the SAME working distance; this trades FOV for pixel density on the
+  // assumption the main burst already secured the full-pad context shot, so
+  // a failure or user movement during this second burst can only ever cost
+  // these extra frames, never the already-encoded main burst. CameraX has no
+  // pan control, so this always targets frame CENTER, not a specific weak
+  // spot -- see the spec's Phase 2 for why an off-center sweep needs a
+  // native Camera2 SCALER_CROP_REGION lift instead.
+  static const double _detailZoomLevel = 2.0;
+  static const int _detailZoomSettleMs = 400;
+  // ambient, flash, ambient -- same alternation convention as the main
+  // burst, just 3 shots since this is a supplementary detail pass, not a
+  // replacement candidate set.
+  static const int _detailBurstCount = 3;
+  final List<Uint8List> _detailFrames = [];
+  final List<bool> _detailFramesFlash = [];
+  bool _detailBurstFired = false;
+  double? _detailZoomAppliedLevel;
+
   // Live ridge-wavelength estimate (2026-07-26, Phase 0 -- diagnostic-only,
   // does NOT drive distanceHint yet). Reconciling "closer for detail" with
   // "far enough for good pixel wavelength" (see _maxZoomFill's own comment
@@ -543,6 +567,10 @@ class FrontCaptureController extends ChangeNotifier {
     _maxZoomLevel = 1.0;
     _underfillStreak = 0;
     _zoomEverApplied = false;
+    _detailFrames.clear();
+    _detailFramesFlash.clear();
+    _detailBurstFired = false;
+    _detailZoomAppliedLevel = null;
     try {
       _maxZoomLevel = (await camera.getMaxZoomLevel()).clamp(1.0, _maxZoomFill);
     } catch (_) {}
@@ -1000,6 +1028,110 @@ class FrontCaptureController extends ChangeNotifier {
     return false;
   }
 
+  /// Supplementary detail burst fired AFTER the main 8-shot burst is already
+  /// safely captured and encoded (see the call site in _fireBurst) -- zooms
+  /// in on frame CENTER (CameraX has no pan control) at a fixed higher zoom
+  /// level to trade FOV for pixel density on the pad's most topologically
+  /// complex region, the whorl core. Best-effort throughout: any failure
+  /// here (zoom rejected, a shot fails, decode fails) only ever costs these
+  /// extra frames -- `_detailFrames` may end up shorter than
+  /// `_detailBurstCount` or even empty, which the backend treats as "no
+  /// detail candidate available" rather than an error.
+  ///
+  /// Reuses the main burst's own flash/EV plumbing (`_flash`, the same
+  /// `flashEvStep` computed once per burst in `_fireBurst`) rather than
+  /// re-deriving it, so the detail shots get the same adaptive exposure
+  /// correction the main burst's flash frames already do.
+  Future<void> _fireDetailBurst(
+    CameraController cam, {
+    required bool torchCapable,
+    required double flashEvStep,
+    double? minEv,
+    double? maxEv,
+  }) async {
+    _detailFrames.clear();
+    _detailFramesFlash.clear();
+    _detailZoomAppliedLevel = null;
+
+    // Device max zoom may be below the nominal _detailZoomLevel -- query the
+    // TRUE hardware ceiling here rather than reusing _maxZoomLevel, which is
+    // deliberately capped at _maxZoomFill (1.3x) for the unrelated zoom-to-
+    // fill feature above and would otherwise prevent ever reaching 2x.
+    var target = _detailZoomLevel;
+    try {
+      final deviceMax = await cam.getMaxZoomLevel();
+      target = _detailZoomLevel.clamp(1.0, deviceMax);
+    } catch (_) {}
+
+    try {
+      await cam.setZoomLevel(target).timeout(const Duration(seconds: 3));
+      _detailZoomAppliedLevel = target;
+    } catch (e) {
+      debugPrint('[front] detail-zoom setZoomLevel failed (non-fatal): $e');
+      return;
+    }
+    await Future<void>.delayed(const Duration(milliseconds: _detailZoomSettleMs));
+
+    _apply(
+      (s) => s.copyWith(confirmationText: 'Hold still — capturing detail…'),
+      force: true,
+    );
+
+    try {
+      for (var i = 0; i < _detailBurstCount; i++) {
+        final wantFlash = torchCapable && i.isOdd; // ambient, flash, ambient
+        try {
+          if (wantFlash) {
+            await _flash!.activate();
+            if (minEv != null && maxEv != null) {
+              await cam.setExposureOffset(
+                  (_appliedEvOffset + flashEvStep).clamp(minEv, maxEv));
+            }
+            await Future<void>.delayed(
+                const Duration(milliseconds: _burstFlashSettleMs));
+          } else {
+            await _flash?.deactivate();
+            if (minEv != null && maxEv != null) {
+              await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+            }
+          }
+        } catch (_) {}
+        try {
+          final xfile = await cam.takePicture();
+          final jpeg = await xfile.readAsBytes();
+          final decoded = await decodeStillJpegToLuma(
+            jpeg, _sensorOrientation,
+            targetWidth: _stillDecodeTargetWidth,
+          );
+          if (decoded != null) {
+            final encoded = await compute(
+              _encodeBurstIsolate,
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+            );
+            _detailFrames.add(encoded);
+            _detailFramesFlash.add(wantFlash);
+          }
+        } catch (e) {
+          debugPrint('[front] detail-zoom shot $i failed (non-fatal): $e');
+        }
+      }
+    } finally {
+      try {
+        await _flash?.deactivate();
+        if (minEv != null && maxEv != null) {
+          await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+        }
+      } catch (_) {}
+      // Always reset zoom regardless of how many shots succeeded -- secondary
+      // cameras and the rest of the flow assume 1x.
+      try {
+        await cam.setZoomLevel(1.0).timeout(const Duration(seconds: 3));
+      } catch (_) {}
+      _detailBurstFired = true;
+      _apply((s) => s.copyWith(confirmationText: null), force: true);
+    }
+  }
+
   static double _lumaSharpness(Uint8List luma, int w, int h) {
     if (w < 8 || h < 8 || luma.length < w * h) return 0.0;
     final x0 = w ~/ 4, x1 = 3 * w ~/ 4;
@@ -1191,6 +1323,22 @@ class FrontCaptureController extends ChangeNotifier {
       final results = await Future.wait(futures.map((f) => f.catchError((_) =>
           (bytes: Uint8List(0), flashOn: false, lap: null as double?, ts: DateTime.now()))));
 
+      // Two-tier adaptive zoom (Phase 0, diagnostic-only backend-side): the
+      // main burst above is now safely captured and encoded, so a
+      // supplementary higher-zoom detail pass on the pad center can only
+      // ever add a candidate, never jeopardise what's already secured.
+      try {
+        await _fireDetailBurst(
+          cam,
+          torchCapable: torchCapable,
+          flashEvStep: flashEvStep,
+          minEv: minEv,
+          maxEv: maxEv,
+        );
+      } catch (e) {
+        debugPrint('[front] detail-zoom burst failed entirely (non-fatal): $e');
+      }
+
       HapticFeedback.heavyImpact();
       unawaited(_audio.playAngleSuccess(isFinal: true));
       _apply(
@@ -1264,6 +1412,16 @@ class FrontCaptureController extends ChangeNotifier {
           if (s.lap != null) 'laplacianScore': double.parse(s.lap!.toStringAsFixed(1)),
           'timestamp': s.ts.toIso8601String(),
         });
+      }
+
+      // Detail-zoom frames upload alongside the main burst -- same
+      // concurrency batching below, just tagged with their own filename
+      // convention so the backend can distinguish them from the main burst.
+      final detailPaths = <String>[];
+      for (var i = 0; i < _detailFrames.length; i++) {
+        final path = '$basePath/detail_zoom_$i.jpg';
+        uploadTasks.add((_detailFrames[i], path));
+        detailPaths.add(path);
       }
 
       final rawSensorSupport = await _queryRawSensorSupport();
@@ -1595,6 +1753,13 @@ class FrontCaptureController extends ChangeNotifier {
           'finalZoomLevel': double.parse(_zoomLevel.toStringAsFixed(3)),
           'maxZoomLevel': double.parse(_maxZoomLevel.toStringAsFixed(3)),
         },
+        'detailZoomCapture': {
+          'paths': detailPaths,
+          'zoomLevel': _detailZoomAppliedLevel,
+          'shotCount': _detailFrames.length,
+          'fired': _detailBurstFired,
+          'flashFlags': _detailFramesFlash,
+        },
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
@@ -1770,7 +1935,7 @@ class FrontCaptureController extends ChangeNotifier {
     // a sequential loop) so the underlying platform decoder can overlap
     // work across shots, same as the main burst's own decode/encode block.
     final encoded = await Future.wait(List.generate(shotCount, (i) async {
-      stageDebug['shot_${i}_encodeStage'] = 'encoding';
+      final encodeStart = DateTime.now();
       var bytes = rawShots[i];
       try {
         final decoded = await decodeStillJpegToLuma(
@@ -1784,6 +1949,9 @@ class FrontCaptureController extends ChangeNotifier {
           );
         }
       } catch (_) {}
+      stageDebug['shot_${i}_encodeMs'] =
+          DateTime.now().difference(encodeStart).inMilliseconds;
+      stageDebug['shot_${i}_encodedBytes'] = bytes.length;
       return bytes;
     }));
 
