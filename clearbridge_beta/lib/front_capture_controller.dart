@@ -268,10 +268,14 @@ class FrontCaptureController extends ChangeNotifier {
   // finger stays framed as it sweeps. Fixed by shifting the guide's own
   // centre (cx) left during sweepPositioning and interpolating it left-to-
   // right in sync with sweepProgress during sweepActive -- see
-  // _sweepGuideShapeForProgress. 0.10 keeps the guide comfortably on-screen
-  // at both extremes (0.5 ± 0.10, well clear of the guide's own rx=0.1346
-  // half-width from either screen edge).
-  static const double _sweepGuideShiftFrac = 0.10;
+  // _sweepGuideShapeForProgress. Round 2 feedback: "needs more distance...
+  // a little further" -- raised 0.10 -> 0.15 (0.5 ± 0.15, still comfortably
+  // clear of the guide's own rx=0.1346 half-width from either screen edge).
+  // Kept deliberately short of _sweepTrackingRoi's own margin below so the
+  // fire-gate's sharpness measurement (still scoped to the narrower,
+  // already-proven _scoreRoi, not widened this round) has a real chance of
+  // resolving near both extremes, not just the centre.
+  static const double _sweepGuideShiftFrac = 0.15;
 
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
@@ -377,6 +381,28 @@ class FrontCaptureController extends ChangeNotifier {
   //   cx=0.5, cy=0.37, rx=0.134604*(1+0.20)=0.161525, ry=0.111195
   //   -> [0.338475,0.258805,0.661525,0.481195]
   static const Rect _scoreRoi = Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
+
+  // Wider row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
+  // window used ONLY by the guided sweep's own centroid tracking -- _scoreRoi
+  // itself (feeding the static hold's focus/brightness/coverage signal via
+  // _onFrame's unconditional _hybrid.offerFrame/meanLuma calls) stays
+  // completely untouched, so this can't regress that already-proven flow.
+  // Real device-test feedback (2026-07-30 round 2): "needs more distance for
+  // the left and right mask movement" -- _scoreRoi's own row span (0.2224)
+  // was tuned for the STATIC hold's much narrower, centred target, not a
+  // thumb sweeping across a wide guide-shift range. Widened 1.8x (top/bottom
+  // only -- left/right, which maps to on-screen Y, is unchanged, matching
+  // "centre Y fixed") to give the centroid tracker real physical room to
+  // keep following the thumb across the wider sweep. Deliberately NOT
+  // applied to the fire-gate's sharpness check (_focusValue, still computed
+  // over _scoreRoi) -- widening that too risks picking up background
+  // texture as false "sharp" signal, an unvalidated regression risk on an
+  // already-proven signal. Honest limitation: shots may still cluster
+  // toward the centre of the sweep, where _scoreRoi and this wider window
+  // overlap, rather than firing right at the guide's shifted extremes --
+  // the next real capture's sweepDebug.centroids trend is the actual
+  // evidence for whether this needs to go further.
+  static const Rect _sweepTrackingRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1038,6 +1064,45 @@ class FrontCaptureController extends ChangeNotifier {
       ),
       force: true,
     );
+    // Real device-test finding (2026-07-30 round 2): "focus is not locked
+    // on the thumb but rather on the background". Root cause: focus was
+    // locked (FocusMode.locked) at the ORIGINAL static hold's centred point
+    // (set once by the hold phase's own _refocus(), before this sweep flow
+    // even existed) and nothing here ever re-aimed it -- so once the guide
+    // shifted left and the user actually moved their thumb to match, the
+    // lens stayed pointed at whatever background was now exposed at the
+    // OLD centred spot. This very likely also explains "capture never
+    // initiates": with the lens focused on the wall, the thumb itself reads
+    // soft in _scoreRoi, so _focusValue's Laplacian score can't clear the
+    // 0.45 fire-gate threshold no matter how well the user positions their
+    // thumb. Fix: continuous (not locked) autofocus re-aimed at the
+    // shifted guide's actual position for the whole positioning phase, so
+    // the lens is already converging on the right spot before the user's
+    // thumb gets there -- _beginSweepActive's existing settle+lock cycle
+    // then takes over once positioning resolves.
+    unawaited(_refocusForSweepPositioning());
+  }
+
+  /// Re-aims CONTINUOUS autofocus (not locked) at the sweep-positioning
+  /// guide's actual on-screen position -- see the real-bug note in
+  /// _beginSweepPositioning above. Uses the same _sweepTrackingRoi-relative
+  /// inverse transform as _beginSweepActive's own re-aim, evaluated at
+  /// progress=0.0 (the guide's fully-left-shifted cx) since the guide
+  /// doesn't move further during positioning itself.
+  Future<void> _refocusForSweepPositioning() async {
+    final cam = _camera;
+    if (cam == null) return;
+    final targetScreenX = _sweepGuideShapeForProgress(0.0).cx;
+    final rawBufferX = (_sweepTrackingRoi.left + _sweepTrackingRoi.right) / 2;
+    final rawBufferY = (_sweepTrackingRoi.top +
+            (1.0 - targetScreenX) * _sweepTrackingRoi.height)
+        .clamp(0.0, 1.0);
+    final pt = Offset(rawBufferX, rawBufferY);
+    try {
+      await cam.setFocusMode(FocusMode.auto);
+      await cam.setFocusPoint(pt);
+      await cam.setExposurePoint(pt);
+    } catch (_) {}
   }
 
   /// Maps the raw CameraImage buffer's own axes into an on-screen
@@ -1063,9 +1128,13 @@ class FrontCaptureController extends ChangeNotifier {
   /// tested yet -- the next real capture's `sweepDebug.centroids` trend
   /// (now recorded in already-correct screen-space fractions) is the actual
   /// go/no-go check.
+  ///
+  /// Uses `_sweepTrackingRoi` (wider than `_scoreRoi`, row axis only --
+  /// see its own docs) so the tracker has real room to follow the thumb
+  /// across the sweep's widened guide-shift range.
   double? _sweepScreenXFraction(CameraImage image) {
     final rowFrac = HybridCaptureService.estimateThumbCentroidX(
-      image, roi: _scoreRoi, alongRows: true,
+      image, roi: _sweepTrackingRoi, alongRows: true,
     );
     if (rowFrac == null) return null;
     return (1.0 - rowFrac).clamp(0.0, 1.0);
@@ -1118,9 +1187,13 @@ class FrontCaptureController extends ChangeNotifier {
     // the buffer's ROW axis (inverted), not its column axis. The buffer's
     // column axis maps to on-screen Y, which the sweep deliberately keeps
     // fixed at the ROI's own centre ("centre Y fixed" per the sweep spec).
-    final rawBufferX = (_scoreRoi.left + _scoreRoi.right) / 2;
-    final rawBufferY =
-        (_scoreRoi.top + (1.0 - startCentroidX) * _scoreRoi.height).clamp(0.0, 1.0);
+    // _sweepTrackingRoi, not _scoreRoi -- must match whatever ROI
+    // _sweepScreenXFraction used to produce startCentroidX in the first
+    // place, or this inverse transform lands on the wrong point.
+    final rawBufferX = (_sweepTrackingRoi.left + _sweepTrackingRoi.right) / 2;
+    final rawBufferY = (_sweepTrackingRoi.top +
+            (1.0 - startCentroidX) * _sweepTrackingRoi.height)
+        .clamp(0.0, 1.0);
     final pt = Offset(rawBufferX, rawBufferY);
     try {
       await cam.setFocusMode(FocusMode.auto);
@@ -1290,6 +1363,14 @@ class FrontCaptureController extends ChangeNotifier {
         timestamp: DateTime.now(),
       ));
       _sweepCentroids.add(centroidAtFire);
+      // Immediate per-shot feedback -- real device-test feedback (2026-07-30
+      // round 2): "I can't hear or see anything fire". The static burst only
+      // confirms once at the very end (all 8 shots); the sweep's shots are
+      // spread over several seconds of active user motion, so a light tick
+      // per shot (distinct from the final heavyImpact success pattern in
+      // _fireBurst) gives real-time confirmation instead of total silence
+      // until the whole sweep resolves.
+      unawaited(HapticFeedback.selectionClick());
     } catch (e) {
       debugPrint('[front] sweep shot failed (non-fatal): $e');
     } finally {
