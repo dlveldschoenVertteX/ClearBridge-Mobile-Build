@@ -139,13 +139,18 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     if (s.phase == FrontCapturePhase.capturingExtra) {
       return (s.extraProgress, CaptureColors.gold);
     }
+    // Both sweep phases fill the same ring the classic static burst always
+    // used (silver, s.burstProgress) -- real device-test feedback
+    // (2026-07-30 round 4): the ring should "fill with progress just like
+    // the original UI", not sit empty during positioning or switch to a
+    // different colour during the active sweep. The horizontal sweep bar
+    // and headline text already carry the fast/slow signal separately, so
+    // the ring doesn't need to double as that indicator too.
+    if (s.phase == FrontCapturePhase.sweepPositioning) {
+      return (s.sweepDwellProgress, CaptureColors.silverBright);
+    }
     if (s.phase == FrontCapturePhase.sweepActive) {
-      // Orange while too blurry to fire (mirrors the tracking highlight
-      // below), green once the current frame clears the sharpness gate.
-      return (
-        s.sweepProgress,
-        s.sweepFastWarning ? CaptureColors.warning : CaptureColors.success,
-      );
+      return (s.sweepProgress, CaptureColors.silverBright);
     }
     if (s.phase == FrontCapturePhase.complete) return (1.0, CaptureColors.success);
     if (s.phase == FrontCapturePhase.holding && s.onTarget) {

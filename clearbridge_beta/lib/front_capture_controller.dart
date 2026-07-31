@@ -63,6 +63,7 @@ class FrontCaptureState {
     this.sweepCentroidX,
     this.sweepFastWarning = false,
     this.sweepPositionOk = false,
+    this.sweepDwellProgress = 0.0,
   });
 
   final FrontCapturePhase phase;
@@ -88,6 +89,12 @@ class FrontCaptureState {
   // identical to a working-but-slow one ("just static"). Drives a text/
   // colour change in the UI so detection is visibly happening.
   final bool sweepPositionOk;
+  // Fraction (0..1) of the left-zone dwell timer elapsed during
+  // sweepPositioning -- drives the outer progress ring so it fills (silver,
+  // matching the classic burst-progress look) as soon as the thumb reaches
+  // the left zone, instead of sitting empty the whole time positioning is
+  // in progress.
+  final double sweepDwellProgress;
   // Fraction of the main burst fired so far (0..1) -- drives the pad-guide
   // fill animation during FrontCapturePhase.capturing, same "fills up as
   // capture progresses" cue the oscillating dial's scan-fill arc already
@@ -137,6 +144,7 @@ class FrontCaptureState {
     Object? sweepCentroidX = _sentinel,
     bool? sweepFastWarning,
     bool? sweepPositionOk,
+    double? sweepDwellProgress,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -164,6 +172,7 @@ class FrontCaptureState {
             : sweepCentroidX as double?,
         sweepFastWarning: sweepFastWarning ?? this.sweepFastWarning,
         sweepPositionOk: sweepPositionOk ?? this.sweepPositionOk,
+        sweepDwellProgress: sweepDwellProgress ?? this.sweepDwellProgress,
       );
 }
 
@@ -1084,6 +1093,7 @@ class FrontCaptureController extends ChangeNotifier {
         sweepCentroidX: null,
         sweepFastWarning: false,
         sweepPositionOk: false,
+        sweepDwellProgress: 0.0,
         // Guide shifted fully left -- this IS the "place thumb at the left
         // edge" target now, not a separate highlight overlay on a static
         // guide (see _sweepGuideShapeForProgress).
@@ -1180,9 +1190,11 @@ class FrontCaptureController extends ChangeNotifier {
     _lastCentroidX = centroid ?? _lastCentroidX;
 
     final inLeftZone = centroid != null && centroid <= _sweepLeftZoneMax;
+    var dwellProgress = 0.0;
     if (inLeftZone) {
       _sweepLeftDwellStart ??= DateTime.now();
       final dwelledMs = DateTime.now().difference(_sweepLeftDwellStart!).inMilliseconds;
+      dwellProgress = (dwelledMs / _sweepLeftDwellMs).clamp(0.0, 1.0);
       if (dwelledMs >= _sweepLeftDwellMs) {
         _sweepActivating = true;
         unawaited(_beginSweepActive(centroid!));
@@ -1195,6 +1207,7 @@ class FrontCaptureController extends ChangeNotifier {
           sweepCentroidX: centroid,
           sweepProgress: 0.0,
           sweepPositionOk: inLeftZone,
+          sweepDwellProgress: dwellProgress,
         ));
   }
 
