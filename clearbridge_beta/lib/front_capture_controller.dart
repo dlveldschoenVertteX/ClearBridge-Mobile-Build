@@ -62,6 +62,7 @@ class FrontCaptureState {
     this.sweepProgress = 0.0,
     this.sweepCentroidX,
     this.sweepFastWarning = false,
+    this.sweepPositionOk = false,
   });
 
   final FrontCapturePhase phase;
@@ -80,6 +81,13 @@ class FrontCaptureState {
   // threshold during sweepActive -- drives the highlight's orange
   // "moving too fast" state (green otherwise).
   final bool sweepFastWarning;
+  // True during sweepPositioning once the thumb's centroid is actually
+  // inside the left zone (dwelling, about to transition to sweepActive) --
+  // real device-test feedback (2026-07-30 round 3): with no visible signal
+  // that positioning was even being evaluated, a stuck sweep looked
+  // identical to a working-but-slow one ("just static"). Drives a text/
+  // colour change in the UI so detection is visibly happening.
+  final bool sweepPositionOk;
   // Fraction of the main burst fired so far (0..1) -- drives the pad-guide
   // fill animation during FrontCapturePhase.capturing, same "fills up as
   // capture progresses" cue the oscillating dial's scan-fill arc already
@@ -128,6 +136,7 @@ class FrontCaptureState {
     double? sweepProgress,
     Object? sweepCentroidX = _sentinel,
     bool? sweepFastWarning,
+    bool? sweepPositionOk,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -154,6 +163,7 @@ class FrontCaptureState {
             ? this.sweepCentroidX
             : sweepCentroidX as double?,
         sweepFastWarning: sweepFastWarning ?? this.sweepFastWarning,
+        sweepPositionOk: sweepPositionOk ?? this.sweepPositionOk,
       );
 }
 
@@ -246,8 +256,20 @@ class FrontCaptureController extends ChangeNotifier {
   // upload) are UNCHANGED -- only the trigger/pacing of individual shots is
   // new. See _beginSweepPositioning/_handleSweepPositioningFrame/
   // _beginSweepActive/_handleSweepActiveFrame/_fireSweepShot/_completeSweep.
-  static const double _sweepLeftZoneMax = 0.25;
-  static const double _sweepRightZoneMin = 0.75;
+  // Loosened 0.25/0.75 -> 0.32/0.68 (2026-07-30 round 3): a real device test
+  // showed the thumb correctly, visibly seated in the shifted guide never
+  // registered as "left zone" (positioning stuck indefinitely). The main fix
+  // was reverting an unrelated tracking-window widening that had compressed
+  // every reading toward 0.5 (see _sweepTrackingRoi's own note) -- this
+  // extra margin is a deliberate, honest hedge on top of that fix: the exact
+  // raw-buffer-to-screen scale was never independently, precisely calibrated
+  // (only reasoned from this project's known 90° rotation convention), so a
+  // more forgiving threshold is safer than an exact-but-possibly-still-off
+  // one. Worse case if this is now too loose: the sweep resolves a little
+  // early -- far better than the confirmed real failure mode of never
+  // resolving at all.
+  static const double _sweepLeftZoneMax = 0.32;
+  static const double _sweepRightZoneMin = 0.68;
   static const int _sweepLeftDwellMs = 400;
   // Hard bound on the whole sweepActive window -- the UX target pace is
   // 2.5-4s (fast enough to feel natural, slow enough that 8 qualifying
@@ -382,27 +404,31 @@ class FrontCaptureController extends ChangeNotifier {
   //   -> [0.338475,0.258805,0.661525,0.481195]
   static const Rect _scoreRoi = Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
-  // Wider row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
-  // window used ONLY by the guided sweep's own centroid tracking -- _scoreRoi
-  // itself (feeding the static hold's focus/brightness/coverage signal via
-  // _onFrame's unconditional _hybrid.offerFrame/meanLuma calls) stays
-  // completely untouched, so this can't regress that already-proven flow.
-  // Real device-test feedback (2026-07-30 round 2): "needs more distance for
-  // the left and right mask movement" -- _scoreRoi's own row span (0.2224)
-  // was tuned for the STATIC hold's much narrower, centred target, not a
-  // thumb sweeping across a wide guide-shift range. Widened 1.8x (top/bottom
-  // only -- left/right, which maps to on-screen Y, is unchanged, matching
-  // "centre Y fixed") to give the centroid tracker real physical room to
-  // keep following the thumb across the wider sweep. Deliberately NOT
-  // applied to the fire-gate's sharpness check (_focusValue, still computed
-  // over _scoreRoi) -- widening that too risks picking up background
-  // texture as false "sharp" signal, an unvalidated regression risk on an
-  // already-proven signal. Honest limitation: shots may still cluster
-  // toward the centre of the sweep, where _scoreRoi and this wider window
-  // overlap, rather than firing right at the guide's shifted extremes --
-  // the next real capture's sweepDebug.centroids trend is the actual
-  // evidence for whether this needs to go further.
-  static const Rect _sweepTrackingRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
+  // Row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
+  // window used by the guided sweep's own centroid tracking and focus
+  // re-aim. Named separately from _scoreRoi (which stays completely
+  // untouched, still feeding the static hold's focus/brightness/coverage
+  // signal) purely for clarity about which code depends on it.
+  //
+  // REAL MATH ERROR, found + reverted 2026-07-30 round 3: an earlier
+  // version of this widened the row span 1.8x, reasoning the tracker
+  // "needed more room" to follow the thumb across the wider guide-shift
+  // range (_sweepGuideShiftFrac). That reasoning was backwards -- the
+  // centroid fraction is normalized by DIVIDING by this window's own
+  // height, so a WIDER window makes the SAME physical thumb displacement
+  // produce a LESS extreme (closer to 0.5) normalized value, making the
+  // 0.25/0.75 zone thresholds HARDER to reach, not easier. A real device
+  // test (round 3) confirmed the symptom this predicts: focus now locks on
+  // the thumb correctly (validating the underlying rotation/axis math is
+  // right), but sweepPositioning never progressed past "place thumb at the
+  // left edge" even with the thumb visibly, correctly seated in the
+  // shifted guide -- consistent with the widened window compressing every
+  // real reading toward the middle, below the zone threshold. Reverted to
+  // exactly _scoreRoi's own span (a value already implicitly proven
+  // reasonably well-scaled by months of real static-hold captures, even
+  // though it was never explicitly validated for lateral tracking) rather
+  // than guessing a new width without real data.
+  static const Rect _sweepTrackingRoi = _scoreRoi;
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1057,6 +1083,7 @@ class FrontCaptureController extends ChangeNotifier {
         sweepProgress: 0.0,
         sweepCentroidX: null,
         sweepFastWarning: false,
+        sweepPositionOk: false,
         // Guide shifted fully left -- this IS the "place thumb at the left
         // edge" target now, not a separate highlight overlay on a static
         // guide (see _sweepGuideShapeForProgress).
@@ -1164,7 +1191,11 @@ class FrontCaptureController extends ChangeNotifier {
     } else {
       _sweepLeftDwellStart = null;
     }
-    _apply((s) => s.copyWith(sweepCentroidX: centroid, sweepProgress: 0.0));
+    _apply((s) => s.copyWith(
+          sweepCentroidX: centroid,
+          sweepProgress: 0.0,
+          sweepPositionOk: inLeftZone,
+        ));
   }
 
   /// Re-aims focus to the centroid's current X position (centre Y fixed),

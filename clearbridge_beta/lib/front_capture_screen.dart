@@ -163,7 +163,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       return 'Align your thumb';
     }
     if (s.phase == FrontCapturePhase.sweepPositioning) {
-      return 'Place thumb at the left edge of the guide';
+      // Real device-test feedback (2026-07-30 round 3): with no visible
+      // change while positioning was being evaluated, a stuck sweep looked
+      // identical to one that was working but just needed a moment --
+      // "just static". sweepPositionOk flips true the instant the centroid
+      // enters the left zone (before the dwell timer even completes), so
+      // the text itself is live confirmation that tracking is active.
+      return s.sweepPositionOk ? 'Hold there…' : 'Place thumb at the left edge of the guide';
     }
     if (s.phase == FrontCapturePhase.sweepActive) {
       return s.sweepFastWarning ? 'Slow down a little…' : 'Slowly sweep right →';
@@ -183,7 +189,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       return s.sweepFastWarning ? CaptureColors.warning : CaptureColors.success;
     }
     if (s.phase == FrontCapturePhase.sweepPositioning) {
-      return CaptureColors.cyan;
+      return s.sweepPositionOk ? CaptureColors.success : CaptureColors.cyan;
     }
     return CaptureColors.silverBright;
   }
@@ -627,6 +633,12 @@ class _StatusPillState extends State<_StatusPill>
   Widget build(BuildContext context) {
     final isRec = widget.phase == FrontCapturePhase.capturing ||
         widget.phase == FrontCapturePhase.capturingExtra;
+    // Real device-test feedback (2026-07-30 round 3): the header pill sat on
+    // "READY" through both sweep phases, giving no indication the app was
+    // actively doing anything -- a stuck sweep and a working one looked
+    // identical from the header alone.
+    final isSweeping = widget.phase == FrontCapturePhase.sweepPositioning ||
+        widget.phase == FrontCapturePhase.sweepActive;
     final isCaptured = widget.phase == FrontCapturePhase.complete;
 
     final Color pillBg;
@@ -650,6 +662,21 @@ class _StatusPillState extends State<_StatusPill>
           height: 7,
           decoration: BoxDecoration(
             color: CaptureColors.warning.withValues(alpha: 0.35 + 0.65 * _dot.value),
+            shape: BoxShape.circle,
+          ),
+        ),
+      );
+    } else if (isSweeping) {
+      pillBg = CaptureColors.cyan.withValues(alpha: 0.18);
+      textColor = CaptureColors.cyan;
+      label = 'TRACKING';
+      leading = AnimatedBuilder(
+        animation: _dot,
+        builder: (_, __) => Container(
+          width: 7,
+          height: 7,
+          decoration: BoxDecoration(
+            color: CaptureColors.cyan.withValues(alpha: 0.35 + 0.65 * _dot.value),
             shape: BoxShape.circle,
           ),
         ),
