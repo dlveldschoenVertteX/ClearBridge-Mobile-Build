@@ -396,6 +396,39 @@ class FrontCaptureController extends ChangeNotifier {
     }
     return _cameraLensInfoCache;
   }
+
+  // Locked-shutter-speed handoff doc, Phase 0 (2026-07-31): same read-only,
+  // no-capture, once-per-session-cached pattern as the three queries above
+  // -- answers whether any real device even advertises MANUAL_SENSOR +
+  // a real exposure-time range before any native Camera2Interop work
+  // (which this app has none of today) is considered for a real locked-
+  // shutter capture mode. A positive result here does NOT by itself mean
+  // "locked shutter + auto ISO" is available for free -- Camera2 has no
+  // such combined AE mode; AE_MODE_OFF requires driving ISO manually too.
+  // See MainActivity.kt's manualExposureSupportByCameraId() for the full
+  // caveat. Same discipline as rawSensorSupport: this is what would have
+  // closed out RAW/DNG immediately instead of after real capture work,
+  // had it existed sooner.
+  static Map<String, Map<String, dynamic>>? _manualExposureSupportCache;
+  static bool _manualExposureSupportQueried = false;
+
+  static Future<Map<String, Map<String, dynamic>>?> _queryManualExposureSupport() async {
+    if (_manualExposureSupportQueried) return _manualExposureSupportCache;
+    _manualExposureSupportQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getManualExposureSupport');
+      if (result != null) {
+        _manualExposureSupportCache = result.map((k, v) => MapEntry(
+              k,
+              (v as Map).map((k2, v2) => MapEntry(k2 as String, v2)),
+            ));
+      }
+    } catch (e) {
+      debugPrint('[front] manual-exposure capability query failed (non-fatal): $e');
+    }
+    return _manualExposureSupportCache;
+  }
   static const Set<String> _uploadNonRetryableCodes = {
     'unauthorized', 'unauthenticated', 'no-default-bucket',
     'invalid-argument', 'invalid-url', 'object-not-found', 'quota-exceeded',
@@ -2101,6 +2134,7 @@ class FrontCaptureController extends ChangeNotifier {
       final rawSensorSupport = await _queryRawSensorSupport();
       final noiseReductionOffSupport = await _queryNoiseReductionSupport();
       final cameraLensInfo = await _queryCameraLensInfo();
+      final manualExposureSupport = await _queryManualExposureSupport();
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
@@ -2441,6 +2475,8 @@ class FrontCaptureController extends ChangeNotifier {
         if (noiseReductionOffSupport != null)
           'noiseReductionOffSupport': noiseReductionOffSupport,
         if (cameraLensInfo != null) 'cameraLensInfo': cameraLensInfo,
+        if (manualExposureSupport != null)
+          'manualExposureSupport': manualExposureSupport,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
       }, SetOptions(merge: true));

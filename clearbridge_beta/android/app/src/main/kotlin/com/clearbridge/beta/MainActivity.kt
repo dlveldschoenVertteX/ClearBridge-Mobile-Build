@@ -53,6 +53,11 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
                     }
+                    "getManualExposureSupport" -> try {
+                        result.success(manualExposureSupportByCameraId())
+                    } catch (e: Exception) {
+                        result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -158,6 +163,50 @@ class MainActivity : FlutterActivity() {
             )
         }
         return info
+    }
+
+    // Locked-shutter-speed handoff doc, Phase 0 (2026-07-31): before any
+    // native Camera2Interop work is considered for a real locked-shutter
+    // capture mode, answer the cheap question first -- same discipline as
+    // rawSensorSupportByCameraId/noiseReductionOffSupportByCameraId above,
+    // and the same reason RAW/DNG got closed out before any real capture
+    // work started (that probe came back false on every camera on every
+    // real device tested, so the much bigger native lift was never built).
+    // Read-only CameraCharacteristics query, never opens a session or
+    // issues a CaptureRequest.
+    //
+    // Two real caveats a positive result here would NOT resolve by itself:
+    // (1) Camera2 has no native "locked shutter, auto ISO" AE mode --
+    // AE_MODE_OFF (the only way to fix exposure time) requires the app to
+    // also drive SENSOR_SENSITIVITY manually, so this only answers "is
+    // manual sensor control possible at all", not "does this exact hybrid
+    // mode exist for free"; (2) this app has no Camera2Interop plumbing
+    // today (confirmed: the camera/camera_android_camerax plugin's public
+    // Dart API exposes no path to CaptureRequest.SENSOR_EXPOSURE_TIME), so
+    // reaching this even on a supporting device is a real native build, not
+    // a follow-up config change. exposureTimeRangeNs is in NANOSECONDS
+    // (Camera2's own unit) -- the handoff doc's targetShutterSpeedUs=6667
+    // assumed microseconds; convert carefully if this is ever used.
+    private fun manualExposureSupportByCameraId(): Map<String, Map<String, Any?>> {
+        val cameraManager = applicationContext
+            .getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val support = mutableMapOf<String, Map<String, Any?>>()
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            val caps = chars.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?: IntArray(0)
+            val hasManualSensor = caps.contains(
+                CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_MANUAL_SENSOR
+            )
+            val exposureRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            support[id] = mapOf(
+                "supportsManualSensor" to hasManualSensor,
+                "exposureTimeRangeNs" to exposureRange?.let { listOf(it.lower, it.upper) },
+                "isoRange" to isoRange?.let { listOf(it.lower, it.upper) },
+            )
+        }
+        return support
     }
 }
 
