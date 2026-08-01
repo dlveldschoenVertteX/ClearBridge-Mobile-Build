@@ -2121,8 +2121,25 @@ class FrontCaptureController extends ChangeNotifier {
     // camera preview up with an explicit "hold still" message instead; the
     // real `uploading` transition happens below, right before the actual
     // Firestore write + upload begin.
+    // Explicitly clear confirmationText when transitioning INTO
+    // capturingExtra -- real device-test feedback (2026-08-01): "IR cam
+    // did not give me any progress guidance or anything like the main
+    // cam". Root cause: _fireBurst sets confirmationText='✓ Captured' just
+    // before calling us, and clears it only in its own finally block
+    // AFTER we've fully returned. front_capture_screen.dart's headline
+    // block is gated on `s.confirmationText == null`, so every countdown
+    // ('3…', '2…', '1…'), status ('Now using $friendly'), and per-camera
+    // '✓ IR captured' string _showCountdown/_showStopConfirmation write
+    // via distanceHint was being rendered but then never actually shown
+    // -- the leftover main-burst banner was covering the display slot for
+    // the entire secondary-camera flow. Cleared here so those status
+    // updates can finally render.
     _apply(
-      (s) => s.copyWith(phase: FrontCapturePhase.capturingExtra, extraProgress: 0.0),
+      (s) => s.copyWith(
+        phase: FrontCapturePhase.capturingExtra,
+        extraProgress: 0.0,
+        confirmationText: null,
+      ),
       force: true,
     );
 

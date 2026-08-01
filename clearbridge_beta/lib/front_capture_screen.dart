@@ -79,10 +79,15 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     if (!mounted) return;
     final s = _ctrl.state;
 
-    // Scan animation: run only while shots are actively being taken.
+    // Scan animation: run while shots are actively being taken (main burst)
+    // OR while secondary cameras are firing (capturingExtra) -- real
+    // device-test feedback (2026-08-01): the IR camera phase had no visible
+    // motion at all, no way for the user to tell the app was doing anything.
     // Stops before the Processing… decode phase so the 8× concurrent
     // ui.instantiateImageCodec calls don't compete with 60 fps repaints.
-    final shouldScan = s.isCapturingBurst && s.confirmationText == null;
+    final shouldScan = s.confirmationText == null &&
+        (s.isCapturingBurst ||
+            s.phase == FrontCapturePhase.capturingExtra);
     if (shouldScan && !_scanAnim.isAnimating) {
       _scanAnim.repeat(reverse: true);
     } else if (!shouldScan && _scanAnim.isAnimating) {
@@ -352,8 +357,11 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               ),
             ),
 
-          // Scan line sweeping through the oval during burst.
-          if (s.isCapturingBurst)
+          // Scan line sweeping through the oval during burst OR while
+          // secondary cameras are firing (same real-device-feedback fix as
+          // shouldScan above -- keeps visible motion on-screen so the IR/
+          // secondary camera phase doesn't look frozen).
+          if (s.isCapturingBurst || s.phase == FrontCapturePhase.capturingExtra)
             Positioned.fill(
               child: IgnorePointer(
                 child: AnimatedBuilder(
