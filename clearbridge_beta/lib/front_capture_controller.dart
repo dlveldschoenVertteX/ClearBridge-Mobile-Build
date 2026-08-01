@@ -308,6 +308,21 @@ class FrontCaptureController extends ChangeNotifier {
   // resolving near both extremes, not just the centre.
   static const double _sweepGuideShiftFrac = 0.15;
 
+  // Guided thumb-sweep feature flag. DISABLED as of 2026-07-31 round 5
+  // after five real device-test rounds each revealed a different failure
+  // mode -- most recently a real, honest finding that the sweep's focus
+  // math was applying an unnecessary 90°-rotation inversion that the
+  // static hold's own working _beginAutofocus() never applied (the Flutter
+  // camera plugin's setFocusPoint takes preview-widget coords, not raw-
+  // sensor coords), plus a separate concern that the centroid tracker's
+  // ROI mapping is not properly validated against real on-screen thumb
+  // position. Rather than ship a sixth speculative fix on top, defaulting
+  // BACK to the proven static capture flow (real NFIQ2 72-81 history) --
+  // the sweep code stays in the repo behind this flag for a future proper
+  // rebuild that can validate coordinate transforms against real captures
+  // before shipping, not after.
+  static const bool _sweepEnabled = false;
+
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
@@ -1078,7 +1093,11 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
       if (heldMs >= _holdDurationMs) {
         _holdStart = null;
-        unawaited(_beginSweepPositioning());
+        // Sweep behind a disabled flag (see _sweepEnabled's own docs) --
+        // routes back to the proven static burst path _fireBurst() by
+        // default, which is _fireBurst's original pre-sweep behaviour when
+        // called with no preCollectedShots argument.
+        unawaited(_sweepEnabled ? _beginSweepPositioning() : _fireBurst());
       }
     } else {
       _holdStart = null;
