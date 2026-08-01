@@ -447,10 +447,10 @@ class FrontCaptureController extends ChangeNotifier {
   static const Rect _scoreRoi = Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
   // Row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
-  // window used by the guided sweep's own centroid tracking and focus
-  // re-aim. Named separately from _scoreRoi (which stays completely
-  // untouched, still feeding the static hold's focus/brightness/coverage
-  // signal) purely for clarity about which code depends on it.
+  // window used by the guided sweep's own CENTROID tracking only. Named
+  // separately from _scoreRoi (which stays completely untouched, still
+  // feeding the static hold's focus/brightness/coverage signal) purely for
+  // clarity about which code depends on it.
   //
   // REAL MATH ERROR, found + reverted 2026-07-30 round 3: an earlier
   // version of this widened the row span 1.8x, reasoning the tracker
@@ -460,7 +460,7 @@ class FrontCaptureController extends ChangeNotifier {
   // height, so a WIDER window makes the SAME physical thumb displacement
   // produce a LESS extreme (closer to 0.5) normalized value, making the
   // 0.25/0.75 zone thresholds HARDER to reach, not easier. A real device
-  // test (round 3) confirmed the symptom this predicts: focus now locks on
+  // test (round 3) confirmed the symptom this predicts: focus locked on
   // the thumb correctly (validating the underlying rotation/axis math is
   // right), but sweepPositioning never progressed past "place thumb at the
   // left edge" even with the thumb visibly, correctly seated in the
@@ -470,7 +470,29 @@ class FrontCaptureController extends ChangeNotifier {
   // reasonably well-scaled by months of real static-hold captures, even
   // though it was never explicitly validated for lateral tracking) rather
   // than guessing a new width without real data.
+  //
+  // REAL REGRESSION, found + fixed round 4: this same constant used to
+  // ALSO drive the focus re-aim point (_refocusForSweepPositioning /
+  // _beginSweepActive), which is a SEPARATE concern from centroid zone
+  // detection -- reverting the width here for the (correct) centroid-math
+  // fix silently moved the focus target too, undoing round 2's real-
+  // device-confirmed focus fix (that fix shipped and was validated together
+  // with the WIDE window, never with this narrow one). A real device test
+  // confirmed exactly this: "focus... catching the background instead of
+  // the foreground" returned. Split into two independent constants below --
+  // _sweepFocusRoi (kept at the wide, validated-for-focus span) for the
+  // two focus call sites, _sweepTrackingRoi (narrow, _scoreRoi) for
+  // centroid/zone detection only. Never let one constant silently serve two
+  // independently-tuned purposes again.
   static const Rect _sweepTrackingRoi = _scoreRoi;
+
+  // Wide row-axis window used ONLY for the sweep's focus re-aim point
+  // (_refocusForSweepPositioning / _beginSweepActive) -- this exact span is
+  // what round 2's real device test confirmed fixes "focus locked on
+  // background, not thumb". Kept deliberately separate from
+  // _sweepTrackingRoi (see its docs above) so a future centroid-math tweak
+  // can never again silently regress this independently-validated value.
+  static const Rect _sweepFocusRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1153,21 +1175,31 @@ class FrontCaptureController extends ChangeNotifier {
     unawaited(_refocusForSweepPositioning());
   }
 
+  /// Converts a SCREEN-space left(0)-right(1) fraction into the raw
+  /// CameraImage buffer point setFocusPoint/setExposurePoint expect, via
+  /// _sweepFocusRoi -- the ONE constant every sweep focus-targeting call
+  /// site must share (see _sweepFocusRoi's own docs for why this was split
+  /// out from _sweepTrackingRoi after a real round-4 regression). Column
+  /// axis fixed at the ROI's own centre ("centre Y fixed" per the sweep
+  /// spec); row axis inverted per this project's confirmed 90°CW
+  /// raw-buffer-to-screen rotation (see _sweepScreenXFraction).
+  Offset _sweepFocusPointFor(double targetScreenX) {
+    final rawBufferX = (_sweepFocusRoi.left + _sweepFocusRoi.right) / 2;
+    final rawBufferY = (_sweepFocusRoi.top +
+            (1.0 - targetScreenX) * _sweepFocusRoi.height)
+        .clamp(0.0, 1.0);
+    return Offset(rawBufferX, rawBufferY);
+  }
+
   /// Re-aims CONTINUOUS autofocus (not locked) at the sweep-positioning
   /// guide's actual on-screen position -- see the real-bug note in
-  /// _beginSweepPositioning above. Uses the same _sweepTrackingRoi-relative
-  /// inverse transform as _beginSweepActive's own re-aim, evaluated at
-  /// progress=0.0 (the guide's fully-left-shifted cx) since the guide
-  /// doesn't move further during positioning itself.
+  /// _beginSweepPositioning above. Evaluated at progress=0.0 (the guide's
+  /// fully-left-shifted cx) since the guide doesn't move further during
+  /// positioning itself.
   Future<void> _refocusForSweepPositioning() async {
     final cam = _camera;
     if (cam == null) return;
-    final targetScreenX = _sweepGuideShapeForProgress(0.0).cx;
-    final rawBufferX = (_sweepTrackingRoi.left + _sweepTrackingRoi.right) / 2;
-    final rawBufferY = (_sweepTrackingRoi.top +
-            (1.0 - targetScreenX) * _sweepTrackingRoi.height)
-        .clamp(0.0, 1.0);
-    final pt = Offset(rawBufferX, rawBufferY);
+    final pt = _sweepFocusPointFor(_sweepGuideShapeForProgress(0.0).cx);
     try {
       await cam.setFocusMode(FocusMode.auto);
       await cam.setFocusPoint(pt);
@@ -1244,11 +1276,13 @@ class FrontCaptureController extends ChangeNotifier {
         ));
   }
 
-  /// Re-aims focus to the centroid's current X position (centre Y fixed),
-  /// waits for it to settle, locks it, then transitions to sweepActive.
-  /// Deliberately does this ONCE at sweep start, not continuously during the
-  /// sweep itself -- focus-chase latency mid-sweep would introduce exactly
-  /// the motion blur the sharpness gate is trying to avoid.
+  /// Re-aims focus to the guide's own left-shifted position (centre Y
+  /// fixed) -- the same point _refocusForSweepPositioning has already been
+  /// continuously converging on -- waits for it to settle, locks it, then
+  /// transitions to sweepActive. Deliberately does this ONCE at sweep
+  /// start, not continuously during the sweep itself -- focus-chase latency
+  /// mid-sweep would introduce exactly the motion blur the sharpness gate
+  /// is trying to avoid.
   Future<void> _beginSweepActive(double startCentroidX) async {
     final cam = _camera;
     if (cam == null) {
@@ -1256,22 +1290,18 @@ class FrontCaptureController extends ChangeNotifier {
       return;
     }
 
-    // startCentroidX is a SCREEN-space left(0)-right(1) fraction (see
-    // _sweepScreenXFraction). setFocusPoint/setExposurePoint expect
-    // coordinates in the raw CameraImage buffer's own space, same
-    // convention _beginAutofocus already uses for _scoreRoi's centre --
-    // convert back through the same 90°CW rotation relationship, landing on
-    // the buffer's ROW axis (inverted), not its column axis. The buffer's
-    // column axis maps to on-screen Y, which the sweep deliberately keeps
-    // fixed at the ROI's own centre ("centre Y fixed" per the sweep spec).
-    // _sweepTrackingRoi, not _scoreRoi -- must match whatever ROI
-    // _sweepScreenXFraction used to produce startCentroidX in the first
-    // place, or this inverse transform lands on the wrong point.
-    final rawBufferX = (_sweepTrackingRoi.left + _sweepTrackingRoi.right) / 2;
-    final rawBufferY = (_sweepTrackingRoi.top +
-            (1.0 - startCentroidX) * _sweepTrackingRoi.height)
-        .clamp(0.0, 1.0);
-    final pt = Offset(rawBufferX, rawBufferY);
+    // Deliberately NOT derived from startCentroidX (which is a live
+    // _sweepTrackingRoi-relative reading) -- REAL REGRESSION, round 4: an
+    // earlier version of this reused startCentroidX through this same
+    // inverse transform, which silently mixed _sweepTrackingRoi's (narrow,
+    // centroid-tuned) calibration into a focus target, undoing round 2's
+    // validated focus fix. _refocusForSweepPositioning has already been
+    // continuously re-aiming at the guide's own fixed left-shifted position
+    // throughout positioning, and reaching sweepActive only happens once
+    // the dwell condition confirms the thumb is actually there -- so
+    // re-aiming at that SAME already-validated point (not a fresh,
+    // differently-calibrated one) is both simpler and correct.
+    final pt = _sweepFocusPointFor(_sweepGuideShapeForProgress(0.0).cx);
     try {
       await cam.setFocusMode(FocusMode.auto);
       await cam.setFocusPoint(pt);
