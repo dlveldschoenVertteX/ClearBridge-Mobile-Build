@@ -449,6 +449,40 @@ class FrontCaptureController extends ChangeNotifier {
     }
     return _manualExposureSupportCache;
   }
+
+  // docs/LOCKED_SHUTTER_SPEED_SCOPE.md, Phase 0 (2026-08-02): unlike the
+  // four capability queries above (plain CameraCharacteristics reads, safe
+  // to run anytime, including while the live CameraX session is open), this
+  // one briefly opens its OWN throwaway Camera2 session natively
+  // (TorchExposureProbe.kt) to test whether the torch survives
+  // CONTROL_AE_MODE_OFF on this device's HAL. Android does not allow two
+  // concurrent CameraDevice handles on the same physical camera, so this
+  // MUST be awaited to completion BEFORE CameraService.initializeCamera()
+  // ever runs -- callers (FrontCaptureScreen._init()) must call this first,
+  // never from inside an already-active capture. Public (not `_`-prefixed)
+  // specifically so the screen can call it ahead of camera init; every
+  // other probe in this file is queried lazily on _finishAndUpload instead,
+  // which this one architecturally cannot do.
+  static Map<String, dynamic>? torchExposureProbeCache;
+  static bool _torchExposureProbeQueried = false;
+
+  static Future<Map<String, dynamic>?> probeTorchExposureCompat() async {
+    if (_torchExposureProbeQueried) return torchExposureProbeCache;
+    _torchExposureProbeQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('probeTorchWithManualExposure')
+          // Belt-and-suspenders on top of the native 6s bound -- if the
+          // platform channel call itself somehow never returns, this must
+          // still not block the real camera init that follows.
+          .timeout(const Duration(seconds: 8), onTimeout: () => null);
+      if (result != null) torchExposureProbeCache = result;
+    } catch (e) {
+      debugPrint('[front] torch-exposure probe failed (non-fatal): $e');
+    }
+    return torchExposureProbeCache;
+  }
+
   static const Set<String> _uploadNonRetryableCodes = {
     'unauthorized', 'unauthenticated', 'no-default-bucket',
     'invalid-argument', 'invalid-url', 'object-not-found', 'quota-exceeded',
@@ -2239,6 +2273,10 @@ class FrontCaptureController extends ChangeNotifier {
       final noiseReductionOffSupport = await _queryNoiseReductionSupport();
       final cameraLensInfo = await _queryCameraLensInfo();
       final manualExposureSupport = await _queryManualExposureSupport();
+      // Already ran (and was awaited to completion) before the camera even
+      // opened, in FrontCaptureScreen._init() -- this just reads the cached
+      // result, does not re-trigger the native probe.
+      final torchExposureProbe = await probeTorchExposureCompat();
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
@@ -2581,6 +2619,7 @@ class FrontCaptureController extends ChangeNotifier {
         if (cameraLensInfo != null) 'cameraLensInfo': cameraLensInfo,
         if (manualExposureSupport != null)
           'manualExposureSupport': manualExposureSupport,
+        if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
       }, SetOptions(merge: true));

@@ -107,6 +107,16 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
 
   Future<void> _init() async {
     try {
+      // docs/LOCKED_SHUTTER_SPEED_SCOPE.md Phase 0: MUST run to completion
+      // before CameraService.initializeCamera() below -- the probe opens
+      // its own short-lived Camera2 session, and Android does not allow two
+      // concurrent CameraDevice handles on the same physical camera.
+      // Cached (see FrontCaptureController.probeTorchExposureCompat), so
+      // this is a real cost only on the very first capture screen open per
+      // app process, never on a second visit. Never blocks camera init on
+      // failure -- the probe itself never throws past its own try/catch,
+      // and this call is additionally timeout-bounded inside that method.
+      await FrontCaptureController.probeTorchExposureCompat();
       await _cameraService.initializeCamera(
         lensDirection: CameraLensDirection.back,
         resolution: ResolutionPreset.max,

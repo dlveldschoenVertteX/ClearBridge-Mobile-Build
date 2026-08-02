@@ -58,6 +58,18 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
                     }
+                    "probeTorchWithManualExposure" -> try {
+                        // Async -- TorchExposureProbe delivers `result` itself
+                        // once its short-lived Camera2 session finishes (or
+                        // times out), never synchronously here. Caller
+                        // (Dart side) MUST await this to completion before
+                        // CameraService.initializeCamera() opens the real
+                        // capture session -- see TorchExposureProbe's own
+                        // doc comment for why the two can never overlap.
+                        TorchExposureProbe(applicationContext).run(result)
+                    } catch (e: Exception) {
+                        result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
+                    }
                     else -> result.notImplemented()
                 }
             }
