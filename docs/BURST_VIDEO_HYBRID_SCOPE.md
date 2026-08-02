@@ -107,7 +107,7 @@ This can only ever raise the final score (additive candidate, same
 discipline as everywhere else in this pipeline) and adds at most 3 extra
 `afis_print.generate()` calls per capture, not 17.
 
-### Phase 4 (fusion/stitching) — not built, real methodological gap
+### Phase 4 (fusion/stitching) — architecture scoped 2026-08-03, not built
 
 The spec's region-stitching step (copy pixels 0-175 from the left frame,
 125-375 from center, 325-500 from right, into one composite) assumes the
@@ -119,23 +119,158 @@ Splicing un-registered regions by raw pixel-coordinate copy would very
 likely produce a visibly discontinuous composite (ridge lines breaking at
 the seams), not a cleaner print.
 
-This project has already done real work on exactly this class of problem
-and found it hard: `ml/deform_correct`'s cylindrical/elastic correction
-line has mixed, sometimes-negative results even with a trained model (see
-CLAUDE.md's extensive `deform_correct` history), and
-`docs/MULTI_DISTANCE_MESH_SCOPE.md` — the sibling distance-based fusion
-idea — explicitly phases around this same risk: normalize and *align*
-(ECC-affine, via the already-existing `_align_face_on_stack`) each
-candidate to a common reference **before** blending, never a naive
-fixed-region splice.
+**Gate, unchanged**: do not start building this until Phase 0 shows real
+evidence — `sweepVideoCandidates.<zone>.wonSelection: true` on a real
+fraction of captures. Everything below is the architecture to build *if*
+that evidence lands, written now (per direct request) so it's ready rather
+than re-derived later.
 
-**Recommendation, mirroring that doc's own precedent exactly**: Phase 4
-should not be attempted until Phase 0 (built here) shows real evidence a
-video-sourced candidate is independently competitive —
-`sweepVideoCandidates.<zone>.wonSelection: true` on a real fraction of
-captures. If that evidence appears, the next step is alignment-then-blend
-via the existing `_align_face_on_stack`/`_focus_stack_face_on` machinery,
-not pixel-region splicing.
+#### The honest starting point: this project already tried multi-angle warping and it lost
+
+`sfm_pipeline.reconstruct_and_unwrap()` — the existing cylindrical-unwrap
+pipeline for the oscillating/arc-sweep capture modes — already projects
+multiple angled views onto a shared surface model and blends them. Per
+CLAUDE.md's own established finding, the resulting unwrap scores
+**14-24 NFIQ points lower** than simply keeping the single sharpest
+face-on frame, and `_fuse_flash_ambient`'s own docstring states the reason
+plainly: "multi-angle reconstruction... warps oblique views and hurts
+NFIQ." Any new fusion design has to explain concretely why it avoids that
+outcome, not just assert that it will. Two real differences justify a
+second attempt, not blind optimism:
+
+1. **Baseline size.** The cylindrical unwrap spans up to a ~270° device
+   orbit — a genuine full 3D reconstruction problem. A hand sweep across
+   the burst+video hybrid's left/center/right zones covers maybe 20-40° of
+   real angular change. At that baseline, a *local* patch of the pad's
+   surface is a much better planar approximation than the whole pad is —
+   this is the standard justification for local-homography mosaicking over
+   global 3D reconstruction in wide-baseline stitching problems generally,
+   not something specific to this pipeline.
+2. **Scope of the claim.** The cylindrical unwrap tries to reconstruct the
+   *entire* pad from partial views — a mandatory, all-or-nothing geometric
+   model. This design only wants to *optionally* recover detail in a
+   narrow edge band the center view already shows (just less sharply),
+   gated at every step so a failed or low-confidence region simply falls
+   back to the center frame's own content — closer in spirit to
+   `_fuse_flash_ambient`'s "same pose, no geometric distortion" framing
+   than to full reconstruction.
+
+#### Architecture: local-patch registration + confidence-weighted multi-band blend
+
+**Do not build a new pipeline from scratch.** Every step below is either a
+direct reuse of existing, already-proven code in this file, or a small,
+clearly-scoped extension of one. Work happens on raw/CLAHE-normalized
+grayscale, matching how `_stack_face_on`/`_focus_stack_face_on`/
+`_fuse_flash_ambient` already operate — **never on already-binarized AFIS
+output** (the spec's original framing). Binarized black/white ridge images
+have thrown away the continuous-tone signal both registration and
+multi-band blending need; fuse first, binarize once, at the end, through
+the existing single-pass Gabor/normalize chain every other candidate
+already goes through.
+
+1. **Per-candidate frequency normalization, before anything else.**
+   Independently resample each zone-winner toward `_TARGET_PERIOD` via the
+   existing `_ridge_wavelength`-based resample already used for
+   `freq_normalize=True`. Must happen before registration — a scale
+   mismatch between zones (different working distance at different sweep
+   positions) would otherwise get folded into the estimated warp as
+   spurious scale correction, exactly the failure
+   `docs/MULTI_DISTANCE_MESH_SCOPE.md` already flagged for its own sibling
+   distance-fusion case.
+
+2. **Coarse pre-alignment via phase correlation — a genuinely new piece.**
+   Unlike same-pose burst frames (near-identical framing, valid for
+   `_align_face_on_stack`'s direct ECC call), a sweep zone's frame shows
+   the thumb at a real, unknown, potentially large pixel offset from the
+   center frame. ECC has a limited convergence basin and will not find a
+   large unknown translation on its own. Use `cv2.phaseCorrelate` (stdlib
+   OpenCV, FFT cross-correlation, no new dependency) between the two
+   frames' CLAHE-normalized grayscale to get a coarse translation estimate
+   first, then seed ECC with it. Backend-only — no client-side position
+   tracking needed (deliberately kept off the client; the disabled guided-
+   sweep feature's whole 5-round saga was almost entirely coordinate-space
+   bugs in exactly this kind of live position tracking, see
+   `docs/GUIDED_SWEEP_ARCHITECTURE.md`).
+
+3. **Local, bounded registration — extend `_align_face_on_stack`, don't
+   replace it.** Restrict the ECC estimation window to the overlap band
+   near the seam (e.g. the outer ~40% of the oblique frame, not the whole
+   image) rather than the whole frame — this is what actually captures
+   "local patch of a curved surface ≈ planar," not a global assumption
+   over the entire pad. Use `cv2.MOTION_HOMOGRAPHY` (not `MOTION_AFFINE`)
+   for the oblique-to-center registration specifically, since a real
+   viewing-angle change is a perspective transform, not just
+   rotation/scale/shear — `_align_face_on_stack`'s existing `MOTION_AFFINE`
+   stays correct and untouched for its own same-pose use case; this is a
+   parallel function, not a modification of the existing one.
+
+4. **Per-region confidence, not a single accept/reject scalar.**
+   `_align_face_on_stack` already gates on one whole-frame correlation
+   number (`> 0.5`). For a local, partially-overlapping patch this needs
+   to be a spatial map: after warping, compute local correlation in a
+   sliding window across the overlap band, so a sub-region where the
+   planarity assumption genuinely breaks down (e.g. near a crease) is
+   excluded from blending even when the rest of the same frame aligned
+   fine. Direct generalization of the existing scalar gate, not new
+   invention.
+
+5. **Blend weight = measured ridge coherence, not fixed pixel columns.**
+   Reuse `_fuse_flash_ambient`'s own `_coh()` helper (currently a local
+   closure inside that function — pull it to module scope so both call
+   sites can use it) to compute a structure-tensor coherence map on both
+   the center frame and the warped oblique frame in the overlap band.
+   Blend toward the oblique frame only where its *measured* coherence
+   exceeds center's at that location, gated by step 4's confidence map —
+   the same "maxc"/"soft" idea `_fuse_flash_ambient` already uses for
+   flash/ambient pairs, applied across genuinely different views instead
+   of the same view under different illumination. This avoids the spec's
+   real failure mode: pulling in oblique edge content just because it's
+   spatially near the edge, even when it's actually blurrier or more
+   foreshortened than what center already has there.
+
+6. **Seam blending: reuse `sfm_pipeline._multiband_combine()` — it
+   already exists and is already correct for this exact problem.** This
+   Laplacian-pyramid (Burt-Adelson) blend is currently built, tested, and
+   sitting unused ("Prototype / diagnostic only — not wired into the
+   default `reconstruct_and_unwrap()` path"). Its own docstring describes
+   precisely the two seam artifacts this design needs to avoid: ridge-line
+   ghosting from imperfect alignment (fixed by blending high frequencies
+   only right at the seam) and visible brightness steps between differently-
+   lit source frames (fixed by blending low frequencies over a wide
+   region). Feed it `(warped_candidate_texture, confidence_weight)` pairs
+   for center + whichever oblique zones pass step 4's gate, instead of its
+   current per-orbit-angle cylindrical inputs — the function itself is
+   already shape-agnostic (any list of same-size texture/weight arrays).
+
+7. **One fused composite → the existing Gabor/binarize/frequency-normalize
+   chain, once.** The blended raw grayscale is masked with the existing
+   `_guide_region`/segmentation machinery exactly as any other candidate,
+   then flows through `afis_print.generate()`'s normal single enhancement
+   pass — no new enhancement code needed here at all.
+
+8. **Output as one more max-of-candidates entry — no override band.**
+   Competes for `best_afis_img` via the exact same `if score > afis_nfiq`
+   gate every other candidate source in this file already uses. Deliberately
+   **not** the spec's Phase 5 tolerance rule ("submit superprint if its
+   score is within 1.0 of the top candidate") — that can submit a *worse*
+   result than the plain best candidate. Strict max, matching this
+   pipeline's one consistent rule everywhere else: a new candidate can only
+   raise the final score, never be allowed to lower it by a tolerance band.
+
+#### Before writing any of the above: a standalone registration-convergence probe
+
+Same "measure before you build" discipline as every other investment this
+project has made (the EXIF diagnostic before the locked-shutter native
+lift, Phase 0 candidate-scoring before this fusion work itself). Once real
+captures with populated `sweepVideoCandidates` exist, build a small
+offline script (same pattern as `scratchpad/harness.py` elsewhere this
+project has used) that runs *only* steps 1-4 above — frequency-normalize,
+phase-correlate, local ECC-homography, per-region confidence — against
+real zone-winner pairs and reports the real confidence-map coverage and
+residuals. If registration itself doesn't converge with usable confidence
+on real pad content, steps 5-8 (the blend) are premature regardless of how
+good the raw candidate images are — this is the cheapest possible way to
+find that out before investing in the rest.
 
 ## What's built (Phase 0)
 
