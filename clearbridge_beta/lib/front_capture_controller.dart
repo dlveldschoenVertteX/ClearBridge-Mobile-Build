@@ -193,11 +193,16 @@ class _RawShot {
   final bool flashOn;
   final double? laplacianScore;
   final DateTime timestamp;
+  // Real per-shot exposure time/ISO read straight out of the JPEG's own
+  // EXIF (see JpegExposureExif) -- what the auto-exposure pipeline actually
+  // did, not anything the app requested.
+  final JpegExposureExif exif;
   const _RawShot({
     required this.jpeg,
     required this.flashOn,
     required this.laplacianScore,
     required this.timestamp,
+    this.exif = const JpegExposureExif(),
   });
 }
 
@@ -1993,11 +1998,21 @@ class FrontCaptureController extends ChangeNotifier {
           try {
             final xfile = await cam.takePicture();
             final jpeg = await xfile.readAsBytes();
+            // Locked-shutter-speed investigation, Stage 1 (2026-08-02): the
+            // `camera` plugin has no public API for manual SENSOR_EXPOSURE_
+            // TIME/SENSITIVITY control (confirmed against the plugin's own
+            // changelog), so real shutter-speed locking would need a native
+            // Camera2Interop lift. Before spending that, read what the HAL's
+            // own auto-exposure actually did for THIS shot straight out of
+            // the JPEG's EXIF -- zero plugin/native change, just bytes we
+            // already have.
+            final exif = parseJpegExposureExif(jpeg);
             rawShots.add(_RawShot(
               jpeg: jpeg,
               flashOn: _flash?.isFlashOn ?? false,
               laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
               timestamp: DateTime.now(),
+              exif: exif,
             ));
             // MAC3D capture-UX-polish mockup dev-handoff note: "fire a light
             // haptic tick on each burst frame, stronger buzz on capture
@@ -2040,7 +2055,7 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(confirmationText: 'Processing…'), force: true);
 
       // Decode + re-encode off the UI isolate.
-      final futures = <Future<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})>>[];
+      final futures = <Future<({Uint8List bytes, bool flashOn, double? lap, DateTime ts, JpegExposureExif exif})>>[];
       for (final raw in rawShots) {
         futures.add(() async {
           final decoded = await decodeStillJpegToLuma(
@@ -2053,12 +2068,17 @@ class FrontCaptureController extends ChangeNotifier {
             _encodeBurstIsolate,
             _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
           );
-          return (bytes: encoded, flashOn: raw.flashOn, lap: sharp, ts: raw.timestamp);
+          return (bytes: encoded, flashOn: raw.flashOn, lap: sharp, ts: raw.timestamp, exif: raw.exif);
         }());
       }
 
-      final results = await Future.wait(futures.map((f) => f.catchError((_) =>
-          (bytes: Uint8List(0), flashOn: false, lap: null as double?, ts: DateTime.now()))));
+      final results = await Future.wait(futures.map((f) => f.catchError((_) => (
+            bytes: Uint8List(0),
+            flashOn: false,
+            lap: null as double?,
+            ts: DateTime.now(),
+            exif: const JpegExposureExif(),
+          ))));
 
       // Each sweep shot (_fireSweepShot) already stops/restarts the stream
       // around its own takePicture() call, so by now it's running again --
@@ -2113,7 +2133,7 @@ class FrontCaptureController extends ChangeNotifier {
   }
 
   Future<void> _finishAndUpload(
-    List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts})> shots,
+    List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts, JpegExposureExif exif})> shots,
     double gyroAtCapture, {
     List<double?>? sweepCentroids,
     Map<String, dynamic>? sweepDebugData,
@@ -2191,6 +2211,17 @@ class FrontCaptureController extends ChangeNotifier {
           if (s.lap != null) 'laplacianScore': double.parse(s.lap!.toStringAsFixed(1)),
           'timestamp': s.ts.toIso8601String(),
           if (centroidX != null) 'centroidX': double.parse(centroidX.toStringAsFixed(3)),
+          // Locked-shutter-speed investigation, Stage 1: real auto-exposure
+          // values the HAL actually used for this shot, read from the JPEG's
+          // own EXIF -- not app-controlled (this plugin has no manual
+          // exposure API), hence isLockedShutter: false always at this
+          // stage. Null fields mean the device/HAL didn't populate that EXIF
+          // tag, not a parse failure being silently swallowed.
+          if (s.exif.exposureTimeUs != null) 'shutterSpeedUs': s.exif.exposureTimeUs,
+          if (s.exif.exposureTimeReadable != null)
+            'shutterSpeedReadable': s.exif.exposureTimeReadable,
+          if (s.exif.isoValue != null) 'isoValue': s.exif.isoValue,
+          'isLockedShutter': false,
         });
       }
 
