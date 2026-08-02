@@ -2,6 +2,7 @@ import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:google_fonts/google_fonts.dart';
 import 'package:mac_capture/mac_capture.dart';
 
 import 'front_capture_controller.dart';
@@ -228,13 +229,32 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
         s.phase == FrontCapturePhase.capturing ||
         s.phase == FrontCapturePhase.capturingExtra;
 
+    // MAC3D capture-UX-polish mockup (2026-08-02): the guide outline itself
+    // should read as a distinct "warning" (orange) state when the frame is
+    // too dark or too soft to score well, not just implicitly via the
+    // bottom warning row -- same 30% cutoff the mockup uses on its
+    // brightness/focus sliders, translated to our own read-only lighting/
+    // focus signals. Purely a UI cue (no capture-pipeline threshold touched)
+    // so it's safe to adopt the mockup's exact number without a device-test
+    // gate the way a capture-affecting parameter would need.
+    final focusVal = _lockedFocusValue ?? _ctrl.focusValue;
+    final brightWarn = s.lightingValue < 0.30;
+    final focusWarn = focusVal < 0.30;
+    final lowQuality = (brightWarn || focusWarn) &&
+        s.phase != FrontCapturePhase.capturingExtra &&
+        s.phase != FrontCapturePhase.sweepPositioning &&
+        s.phase != FrontCapturePhase.sweepActive &&
+        !s.isCapturingBurst;
+
     final silhouetteState = (s.isCapturingBurst ||
             s.phase == FrontCapturePhase.capturingExtra ||
             s.phase == FrontCapturePhase.sweepActive)
         ? PadSilhouetteState.capturing
-        : (s.onTarget || s.phase == FrontCapturePhase.sweepPositioning
-            ? PadSilhouetteState.locked
-            : PadSilhouetteState.aligning);
+        : (lowQuality
+            ? PadSilhouetteState.warning
+            : (s.onTarget || s.phase == FrontCapturePhase.sweepPositioning
+                ? PadSilhouetteState.locked
+                : PadSilhouetteState.aligning));
 
     final (ringProgress, ringColor) = _ringState(s);
 
@@ -265,11 +285,18 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
           : '↓ Move phone BACK a little';
     } else if (showGuide &&
         s.distanceHint == null &&
-        s.lightingValue < 0.18 &&
+        lowQuality &&
         (s.phase == FrontCapturePhase.calibrating ||
             s.phase == FrontCapturePhase.holding)) {
-      warningText = '☀  Brighter light = sharper print';
-      warningColor = CaptureColors.gold;
+      // MAC3D capture-UX-polish mockup: focus takes priority over brightness
+      // when both are low (same order the mockup's own warningText uses).
+      // Copy adapted from the mockup's "Move slider or refocus" -- this app
+      // has no draggable slider, so the wording points at what the user can
+      // actually do (hold steadier / move to better light).
+      warningText = focusWarn
+          ? 'Hold steadier — image is too soft'
+          : 'Move to better light — image is too dark';
+      warningColor = CaptureColors.warning;
     }
 
     final headline = _headlineText(s);
@@ -341,6 +368,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
                 value: s.lightingValue,
                 color: CaptureColors.gold,
                 icon: Icons.wb_sunny_outlined,
+                label: 'BRIGHT',
+                warning: brightWarn && lowQuality,
               ),
             ),
 
@@ -351,9 +380,11 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               left: focusLeft,
               top: meterTop,
               child: _VerticalMeter(
-                value: _lockedFocusValue ?? _ctrl.focusValue,
+                value: focusVal,
                 color: CaptureColors.cyan,
                 icon: Icons.center_focus_strong_outlined,
+                label: 'FOCUS',
+                warning: focusWarn && lowQuality,
               ),
             ),
 
@@ -397,21 +428,34 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               ),
             ),
 
-          // Frame counter X/8 shown under the ring during burst.
-          if (s.isCapturingBurst)
+          // Frame counter + burst dots INSIDE the ring during the burst —
+          // MAC3D capture-UX-polish mockup moves both from a plain "X / 8"
+          // caption below the ring into the ring itself (mono counter near
+          // the top, 8 glowing dots near the bottom) so progress reads at a
+          // glance without competing with the headline text below.
+          if (s.isCapturingBurst) ...[
             Positioned(
-              top: ringTop + ringD + 6,
+              top: ringTop + 20,
               left: ringLeft,
               width: ringD,
               child: Text(
                 '${(s.burstProgress * 8).ceil()} / 8',
                 textAlign: TextAlign.center,
-                style: CaptureTypography.label.copyWith(
-                  fontSize: 11,
-                  color: CaptureColors.silver,
+                style: GoogleFonts.jetBrainsMono(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: CaptureColors.silverBright,
+                  letterSpacing: 1.0,
                 ),
               ),
             ),
+            Positioned(
+              top: ringTop + ringD - 34,
+              left: ringLeft,
+              width: ringD,
+              child: _BurstDots(filled: (s.burstProgress * 8).ceil(), total: 8),
+            ),
+          ],
 
           // Per-camera confirmation banners (e.g. "✓ IR captured"), and the
           // sweep-retry prompt ("Try again — sweep a little slower") shown
@@ -421,9 +465,45 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               top: topPad + 64,
               left: 40,
               right: 40,
-              child: _ConfirmationBanner(
-                text: s.confirmationText!,
-                isWarning: s.phase == FrontCapturePhase.sweepPositioning,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  _ConfirmationBanner(
+                    text: s.confirmationText!,
+                    isWarning: s.phase == FrontCapturePhase.sweepPositioning,
+                  ),
+                  // MAC3D capture-UX-polish mockup: a small mono BRIGHT/FOCUS
+                  // percentage readout under the "Captured" moment specifically
+                  // (not the secondary-camera/sweep-retry banners, which reuse
+                  // this same widget with different text) — a quick confirm of
+                  // the conditions the just-finished burst was actually shot
+                  // under.
+                  if (s.confirmationText == '✓ Captured') ...[
+                    const SizedBox(height: 10),
+                    Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Text(
+                          'BRIGHT ${(s.lightingValue.clamp(0.0, 1.0) * 100).round()}%',
+                          style: GoogleFonts.jetBrainsMono(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: CaptureColors.silverDim,
+                          ),
+                        ),
+                        const SizedBox(width: 14),
+                        Text(
+                          'FOCUS ${(focusVal.clamp(0.0, 1.0) * 100).round()}%',
+                          style: GoogleFonts.jetBrainsMono(
+                            fontSize: 11,
+                            fontWeight: FontWeight.w600,
+                            color: CaptureColors.silverDim,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
+                ],
               ),
             ),
 
@@ -541,10 +621,20 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   // Bottom CTA row: only the idle and error phases show an action button.
   Widget _buildCta(FrontCaptureState s) {
     if (s.phase == FrontCapturePhase.idle) {
-      return CaptureButton(
-        label: 'Start Capture',
-        leadingIcon: Icons.fingerprint,
-        onPressed: _onStart,
+      // MAC3D capture-UX-polish mockup: a large circular shutter-style
+      // button (fingerprint icon on a green radial gradient) replaces the
+      // rectangular labelled button as the idle CTA — a stronger, more
+      // immediately-recognizable "tap here" affordance than a text button.
+      return Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _CircularCaptureButton(onPressed: _onStart),
+          const SizedBox(height: 12),
+          Text(
+            'PRESS TO CAPTURE',
+            style: CaptureTypography.label.copyWith(letterSpacing: 1.2),
+          ),
+        ],
       );
     }
     // Active phases: small, non-interactive status line so the area
@@ -726,37 +816,163 @@ class _StatusPillState extends State<_StatusPill>
   }
 }
 
+// ── Circular capture button (idle CTA) ──────────────────────────────────────────
+
+class _CircularCaptureButton extends StatefulWidget {
+  const _CircularCaptureButton({required this.onPressed});
+  final VoidCallback onPressed;
+
+  @override
+  State<_CircularCaptureButton> createState() => _CircularCaptureButtonState();
+}
+
+class _CircularCaptureButtonState extends State<_CircularCaptureButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _glow;
+  bool _pressed = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _glow = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2200),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _glow.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTapDown: (_) => setState(() => _pressed = true),
+      onTapCancel: () => setState(() => _pressed = false),
+      onTapUp: (_) => setState(() => _pressed = false),
+      onTap: widget.onPressed,
+      child: AnimatedBuilder(
+        animation: _glow,
+        builder: (_, child) {
+          final g = 0.35 + 0.25 * _glow.value;
+          return AnimatedScale(
+            scale: _pressed ? 0.93 : 1.0,
+            duration: const Duration(milliseconds: 100),
+            child: Container(
+              width: 84,
+              height: 84,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: const RadialGradient(
+                  center: Alignment(-0.3, -0.45),
+                  radius: 0.9,
+                  colors: [
+                    Color(0xFF4ADE80),
+                    Color(0xFF22C55E),
+                    Color(0xFF16A34A),
+                    Color(0xFF14532D),
+                  ],
+                  stops: [0.0, 0.42, 0.78, 1.0],
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: CaptureColors.success.withValues(alpha: g),
+                    blurRadius: 26,
+                    spreadRadius: 2,
+                  ),
+                ],
+              ),
+              child: child,
+            ),
+          );
+        },
+        child: const Icon(
+          Icons.fingerprint,
+          size: 40,
+          color: Color(0x8C062A14),
+        ),
+      ),
+    );
+  }
+}
+
 // ── Vertical meter ────────────────────────────────────────────────────────────
 
+// MAC3D capture-UX-polish mockup (2026-08-02): thin center track + a
+// circular handle capsule at the fill line, icon above and a label/percentage
+// readout below -- replaces the old solid filled-bar-in-a-card look. These
+// are read-only telemetry (real camera lighting/focus signals), not user
+// controls -- the mockup's own drag handlers have no backing camera API in
+// this project (no manual EV/focus override exists; see CLAUDE.md's
+// locked-shutter-speed research) so the handle is visual only, not
+// draggable. [warning] recolors the handle/fill orange, matching the guide
+// outline's own PadSilhouetteState.warning treatment for the same signal.
 class _VerticalMeter extends StatelessWidget {
   const _VerticalMeter({
     required this.value,
     required this.color,
     required this.icon,
+    required this.label,
+    this.warning = false,
   });
 
   final double value;
   final Color color;
   final IconData icon;
+  final String label;
+  final bool warning;
 
   @override
   Widget build(BuildContext context) {
-    return SizedBox(
-      width: 40,
-      height: 180,
-      child: ClipRRect(
-        borderRadius: BorderRadius.circular(10),
-        child: CustomPaint(
-          painter: _MeterPainter(value: value.clamp(0.0, 1.0), color: color),
-          child: Align(
+    final v = value.clamp(0.0, 1.0);
+    final activeColor = warning ? CaptureColors.warning : color;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 40,
+          height: 180,
+          child: Stack(
             alignment: Alignment.topCenter,
-            child: Padding(
-              padding: const EdgeInsets.only(top: 8),
-              child: Icon(icon, color: color.withValues(alpha: 0.65), size: 14),
-            ),
+            children: [
+              // Track painted first so the icon (below) sits visibly on top
+              // of it rather than being covered by the track's fill.
+              Positioned.fill(
+                child: CustomPaint(
+                  painter: _MeterPainter(value: v, color: activeColor),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Container(
+                  padding: const EdgeInsets.all(3),
+                  decoration: BoxDecoration(
+                    color: CaptureColors.void_.withValues(alpha: 0.85),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: activeColor.withValues(alpha: 0.85), size: 14),
+                ),
+              ),
+            ],
           ),
         ),
-      ),
+        const SizedBox(height: 6),
+        Text(
+          label,
+          style: CaptureTypography.label.copyWith(fontSize: 8, letterSpacing: 0.8),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          '${(v * 100).round()}%',
+          style: GoogleFonts.jetBrainsMono(
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: CaptureColors.silver,
+          ),
+        ),
+      ],
     );
   }
 }
@@ -769,32 +985,36 @@ class _MeterPainter extends CustomPainter {
 
   @override
   void paint(Canvas canvas, Size size) {
-    const radius = Radius.circular(10);
-    final rrect = RRect.fromRectAndRadius(Offset.zero & size, radius);
-
-    // Track background.
-    canvas.drawRRect(rrect, Paint()..color = CaptureColors.cardBg);
+    final trackW = 6.0;
+    final cx = size.width / 2;
+    final track = RRect.fromRectAndRadius(
+      Rect.fromLTWH(cx - trackW / 2, 0, trackW, size.height),
+      const Radius.circular(3),
+    );
+    canvas.drawRRect(track, Paint()..color = CaptureColors.cardBg);
 
     // Filled portion grows from the bottom.
     final fillH = size.height * value;
     if (fillH > 0) {
-      final fillRect =
-          Rect.fromLTWH(0, size.height - fillH, size.width, fillH);
-      canvas.drawRRect(
-        RRect.fromRectAndRadius(fillRect, radius),
-        Paint()..color = color.withValues(alpha: 0.28),
+      final fillRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(cx - trackW / 2, size.height - fillH, trackW, fillH),
+        const Radius.circular(3),
       );
+      canvas.drawRRect(fillRect, Paint()..color = color.withValues(alpha: 0.55));
     }
 
-    // Thumb line at the top of the fill.
-    final thumbY = size.height - fillH;
-    canvas.drawLine(
-      Offset(8, thumbY),
-      Offset(size.width - 8, thumbY),
+    // Circular handle capsule at the fill line.
+    final handleY = (size.height - fillH).clamp(8.0, size.height - 8.0);
+    final handleCenter = Offset(cx, handleY);
+    canvas.drawCircle(handleCenter, 8, Paint()..color = color.withValues(alpha: 0.25));
+    canvas.drawCircle(handleCenter, 5.5, Paint()..color = CaptureColors.silverBright);
+    canvas.drawCircle(
+      handleCenter,
+      5.5,
       Paint()
         ..color = color
-        ..strokeWidth = 2
-        ..strokeCap = StrokeCap.round,
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
     );
   }
 
@@ -830,7 +1050,11 @@ class _RingPainter extends CustomPainter {
   void paint(Canvas canvas, Size size) {
     final cx = size.width / 2;
     final cy = size.height / 2;
-    final r = cx - 6; // inset so stroke doesn't clip at the widget edge
+    // MAC3D capture-UX-polish mockup: a much thicker donut-style ring
+    // (roughly 20px band on a 270px circle) rather than a thin stroke arc --
+    // reads as a more premium capture-progress indicator at a glance.
+    const strokeW = 14.0;
+    final r = cx - strokeW / 2 - 2; // inset so stroke doesn't clip at the widget edge
     final rect = Rect.fromCircle(center: Offset(cx, cy), radius: r);
 
     // Ring track — always visible, at low opacity.
@@ -841,7 +1065,7 @@ class _RingPainter extends CustomPainter {
       false,
       Paint()
         ..color = color.withValues(alpha: 0.12)
-        ..strokeWidth = 5
+        ..strokeWidth = strokeW
         ..style = PaintingStyle.stroke,
     );
 
@@ -854,7 +1078,7 @@ class _RingPainter extends CustomPainter {
         false,
         Paint()
           ..color = color
-          ..strokeWidth = 5
+          ..strokeWidth = strokeW
           ..style = PaintingStyle.stroke
           ..strokeCap = StrokeCap.round,
       );
@@ -864,6 +1088,46 @@ class _RingPainter extends CustomPainter {
   @override
   bool shouldRepaint(_RingPainter old) =>
       old.progress != progress || old.color != color;
+}
+
+// ── Burst progress dots ───────────────────────────────────────────────────────
+
+/// 8 small dots inside the ring, filled + glowing as each burst frame fires —
+/// MAC3D capture-UX-polish mockup, replaces the plain "X / 8" text as the
+/// sole progress cue (the counter now sits above these, not instead of them).
+class _BurstDots extends StatelessWidget {
+  const _BurstDots({required this.filled, required this.total});
+  final int filled;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(total, (i) {
+        final on = i < filled;
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: on
+                ? CaptureColors.silverBright
+                : CaptureColors.silverBright.withValues(alpha: 0.22),
+            boxShadow: on
+                ? [
+                    BoxShadow(
+                      color: CaptureColors.silverBright.withValues(alpha: 0.7),
+                      blurRadius: 6,
+                    ),
+                  ]
+                : null,
+          ),
+        );
+      }),
+    );
+  }
 }
 
 // ── Warning row ───────────────────────────────────────────────────────────────

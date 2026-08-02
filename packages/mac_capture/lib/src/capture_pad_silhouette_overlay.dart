@@ -230,7 +230,7 @@ class PadSilhouetteShape {
 /// superellipse and the scrim edge fades gradually (large-sigma blur) so it
 /// reads as a guide, not a hard cut. Its region IS what the backend uses as
 /// the crop mask (see [PadSilhouetteShape]).
-class CapturePadSilhouetteOverlay extends StatelessWidget {
+class CapturePadSilhouetteOverlay extends StatefulWidget {
   const CapturePadSilhouetteOverlay({
     super.key,
     this.state = PadSilhouetteState.aligning,
@@ -250,19 +250,55 @@ class CapturePadSilhouetteOverlay extends StatelessWidget {
   final double progress;
 
   @override
+  State<CapturePadSilhouetteOverlay> createState() => _CapturePadSilhouetteOverlayState();
+}
+
+// MAC3D capture-UX-polish mockup (2026-08-02) specified a breathing glow on
+// the guide outline itself (pulseIdle/pulseCyan/pulseGreen/pulseOrange CSS
+// keyframes, one per state) rather than a flat static stroke. Self-contained
+// ticker (no external state feeds it) so it costs nothing beyond this one
+// overlay -- same "small, proven-safe" pattern as the header status pill's
+// own dot pulse in front_capture_screen.dart.
+class _CapturePadSilhouetteOverlayState extends State<CapturePadSilhouetteOverlay>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _pulse;
+
+  @override
+  void initState() {
+    super.initState();
+    _pulse = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    )..repeat(reverse: true);
+  }
+
+  @override
+  void dispose() {
+    _pulse.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
     return IgnorePointer(
-      child: CustomPaint(
-        painter: _PadSilhouettePainter(
-          state: state, hint: hint, shape: shape, progress: progress,
+      child: AnimatedBuilder(
+        animation: _pulse,
+        builder: (_, __) => CustomPaint(
+          painter: _PadSilhouettePainter(
+            state: widget.state,
+            hint: widget.hint,
+            shape: widget.shape,
+            progress: widget.progress,
+            pulse: _pulse.value,
+          ),
+          child: const SizedBox.expand(),
         ),
-        child: const SizedBox.expand(),
       ),
     );
   }
 }
 
-enum PadSilhouetteState { aligning, locked, capturing }
+enum PadSilhouetteState { aligning, locked, capturing, warning }
 
 class _PadSilhouettePainter extends CustomPainter {
   _PadSilhouettePainter({
@@ -270,12 +306,15 @@ class _PadSilhouettePainter extends CustomPainter {
     required this.shape,
     this.hint,
     this.progress = 0.0,
+    this.pulse = 0.0,
   });
 
   final PadSilhouetteState state;
   final PadSilhouetteShape shape;
   final String? hint;
   final double progress;
+  /// 0..1 breathing phase from the overlay's own looping ticker.
+  final double pulse;
 
   Color get _accent {
     switch (state) {
@@ -285,6 +324,8 @@ class _PadSilhouettePainter extends CustomPainter {
         return CaptureColors.gold;
       case PadSilhouetteState.aligning:
         return CaptureColors.cyan;
+      case PadSilhouetteState.warning:
+        return CaptureColors.warning;
     }
   }
 
@@ -336,6 +377,20 @@ class _PadSilhouettePainter extends CustomPainter {
         ..style = PaintingStyle.stroke
         ..strokeWidth = 10
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 9),
+    );
+    // Breathing pulse layer -- a second, wider glow whose alpha/blur ride the
+    // overlay's own looping ticker, approximating the mockup's per-state CSS
+    // box-shadow pulse (idle: slow and faint; capturing/warning: brighter and
+    // tighter, reading as more urgent). Purely additive over the static glow
+    // above -- never removes it, so this can't make the guide harder to see.
+    final breathe = state == PadSilhouetteState.aligning ? 0.5 : 1.0;
+    canvas.drawPath(
+      pad,
+      Paint()
+        ..color = accent.withValues(alpha: (0.12 + 0.22 * pulse) * breathe)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 14 + 8 * pulse
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, 14 + 6 * pulse),
     );
 
     // Capture-progress fill: a bright arc traced along the pad's own
@@ -477,5 +532,6 @@ class _PadSilhouettePainter extends CustomPainter {
       old.state != state ||
       old.hint != hint ||
       old.shape != shape ||
-      old.progress != progress;
+      old.progress != progress ||
+      old.pulse != pulse;
 }

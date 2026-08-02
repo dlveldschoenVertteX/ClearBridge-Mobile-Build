@@ -1999,6 +1999,13 @@ class FrontCaptureController extends ChangeNotifier {
               laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
               timestamp: DateTime.now(),
             ));
+            // MAC3D capture-UX-polish mockup dev-handoff note: "fire a light
+            // haptic tick on each burst frame, stronger buzz on capture
+            // completion" -- the completion buzz already existed
+            // (HapticFeedback.heavyImpact() below); this adds the per-frame
+            // tick, same call already used elsewhere in this file for
+            // real-time "something just happened" confirmation.
+            unawaited(HapticFeedback.selectionClick());
           } catch (e) {
             debugPrint('[front] burst shot $i failed (non-fatal): $e');
           }
