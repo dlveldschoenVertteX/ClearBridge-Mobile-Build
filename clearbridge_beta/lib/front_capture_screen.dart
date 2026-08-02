@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:google_fonts/google_fonts.dart';
 import 'package:mac_capture/mac_capture.dart';
 
@@ -35,6 +37,11 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   final CameraService _cameraService = CameraService();
   late final FrontCaptureController _ctrl;
   late final AnimationController _scanAnim;
+  // One-shot "pop" played on the guide outline the instant the primary burst
+  // finishes (the mockup's successPop) -- see _onState's confirmationText
+  // transition check below.
+  late final AnimationController _popCtrl;
+  late final Animation<double> _popScale;
   bool _ready = false;
   bool _navigated = false;
   String? _initError;
@@ -45,6 +52,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   // since the burst already started because focus was good). Cleared once
   // isCapturingBurst goes false.
   double? _lockedFocusValue;
+
+  // Tracked purely to detect the false->true edge of the low-quality signal
+  // (see _isLowQuality) so the warning haptic fires once on entry rather than
+  // every rebuild, and to detect the confirmationText edge that triggers the
+  // capture "pop".
+  bool _wasLowQuality = false;
+  String? _lastConfirmationText;
 
   CameraController? get _camera => _cameraService.controller;
 
@@ -60,7 +74,35 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       vsync: this,
       duration: const Duration(milliseconds: 2000),
     );
+    _popCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 450),
+      // Starts settled at the tween's END (full scale) -- only
+      // forward(from: 0) (fired on the capture edge) should ever dip it
+      // down to the tween's start, otherwise the guide would render at 90%
+      // scale for the entire idle/holding/capturing phases before the
+      // first "✓ Captured" ever fires.
+      value: 1.0,
+    );
+    _popScale = Tween(begin: 0.9, end: 1.0)
+        .animate(CurvedAnimation(parent: _popCtrl, curve: Curves.elasticOut));
     _init();
+  }
+
+  // Real camera/lighting signal only exists once the image stream is running
+  // (started in FrontCaptureController.start(), triggered by the idle CTA) --
+  // during FrontCapturePhase.idle, lightingValue/focusValue are still at
+  // their pre-stream defaults (0.5 / 0), which would otherwise read as a
+  // false "too dark / too soft" warning before the user has done anything.
+  // Scoped further to `holding` specifically (not just "stream running"):
+  // during `calibrating` the user hasn't placed their thumb yet either, so
+  // focus is genuinely near-zero there too -- a real gap the initial
+  // warning-state feature shipped with, tightened here rather than left for
+  // a device test to catch.
+  bool _isLowQuality(FrontCaptureState s) {
+    if (s.phase != FrontCapturePhase.holding) return false;
+    final focusVal = _lockedFocusValue ?? _ctrl.focusValue;
+    return s.lightingValue < 0.30 || focusVal < 0.30;
   }
 
   Future<void> _init() async {
@@ -104,6 +146,27 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       _lockedFocusValue = null;
     }
 
+    // A light tick the instant the guide flips INTO the low-quality warning
+    // state (not on every frame while it stays there) -- the orange guide/
+    // meter color is already a strong visual cue; this adds a physical one
+    // for the moment it first becomes true, same "real-time confirmation"
+    // pattern already used elsewhere in the controller for state changes.
+    final lowQuality = _isLowQuality(s);
+    if (lowQuality && !_wasLowQuality) {
+      unawaited(HapticFeedback.lightImpact());
+    }
+    _wasLowQuality = lowQuality;
+
+    // "Pop" the guide outline the instant the primary burst's own "✓
+    // Captured" confirmation appears -- fires once per capture (the edge,
+    // not the level), distinct from the secondary-camera/sweep-retry
+    // confirmations which reuse the same confirmationText field with
+    // different copy.
+    if (s.confirmationText == '✓ Captured' && _lastConfirmationText != '✓ Captured') {
+      _popCtrl.forward(from: 0);
+    }
+    _lastConfirmationText = s.confirmationText;
+
     setState(() {});
 
     if (!_navigated &&
@@ -120,6 +183,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     _ctrl.dispose();
     _cameraService.disposeCamera();
     _scanAnim.dispose();
+    _popCtrl.dispose();
     super.dispose();
   }
 
@@ -236,15 +300,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     // brightness/focus sliders, translated to our own read-only lighting/
     // focus signals. Purely a UI cue (no capture-pipeline threshold touched)
     // so it's safe to adopt the mockup's exact number without a device-test
-    // gate the way a capture-affecting parameter would need.
+    // gate the way a capture-affecting parameter would need. Gated to the
+    // `holding` phase only (see _isLowQuality) so it can't misfire before
+    // the user has even placed their thumb.
     final focusVal = _lockedFocusValue ?? _ctrl.focusValue;
-    final brightWarn = s.lightingValue < 0.30;
-    final focusWarn = focusVal < 0.30;
-    final lowQuality = (brightWarn || focusWarn) &&
-        s.phase != FrontCapturePhase.capturingExtra &&
-        s.phase != FrontCapturePhase.sweepPositioning &&
-        s.phase != FrontCapturePhase.sweepActive &&
-        !s.isCapturingBurst;
+    final lowQuality = _isLowQuality(s);
+    final brightWarn = lowQuality && s.lightingValue < 0.30;
+    final focusWarn = lowQuality && focusVal < 0.30;
 
     final silhouetteState = (s.isCapturingBurst ||
             s.phase == FrontCapturePhase.capturingExtra ||
@@ -283,11 +345,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       warningText = s.distanceHint == 'Move closer'
           ? '↑ Move phone CLOSER to your thumb'
           : '↓ Move phone BACK a little';
-    } else if (showGuide &&
-        s.distanceHint == null &&
-        lowQuality &&
-        (s.phase == FrontCapturePhase.calibrating ||
-            s.phase == FrontCapturePhase.holding)) {
+    } else if (showGuide && s.distanceHint == null && lowQuality) {
       // MAC3D capture-UX-polish mockup: focus takes priority over brightness
       // when both are low (same order the mockup's own warningText uses).
       // Copy adapted from the mockup's "Move slider or refocus" -- this app
@@ -317,11 +375,19 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
           if (showGuide)
             Positioned.fill(
               child: RepaintBoundary(
-                child: CapturePadSilhouetteOverlay(
-                  state: silhouetteState,
-                  hint: null,
-                  progress: 0,
-                  shape: s.activeGuideShape ?? PadSilhouetteShape.defaultShape,
+                // MAC3D capture-UX-polish mockup: a brief "pop" (successPop)
+                // on the guide outline the instant the primary burst's own
+                // "✓ Captured" confirmation appears -- _popCtrl is driven
+                // from _onState's confirmationText edge-detect, not from
+                // build(), so it fires exactly once per capture.
+                child: ScaleTransition(
+                  scale: _popScale,
+                  child: CapturePadSilhouetteOverlay(
+                    state: silhouetteState,
+                    hint: null,
+                    progress: 0,
+                    shape: s.activeGuideShape ?? PadSilhouetteShape.defaultShape,
+                  ),
                 ),
               ),
             )
@@ -369,7 +435,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
                 color: CaptureColors.gold,
                 icon: Icons.wb_sunny_outlined,
                 label: 'BRIGHT',
-                warning: brightWarn && lowQuality,
+                tooltip: 'How well-lit your thumb is right now',
+                warning: brightWarn,
               ),
             ),
 
@@ -384,7 +451,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
                 color: CaptureColors.cyan,
                 icon: Icons.center_focus_strong_outlined,
                 label: 'FOCUS',
-                warning: focusWarn && lowQuality,
+                tooltip: 'How sharp the camera\'s autofocus is on your thumb',
+                warning: focusWarn,
               ),
             ),
 
@@ -915,6 +983,7 @@ class _VerticalMeter extends StatelessWidget {
     required this.color,
     required this.icon,
     required this.label,
+    required this.tooltip,
     this.warning = false,
   });
 
@@ -922,13 +991,28 @@ class _VerticalMeter extends StatelessWidget {
   final Color color;
   final IconData icon;
   final String label;
+  final String tooltip;
   final bool warning;
 
   @override
   Widget build(BuildContext context) {
     final v = value.clamp(0.0, 1.0);
     final activeColor = warning ? CaptureColors.warning : color;
-    return Column(
+    // Tap-to-explain: these are more prominent now than the old plain bar,
+    // so a first-time user may not immediately know what "72%" means here.
+    // Tap trigger (not the default long-press) since this is a quick glance
+    // UI, not a discoverability-first one.
+    return Tooltip(
+      message: tooltip,
+      triggerMode: TooltipTriggerMode.tap,
+      showDuration: const Duration(seconds: 3),
+      textStyle: CaptureTypography.label.copyWith(color: CaptureColors.silverBright, fontSize: 11),
+      decoration: BoxDecoration(
+        color: CaptureColors.steel,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: CaptureColors.cardBorder),
+      ),
+      child: Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
@@ -973,6 +1057,7 @@ class _VerticalMeter extends StatelessWidget {
           ),
         ),
       ],
+      ),
     );
   }
 }
