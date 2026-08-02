@@ -26,10 +26,25 @@ class CameraService {
 
   /// Initializes the camera with the given [lensDirection].
   /// Default is [CameraLensDirection.back].
+  ///
+  /// [fps]/[videoBitrate] (burst+video hybrid capture, Phase 0, 2026-08-02):
+  /// real, plugin-supported `CameraController` constructor params (confirmed
+  /// against the `camera` package's own changelog -- "Adds support to
+  /// control video fps and bitrate", v0.10.6+) for whoever later calls
+  /// [startVideoRecording]. Unlike manual exposure control (see
+  /// docs/LOCKED_SHUTTER_SPEED_SCOPE.md), this is NOT a Camera2Interop gap --
+  /// it's a supported public API, just never previously wired up since
+  /// nothing in this app called startVideoRecording until now. Harmless to
+  /// pass even when the caller never records video (photo-only capture
+  /// ignores them). Codec (H.264 vs H.265/HEVC) and true constant-bitrate
+  /// enforcement are NOT controllable through this plugin -- the platform
+  /// picks the codec; [videoBitrate] is a target, not a hard guarantee.
   Future<void> initializeCamera({
     CameraLensDirection lensDirection = CameraLensDirection.back,
     ResolutionPreset resolution = ResolutionPreset.max,
     CameraDescription? cameraDescription,
+    int? fps,
+    int? videoBitrate,
   }) async {
     // Budget devices (e.g. CameraX capability negotiation at
     // ResolutionPreset.max on a cold HAL start) occasionally exceed a single
@@ -40,6 +55,8 @@ class CameraService {
         lensDirection: lensDirection,
         resolution: resolution,
         cameraDescription: cameraDescription,
+        fps: fps,
+        videoBitrate: videoBitrate,
         timeout: const Duration(seconds: 12),
       );
     } on TimeoutException {
@@ -49,6 +66,8 @@ class CameraService {
           lensDirection: lensDirection,
           resolution: resolution,
           cameraDescription: cameraDescription,
+          fps: fps,
+          videoBitrate: videoBitrate,
           timeout: const Duration(seconds: 20),
         );
       } on TimeoutException {
@@ -62,6 +81,8 @@ class CameraService {
     required ResolutionPreset resolution,
     required CameraDescription? cameraDescription,
     required Duration timeout,
+    int? fps,
+    int? videoBitrate,
   }) async {
     try {
       // Get available cameras if not already fetched
@@ -80,6 +101,8 @@ class CameraService {
         camera,
         resolution,
         enableAudio: false,
+        fps: fps,
+        videoBitrate: videoBitrate,
       );
       _pendingController = controller;
       debugPrint(

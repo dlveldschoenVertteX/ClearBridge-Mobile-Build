@@ -120,6 +120,12 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       await _cameraService.initializeCamera(
         lensDirection: CameraLensDirection.back,
         resolution: ResolutionPreset.max,
+        // Burst+video hybrid capture, Phase 0: real, supported params
+        // (see CameraService.initializeCamera's own doc comment) for the
+        // post-burst sweep-video step. Harmless when video is never
+        // recorded on a given run.
+        fps: 30,
+        videoBitrate: 2500000,
       );
       if (!mounted) return;
       setState(() => _ready = true);

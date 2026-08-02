@@ -224,6 +224,15 @@ class FrontCaptureController extends ChangeNotifier {
   // instead of the bare 2-frame minimum.
   static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 0;
+
+  // Burst+video hybrid capture, Phase 0 (2026-08-02, see
+  // docs/BURST_VIDEO_HYBRID_SCOPE.md): best-effort video recorded right
+  // after the main burst, while the user sweeps their thumb left-to-right,
+  // giving the backend oblique-angle candidate frames the static burst/hold
+  // can never capture. Fixed duration, not "user confirms sweep complete"
+  // (the handoff spec's alternative) -- simplest safe first cut, same
+  // reasoning as the disabled guided-sweep feature's own fixed timeout.
+  static const int _sweepVideoDurationMs = 6000;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -2166,6 +2175,76 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
+  /// Best-effort video capture, Phase 0 of the burst+video hybrid spec
+  /// (docs/BURST_VIDEO_HYBRID_SCOPE.md) -- records ~6s of video on the SAME
+  /// main CameraController the burst just used (no second session, unlike
+  /// the secondary-camera loop right after this: that one switches to a
+  /// DIFFERENT physical camera and has its own real, already-documented
+  /// session-contention history; this stays on the one already-open
+  /// session, the lower-risk case). Uploads the raw file -- the backend
+  /// decides what candidate frames to pull from it; nothing here decodes or
+  /// interprets the video.
+  ///
+  /// Deliberately does NOT attempt the full spec's multi-region fusion --
+  /// see the scope doc for why (unregistered oblique-angle stitching is a
+  /// real, unproven research question, not a formality). This only gets a
+  /// video onto the capture doc so the backend's Phase 0 (score each
+  /// candidate frame independently, no fusion) has real data to work with.
+  ///
+  /// Never throws past its own try/catch -- a failure here can't jeopardise
+  /// the main burst, which is already safely uploaded via the caller's own
+  /// separate path regardless of this method's outcome.
+  Future<Map<String, dynamic>> _captureSweepVideo(String basePath) async {
+    final debug = <String, dynamic>{'attempted': true};
+    final svc = _cameraService;
+    if (svc == null) {
+      debug['error'] = 'no camera service';
+      return debug;
+    }
+    final stopwatch = Stopwatch()..start();
+    var recording = false;
+    try {
+      await _stopStream();
+      await svc.startVideoRecording();
+      recording = true;
+      // Reuses the same distanceHint-driven banner capturingExtra already
+      // renders (front_capture_screen.dart) -- no screen-side change
+      // needed. Explicit "sweep" instruction, distinct from this phase's
+      // own default "hold still" framing (the rest of capturingExtra --
+      // secondary cameras, distance-stage-2 -- genuinely wants the thumb
+      // held still; this step is the one exception that wants motion).
+      _apply((s) => s.copyWith(distanceHint: 'Slowly sweep your thumb left to right'));
+      await Future<void>.delayed(const Duration(milliseconds: _sweepVideoDurationMs));
+
+      final xfile = await svc.stopVideoRecording();
+      recording = false;
+      stopwatch.stop();
+      debug['durationMs'] = stopwatch.elapsedMilliseconds;
+
+      final bytes = await xfile.readAsBytes();
+      debug['fileSizeBytes'] = bytes.length;
+      if (bytes.isEmpty) {
+        debug['error'] = 'empty video file';
+        return debug;
+      }
+      final path = '$basePath/sweep_video.mp4';
+      await _uploadWithRetry(bytes, path, contentType: 'video/mp4');
+      debug['path'] = path;
+      debug['uploaded'] = true;
+    } catch (e) {
+      debug['error'] = e.toString();
+      debugPrint('[front] sweep video capture failed (non-fatal): $e');
+      if (recording) {
+        try {
+          await svc.stopVideoRecording();
+        } catch (_) {}
+      }
+    } finally {
+      _apply((s) => s.copyWith(distanceHint: null));
+    }
+    return debug;
+  }
+
   Future<void> _finishAndUpload(
     List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts, JpegExposureExif exif})> shots,
     double gyroAtCapture, {
@@ -2277,6 +2356,12 @@ class FrontCaptureController extends ChangeNotifier {
       // opened, in FrontCaptureScreen._init() -- this just reads the cached
       // result, does not re-trigger the native probe.
       final torchExposureProbe = await probeTorchExposureCompat();
+
+      // Runs BEFORE the secondary-camera loop below (which switches to a
+      // different physical camera) so this step's "same main camera,
+      // already-open session" assumption holds -- see _captureSweepVideo's
+      // own doc comment.
+      final sweepVideoDebug = await _captureSweepVideo(basePath);
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
@@ -2620,6 +2705,7 @@ class FrontCaptureController extends ChangeNotifier {
         if (manualExposureSupport != null)
           'manualExposureSupport': manualExposureSupport,
         if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
+        'sweepVideoDebug': sweepVideoDebug,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
       }, SetOptions(merge: true));
@@ -2904,13 +2990,17 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
-  Future<void> _uploadWithRetry(Uint8List bytes, String path) async {
+  Future<void> _uploadWithRetry(
+    Uint8List bytes,
+    String path, {
+    String contentType = 'image/jpeg',
+  }) async {
     for (var attempt = 0; ; attempt++) {
       try {
         await FirebaseStorage.instance
             .ref()
             .child(path)
-            .putData(bytes, SettableMetadata(contentType: 'image/jpeg'));
+            .putData(bytes, SettableMetadata(contentType: contentType));
         return;
       } catch (e) {
         final code = e is FirebaseException ? e.code : null;

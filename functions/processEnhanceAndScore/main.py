@@ -709,6 +709,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # same defensive pattern this should have applied to
         # _secondary_cam_scores too, but that one predates this change.
         _detail_zoom_debug: dict = {}
+        _sweep_video_debug: dict = {}
         try:
             _laps = [
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
@@ -1230,6 +1231,79 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 logger.warning('detail-zoom candidate scoring failed (non-critical): %s', _dz_exc)
                 _detail_zoom_debug['error'] = str(_dz_exc)
 
+            # Sweep-video candidates (Phase 0 of the burst+video hybrid
+            # spec, 2026-08-02, see docs/BURST_VIDEO_HYBRID_SCOPE.md): the
+            # client-side sweep video (front_capture_controller.dart,
+            # _captureSweepVideo) is best-effort and often absent -- this
+            # whole block is a no-op whenever sweepVideoDebug/path isn't on
+            # the capture doc.
+            #
+            # Deliberately NOT the spec's full 17-candidate-through-the-
+            # full-pipeline design: that would run afis_print.generate()
+            # (masking + orientation + Gabor + frequency-normalize) 17
+            # independent times per capture, on top of the ~15 variants the
+            # existing loop above already runs against its OWN 70s wall-
+            # clock budget (see _variants_deadline) -- which a real 2026-
+            # 07-16 production incident already showed is enough to blow a
+            # Cloud Run request's timeout on a single poorly-behaved
+            # capture (deepFuse/deepMaxc/deepSoft each independently redoing
+            # expensive alignment work took 15+ minutes before that got
+            # fixed). Instead: pick each zone's single sharpest raw frame by
+            # CHEAP real Laplacian variance first (_extract_video_zone_
+            # candidates, no full pipeline involved), then run the full,
+            # expensive afis_print.generate() pipeline only on those 3
+            # zone-winners -- same "cheap pre-select, expensive-score only
+            # the survivors" shape as every other candidate source in this
+            # loop (secondary cameras, detail-zoom), not a new pattern.
+            #
+            # Max-of-candidates: can only ever raise afis_nfiq via the same
+            # `if _vs > afis_nfiq` gate every other candidate source above
+            # uses, never regress a capture this sweep-video step doesn't
+            # apply to.
+            _sweep_video_debug: dict = {}
+            try:
+                _sv_meta = _cap_doc.get('sweepVideoDebug') or {}
+                _sv_path = _sv_meta.get('path') if _sv_meta.get('uploaded') else None
+                _sweep_video_debug['present'] = bool(_sv_path)
+                if _sv_path:
+                    _sv_bytes = _download_storage_file(_sv_path)
+                    _sv_candidates = _extract_video_zone_candidates(_sv_bytes)
+                    _sweep_video_debug['zonesExtracted'] = list(_sv_candidates.keys())
+                    for _zone, (_vframe, _vts, _vlap) in _sv_candidates.items():
+                        _zone_debug = {
+                            'timestampMs': _vts,
+                            'laplacian': round(_vlap, 1),
+                        }
+                        try:
+                            _vimg_res, _vp = afis_print.generate(
+                                [_vframe], [0.0], [None],
+                                guide_region=_guide_region,
+                                freq_normalize=True,
+                                stack_cache={},
+                            )
+                            if _vimg_res is not None:
+                                _vres = _score_nfiq(_vimg_res, sfm_coverage=1.0)
+                                _vs = _vres.get('nfiq_score', 0.0) if not _vres.get('error') else 0.0
+                                _zone_debug['proxyScore'] = round(_vs, 2)
+                                _sname = f'sweepVideo_{_zone}'
+                                logger.info('AFIS variant %s nfiq=%.1f lap=%.1f ts=%dms',
+                                            _sname, _vs, _vlap, _vts)
+                                _zone_debug['wonSelection'] = bool(_vs > afis_nfiq)
+                                if _vs > afis_nfiq:
+                                    afis_nfiq = _vs
+                                    best_afis_img = _vimg_res
+                                    afis_params = {**_vp, 'afisNfiq': round(_vs, 2),
+                                                   'afisSource': _sname}
+                            else:
+                                _zone_debug['wonSelection'] = False
+                        except Exception as _vz_exc:   # noqa: BLE001
+                            logger.warning('sweep video zone %s scoring failed: %s', _zone, _vz_exc)
+                            _zone_debug['error'] = str(_vz_exc)
+                        _sweep_video_debug[_zone] = _zone_debug
+            except Exception as _sv_exc:   # noqa: BLE001 -- never block the pipeline
+                logger.warning('sweep video candidate scoring failed (non-critical): %s', _sv_exc)
+                _sweep_video_debug['error'] = str(_sv_exc)
+
             if best_afis_img is not None:
                 afis_path = _save_afis_print(best_afis_img, user_id, capture_id)
         except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline
@@ -1337,6 +1411,15 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # wonSelection:true on a real fraction of captures before that
             # further investment is justified.
             'detailZoomDebug': _detail_zoom_debug or None,
+            # Burst+video hybrid capture, Phase 0 diagnostic (see
+            # docs/BURST_VIDEO_HYBRID_SCOPE.md): per-zone real Laplacian +
+            # proxy score + whether that zone's video-sourced candidate won
+            # selection. Gate for building the spec's Phase 4 fusion: needs
+            # wonSelection:true on a real fraction of captures (evidence a
+            # video-sourced frame is genuinely competitive) before that
+            # much harder, currently-unproven registration/stitching work
+            # is justified.
+            'sweepVideoCandidates': _sweep_video_debug or None,
         }, critical=True)
 
         # POPIA data minimization: raw frames served their purpose (pipeline input).
@@ -1846,6 +1929,77 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     logger.info('front_only: %d ambient + %d flash frames loaded',
                 len(amb_frames_list), len(fl_frames_list))
     return frames, meta_out, angles_out, ambient_frames_out, flash_frames_out
+
+
+# Burst+video hybrid capture, Phase 0 (2026-08-02, see
+# docs/BURST_VIDEO_HYBRID_SCOPE.md). Candidate timestamps taken from the
+# handoff spec's own left/center/right zone windows -- a reasonable a-priori
+# split of a 6s sweep, kept as-is since nothing here has been measured/
+# refuted yet (unlike several already-tested tuning ideas elsewhere in this
+# file). Deliberately does NOT decode+hold all ~180 frames the way the
+# original spec describes -- cv2.VideoCapture seeks directly to each
+# candidate timestamp instead of decoding sequentially through the whole
+# clip, avoiding ~1GB+ of raw-frame memory for candidates that are never
+# used (180 frames x 1920x1080x3 bytes). Frame-accurate seeking on a
+# real device-encoded H.264/H.265 clip is not perfectly precise (keyframe-
+# interval-dependent) -- acceptable here since the "5 timestamps per zone"
+# design already exists specifically to tolerate landing near, not exactly
+# on, each target.
+_SWEEP_VIDEO_ZONE_TIMESTAMPS_MS = {
+    'left':   [500, 900, 1300, 1500, 1800],
+    'center': [2000, 2800, 3000, 3200, 4000],
+    'right':  [4200, 4500, 4800, 5200, 5500],
+}
+
+
+def _extract_video_zone_candidates(video_bytes: bytes) -> dict:
+    """
+    Returns {zone: (bgr_frame, timestamp_ms, laplacian)} for whichever
+    zone(s) yielded at least one decodable frame -- the SHARPEST real
+    (backend-measured, not client-reported -- the client never analyzes
+    video frames) candidate per zone, by raw Laplacian variance. Missing
+    zones (short video, decode failure) are simply absent from the result,
+    never raised as an error -- this is a best-effort candidate source, same
+    discipline as secondary-camera/detail-zoom scoring elsewhere in this
+    file.
+
+    Writes to a temp file first: cv2.VideoCapture does not reliably read an
+    in-memory buffer across OpenCV builds/backends, and Cloud Run's own
+    /tmp is already ephemeral per-request, the same convention as every
+    other Storage-backed binary this pipeline handles.
+    """
+    import tempfile
+    winners: dict = {}
+    try:
+        with tempfile.NamedTemporaryFile(suffix='.mp4') as tmp:
+            tmp.write(video_bytes)
+            tmp.flush()
+            cap = cv2.VideoCapture(tmp.name)
+            try:
+                if not cap.isOpened():
+                    logger.warning('sweep video: failed to open for decode')
+                    return winners
+                for zone, timestamps in _SWEEP_VIDEO_ZONE_TIMESTAMPS_MS.items():
+                    best_frame = None
+                    best_lap = -1.0
+                    best_ts = None
+                    for ts_ms in timestamps:
+                        cap.set(cv2.CAP_PROP_POS_MSEC, float(ts_ms))
+                        ok, frame = cap.read()
+                        if not ok or frame is None:
+                            continue
+                        lap = float(cv2.Laplacian(
+                            cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY), cv2.CV_64F
+                        ).var())
+                        if lap > best_lap:
+                            best_lap, best_frame, best_ts = lap, frame, ts_ms
+                    if best_frame is not None:
+                        winners[zone] = (best_frame, best_ts, best_lap)
+            finally:
+                cap.release()
+    except Exception as exc:   # noqa: BLE001 -- best-effort candidate source
+        logger.warning('sweep video: candidate extraction failed: %s', exc)
+    return winners
 
 
 def _download_oscillating_frames(capture_id: str, base_path: str):
