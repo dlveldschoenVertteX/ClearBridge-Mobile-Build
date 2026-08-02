@@ -233,6 +233,26 @@ class FrontCaptureController extends ChangeNotifier {
   // (the handoff spec's alternative) -- simplest safe first cut, same
   // reasoning as the disabled guided-sweep feature's own fixed timeout.
   static const int _sweepVideoDurationMs = 6000;
+  // Bounds the record-start -> record-stop -> read-bytes sequence only
+  // (NOT the upload after it, which has its own legitimate retry/backoff
+  // and shouldn't be killed for being slow on a bad connection). 6s
+  // recording + generous margin for native start/stop/flush overhead --
+  // same proportion as this file's other camera-operation timeouts (e.g.
+  // the secondary-camera path's 28s bound against its own, heavier,
+  // multi-shot sequence). A hang here is caught by .timeout() rather than
+  // blocking the whole capture forever the way an uncaught-hang camera
+  // Future would -- try/catch alone does not protect against that.
+  static const int _sweepVideoRecordTimeoutMs = 15000;
+
+  // Instant kill-switch for the whole video-sweep step, same pattern as
+  // the disabled guided-sweep feature's own _sweepEnabled -- if a real
+  // device test finds a problem, flip this to false, commit, push, rebuild.
+  // No revert or branch surgery needed to detach this specific feature
+  // from everything else on this branch. The backend's own sweepVideoCandidates
+  // scoring block (main.py) is already inert whenever no video was
+  // uploaded, so this one flag fully controls the feature's real-world
+  // effect regardless of what's deployed backend-side.
+  static const bool _sweepVideoHybridEnabled = true;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -2205,23 +2225,31 @@ class FrontCaptureController extends ChangeNotifier {
     var recording = false;
     try {
       await _stopStream();
-      await svc.startVideoRecording();
-      recording = true;
-      // Reuses the same distanceHint-driven banner capturingExtra already
-      // renders (front_capture_screen.dart) -- no screen-side change
-      // needed. Explicit "sweep" instruction, distinct from this phase's
-      // own default "hold still" framing (the rest of capturingExtra --
-      // secondary cameras, distance-stage-2 -- genuinely wants the thumb
-      // held still; this step is the one exception that wants motion).
-      _apply((s) => s.copyWith(distanceHint: 'Slowly sweep your thumb left to right'));
-      await Future<void>.delayed(const Duration(milliseconds: _sweepVideoDurationMs));
+      // The actual record-start -> record-stop -> read-bytes sequence is
+      // wrapped in its own timeout, separate from the upload below -- a
+      // hang anywhere in native video recording must not block the whole
+      // capture forever (try/catch alone doesn't catch a Future that never
+      // resolves).
+      final bytes = await (() async {
+        await svc.startVideoRecording();
+        recording = true;
+        // Reuses the same distanceHint-driven banner capturingExtra
+        // already renders (front_capture_screen.dart) -- no screen-side
+        // change needed. Explicit "sweep" instruction, distinct from this
+        // phase's own default "hold still" framing (the rest of
+        // capturingExtra -- secondary cameras, distance-stage-2 --
+        // genuinely wants the thumb held still; this step is the one
+        // exception that wants motion).
+        _apply((s) => s.copyWith(distanceHint: 'Slowly sweep your thumb left to right'));
+        await Future<void>.delayed(const Duration(milliseconds: _sweepVideoDurationMs));
 
-      final xfile = await svc.stopVideoRecording();
-      recording = false;
+        final xfile = await svc.stopVideoRecording();
+        recording = false;
+        return xfile.readAsBytes();
+      }()).timeout(const Duration(milliseconds: _sweepVideoRecordTimeoutMs));
       stopwatch.stop();
       debug['durationMs'] = stopwatch.elapsedMilliseconds;
 
-      final bytes = await xfile.readAsBytes();
       debug['fileSizeBytes'] = bytes.length;
       if (bytes.isEmpty) {
         debug['error'] = 'empty video file';
@@ -2360,8 +2388,12 @@ class FrontCaptureController extends ChangeNotifier {
       // Runs BEFORE the secondary-camera loop below (which switches to a
       // different physical camera) so this step's "same main camera,
       // already-open session" assumption holds -- see _captureSweepVideo's
-      // own doc comment.
-      final sweepVideoDebug = await _captureSweepVideo(basePath);
+      // own doc comment. Gated on _sweepVideoHybridEnabled -- flip that one
+      // flag to detach this feature instantly if a real device test finds
+      // a problem, without touching anything else in this file.
+      final sweepVideoDebug = _sweepVideoHybridEnabled
+          ? await _captureSweepVideo(basePath)
+          : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
       // BEFORE the single Firestore document write below, and their results
