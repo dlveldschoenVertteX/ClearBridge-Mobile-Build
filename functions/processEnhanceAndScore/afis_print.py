@@ -1297,6 +1297,7 @@ def generate(
     geom: Optional[str] = None,
     gabor_sigma_ratio: Optional[float] = None,
     gabor_gamma: Optional[float] = None,
+    mirror: bool = False,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -1929,6 +1930,30 @@ def generate(
     else:
         binimg, mask = _upright_rotate(binimg, mask)
     params['afisRotated'] = True
+
+    # Mirror-correction SCAFFOLD (2026-08-03, CTO-reported): this capture
+    # flow requires the user to twist their thumb behind the phone to
+    # present the pad to the rear camera -- a real geometric mirror vs. a
+    # direct scan/ink impression (finger pressed straight down, never
+    # twisted), already root-caused in this project's history (see
+    # CLAUDE.md, "CTO capture-geometry explanation: thumb-twist mirroring",
+    # 2026-07-17). No flip has ever been applied anywhere in this pipeline
+    # (confirmed: this module has zero `cv2.flip`/mirror logic elsewhere) --
+    # so every AFIS print produced so far is in "as captured" orientation,
+    # not "as if pressed directly" orientation. An earlier SourceAFIS test
+    # that round found mirroring did NOT improve match score on average, but
+    # was run against a single low-quality ink-scan reference already known
+    # to sit at the matcher's noise floor -- inconclusive, not a refutation.
+    # Applied LAST (after upright rotation), so it composes cleanly with
+    # every other step. Default OFF -- gated the same as every other
+    # unvalidated lever in this pipeline (geom=, enhance='fidelity', etc.):
+    # needs a real matcher test against a trustworthy reference before this
+    # becomes the default, not just a visual guess this time either.
+    if mirror:
+        binimg = cv2.flip(binimg, 1)
+        mask = cv2.flip(mask, 1)
+        params['afisMirrored'] = True
+
     ys, xs = np.where(mask > 0)
     m = 30
     y0, x0 = max(0, ys.min() - m), max(0, xs.min() - m)
