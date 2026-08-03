@@ -784,11 +784,12 @@ class FrontCaptureController extends ChangeNotifier {
       // a single noisy reading -- same hysteresis rationale as
       // _maxSteadyDegPerSec's gyro smoothing.
   static const double _zoomStep = 0.15;
-  // Cap digital zoom at 1.3x: afe5b02c (round 3) scored nfiq2=74 at 1.3x,
-  // and native wavelength ~9.75px × 1.3 = ~12.7px stays in the 9-14px sweet
-  // spot.  Beyond 1.3x the pixel wavelength hits the 20px ceiling and NFIQ2
-  // collapses (real captures: nfiq2=10, nfiq2=6 at 2.05x).
-  static const double _maxZoomFill = 1.3;
+  // Zoom-to-fill disabled: digital zoom inflates afisWavelengthPx even when
+  // the user is correctly positioned, because zoom-in is never reversed during
+  // the hold phase. Guide is already calibrated for the right working distance;
+  // the "Move closer" hint handles under-fill without zooming. Set to 1.0 so
+  // _maxZoomLevel clamps to 1.0 and _maybeAdjustZoom is always a no-op.
+  static const double _maxZoomFill = 1.0;
 
   // Two-tier adaptive zoom burst (2026-07-30, Phase 0 -- diagnostic-only on
   // the backend side). After the main 8-shot burst is safely captured and
