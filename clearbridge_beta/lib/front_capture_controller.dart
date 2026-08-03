@@ -2974,6 +2974,22 @@ class FrontCaptureController extends ChangeNotifier {
     const lockThreshold = 0.45; // same relative threshold as onTarget's gate.
     var peak = 1.0;
     var focusEma = 0.0;
+    // Diagnostic only, 2026-08-03 (see the real capture 19184018-be77-4320-
+    // 9648-42f44ba5a35b root-cause: camera "3" reported focusScoreAtFire
+    // 0.943 -- reads as high confidence -- while its actual captured frames
+    // were catastrophically blurry, real Laplacian ~6.5). focusEma is
+    // PURELY self-relative (raw ÷ its own observed peak, starting from a
+    // floor of 1.0) -- a camera whose lens never finds real sharp focus but
+    // stays roughly equally blurry throughout the wait window can satisfy
+    // this convergence check almost immediately, because nothing here ever
+    // checks the ABSOLUTE raw value against a floor the way the backend's
+    // own _SECONDARY_MIN_LAPLACIAN gate does downstream. Not fixed yet --
+    // this project's own established discipline is real data before a new
+    // threshold, and there's no calibrated absolute floor for this specific
+    // client-side metric's scale yet. This just records what the raw,
+    // un-normalized value actually was at lock time, so the next several
+    // real captures build the dataset a real fix would need.
+    var lastRaw = 0.0;
     var streaming = false;
     var processingFrame = false; // re-entrancy guard: offerFrame can take
         // >33ms, so at 30fps the event queue backs up and starves the UI
@@ -2985,6 +3001,7 @@ class FrontCaptureController extends ChangeNotifier {
       processingFrame = true;
       try {
         final raw = _hybrid.offerFrame(image, thumbRoi: roi);
+        lastRaw = raw;
         if (raw > peak) peak = raw;
         focusEma = HybridCaptureService.ema(
           focusEma,
@@ -3016,6 +3033,10 @@ class FrontCaptureController extends ChangeNotifier {
           DateTime.now().difference(start).inMilliseconds;
       stageDebug['${keyPrefix}focusScoreAtFire'] =
           double.parse(focusEma.toStringAsFixed(3));
+      stageDebug['${keyPrefix}focusRawAtFire'] =
+          double.parse(lastRaw.toStringAsFixed(3));
+      stageDebug['${keyPrefix}focusRawPeak'] =
+          double.parse(peak.toStringAsFixed(3));
       // true = AF never actually converged; burst fired at the maxWaitMs
       // bound. Distinguishes "fast lock" from "gave up and fired anyway".
       stageDebug['${keyPrefix}focusTimedOut'] = !completer.isCompleted;
