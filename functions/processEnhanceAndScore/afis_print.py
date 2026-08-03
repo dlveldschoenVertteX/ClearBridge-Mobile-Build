@@ -195,6 +195,33 @@ _FOMFE_ORDER = 4   # basis order in each axis (5x5 (p,q) grid x 4 sin/cos
 # treatment as gaborVarFreq/fidelity/gaborPyfingField/deepFocus*) -- do not
 # wire into production without first understanding why 382cc4b2 resists
 # every setting tried.
+#
+# BROADER VALIDATION 2026-08-04 (CTO's explicit ask: don't trust a 4-
+# capture/6-pair sample, test wider) -- the "382cc4b2 is a special case"
+# theory above was ITSELF a small-sample artifact. Widened real NFIQ2 to
+# 22 real captures across 10 independent real users (every real cross-
+# session genuine-pair group found in Storage, not hand-picked): mean
+# +2.36 (was +4.0 on the original 8) -- still net positive, but a
+# meaningfully smaller effect once tested broadly, with 6/22 regressing
+# (was 1/8). Widened real SourceAFIS matchability to all 15 genuine pairs
+# across those same 10 users (was 6 pairs / 1 user): mean 55.65 -> 50.03,
+# a ~10% REAL LOSS, 8/15 pairs improved vs 7/15 regressed -- essentially a
+# coin flip with real variance in both directions, not a clean win.
+# Critically: a NEW pair not involving 382cc4b2 at all (367fb854 vs
+# de540624) showed the single BIGGEST regression of the whole set
+# (91.0 -> 27.5, -63.5) -- bigger than anything 382cc4b2 produced. So the
+# earlier "one specific capture is miscalibrated" theory doesn't hold up;
+# this is a real, broader property of the technique -- it helps some real
+# captures a lot (+19.5, +13.5, +10.9) and hurts others a lot (-63.5,
+# -32.3, -16.3), fairly unpredictably, netting slightly negative on
+# average. NOT wired into main.py's production variant list, and NOT
+# recommended even as an additive max-of-variants candidate: main.py's
+# variant selection runs on the NFIQ2 proxy/real score, and this technique
+# can win that internal quality race on a capture where it's real-
+# matchability-negative (the same "the proxy is foolable" failure mode
+# already documented elsewhere in this project, just for a new variant).
+# Left here as an available, honestly-negative-on-the-metric-that-matters
+# scaffold -- not a wasted effort, a real answer.
 
 
 _FOMFE_BLEND_CONF_SIGMA = 12.0  # Gaussian smoothing (px) on the raw per-pixel
