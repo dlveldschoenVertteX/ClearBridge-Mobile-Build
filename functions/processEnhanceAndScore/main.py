@@ -710,6 +710,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # _secondary_cam_scores too, but that one predates this change.
         _detail_zoom_debug: dict = {}
         _sweep_video_debug: dict = {}
+        _minutiae_patch_debug: dict = {}
         try:
             _laps = [
                 (m.get('laplacianScore') if isinstance(m, dict) else None)
@@ -1304,6 +1305,87 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 logger.warning('sweep video candidate scoring failed (non-critical): %s', _sv_exc)
                 _sweep_video_debug['error'] = str(_sv_exc)
 
+            # Minutiae-patch candidates (2026-08-03): three sub-region crops of
+            # the same main burst frames, each scored independently as a
+            # max-of-variants candidate.  Using tighter guide bounds on the same
+            # already-downloaded stills amplifies ridge density in three distinct
+            # pad sub-regions without any extra device capture:
+            #   core  — 70 % of rx/ry, same centre: densest central-whorl ridges
+            #   left  — cx shifted left by 35 % of rx, 70 % rx: left-delta ridges
+            #   right — cx shifted right by 35 % of rx, 70 % rx: right-delta ridges
+            # Reuses _stack_cache from the main variant loop: the ECC alignment
+            # produced there is frame-content-keyed (not guide-keyed), so the
+            # cached stacks are valid inputs for any sub-guide crop.
+            # Skipped when _guide_region is absent (no sub-guides can be derived).
+            try:
+                if _guide_region:
+                    _gr = _guide_region
+                    _patch_subguides = {
+                        'core': {
+                            'cx': _gr['cx'],
+                            'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.70,
+                            'ry': _gr['ry'] * 0.70,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'left': {
+                            'cx': _gr['cx'] - _gr['rx'] * 0.35,
+                            'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.70,
+                            'ry': _gr['ry'],
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'right': {
+                            'cx': _gr['cx'] + _gr['rx'] * 0.35,
+                            'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.70,
+                            'ry': _gr['ry'],
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                    }
+                    for _pname, _pguide in _patch_subguides.items():
+                        _pdebug: dict = {
+                            'guide': {k: round(v, 4) for k, v in _pguide.items()
+                                      if isinstance(v, (int, float))}
+                        }
+                        try:
+                            _pimg, _pp = afis_print.generate(
+                                frames, angles_for_sfm, _laps,
+                                ambient_frames=ambient_frames,
+                                flash_frames=flash_frames,
+                                ambient_burst=ambient_burst,
+                                flash_burst=flash_burst,
+                                guide_region=_pguide,
+                                freq_normalize=True,
+                                stack_cache=_stack_cache,
+                            )
+                            if _pimg is not None:
+                                _pres = _score_nfiq(_pimg, sfm_coverage=1.0)
+                                _ps = (_pres.get('nfiq_score', 0.0)
+                                       if not _pres.get('error') else 0.0)
+                                _pdebug['proxyScore'] = round(_ps, 2)
+                                logger.info('AFIS minutiae patch %s nfiq=%.1f', _pname, _ps)
+                                _pdebug['wonSelection'] = bool(_ps > afis_nfiq)
+                                if _ps > afis_nfiq:
+                                    afis_nfiq = _ps
+                                    best_afis_img = _pimg
+                                    afis_params = {**_pp, 'afisNfiq': round(_ps, 2),
+                                                   'afisSource': f'minutiae_{_pname}'}
+                            else:
+                                _pdebug['wonSelection'] = False
+                        except Exception as _pe:   # noqa: BLE001
+                            logger.warning('minutiae patch %s scoring failed: %s', _pname, _pe)
+                            _pdebug['error'] = str(_pe)
+                        _minutiae_patch_debug[_pname] = _pdebug
+                else:
+                    _minutiae_patch_debug['skipped'] = 'no guide region'
+            except Exception as _mp_exc:   # noqa: BLE001 -- never block the pipeline
+                logger.warning('minutiae patch scoring failed (non-critical): %s', _mp_exc)
+                _minutiae_patch_debug['error'] = str(_mp_exc)
+
             if best_afis_img is not None:
                 afis_path = _save_afis_print(best_afis_img, user_id, capture_id)
         except Exception as afis_exc:   # noqa: BLE001 — never block the pipeline
@@ -1420,6 +1502,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # much harder, currently-unproven registration/stitching work
             # is justified.
             'sweepVideoCandidates': _sweep_video_debug or None,
+            # Minutiae-patch candidates diagnostic (2026-08-03): per-patch
+            # sub-guide, proxy score, and whether that patch won selection.
+            # Gate for deciding whether to invest further in patch-level
+            # fusion: needs wonSelection:true on a real fraction of captures
+            # (evidence a tighter crop genuinely beats the full-guide result).
+            'minutiaeDebug': _minutiae_patch_debug or None,
         }, critical=True)
 
         # POPIA data minimization: raw frames served their purpose (pipeline input).
