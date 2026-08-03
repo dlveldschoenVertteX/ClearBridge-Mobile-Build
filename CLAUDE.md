@@ -1,5 +1,79 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep-video replaced with sweep-burst stills; minutiae-patch sub-guide candidates added (2026-08-03/2026-08-05, round 21)
+CTO asked whether the burst+video hybrid sweep ("prime directive" fusion
+architecture) actually works, and — once shown the real Phase 0 data said no
+— proposed the direct fix: fire real stills at the start/middle/right sweep
+positions instead of extracting frames from a recorded video.
+
+**Real data behind the "does it work" answer**: two of the most recent real
+captures with sweep data (`9408bb2a` nfiq2=73, `1febdba7` nfiq2=7) both
+showed sweep-video zone frames scoring Laplacian 23-59, vs 311-327 for plain
+main-burst ambient stills on the SAME captures — a ~5-6x sharpness gap. Root
+cause is structural, not tunable: 30fps video gives each frame only ~33ms
+exposure (vs a still's proper exposure time), and H.264 compression further
+softens detail relative to an uncompressed JPEG. Zero sweep-video zone
+candidates had ever won selection (`wonSelection: true`) across any real
+capture checked — mechanically the extraction/scoring loop worked correctly,
+it just never had competitive material to work with.
+
+**Fixed by replacing the capture mechanism, not the extraction logic**:
+`_captureSweepVideo` (recorded a fixed-duration video while the guide
+translated left-to-right, backend seeked to 5 candidate timestamps per zone
+and picked the sharpest via Laplacian) is now `_captureSweepBurst` — the
+guide still translates through the same left/centre/right positions with
+the same real-time-to-react pacing (per-hop `_sweepZoneMoveMs` animation +
+`_sweepZoneSettleMs` dwell before each shutter), but a real `takePicture()`
+JPEG still fires at each of the 3 stops instead of a video ever being
+recorded. Same discipline as every other bounded camera sequence in this
+file: the whole 3-zone sequence is wrapped in one `.timeout()`
+(`_sweepBurstTimeoutMs`, 18s) since `takePicture()` is an unbounded
+platform-channel await, and each zone's shot is ALSO individually
+try/caught so one failed zone only costs that one candidate, never aborts
+the other two.
+
+**Per-zone guide region, not just per-zone stills**: since the on-screen
+guide visibly translates for each zone, the still-space AFIS mask must
+translate with it too, or the backend would crop e.g. the left zone's frame
+using the centre zone's guide bounds. Rather than hand-derive a second,
+easily-drifting copy of the existing BoxFit.cover + 90°-rotation transform
+(`_computeGuideRegion`), that transform was factored out into
+`_stillSpaceRegionForShape()` and reused by a new
+`_guideRegionForSweepZone()` — guaranteed to stay in sync with the main
+guide's own derivation since there's only one implementation of the math.
+Requires caching `screenSize`/`previewSize` from `start()` (new
+`_cachedScreenSize`/`_cachedPreviewSize` fields) since the sweep-burst
+capture runs later in `_finishAndUpload`, well after `start()`'s original
+call site for this geometry.
+
+Backend (`main.py`): the old `_extract_video_zone_candidates` function and
+`_SWEEP_VIDEO_ZONE_TIMESTAMPS_MS` constant (video-seek-and-decode) are
+removed outright — no longer reachable now that the client never uploads a
+video. The replacement block downloads the 3 real zone stills directly from
+`sweepBurstDebug.paths`, scores each through `afis_print.generate()` using
+that zone's own `sweepBurstDebug.guideRegions[zone]` (falling back to the
+main capture's `guideRegion` if the client couldn't compute one), and
+competes via the same `if _zs > afis_nfiq` max-of-variants gate as every
+other candidate source in this loop. Firestore fields renamed to match:
+client writes `sweepBurstDebug`, backend writes `sweepBurstCandidates`
+(was `sweepVideoDebug`/`sweepVideoCandidates`).
+
+**Also same-session**: added minutiae-patch sub-guide candidates (`core`/
+`left`/`right`, each a tighter crop of the same already-downloaded main
+burst frames — 70% rx/ry centred, and cx-shifted ±35% of rx for the two
+delta regions) to `main.py`'s AFIS variant scoring, per the CTO's idea to
+use tighter crops of the existing high-res burst to sharpen matchability-
+relevant sub-regions without any new capture. Purely additive (same
+max-of-variants gate), reuses `_stack_cache` from the main variant loop.
+Written to Firestore as `minutiaeDebug` for per-capture validation of
+whether any patch ever wins selection.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project: needs a real APK build + real capture to
+confirm the sweep-burst stills actually score competitively against the
+main burst (the whole point of the fix) and that the per-zone guide regions
+crop correctly. Backend changes need their own explicit deploy go-ahead.
+
 ## Deep-dive on why the re-verified capture scored lower + adaptive flash EV curve softened (2026-07-24, round 20)
 CTO asked why the manually re-verified `3f8fd075` capture (real NFIQ2 64)
 scored lower than recent captures like `dadd4ef9` (81) or `03b91b6f` (72),

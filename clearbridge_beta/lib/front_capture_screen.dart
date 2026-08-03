@@ -444,13 +444,13 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               ),
             ),
 
-          // Directional arrow cue for the sweep-video step -- real device-
+          // Directional arrow cue for the sweep-burst step -- real device-
           // test feedback (2026-08-03): "I did not recognize any sweep UX",
           // and separately asked for the guide to move + arrows to indicate
           // direction "as before" (the disabled guided-sweep feature's own
           // left-to-right guide translation). The guide itself already
-          // moves via activeGuideShape (see _captureSweepVideo's timer);
-          // this adds the explicit "which way" cue on top.
+          // moves via activeGuideShape (see _captureSweepBurst); this adds
+          // the explicit "which way" cue on top.
           if (s.videoSweepActive)
             Positioned(
               left: ringLeft,

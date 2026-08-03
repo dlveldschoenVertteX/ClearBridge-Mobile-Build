@@ -125,14 +125,16 @@ class FrontCaptureState {
   // camera turns (see _secondaryCameraGuideShape) -- null means "use
   // PadSilhouetteShape.defaultShape".
   final PadSilhouetteShape? activeGuideShape;
-  // True only while the burst+video hybrid capture's sweep video is
-  // actively recording (see FrontCaptureController._captureSweepVideo) --
-  // drives the screen's directional arrow cue. Reuses sweepProgress/
-  // activeGuideShape (already existed for the disabled guided-sweep
-  // feature) to animate the guide left-to-right in sync with the real
-  // recording window; this flag is what tells the screen those fields mean
-  // "sweep in progress" rather than their old sweepPositioning/sweepActive
-  // meaning (which never applies here -- this step runs during
+  // True only while the burst+sweep hybrid capture's zone sequence is
+  // actively moving/capturing (see FrontCaptureController._captureSweepBurst
+  // -- name predates the 2026-08-03 switch from a video recording to real
+  // per-zone stills, kept as-is since it's just a UI-driving flag, not a
+  // capture-mechanism label). Drives the screen's directional arrow cue.
+  // Reuses sweepProgress/activeGuideShape (already existed for the disabled
+  // guided-sweep feature) to animate the guide left-to-right in sync with
+  // the real zone sequence; this flag is what tells the screen those fields
+  // mean "sweep in progress" rather than their old sweepPositioning/
+  // sweepActive meaning (which never applies here -- this step runs during
   // capturingExtra, not those phases).
   final bool videoSweepActive;
 
@@ -238,57 +240,63 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 0;
 
-  // Burst+video hybrid capture, Phase 0 (2026-08-02, see
-  // docs/BURST_VIDEO_HYBRID_SCOPE.md): best-effort video recorded right
-  // after the main burst, while the user sweeps their thumb left-to-right,
-  // giving the backend oblique-angle candidate frames the static burst/hold
-  // can never capture. Fixed duration, not "user confirms sweep complete"
-  // (the handoff spec's alternative) -- simplest safe first cut, same
-  // reasoning as the disabled guided-sweep feature's own fixed timeout.
+  // Burst+sweep hybrid capture (2026-08-03, see
+  // docs/BURST_VIDEO_HYBRID_SCOPE.md): best-effort extra stills captured at
+  // three positions (left/centre/right) while the guide sweeps across the
+  // screen, giving the backend off-centre candidate frames the static
+  // burst/hold can never capture.
   //
-  // 6000 -> 9000, 2026-08-03: real device-test feedback -- "moving too
-  // fast... once it came to the other side it was static" -- and the
-  // screenshots back it up: two frames captured a real 1 second apart both
-  // already showed the guide parked at the fully-right-shifted position
-  // (sweepProgress already at 100% in both). The interpolation math itself
-  // is linear and correct; 6s was simply too short once real human reaction
-  // time (read the cue, start moving) eats into it -- the guide reaches the
-  // far side well before the user's own physical sweep catches up, then
-  // correctly holds there for whatever's left of the window, which reads
-  // as "broken" even though it isn't. _SWEEP_VIDEO_ZONE_TIMESTAMPS_MS in
-  // main.py is rescaled by the same 1.5x factor alongside this -- the two
-  // MUST move together, since the backend's candidate-extraction timestamps
-  // are meaningless if they don't span this same real recording window.
-  static const int _sweepVideoDurationMs = 9000;
-  // Bounds the record-start -> record-stop -> read-bytes sequence only
-  // (NOT the upload after it, which has its own legitimate retry/backoff
-  // and shouldn't be killed for being slow on a bad connection). Recording
-  // duration + generous margin for native start/stop/flush overhead --
-  // same proportion as this file's other camera-operation timeouts (e.g.
-  // the secondary-camera path's 28s bound against its own, heavier,
-  // multi-shot sequence). A hang here is caught by .timeout() rather than
-  // blocking the whole capture forever the way an uncaught-hang camera
-  // Future would -- try/catch alone does not protect against that.
-  static const int _sweepVideoRecordTimeoutMs = 20000;
-  // Real device-test feedback (2026-08-05): the guide started translating
-  // the instant recording began, giving zero time to physically place the
-  // thumb at the starting position first. This pre-roll pause happens
-  // entirely BEFORE svc.startVideoRecording() -- see _captureSweepVideo --
-  // so it costs real wall-clock time but never touches the recorded clip
-  // itself or main.py's zone timestamps. Held-instruction phase, then a
-  // 3-tick haptic count-in ending right as recording/motion begins.
+  // Originally shipped as a 9s VIDEO recording with candidate frames
+  // extracted backend-side (_extract_video_zone_candidates in main.py) --
+  // replaced 2026-08-03 after real device-test data (captures 9408bb2a,
+  // 1febdba7) showed every extracted video-zone frame scored Laplacian
+  // 23-59, vs 311-327 for plain main-burst stills on the SAME captures.
+  // Root cause is structural, not tunable: 30fps video gives each frame
+  // only ~33ms exposure (vs a still's proper exposure time), and H.264
+  // compression further softens detail relative to an uncompressed JPEG
+  // still. Not one real sweep-zone candidate ever won selection across
+  // either capture. Firing real JPEG stills at each zone (this file's own
+  // main/secondary bursts' own proven approach) removes both problems at
+  // the source instead of trying to extract more signal out of an
+  // intrinsically lower-quality source.
+  //
+  // The guide motion/timing UX itself (calibration hold, count-in, smooth
+  // left-to-right translation, direction-arrow cue) is unchanged from the
+  // video version -- only WHAT fires at each stop changed.
   static const int _sweepCalibrationHoldMs = 1500;
   static const int _sweepCalibrationTickMs = 700;
+  // Time to animate the guide translating from one zone to the next
+  // (left->centre, centre->right) -- gives the user's eye + thumb real time
+  // to track the motion, same real-time-to-react reasoning as the former
+  // video version's 9s full-sweep duration, just now split across 2
+  // transitions instead of one continuous motion.
+  static const int _sweepZoneMoveMs = 1400;
+  // Dwell after the guide stops translating, before the shutter fires --
+  // real settle time for the user to finish repositioning their thumb at
+  // the new zone, same role as the secondary-camera distance-sweep's own
+  // _camera2SweepMoveDelayMs.
+  static const int _sweepZoneSettleMs = 700;
+  // Bounds the whole 3-zone sequence (2 guide translations + 3 settle
+  // delays + 3 takePicture() calls) -- NOT the upload after it, which has
+  // its own legitimate retry/backoff. takePicture() is a raw platform-
+  // channel await with no bound of its own; a hang on any one zone must not
+  // block the rest of the capture forever the way an uncaught-hang camera
+  // Future would (try/catch alone does not protect against that -- same
+  // reasoning as every other bounded camera sequence in this file).
+  // Budget: 2 moves (2*1400=2800) + 3 settles (3*700=2100) + 3 shots
+  // (~500ms each in practice) + generous margin for native capture overhead.
+  static const int _sweepBurstTimeoutMs = 18000;
 
-  // Instant kill-switch for the whole video-sweep step, same pattern as
+  // Instant kill-switch for the whole sweep-burst step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
   // device test finds a problem, flip this to false, commit, push, rebuild.
   // No revert or branch surgery needed to detach this specific feature
-  // from everything else on this branch. The backend's own sweepVideoCandidates
-  // scoring block (main.py) is already inert whenever no video was
-  // uploaded, so this one flag fully controls the feature's real-world
-  // effect regardless of what's deployed backend-side.
-  static const bool _sweepVideoHybridEnabled = true;
+  // from everything else on this branch. The backend's own
+  // sweepBurstCandidates scoring block (main.py) is already inert whenever
+  // no sweepBurstDebug paths were uploaded, so this one flag fully controls
+  // the feature's real-world effect regardless of what's deployed
+  // backend-side.
+  static const bool _sweepBurstHybridEnabled = true;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -631,6 +639,16 @@ class FrontCaptureController extends ChangeNotifier {
   double _guideRy = 0.17;
   static const double _guideN = 2.5;
 
+  // Cached inputs to the BoxFit.cover transform (_stillSpaceRegionForShape),
+  // set once in start(). Lets the sweep-burst zone capture (see
+  // _guideRegionForSweepZone) re-derive a still-space guide region for the
+  // TRANSLATED sweep guide on demand, without threading screenSize/
+  // previewSize through the whole _finishAndUpload call chain -- the same
+  // geometry that already produced _guideCx/_guideCy/_guideRx/_guideRy for
+  // the base (untranslated) guide.
+  Size? _cachedScreenSize;
+  Size? _cachedPreviewSize;
+
   static const double _glareHighLuma = 205.0;
   // Hysteresis gap below _glareHighLuma before walking the EV offset back
   // toward 0 -- a real gap (not right at 205) so a scene sitting near the
@@ -878,6 +896,8 @@ class FrontCaptureController extends ChangeNotifier {
     _userId = userId;
     _sensorOrientation = camera.description.sensorOrientation;
 
+    _cachedScreenSize = screenSize;
+    _cachedPreviewSize = camera.value.previewSize;
     _computeGuideRegion(screenSize: screenSize, previewSize: camera.value.previewSize);
 
     _holdStart = null;
@@ -975,12 +995,36 @@ class FrontCaptureController extends ChangeNotifier {
     if (previewSize == null || screenSize.width <= 0 || screenSize.height <= 0) {
       return; // keep the existing (last-good or default) values
     }
+    final region = _stillSpaceRegionForShape(
+      PadSilhouetteShape.defaultShape,
+      screenSize: screenSize,
+      previewSize: previewSize,
+    );
+    if (region == null) return;
+    _guideCx = region.cx;
+    _guideCy = region.cy;
+    _guideRx = region.rx;
+    _guideRy = region.ry;
+  }
+
+  /// Shared BoxFit.cover + 90°-rotation transform underlying
+  /// _computeGuideRegion above -- factored out so the sweep-burst zone
+  /// capture (_guideRegionForSweepZone) can derive a still-space guide
+  /// region for the TRANSLATED sweep guide shape using the exact same,
+  /// already-verified math, instead of a second hand-copied derivation that
+  /// could silently drift out of sync with this one.
+  ({double cx, double cy, double rx, double ry})? _stillSpaceRegionForShape(
+    PadSilhouetteShape shape, {
+    required Size screenSize,
+    required Size previewSize,
+  }) {
     // _cameraLayer() swaps previewSize's width/height to get the portrait
     // display aspect ratio before handing it to FittedBox(fit: BoxFit.cover).
     final wp = previewSize.height;
     final hp = previewSize.width;
     final ws = screenSize.width;
     final hs = screenSize.height;
+    if (wp <= 0 || hp <= 0 || ws <= 0 || hs <= 0) return null;
     final scale = math.max(ws / wp, hs / hp);
     final offX = (wp * scale - ws) / 2;
     final offY = (hp * scale - hs) / 2;
@@ -995,7 +1039,6 @@ class FrontCaptureController extends ChangeNotifier {
       return Offset(1.0 - previewV, previewU);
     }
 
-    const shape = PadSilhouetteShape.defaultShape;
     final center = toStill(shape.cx, shape.cy);
     final top = toStill(shape.cx, shape.cy - shape.ry);
     final bottom = toStill(shape.cx, shape.cy + shape.ry);
@@ -1004,10 +1047,40 @@ class FrontCaptureController extends ChangeNotifier {
 
     final xs = [top.dx, bottom.dx, left.dx, right.dx];
     final ys = [top.dy, bottom.dy, left.dy, right.dy];
-    _guideCx = center.dx;
-    _guideCy = center.dy;
-    _guideRx = (xs.reduce(math.max) - xs.reduce(math.min)) / 2;
-    _guideRy = (ys.reduce(math.max) - ys.reduce(math.min)) / 2;
+    return (
+      cx: center.dx,
+      cy: center.dy,
+      rx: (xs.reduce(math.max) - xs.reduce(math.min)) / 2,
+      ry: (ys.reduce(math.max) - ys.reduce(math.min)) / 2,
+    );
+  }
+
+  /// Still-space guide region for one sweep-burst zone (progress 0.0/0.5/1.0
+  /// = left/center/right) -- the region the backend should use as this
+  /// zone's own AFIS mask, since the on-screen guide (and therefore where
+  /// the pad actually sits in that zone's still frame) has translated away
+  /// from the base guide's position. Returns null if the cached screen/
+  /// preview geometry isn't available yet (camera not started) -- callers
+  /// fall back to the base guide region in that case, same as any other
+  /// best-effort capture-side diagnostic in this file.
+  Map<String, dynamic>? _guideRegionForSweepZone(double progress, double tipAngleDeg) {
+    final screenSize = _cachedScreenSize;
+    final previewSize = _cachedPreviewSize;
+    if (screenSize == null || previewSize == null) return null;
+    final region = _stillSpaceRegionForShape(
+      _sweepGuideShapeForProgress(progress),
+      screenSize: screenSize,
+      previewSize: previewSize,
+    );
+    if (region == null) return null;
+    return {
+      'cx': region.cx,
+      'cy': region.cy,
+      'rx': region.rx,
+      'ry': region.ry,
+      'n': _guideN,
+      'tipAngleDeg': tipAngleDeg,
+    };
   }
 
   /// Converts a raw-live-preview-pixel wavelength estimate into the same
@@ -2231,61 +2304,58 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
-  /// Best-effort video capture, Phase 0 of the burst+video hybrid spec
-  /// (docs/BURST_VIDEO_HYBRID_SCOPE.md) -- records ~6s of video on the SAME
-  /// main CameraController the burst just used (no second session, unlike
-  /// the secondary-camera loop right after this: that one switches to a
-  /// DIFFERENT physical camera and has its own real, already-documented
-  /// session-contention history; this stays on the one already-open
-  /// session, the lower-risk case). Uploads the raw file -- the backend
-  /// decides what candidate frames to pull from it; nothing here decodes or
-  /// interprets the video.
+  /// Best-effort extra stills captured at three sweep positions (left/
+  /// centre/right) on the SAME main CameraController the burst just used
+  /// (no second session, unlike the secondary-camera loop right after this,
+  /// which switches to a DIFFERENT physical camera and has its own real,
+  /// already-documented session-contention history).
   ///
-  /// Deliberately does NOT attempt the full spec's multi-region fusion --
-  /// see the scope doc for why (unregistered oblique-angle stitching is a
-  /// real, unproven research question, not a formality). This only gets a
-  /// video onto the capture doc so the backend's Phase 0 (score each
-  /// candidate frame independently, no fusion) has real data to work with.
+  /// Replaces this step's original 9s VIDEO-recording implementation (see
+  /// the constants block above for the real measured reason it was dropped:
+  /// real device captures showed every video-extracted zone frame at
+  /// Laplacian 23-59 vs 311-327 for plain main-burst stills on the SAME
+  /// capture -- a 30fps video frame's ~33ms exposure plus H.264 compression
+  /// can't match a real JPEG still, no matter how the extraction is tuned).
+  /// Firing a real still at each zone removes that problem at the source,
+  /// using the exact same takePicture()-then-encode-then-upload shape this
+  /// file already uses for the main and secondary-camera bursts.
+  ///
+  /// The whole 3-zone sequence is wrapped in ONE .timeout() -- takePicture()
+  /// is a raw platform-channel await with no bound of its own, so a hang on
+  /// any single zone must not block the rest of the capture forever
+  /// (try/catch alone does not protect against that). Each zone's shot is
+  /// ALSO individually try/caught, so one failed zone just yields fewer
+  /// candidates rather than aborting the other two -- same discipline as
+  /// the secondary-camera burst's per-shot guard.
   ///
   /// Never throws past its own try/catch -- a failure here can't jeopardise
   /// the main burst, which is already safely uploaded via the caller's own
   /// separate path regardless of this method's outcome.
-  Future<Map<String, dynamic>> _captureSweepVideo(String basePath) async {
+  Future<Map<String, dynamic>> _captureSweepBurst(
+    String basePath,
+    double tipAngleDeg,
+  ) async {
     final debug = <String, dynamic>{'attempted': true};
-    final svc = _cameraService;
-    if (svc == null) {
-      debug['error'] = 'no camera service';
+    final cam = _camera;
+    if (cam == null) {
+      debug['error'] = 'no camera controller';
       return debug;
     }
     final stopwatch = Stopwatch()..start();
-    var recording = false;
-    // Real device-test feedback (2026-08-03): "I did not recognize any
-    // sweep UX" / "the mask needs to move left/right ... as before" --
-    // the guide sat static the whole recording window with only a text
-    // prompt. Reuses _sweepGuideShapeForProgress (built for the disabled
-    // guided-sweep feature) to visibly translate the guide left-to-right,
-    // but driven purely by ELAPSED TIME against the fixed recording
-    // duration -- never live centroid/frame tracking. That's the
-    // deliberate difference from the disabled feature: this can't
-    // reintroduce any of its coordinate-space bugs because nothing here
-    // reads a camera frame to decide where the guide is.
-    Timer? guideTimer;
+    const zones = <MapEntry<String, double>>[
+      MapEntry('left', 0.0),
+      MapEntry('center', 0.5),
+      MapEntry('right', 1.0),
+    ];
+    final rawShots = <String, Uint8List>{};
+    final zoneDebug = <String, dynamic>{};
     try {
       await _stopStream();
 
-      // Real device-test feedback (2026-08-05): "needs a moment for user to
-      // get their finger at the right spot before it starts moving" -- the
-      // guide previously started translating the INSTANT recording began,
-      // giving zero real time to physically place the thumb at the
-      // starting (left) position first. Show the guide STATIC at its start
-      // position with an explicit placement instruction, then a short
-      // haptic count-in, entirely BEFORE video recording starts -- so the
-      // recorded clip itself is unchanged (still exactly
-      // _sweepVideoDurationMs of pure sweep motion starting at the first
-      // recorded frame) and main.py's zone timestamps don't need to move
-      // again. videoSweepActive is already true here so the direction
-      // arrows/progress bar render during this static hold too -- a real,
-      // deliberate early hint of the motion about to start, not a bug.
+      // Same placement pre-roll as the video version -- real time to
+      // physically get the thumb at the start position before the guide
+      // starts translating. videoSweepActive is already true here so the
+      // direction arrows/progress bar render during this static hold too.
       _apply(
         (s) => s.copyWith(
           distanceHint: 'Place your thumb at the start position',
@@ -2306,25 +2376,10 @@ class FrontCaptureController extends ChangeNotifier {
       }
       if (_disposed) return debug;
 
-      // The actual record-start -> record-stop -> read-bytes sequence is
-      // wrapped in its own timeout, separate from the upload below -- a
-      // hang anywhere in native video recording must not block the whole
-      // capture forever (try/catch alone doesn't catch a Future that never
-      // resolves).
-      final bytes = await (() async {
-        await svc.startVideoRecording();
-        recording = true;
-        // Real device-test finding (2026-08-03): "no flash present on any
-        // angle movement, only on the initial burst" -- confirmed a real
-        // gap, not a device issue: this method never touched _flash at
-        // all, so the sweep video recorded under whatever torch state the
-        // main burst left behind (always OFF -- _fireBurst deactivates the
-        // torch unconditionally when it finishes). Same _flash.isNeeded
-        // gate every other torch-firing path in this file already uses,
-        // so a genuinely bright-ambient capture still correctly skips the
-        // torch here too. Left on for the whole recording (not alternated
-        // like the main burst) -- this step wants one consistent,
-        // well-lit video, not paired ambient/flash variants.
+      await (() async {
+        // Left on for all 3 zone shots (not alternated like the main
+        // burst) -- same rationale as the video version: this step wants
+        // consistent, well-lit stills, not paired ambient/flash variants.
         final torchCapable = _flash?.isNeeded ?? false;
         if (torchCapable) {
           try {
@@ -2332,79 +2387,142 @@ class FrontCaptureController extends ChangeNotifier {
           } catch (_) {}
         }
         debug['torchCapable'] = torchCapable;
-        // Distinct start cue -- a real device-test round earlier flagged
-        // this step had no audio/haptic differentiation from any other
-        // "waiting" moment in the flow, making it easy to miss.
         unawaited(HapticFeedback.mediumImpact());
         unawaited(_audio.playSweepStart());
-        // Reuses the same distanceHint-driven banner capturingExtra
-        // already renders (front_capture_screen.dart) -- no screen-side
-        // change needed. Explicit "sweep" instruction, distinct from this
-        // phase's own default "hold still" framing (the rest of
-        // capturingExtra -- secondary cameras, distance-stage-2 --
-        // genuinely wants the thumb held still; this step is the one
-        // exception that wants motion).
-        _apply(
-          (s) => s.copyWith(
-            distanceHint: 'Slowly sweep your thumb left to right',
-            videoSweepActive: true,
-            sweepProgress: 0.0,
-            activeGuideShape: _sweepGuideShapeForProgress(0.0),
-          ),
-          force: true,
-        );
 
-        final sweepStart = DateTime.now();
-        guideTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
-          final elapsedMs = DateTime.now().difference(sweepStart).inMilliseconds;
-          final progress = (elapsedMs / _sweepVideoDurationMs).clamp(0.0, 1.0);
-          _apply((s) => s.copyWith(
-                sweepProgress: progress,
-                activeGuideShape: _sweepGuideShapeForProgress(progress),
-              ));
-        });
+        for (var i = 0; i < zones.length; i++) {
+          final zone = zones[i].key;
+          final target = zones[i].value;
+          if (_disposed) break;
 
-        await Future<void>.delayed(const Duration(milliseconds: _sweepVideoDurationMs));
+          if (i == 0) {
+            // Already at the left position from the pre-roll above.
+            _apply((s) => s.copyWith(
+                  sweepProgress: target,
+                  activeGuideShape: _sweepGuideShapeForProgress(target),
+                ));
+          } else {
+            // Animate the guide from the previous zone to this one -- real
+            // time for the user's eye + thumb to track the motion, same
+            // reasoning as the video version's continuous translation, now
+            // paced per-hop instead of over one long continuous window.
+            final fromProgress = zones[i - 1].value;
+            _apply((s) => s.copyWith(
+                  distanceHint: zone == 'right'
+                      ? 'Slowly move right'
+                      : 'Slowly move to the middle',
+                ));
+            final moveStart = DateTime.now();
+            while (true) {
+              final elapsedMs =
+                  DateTime.now().difference(moveStart).inMilliseconds;
+              final t = (elapsedMs / _sweepZoneMoveMs).clamp(0.0, 1.0);
+              final progress = fromProgress + (target - fromProgress) * t;
+              _apply((s) => s.copyWith(
+                    sweepProgress: progress,
+                    activeGuideShape: _sweepGuideShapeForProgress(progress),
+                  ));
+              if (t >= 1.0) break;
+              await Future<void>.delayed(const Duration(milliseconds: 60));
+            }
+          }
 
-        final xfile = await svc.stopVideoRecording();
-        recording = false;
-        // Torch only needed for the recording itself, not the upload that
-        // follows -- turn it off as soon as the video is captured.
+          // Real settle time at the new position before the shutter fires
+          // -- same role as the secondary-camera distance-sweep's own
+          // move-delay + a distinct per-zone haptic so the user feels each
+          // capture happen, not just at the very end.
+          unawaited(HapticFeedback.lightImpact());
+          _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zone'));
+          await Future<void>.delayed(const Duration(milliseconds: _sweepZoneSettleMs));
+          if (_disposed) break;
+
+          final shotStart = DateTime.now();
+          try {
+            final xfile = await cam.takePicture();
+            rawShots[zone] = await xfile.readAsBytes();
+            zoneDebug['${zone}_captureMs'] =
+                DateTime.now().difference(shotStart).inMilliseconds;
+          } catch (e) {
+            zoneDebug['${zone}_error'] = e.toString();
+            debugPrint('[front] sweep-burst zone $zone capture failed (non-blocking): $e');
+          }
+        }
+
         try {
           await _flash?.deactivate();
         } catch (_) {}
-        return xfile.readAsBytes();
-      }()).timeout(const Duration(milliseconds: _sweepVideoRecordTimeoutMs));
+      }()).timeout(const Duration(milliseconds: _sweepBurstTimeoutMs));
       stopwatch.stop();
       debug['durationMs'] = stopwatch.elapsedMilliseconds;
 
-      debug['fileSizeBytes'] = bytes.length;
-      if (bytes.isEmpty) {
-        debug['error'] = 'empty video file';
+      if (rawShots.isEmpty) {
+        debug['error'] = 'no zone shots captured';
+        debug['zones'] = zoneDebug;
         return debug;
       }
-      final path = '$basePath/sweep_video.mp4';
-      await _uploadWithRetry(bytes, path, contentType: 'video/mp4');
-      debug['path'] = path;
+
+      // Downscale + convert to grayscale AFTER the hold, same convention as
+      // the main/secondary bursts -- keeps per-shot latency during the
+      // actual capture window low; the expensive decode/encode work
+      // happens once the user no longer needs to hold position.
+      final zoneNames = rawShots.keys.toList(growable: false);
+      final encoded = await Future.wait(zoneNames.map((zone) async {
+        final encodeStart = DateTime.now();
+        var bytes = rawShots[zone]!;
+        try {
+          final decoded = await decodeStillJpegToLuma(
+            bytes, _sensorOrientation,
+            targetWidth: _stillDecodeTargetWidth,
+          );
+          if (decoded != null) {
+            bytes = await compute(
+              _encodeBurstIsolate,
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+            );
+          }
+        } catch (_) {}
+        zoneDebug['${zone}_encodeMs'] =
+            DateTime.now().difference(encodeStart).inMilliseconds;
+        zoneDebug['${zone}_encodedBytes'] = bytes.length;
+        return bytes;
+      }));
+
+      final paths = <String, String>{};
+      await Future.wait(List.generate(zoneNames.length, (i) async {
+        final zone = zoneNames[i];
+        final path = '$basePath/sweep_burst_$zone.jpg';
+        final uploadStart = DateTime.now();
+        await _uploadWithRetry(encoded[i], path);
+        zoneDebug['${zone}_uploadMs'] =
+            DateTime.now().difference(uploadStart).inMilliseconds;
+        paths[zone] = path;
+      }));
+
+      // Per-zone guide region: the on-screen guide translated for each
+      // zone, so the still-space AFIS mask must translate with it --
+      // otherwise the backend would crop the LEFT zone's frame using the
+      // CENTRE zone's guide bounds. Falls back silently (field just absent)
+      // if cached screen/preview geometry isn't available; the backend
+      // treats a missing per-zone guide as "use the main guideRegion".
+      final guideRegions = <String, dynamic>{};
+      for (final entry in zones) {
+        final region = _guideRegionForSweepZone(entry.value, tipAngleDeg);
+        if (region != null) guideRegions[entry.key] = region;
+      }
+
+      debug['paths'] = paths;
+      debug['zones'] = zoneDebug;
+      if (guideRegions.isNotEmpty) debug['guideRegions'] = guideRegions;
       debug['uploaded'] = true;
       // Distinct completion cue -- lighter than the main burst's
       // heavyImpact()+brand-jingle (this is one bonus step, not "the whole
-      // capture is done"), but still a clear, real signal recording ended.
+      // capture is done"), but still a clear, real signal the sweep ended.
       unawaited(HapticFeedback.lightImpact());
       unawaited(_audio.playSweepComplete());
     } catch (e) {
       debug['error'] = e.toString();
-      debugPrint('[front] sweep video capture failed (non-fatal): $e');
-      if (recording) {
-        try {
-          await svc.stopVideoRecording();
-        } catch (_) {}
-      }
+      debugPrint('[front] sweep burst capture failed (non-fatal): $e');
     } finally {
-      guideTimer?.cancel();
-      // Belt-and-suspenders -- idempotent, and covers any error path above
-      // that stopped recording without reaching the deactivate() call
-      // right after it (e.g. the timeout/exception branches).
       try {
         await _flash?.deactivate();
       } catch (_) {}
@@ -2535,12 +2653,12 @@ class FrontCaptureController extends ChangeNotifier {
 
       // Runs BEFORE the secondary-camera loop below (which switches to a
       // different physical camera) so this step's "same main camera,
-      // already-open session" assumption holds -- see _captureSweepVideo's
-      // own doc comment. Gated on _sweepVideoHybridEnabled -- flip that one
+      // already-open session" assumption holds -- see _captureSweepBurst's
+      // own doc comment. Gated on _sweepBurstHybridEnabled -- flip that one
       // flag to detach this feature instantly if a real device test finds
       // a problem, without touching anything else in this file.
-      final sweepVideoDebug = _sweepVideoHybridEnabled
-          ? await _captureSweepVideo(basePath)
+      final sweepBurstDebug = _sweepBurstHybridEnabled
+          ? await _captureSweepBurst(basePath, tipAngleDeg)
           : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
 
       // Secondary-camera capture and distance-stage-2 capture both run here,
@@ -2885,7 +3003,7 @@ class FrontCaptureController extends ChangeNotifier {
         if (manualExposureSupport != null)
           'manualExposureSupport': manualExposureSupport,
         if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
-        'sweepVideoDebug': sweepVideoDebug,
+        'sweepBurstDebug': sweepBurstDebug,
         'secondaryCameraDebug': secondaryDebug,
         if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
       }, SetOptions(merge: true));
