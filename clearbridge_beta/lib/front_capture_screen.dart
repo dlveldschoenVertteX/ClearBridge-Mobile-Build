@@ -430,15 +430,33 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
           // Sweep Step 2: horizontal progress bar + moving centroid-tracking
           // highlight beneath the guide. Replaces the need for mid-sweep text
           // instruction — the user watches this fill left-to-right instead.
-          if (s.phase == FrontCapturePhase.sweepActive)
+          // Also reused for the burst+video hybrid's sweep-video step
+          // (videoSweepActive) -- same visual, driven by elapsed-time
+          // progress there instead of live centroid tracking.
+          if (s.phase == FrontCapturePhase.sweepActive || s.videoSweepActive)
             Positioned(
               left: ringLeft,
-              top: ringTop + ringD + 10,
+              top: ringTop + ringD + 34,
               width: ringD,
               child: _SweepProgressBar(
                 progress: s.sweepProgress,
                 fastWarning: s.sweepFastWarning,
               ),
+            ),
+
+          // Directional arrow cue for the sweep-video step -- real device-
+          // test feedback (2026-08-03): "I did not recognize any sweep UX",
+          // and separately asked for the guide to move + arrows to indicate
+          // direction "as before" (the disabled guided-sweep feature's own
+          // left-to-right guide translation). The guide itself already
+          // moves via activeGuideShape (see _captureSweepVideo's timer);
+          // this adds the explicit "which way" cue on top.
+          if (s.videoSweepActive)
+            Positioned(
+              left: ringLeft,
+              top: ringTop + ringD + 10,
+              width: ringD,
+              child: const _SweepDirectionArrows(),
             ),
 
           // Brightness meter — left of ring.
@@ -609,7 +627,15 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
             Positioned(
               left: 24,
               right: 24,
-              top: ringTop + ringD + (s.isCapturingBurst ? 24 : 20),
+              // Pushed down when the sweep-video arrows + progress bar are
+              // occupying the space right below the ring, so the headline
+              // text (which already shows this step's distanceHint) doesn't
+              // collide with them.
+              top: ringTop +
+                  ringD +
+                  (s.videoSweepActive
+                      ? 58
+                      : (s.isCapturingBurst ? 24 : 20)),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
@@ -1293,6 +1319,69 @@ class _ConfirmationBanner extends StatelessWidget {
           style: CaptureTypography.h3.copyWith(color: color, fontSize: 15),
         ),
       ),
+    );
+  }
+}
+
+// ── Sweep direction arrows ────────────────────────────────────────────────────
+
+/// Row of chevrons with a brightness highlight that sweeps left-to-right in
+/// a continuous loop -- a direct "move this way" cue for the burst+video
+/// hybrid's sweep-video step, alongside the guide itself physically
+/// translating left-to-right (see FrontCaptureController._captureSweepVideo).
+class _SweepDirectionArrows extends StatefulWidget {
+  const _SweepDirectionArrows();
+
+  @override
+  State<_SweepDirectionArrows> createState() => _SweepDirectionArrowsState();
+}
+
+class _SweepDirectionArrowsState extends State<_SweepDirectionArrows>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _ctrl;
+
+  @override
+  void initState() {
+    super.initState();
+    _ctrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1400),
+    )..repeat();
+  }
+
+  @override
+  void dispose() {
+    _ctrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    const count = 4;
+    return AnimatedBuilder(
+      animation: _ctrl,
+      builder: (_, __) {
+        // A highlight position that sweeps 0..count continuously; each
+        // chevron's brightness peaks as the highlight passes over it.
+        final head = _ctrl.value * count;
+        return Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: List.generate(count, (i) {
+            final dist = (head - i) % count;
+            // Closer to the highlight (dist near 0, wrapping) = brighter.
+            final proximity = (1.0 - (dist / count)).clamp(0.0, 1.0);
+            final alpha = 0.25 + 0.65 * math.pow(proximity, 3);
+            return Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 3),
+              child: Icon(
+                Icons.chevron_right_rounded,
+                size: 22,
+                color: CaptureColors.cyan.withValues(alpha: alpha.toDouble()),
+              ),
+            );
+          }),
+        );
+      },
     );
   }
 }

@@ -64,6 +64,7 @@ class FrontCaptureState {
     this.sweepFastWarning = false,
     this.sweepPositionOk = false,
     this.sweepDwellProgress = 0.0,
+    this.videoSweepActive = false,
   });
 
   final FrontCapturePhase phase;
@@ -124,6 +125,16 @@ class FrontCaptureState {
   // camera turns (see _secondaryCameraGuideShape) -- null means "use
   // PadSilhouetteShape.defaultShape".
   final PadSilhouetteShape? activeGuideShape;
+  // True only while the burst+video hybrid capture's sweep video is
+  // actively recording (see FrontCaptureController._captureSweepVideo) --
+  // drives the screen's directional arrow cue. Reuses sweepProgress/
+  // activeGuideShape (already existed for the disabled guided-sweep
+  // feature) to animate the guide left-to-right in sync with the real
+  // recording window; this flag is what tells the screen those fields mean
+  // "sweep in progress" rather than their old sweepPositioning/sweepActive
+  // meaning (which never applies here -- this step runs during
+  // capturingExtra, not those phases).
+  final bool videoSweepActive;
 
   FrontCaptureState copyWith({
     FrontCapturePhase? phase,
@@ -145,6 +156,7 @@ class FrontCaptureState {
     bool? sweepFastWarning,
     bool? sweepPositionOk,
     double? sweepDwellProgress,
+    bool? videoSweepActive,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -173,6 +185,7 @@ class FrontCaptureState {
         sweepFastWarning: sweepFastWarning ?? this.sweepFastWarning,
         sweepPositionOk: sweepPositionOk ?? this.sweepPositionOk,
         sweepDwellProgress: sweepDwellProgress ?? this.sweepDwellProgress,
+        videoSweepActive: videoSweepActive ?? this.videoSweepActive,
       );
 }
 
@@ -2223,6 +2236,17 @@ class FrontCaptureController extends ChangeNotifier {
     }
     final stopwatch = Stopwatch()..start();
     var recording = false;
+    // Real device-test feedback (2026-08-03): "I did not recognize any
+    // sweep UX" / "the mask needs to move left/right ... as before" --
+    // the guide sat static the whole recording window with only a text
+    // prompt. Reuses _sweepGuideShapeForProgress (built for the disabled
+    // guided-sweep feature) to visibly translate the guide left-to-right,
+    // but driven purely by ELAPSED TIME against the fixed recording
+    // duration -- never live centroid/frame tracking. That's the
+    // deliberate difference from the disabled feature: this can't
+    // reintroduce any of its coordinate-space bugs because nothing here
+    // reads a camera frame to decide where the guide is.
+    Timer? guideTimer;
     try {
       await _stopStream();
       // The actual record-start -> record-stop -> read-bytes sequence is
@@ -2233,6 +2257,11 @@ class FrontCaptureController extends ChangeNotifier {
       final bytes = await (() async {
         await svc.startVideoRecording();
         recording = true;
+        // Distinct start cue -- a real device-test round earlier flagged
+        // this step had no audio/haptic differentiation from any other
+        // "waiting" moment in the flow, making it easy to miss.
+        unawaited(HapticFeedback.mediumImpact());
+        unawaited(_audio.playSweepStart());
         // Reuses the same distanceHint-driven banner capturingExtra
         // already renders (front_capture_screen.dart) -- no screen-side
         // change needed. Explicit "sweep" instruction, distinct from this
@@ -2240,7 +2269,26 @@ class FrontCaptureController extends ChangeNotifier {
         // capturingExtra -- secondary cameras, distance-stage-2 --
         // genuinely wants the thumb held still; this step is the one
         // exception that wants motion).
-        _apply((s) => s.copyWith(distanceHint: 'Slowly sweep your thumb left to right'));
+        _apply(
+          (s) => s.copyWith(
+            distanceHint: 'Slowly sweep your thumb left to right',
+            videoSweepActive: true,
+            sweepProgress: 0.0,
+            activeGuideShape: _sweepGuideShapeForProgress(0.0),
+          ),
+          force: true,
+        );
+
+        final sweepStart = DateTime.now();
+        guideTimer = Timer.periodic(const Duration(milliseconds: 100), (_) {
+          final elapsedMs = DateTime.now().difference(sweepStart).inMilliseconds;
+          final progress = (elapsedMs / _sweepVideoDurationMs).clamp(0.0, 1.0);
+          _apply((s) => s.copyWith(
+                sweepProgress: progress,
+                activeGuideShape: _sweepGuideShapeForProgress(progress),
+              ));
+        });
+
         await Future<void>.delayed(const Duration(milliseconds: _sweepVideoDurationMs));
 
         final xfile = await svc.stopVideoRecording();
@@ -2259,6 +2307,11 @@ class FrontCaptureController extends ChangeNotifier {
       await _uploadWithRetry(bytes, path, contentType: 'video/mp4');
       debug['path'] = path;
       debug['uploaded'] = true;
+      // Distinct completion cue -- lighter than the main burst's
+      // heavyImpact()+brand-jingle (this is one bonus step, not "the whole
+      // capture is done"), but still a clear, real signal recording ended.
+      unawaited(HapticFeedback.lightImpact());
+      unawaited(_audio.playSweepComplete());
     } catch (e) {
       debug['error'] = e.toString();
       debugPrint('[front] sweep video capture failed (non-fatal): $e');
@@ -2268,7 +2321,16 @@ class FrontCaptureController extends ChangeNotifier {
         } catch (_) {}
       }
     } finally {
-      _apply((s) => s.copyWith(distanceHint: null));
+      guideTimer?.cancel();
+      _apply(
+        (s) => s.copyWith(
+          distanceHint: null,
+          videoSweepActive: false,
+          sweepProgress: 0.0,
+          activeGuideShape: null,
+        ),
+        force: true,
+      );
     }
     return debug;
   }
