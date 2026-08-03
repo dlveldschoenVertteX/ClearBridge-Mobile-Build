@@ -313,12 +313,6 @@ class FrontCaptureController extends ChangeNotifier {
   // capture + NFIQ2/SourceAFIS comparison against the 2048 baseline before
   // trusting it; revert if budget devices show memory/latency regressions.
   static const int _stillDecodeTargetWidth = 3200;
-  // Secondary-camera (IR/ultrawide) burst depth. Was a single takePicture()
-  // per camera with no sharpness ranking -- a short burst here lets the
-  // backend keep the sharpest shot per camera (same Laplacian-variance
-  // pattern already used for the main burst), same rationale as the main
-  // burst's own frame-count bump above.
-  static const int _secondaryBurstCount = 3;
   static const int _burstFlashSettleMs = 70;
   // EV multipliers applied to flashEvStep across the 4 flash shots in the
   // main burst. flashEvStep is negative (reduces exposure to guard against
@@ -729,9 +723,6 @@ class FrontCaptureController extends ChangeNotifier {
   // framing target instead of none, and the countdown below gives them
   // real time to use it, before ever investing in precise per-lens
   // calibration.
-  static const PadSilhouetteShape _secondaryCameraGuideShape =
-      PadSilhouetteShape.defaultShape;
-
   // Device must be this still (gyroscope magnitude, deg/s) before the hold
   // timer counts and the burst can fire. Real captures showed motion-blur
   // streaking in BOTH ambient and flash frames of the same burst — camera
@@ -1815,34 +1806,6 @@ class FrontCaptureController extends ChangeNotifier {
   /// "3…" -> "2…" -> "1…", ~700ms apart with a light haptic pulse each, then
   /// hands off to "Capturing…". Real time for the user to react to
   /// whatever guide is currently shown, not just a label change.
-  Future<void> _showCountdown() async {
-    for (final n in const ['3…', '2…', '1…']) {
-      if (_disposed) return;
-      _apply((s) => s.copyWith(distanceHint: n));
-      HapticFeedback.lightImpact();
-      await Future<void>.delayed(const Duration(milliseconds: 700));
-    }
-    if (_disposed) return;
-    _apply((s) => s.copyWith(distanceHint: 'Capturing…'));
-  }
-
-  /// Real, visible confirmation that a camera turn has ended -- shown only
-  /// AFTER the caller has already awaited that camera's explicit stop (e.g.
-  /// `svc.disposeCamera()`), so "this camera stopped" is a fact by the time
-  /// this banner appears, not an assumption. Clears the guide shape so the
-  /// next turn (or the real uploading transition) starts from a clean slate.
-  Future<void> _showStopConfirmation(String friendly, {required bool success}) async {
-    if (_disposed) return;
-    _apply((s) => s.copyWith(
-          distanceHint: success ? '✓ $friendly captured' : '$friendly skipped',
-          activeGuideShape: null,
-        ));
-    if (success) {
-      unawaited(_audio.playAngleSuccess(isFinal: false));
-    }
-    await Future<void>.delayed(const Duration(milliseconds: 600));
-  }
-
   // Real bug found + fixed 2026-07-29: this previously had no settle delay
   // (could ratchet several -0.7 steps within under a second on a bright
   // scene, well before _lastStableBrightness reflected the prior
@@ -2213,45 +2176,6 @@ class FrontCaptureController extends ChangeNotifier {
         }
       } catch (_) {}
 
-      // Real device test (2026-07-22): a noticeable silent pause right at
-      // the end of the main burst -- the guide's fill ring hits 100% (last
-      // shutter click) then nothing visibly happens until "✓ Captured"
-      // appears. Root cause: the decode+sharpness+re-encode work below runs
-      // AFTER the ring already reads full, with no UI change during it, so
-      // it reads as a freeze rather than the app doing something. This work
-      // got real slower after the _stillDecodeTargetWidth 2048->3200 bump
-      // (2026-07-20, ~2.4x more decode pixels per frame across all 8 burst
-      // shots) — plausibly what made an always-present pause newly
-      // noticeable. Show an explicit "Processing…" banner for this window
-      // instead of a silent gap.
-      _apply((s) => s.copyWith(confirmationText: 'Processing…'), force: true);
-
-      // Decode + re-encode off the UI isolate.
-      final futures = <Future<({Uint8List bytes, bool flashOn, double? lap, DateTime ts, JpegExposureExif exif})>>[];
-      for (final raw in rawShots) {
-        futures.add(() async {
-          final decoded = await decodeStillJpegToLuma(
-            raw.jpeg, _sensorOrientation,
-            targetWidth: _stillDecodeTargetWidth,
-          );
-          if (decoded == null) throw StateError('decode failed');
-          final sharp = _lumaSharpness(decoded.luma, decoded.width, decoded.height);
-          final encoded = await compute(
-            _encodeBurstIsolate,
-            _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
-          );
-          return (bytes: encoded, flashOn: raw.flashOn, lap: sharp, ts: raw.timestamp, exif: raw.exif);
-        }());
-      }
-
-      final results = await Future.wait(futures.map((f) => f.catchError((_) => (
-            bytes: Uint8List(0),
-            flashOn: false,
-            lap: null as double?,
-            ts: DateTime.now(),
-            exif: const JpegExposureExif(),
-          ))));
-
       // Each sweep shot (_fireSweepShot) already stops/restarts the stream
       // around its own takePicture() call, so by now it's running again --
       // stop it here before any further still captures (the detail-zoom
@@ -2289,7 +2213,7 @@ class FrontCaptureController extends ChangeNotifier {
       await Future<void>.delayed(const Duration(milliseconds: _confirmationDisplayMs));
 
       await _finishAndUpload(
-        results,
+        rawShots,
         gyro,
         sweepCentroids: preCollectedCentroids,
         sweepDebugData: preCollectedShots != null ? _sweepDebug : null,
@@ -2427,14 +2351,25 @@ class FrontCaptureController extends ChangeNotifier {
             }
           }
 
-          // Real settle time at the new position before the shutter fires
-          // -- same role as the secondary-camera distance-sweep's own
-          // move-delay + a distinct per-zone haptic so the user feels each
-          // capture happen, not just at the very end.
-          unawaited(HapticFeedback.lightImpact());
-          _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zone'));
-          await Future<void>.delayed(const Duration(milliseconds: _sweepZoneSettleMs));
-          if (_disposed) break;
+          // Left zone: pre-roll already counted in above; a short settle is
+          // enough. Center and right zones get a full count-in so the user
+          // knows each shot is about to fire, not just the start of the sweep.
+          if (i == 0) {
+            unawaited(HapticFeedback.lightImpact());
+            _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zone'));
+            await Future<void>.delayed(
+                const Duration(milliseconds: _sweepZoneSettleMs));
+            if (_disposed) break;
+          } else {
+            for (final n in const ['Hold still…', '2…', '1…']) {
+              if (_disposed) break;
+              _apply((s) => s.copyWith(distanceHint: n));
+              unawaited(HapticFeedback.lightImpact());
+              await Future<void>.delayed(
+                  const Duration(milliseconds: _sweepCalibrationTickMs));
+            }
+            if (_disposed) break;
+          }
 
           final shotStart = DateTime.now();
           try {
@@ -2540,34 +2475,18 @@ class FrontCaptureController extends ChangeNotifier {
   }
 
   Future<void> _finishAndUpload(
-    List<({Uint8List bytes, bool flashOn, double? lap, DateTime ts, JpegExposureExif exif})> shots,
+    List<_RawShot> rawShots,
     double gyroAtCapture, {
     List<double?>? sweepCentroids,
     Map<String, dynamic>? sweepDebugData,
   }) async {
     _audio.silence();
-    // NOT `uploading` yet -- the secondary-camera + distance-stage-2 blocks
-    // below still need the thumb held in place (same physical placement, a
-    // different lens/distance). Telling the user "Uploading…" here was the
-    // root cause of the 2026-07-17 "fires blindly" report: they saw that
-    // text, assumed capture was over, and had already moved by the time the
-    // extra torch shots actually fired. `capturingExtra` keeps the guide +
-    // camera preview up with an explicit "hold still" message instead; the
-    // real `uploading` transition happens below, right before the actual
-    // Firestore write + upload begin.
-    // Explicitly clear confirmationText when transitioning INTO
-    // capturingExtra -- real device-test feedback (2026-08-01): "IR cam
-    // did not give me any progress guidance or anything like the main
-    // cam". Root cause: _fireBurst sets confirmationText='✓ Captured' just
-    // before calling us, and clears it only in its own finally block
-    // AFTER we've fully returned. front_capture_screen.dart's headline
-    // block is gated on `s.confirmationText == null`, so every countdown
-    // ('3…', '2…', '1…'), status ('Now using $friendly'), and per-camera
-    // '✓ IR captured' string _showCountdown/_showStopConfirmation write
-    // via distanceHint was being rendered but then never actually shown
-    // -- the leftover main-burst banner was covering the display slot for
-    // the entire secondary-camera flow. Cleared here so those status
-    // updates can finally render.
+    // NOT `uploading` yet -- the sweep burst below still needs the thumb held
+    // in place on the main camera. `capturingExtra` keeps the guide + camera
+    // preview visible; the real `uploading` transition happens after processing.
+    // Clear confirmationText so the sweep's own status banners (distanceHint)
+    // can render -- _fireBurst sets it to '✓ Captured' and only clears it in
+    // its own finally block after we return, which would cover our banners.
     _apply(
       (s) => s.copyWith(
         phase: FrontCapturePhase.capturingExtra,
@@ -2590,23 +2509,54 @@ class FrontCaptureController extends ChangeNotifier {
       final tipAngleDeg =
           (_sensorOrientation == 90 || _sensorOrientation == 270) ? 0.0 : 90.0;
 
-      // Build upload tasks and Firestore frames metadata.
+      final rawSensorSupport = await _queryRawSensorSupport();
+      final noiseReductionOffSupport = await _queryNoiseReductionSupport();
+      final cameraLensInfo = await _queryCameraLensInfo();
+      final manualExposureSupport = await _queryManualExposureSupport();
+      // Already ran (and was awaited to completion) before the camera even
+      // opened, in FrontCaptureScreen._init() -- this just reads the cached
+      // result, does not re-trigger the native probe.
+      final torchExposureProbe = await probeTorchExposureCompat();
+
+      // Sweep burst: 3 zone stills (left/centre/right) on the same main camera
+      // session, before the camera is disposed. Gated on _sweepBurstHybridEnabled
+      // -- flip that flag to disable instantly without touching anything else.
+      final sweepBurstDebug = _sweepBurstHybridEnabled
+          ? await _captureSweepBurst(basePath, tipAngleDeg)
+          : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
+
+      // Decode and encode all burst frames now (deferred until after the sweep
+      // so the user never saw "Processing…" mid-session). Each raw JPEG is
+      // converted to grayscale + downscaled, same as before but moved here.
+      _apply((s) => s.copyWith(distanceHint: 'Processing…', activeGuideShape: null));
+      final decodedShots = await Future.wait(rawShots.map((r) async {
+        var bytes = r.jpeg;
+        try {
+          final decoded = await decodeStillJpegToLuma(
+            r.jpeg, _sensorOrientation,
+            targetWidth: _stillDecodeTargetWidth,
+          );
+          if (decoded != null) {
+            bytes = await compute(
+              _encodeBurstIsolate,
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+            );
+          }
+        } catch (_) {}
+        return (bytes: bytes, flashOn: r.flashOn, lap: r.laplacianScore, ts: r.timestamp, exif: r.exif);
+      }));
+
+      // Build upload tasks and Firestore frames metadata from the decoded shots.
       final uploadTasks = <(Uint8List, String)>[];
       final framesMeta = <Map<String, dynamic>>[];
       var ambIdx = 0, flIdx = 0;
-
-      for (var frameIdx = 0; frameIdx < shots.length; frameIdx++) {
-        final s = shots[frameIdx];
+      for (var frameIdx = 0; frameIdx < decodedShots.length; frameIdx++) {
+        final s = decodedShots[frameIdx];
         if (s.bytes.isEmpty) continue;
         final type = s.flashOn ? 'fl' : 'amb';
         final idx = s.flashOn ? flIdx++ : ambIdx++;
         final path = '$basePath/front_burst_${type}_$idx.jpg';
         uploadTasks.add((s.bytes, path));
-        // centroidX (diagnostic-only, guided-sweep capture): the thumb's
-        // intensity-weighted centroid X position at the moment THIS frame
-        // fired, normalized 0.0-1.0 within the guide width. sweepCentroids is
-        // parallel (by index) to the raw-shot list _fireBurst built `shots`
-        // from -- null/absent for the non-sweep static-burst path.
         final centroidX = (sweepCentroids != null && frameIdx < sweepCentroids.length)
             ? sweepCentroids[frameIdx]
             : null;
@@ -2618,12 +2568,6 @@ class FrontCaptureController extends ChangeNotifier {
           if (s.lap != null) 'laplacianScore': double.parse(s.lap!.toStringAsFixed(1)),
           'timestamp': s.ts.toIso8601String(),
           if (centroidX != null) 'centroidX': double.parse(centroidX.toStringAsFixed(3)),
-          // Locked-shutter-speed investigation, Stage 1: real auto-exposure
-          // values the HAL actually used for this shot, read from the JPEG's
-          // own EXIF -- not app-controlled (this plugin has no manual
-          // exposure API), hence isLockedShutter: false always at this
-          // stage. Null fields mean the device/HAL didn't populate that EXIF
-          // tag, not a parse failure being silently swallowed.
           if (s.exif.exposureTimeUs != null) 'shutterSpeedUs': s.exif.exposureTimeUs,
           if (s.exif.exposureTimeReadable != null)
             'shutterSpeedReadable': s.exif.exposureTimeReadable,
@@ -2632,315 +2576,12 @@ class FrontCaptureController extends ChangeNotifier {
         });
       }
 
-      // Detail-zoom frames upload alongside the main burst -- same
-      // concurrency batching below, just tagged with their own filename
-      // convention so the backend can distinguish them from the main burst.
+      // Detail-zoom frames alongside the main burst (already decoded in _fireDetailBurst).
       final detailPaths = <String>[];
       for (var i = 0; i < _detailFrames.length; i++) {
         final path = '$basePath/detail_zoom_$i.jpg';
         uploadTasks.add((_detailFrames[i], path));
         detailPaths.add(path);
-      }
-
-      final rawSensorSupport = await _queryRawSensorSupport();
-      final noiseReductionOffSupport = await _queryNoiseReductionSupport();
-      final cameraLensInfo = await _queryCameraLensInfo();
-      final manualExposureSupport = await _queryManualExposureSupport();
-      // Already ran (and was awaited to completion) before the camera even
-      // opened, in FrontCaptureScreen._init() -- this just reads the cached
-      // result, does not re-trigger the native probe.
-      final torchExposureProbe = await probeTorchExposureCompat();
-
-      // Runs BEFORE the secondary-camera loop below (which switches to a
-      // different physical camera) so this step's "same main camera,
-      // already-open session" assumption holds -- see _captureSweepBurst's
-      // own doc comment. Gated on _sweepBurstHybridEnabled -- flip that one
-      // flag to detach this feature instantly if a real device test finds
-      // a problem, without touching anything else in this file.
-      final sweepBurstDebug = _sweepBurstHybridEnabled
-          ? await _captureSweepBurst(basePath, tipAngleDeg)
-          : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
-
-      // Secondary-camera capture and distance-stage-2 capture both run here,
-      // BEFORE the single Firestore document write below, and their results
-      // are folded directly into that one write. Firestore security rules
-      // evaluate a brand-new document's first write against `allow create`
-      // (which this project's rules permit for clients), but ANY subsequent
-      // `.update()` on that same doc is evaluated against `allow update`,
-      // which this project's rules blanket-deny for non-admin clients
-      // (`allow update, delete: if false;`). The two blocks below used to
-      // run AFTER the initial `.set()` and record their results via a
-      // separate `.update()` call each -- both silently rejected by the
-      // rules engine every single time, which is why secondaryCameras/
-      // distanceStage2 have never actually landed in a real capture doc.
-      // Both blocks only touch Cloud Storage (via _uploadWithRetry) for
-      // their own image uploads, which has no such restriction, so nothing
-      // here depends on the Firestore doc already existing.
-
-      // Best-effort secondary-camera capture: try any OTHER back cameras this
-      // device exposes (e.g. IR/night-vision + ultrawide sensors) for one
-      // extra torch-lit still each, purely additive to the main flow above.
-      // Ported from OscillatingCaptureController (built + validated there,
-      // proven server-side: the IR camera's torch shot alone scored
-      // competitively with -- and on one device, above -- the main camera's
-      // best single frame; see docs/CAPTURE_OPTIMIZATION_SCOPE.md). Was never
-      // wired into front_only_v1 before now since that flow didn't exist yet
-      // when this was built. Runs BEFORE the single Firestore write below
-      // (see the note above) and BEFORE the processEnhanceAndScore trigger,
-      // so the backend's one-time doc read sees secondaryCameras already
-      // present. A failure here can't jeopardise the main burst, which is
-      // uploaded separately below regardless of this block's outcome. Many
-      // devices can only hold one camera session open at a time -- opening
-      // a second physical camera here may simply fail, which is caught and
-      // skipped silently per-camera.
-      // Diagnostic trail written unconditionally (unlike secondaryMeta below,
-      // which only ever reflects successes) -- added after a real device
-      // test on the Doogee S118 (previously confirmed to expose separate
-      // IR/ultrawide camera IDs) silently produced zero secondaryCameras
-      // with no way to tell whether that meant "no other camera found" or
-      // "every attempt failed". Written even on total failure so the next
-      // real capture actually explains itself instead of staying silent.
-      // Real device test (2026-07-17) found the live preview lags/freezes
-      // hard through this whole block, with no visible sign of the other
-      // cameras firing -- root cause: the main camera's CameraController
-      // stayed fully active (its texture still bound to the on-screen
-      // CameraPreview) for the ENTIRE secondary-camera loop while a SECOND,
-      // completely separate CameraController was opened and driven at the
-      // same time. The `camera` plugin shares a native rendering/platform-
-      // channel thread across controllers, so two simultaneously-live
-      // sessions contend and stall Flutter's texture updates -- not (only) a
-      // sensor-hardware limit, a plugin-level threading one, which is why
-      // this reproduced even though secondaryCameras data landed fine in
-      // Storage (the DATA path was never broken, only the live view). A
-      // first fix (pausePreview()/resumePreview() on the main controller)
-      // was NOT sufficient on real hardware -- pausing stops Flutter from
-      // requesting new frames but doesn't release the underlying camera
-      // session, so the second controller still contended for it.
-      //
-      // Real fix: route secondary-camera capture through the SAME
-      // CameraService the screen's CameraPreview already reads its
-      // controller from (a live getter, not a cached reference) via
-      // `initializeCamera(cameraDescription: ...)`, which internally
-      // disposes the current controller before opening the next one -- a
-      // full, clean handoff, not two sessions open at once. Side benefit
-      // this also directly satisfies "so I can see the captures firing live
-      // for all cameras before upload": since the screen's preview always
-      // shows whatever CameraService.controller currently is, switching to
-      // each secondary camera this way makes ITS live feed appear on screen
-      // while it's active, instead of a frozen/paused main-camera frame.
-      final secondaryDebug = <String, dynamic>{'foundBackCams': <String>[]};
-      final secondaryMeta = <Map<String, dynamic>>[];
-      final mainCameraDescription = _camera?.description;
-      final svc = _cameraService;
-      // Total/completed "extra capture" steps (secondary cameras) -- drives
-      // extraProgress. Defaults to 0 in case availableCameras() itself
-      // throws before the real count is known.
-      var extraTotal = 0;
-      var extraCompleted = 0;
-      try {
-        final allCams = await availableCameras();
-        final mainName = mainCameraDescription?.name;
-        secondaryDebug['allCamsCount'] = allCams.length;
-        secondaryDebug['mainCamName'] = mainName;
-        final allBack = allCams.where((c) =>
-            c.lensDirection == CameraLensDirection.back && c.name != mainName);
-        // Sensor-size quality gate: skip auxiliary cameras (macro, depth)
-        // whose physical sensor area is less than 50% of the main camera's.
-        // They add upload cost without improving quality. Exception: always
-        // include MONO/NIR cameras regardless of size -- they offer a unique
-        // spectral channel no RGB sensor can replicate, which is exactly what
-        // makes them useful for beta-device discovery (if a user has a real
-        // IR sensor we want to know and test it, even on a small chip).
-        final lensInfo = await _queryCameraLensInfo();
-        final mainInfo = lensInfo?[mainName];
-        final mainArea = mainInfo != null
-            ? ((mainInfo['sensorWidthMm'] as double? ?? 0) *
-               (mainInfo['sensorHeightMm'] as double? ?? 0))
-            : 0.0;
-        final others = allBack.where((c) {
-          final info = lensInfo?[c.name];
-          if (info == null || mainArea == 0) return true; // no data → include
-          if (info['colorFilterArrangement'] == 'MONO') return true; // true NIR → always include
-          final area = ((info['sensorWidthMm'] as double? ?? 0) *
-                        (info['sensorHeightMm'] as double? ?? 0));
-          return area == 0 || area >= mainArea * 0.5;
-        }).toList(growable: false);
-        secondaryDebug['foundBackCams'] =
-            allBack.map((c) => c.name).toList(growable: false);
-        secondaryDebug['qualifiedBackCams'] =
-            others.map((c) => c.name).toList(growable: false);
-        // Drives the guide's fill-ring during capturingExtra (see
-        // extraProgress on FrontCaptureState) -- CTO real-device feedback
-        // 2026-07-20/22: only the main burst had a progress cue; secondary
-        // cameras (wide/IR) left the guide static the whole time.
-        extraTotal = others.length;
-        for (final desc in others) {
-          final labelName = desc.name.toLowerCase();
-          final friendly = labelName.contains('ir') || labelName.contains('night')
-              ? 'IR camera'
-              : labelName.contains('wide')
-                  ? 'wide lens'
-                  : 'secondary camera';
-          var succeeded = false;
-          try {
-            CameraController active;
-            if (svc != null) {
-              await svc
-                  .initializeCamera(
-                    lensDirection: CameraLensDirection.back,
-                    resolution: ResolutionPreset.max,
-                    cameraDescription: desc,
-                  )
-                  .timeout(const Duration(seconds: 8));
-              active = svc.controller!;
-              _camera = active; // resync so the UI's live preview sees the current controller
-            } else {
-              // Defensive fallback if no CameraService was supplied (should
-              // not happen via the real screen, which always passes one) --
-              // same isolated-controller behavior as before this fix, so
-              // this path still works, just without the live-preview fix.
-              active = CameraController(desc, ResolutionPreset.max, enableAudio: false);
-              await active.initialize().timeout(const Duration(seconds: 8));
-            }
-
-            // Explicit per-camera-turn sequence (2026-07-23), per the CTO's
-            // real-device report: "no dead stop for any camera... it goes
-            // ahead to the next camera" and "Uploading... but camera is
-            // still live in the background". Step 1+2: switch in, show a
-            // generic centered guide on THIS camera's own live feed (already
-            // shown automatically -- _cameraLayer() reads the live
-            // CameraService controller). Not precisely calibrated per-lens
-            // yet (real per-lens FOV-offset data doesn't exist) -- a
-            // deliberate first cut, per the camera-comparison investigation
-            // this same session: secondary cameras have real, sometimes-
-            // excellent ridge detail but fire blind with no framing cue at
-            // all today.
-            _apply((s) => s.copyWith(
-                  distanceHint: 'Now using $friendly — center your thumb pad',
-                  activeGuideShape: _secondaryCameraGuideShape,
-                  extraProgress: extraCompleted / extraTotal,
-                ));
-            await Future<void>.delayed(const Duration(milliseconds: 1200));
-            // Step 3: countdown -- real time to use the guide above before
-            // the shutter fires, not just a label change.
-            await _showCountdown();
-
-            // Step 4: capture. Real device test (2026-07-22): capture got
-            // permanently stuck on the wide-angle camera, never progressing
-            // past this phase -- root cause: initializeCamera above already
-            // has an 8s timeout, but NOTHING after it did. takePicture()
-            // itself is a raw await with no bound, so a hung native capture
-            // session stalled the whole rest of the flow with zero
-            // user-visible progress. Bound the ENTIRE per-camera
-            // exposure/focus/burst sequence in one timeout so a hang here
-            // can only ever cost this one camera's data.
-            //
-            // Widened 12s -> 28s (2026-07-23): real Firestore data across 3
-            // captures after the burst upgrade (1->3 shots) showed BOTH
-            // secondary cameras timing out on every one, always mid-upload
-            // -- 12s was calibrated for the old single-shot flow.
-            //
-            // Widened 28s -> 38s (2026-07-26): 3/4 consecutive real captures
-            // showed cam-3 timing out at flash_off with shot_2 upload still
-            // running. Real burst timeline: ~4-8s setup+capture, then 3
-            // parallel uploads each taking ~9-20s (bandwidth contention).
-            // shot_2 consistently arrives last, taking ~20s from upload start.
-            // Worst-case 8s init + 25s shot_2 upload = 33s; 38s gives real margin.
-            final stageDebug = <String, dynamic>{'stage': 'not_started'};
-            final paths = await _captureSecondaryBurst(
-              active,
-              desc,
-              basePath,
-              stageDebug,
-            ).timeout(const Duration(seconds: 38), onTimeout: () {
-              debugPrint(
-                  '[front] secondary camera ${desc.name} timed out mid-capture '
-                  '(stuck at: ${stageDebug['stage']}) -- skipping');
-              secondaryDebug['${desc.name}_timeout'] = true;
-              // Last stage entered before the timeout fired -- e.g.
-              // 'settle_delay'/'focus_setup' points at AF convergence never
-              // completing, 'shot_N' points at takePicture() itself hanging.
-              secondaryDebug['${desc.name}_stuckAt'] = stageDebug['stage'];
-              return <String>[];
-            });
-            // Real bug found 2026-07-23: the per-camera stageDebug map (now
-            // carrying focusConvergedMs/focusScoreAtFire and per-shot
-            // capture/upload timings) was only ever read for its 'stage'
-            // key on timeout -- every other field silently never reached
-            // Firestore, regardless of outcome. Preserve the whole map here,
-            // unconditionally, so the next real capture's data actually
-            // shows the new diagnostics.
-            secondaryDebug['${desc.name}_stageDebug'] =
-                Map<String, dynamic>.from(stageDebug);
-
-            // Step 5: explicit, AWAITED stop -- regardless of success or
-            // timeout -- before this iteration ends. Previously this loop
-            // relied entirely on the NEXT camera's own initializeCamera()
-            // call to dispose this one as a side effect (internally,
-            // CameraService._initializeCameraAttempt calls disposeCamera()
-            // first) -- meaning there was never an await'd "this camera has
-            // fully stopped" checkpoint owned by the turn that just
-            // finished. A timeout firing meant the loop raced on to open
-            // the NEXT camera while the timed-out camera's takePicture()/
-            // upload call was very likely STILL running in the background
-            // (.timeout() cannot cancel the underlying native Future) --
-            // the leading real ANR ("ClearBridge Beta isn't responding")
-            // hypothesis this session. Disposing HERE, awaited, closes that
-            // gap at its source: the native session is actively torn down
-            // (which should fail any still-pending call against it) before
-            // we ever consider this turn done.
-            if (svc != null) {
-              await svc.disposeCamera();
-            } else {
-              try {
-                await active.dispose();
-              } catch (_) {}
-            }
-            // Real gap found 2026-07-29: a timeout above means
-            // _captureSecondaryBurst's underlying Future is very likely
-            // still running in the background (.timeout() doesn't cancel
-            // it -- e.g. still inside takePicture()/an upload call against
-            // the controller just disposed). Android's native camera
-            // teardown is itself asynchronous at the HAL level, so this
-            // awaited dispose() resolving doesn't guarantee the native
-            // session has fully closed before the NEXT camera's
-            // initializeCamera() opens below -- the same "two native camera
-            // sessions contending" hazard this project's own ANR history
-            // already root-caused once (see the 28s->38s/12s->28s timeout
-            // widening notes above). Only pay this on the timeout path (not
-            // every successful turn, which has no orphaned Future to wait
-            // out) -- real, deliberate cost only where there's real risk.
-            if (secondaryDebug['${desc.name}_timeout'] == true) {
-              await Future<void>.delayed(const Duration(milliseconds: 500));
-            }
-
-            if (paths.isNotEmpty) {
-              secondaryMeta.add({'name': desc.name, 'paths': paths});
-              secondaryDebug['${desc.name}_ok'] = true;
-              succeeded = true;
-            }
-            await _showStopConfirmation(friendly, success: succeeded);
-            extraCompleted++;
-            _apply((s) => s.copyWith(
-                  distanceHint: null,
-                  extraProgress: extraCompleted / extraTotal,
-                ));
-          } catch (e) {
-            debugPrint('[front] secondary camera ${desc.name} skipped: $e');
-            secondaryDebug['${desc.name}_error'] = e.toString();
-            await _showStopConfirmation(friendly, success: false);
-            extraCompleted++;
-            _apply((s) => s.copyWith(
-                  distanceHint: null,
-                  extraProgress: extraCompleted / extraTotal,
-                ));
-          }
-        }
-      } catch (e) {
-        debugPrint('[front] secondary camera capture skipped entirely: $e');
-        secondaryDebug['fatalError'] = e.toString();
-      } finally {
-        _apply((s) => s.copyWith(distanceHint: null, activeGuideShape: null));
       }
 
       // Real upload begins here -- the actual Firestore write + main burst
@@ -2978,7 +2619,7 @@ class FrontCaptureController extends ChangeNotifier {
           'n': _guideN,
           'tipAngleDeg': tipAngleDeg,
         },
-        'burstFrameCount': shots.where((s) => s.bytes.isNotEmpty).length,
+        'burstFrameCount': decodedShots.where((s) => s.bytes.isNotEmpty).length,
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
         if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
@@ -3004,8 +2645,6 @@ class FrontCaptureController extends ChangeNotifier {
           'manualExposureSupport': manualExposureSupport,
         if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
         'sweepBurstDebug': sweepBurstDebug,
-        'secondaryCameraDebug': secondaryDebug,
-        if (secondaryMeta.isNotEmpty) 'secondaryCameras': secondaryMeta,
       }, SetOptions(merge: true));
 
       var completed = 0;
@@ -3050,264 +2689,8 @@ class FrontCaptureController extends ChangeNotifier {
     }
   }
 
-  /// Exposure/focus setup + torch burst for ONE secondary (IR/wide) camera.
-  /// Extracted so the whole sequence can be wrapped in a single `.timeout()`
-  /// by the caller -- see the 2026-07-22 real-device "stuck on Wide cam"
-  /// report: `takePicture()` (and, in principle, any of the setup calls
-  /// below) is a raw platform-channel await with no bound of its own, so a
-  /// hang on a secondary sensor's native capture session previously stalled
-  /// the entire remaining capture forever, not just this one camera.
-  /// `stageDebug` is mutated SYNCHRONOUSLY right before each major await --
-  /// real device test 2026-07-22: both secondary cameras timed out with no
-  /// way to tell whether they stalled on AF convergence, exposure setup, or
-  /// a specific shot's takePicture() call (the CTO separately reported "IR
-  /// cam struggled to focus", consistent with an AF-convergence stall, but
-  /// the raw timeout alone couldn't confirm that). Since `.timeout()` on
-  /// the caller's side doesn't cancel this function -- it just stops
-  /// waiting for it -- a synchronous write immediately before the await
-  /// that ends up hanging is what survives into secondaryDebug even though
-  /// the overall Future never completes in time.
-  Future<List<String>> _captureSecondaryBurst(
-    CameraController active,
-    CameraDescription desc,
-    String basePath,
-    Map<String, dynamic> stageDebug,
-  ) async {
-    stageDebug['stage'] = 'flash_on';
-    await active.setFlashMode(FlashMode.torch);
-    // Adaptive EV step -- same curve as the main burst (_adaptiveFlashEvStep),
-    // so the secondary camera's flash exposure responds to ambient brightness
-    // the same way the main burst does. Ambient luma reading is scene-level
-    // (doesn't change by active camera), so the value is valid here.
-    // setExposureOffset() is safe; setExposureMode() is the Camera2-interop
-    // landmine, never called here.
-    stageDebug['stage'] = 'exposure_setup';
-    try {
-      final minEv = await active.getMinExposureOffset();
-      final maxEv = await active.getMaxExposureOffset();
-      await active.setExposureOffset(_adaptiveFlashEvStep().clamp(minEv, maxEv));
-    } catch (_) {
-      // Some secondary sensors may not support exposure offset -- non-fatal,
-      // the burst still fires at default exposure.
-    }
-    // AUTOFOCUS on the near thumb before firing. Without this the secondary
-    // sensor stays at its resting focus (usually far), so a ~10cm thumb
-    // comes back badly out of focus -- real device test 2026-07-18: the
-    // wide lens returned laplacian ~18 (vs ~1900 on the focused main camera)
-    // and never converged. Point AF at the frame centre (where the thumb
-    // sits) and give it time to converge before the burst; guard each call
-    // since some secondary sensors are fixed-focus and will throw.
-    stageDebug['stage'] = 'focus_setup';
-    try {
-      await active.setFocusPoint(const Offset(0.5, 0.5));
-      await active.setFocusMode(FocusMode.auto);
-    } catch (_) {
-      // fixed-focus secondary sensor -- nothing to converge, fall through to
-      // the settle delay and shoot at native focus.
-    }
-    // Real device report, 2026-07-23: some secondary cameras don't focus
-    // immediately, producing blurry captures. This used to be a blind fixed
-    // 1400ms delay with zero verification that AF actually converged --
-    // unlike the primary camera's own burst, which only fires once a real
-    // measured sharpness signal (_focusValue) clears a threshold. Replaced
-    // with an equivalent measured wait on the secondary camera's own stream.
-    stageDebug['stage'] = 'settle_delay';
-    await _waitForSecondaryFocusLock(active, stageDebug);
-    // Lock focus at the converged position so AF can't drift between shots.
-    // Same as the primary camera's _lockFocusOnly() before its own burst.
-    stageDebug['stage'] = 'focus_lock';
-    try {
-      await active.setFocusMode(FocusMode.locked);
-    } catch (_) {}
-    final safeName = desc.name.replaceAll(RegExp(r'[^A-Za-z0-9_-]'), '_');
-    final secondarySensorOrientation = desc.sensorOrientation;
-    // Capture RAW shots only while the user holds still, then decode/encode/
-    // upload ALL of them afterward -- mirrors the main burst's own
-    // _finishAndUpload pattern. Real device regression found 2026-07-25:
-    // doing the grayscale decode+encode INLINE per shot (as first shipped)
-    // pushed captureMs from ~600ms to ~7100-7800ms per shot on a real
-    // device -- moving the expensive work back into the "hold still" phase
-    // it was built to avoid, and blowing the 28s per-camera timeout
-    // (secondaryCameraDebug showed '3_timeout: true', stuck at
-    // 'flash_off'). Capture stays fast; the expensive work now happens
-    // after, in parallel, same as the upload step already does.
-    // Real bug found + fixed 2026-07-29: unlike the main burst's own per-shot
-    // loop (_fireBurst), which wraps each takePicture() in its own try/catch
-    // so one bad shot just yields fewer frames, this loop had no per-shot
-    // guard at all -- any single transient CameraException on shot 1 of 3
-    // threw out of the whole function, discarding shots 0 (and any after)
-    // even if they'd already succeeded. The outer per-camera catch in
-    // _finishAndUpload still keeps this from crashing the capture, but it
-    // meant an avoidable total loss of that camera's already-good data on a
-    // transient glitch. Now: each shot is individually guarded; a failure
-    // stops the burst early (rather than leaving a gap mid-sequence, which
-    // the encode/upload loops below assume don't exist) but keeps whatever
-    // was already captured.
-    final rawShots = <Uint8List>[];
-    for (var i = 0; i < _secondaryBurstCount; i++) {
-      stageDebug['stage'] = 'shot_$i';
-      final shotStart = DateTime.now();
-      try {
-        final shot = await active.takePicture();
-        stageDebug['stage'] = 'shot_${i}_readBytes';
-        rawShots.add(await shot.readAsBytes());
-        stageDebug['shot_${i}_captureMs'] =
-            DateTime.now().difference(shotStart).inMilliseconds;
-      } catch (e) {
-        stageDebug['shot_${i}_error'] = e.toString();
-        debugPrint('[front] secondary camera shot $i failed (non-blocking): $e');
-        break;
-      }
-    }
-    stageDebug['stage'] = 'flash_off';
-    await active.setFlashMode(FlashMode.off);
-    if (rawShots.isEmpty) return const <String>[];
-    final shotCount = rawShots.length;
-
-    // Downscale + convert to grayscale before upload -- same convention the
-    // main burst already uses (decodeStillJpegToLuma/encodeGrayscaleJpeg).
-    // takePicture() on a secondary sensor returns a full native-ISP-
-    // resolution COLOR JPEG; without this, uploads were 12-20s per shot
-    // even in parallel. Falls back to the raw JPEG on any decode/encode
-    // failure so this can never block a capture. Run via Future.wait (not
-    // a sequential loop) so the underlying platform decoder can overlap
-    // work across shots, same as the main burst's own decode/encode block.
-    final encoded = await Future.wait(List.generate(shotCount, (i) async {
-      final encodeStart = DateTime.now();
-      var bytes = rawShots[i];
-      try {
-        final decoded = await decodeStillJpegToLuma(
-          rawShots[i], secondarySensorOrientation,
-          targetWidth: _stillDecodeTargetWidth,
-        );
-        if (decoded != null) {
-          bytes = await compute(
-            _encodeBurstIsolate,
-            _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
-          );
-        }
-      } catch (_) {}
-      stageDebug['shot_${i}_encodeMs'] =
-          DateTime.now().difference(encodeStart).inMilliseconds;
-      stageDebug['shot_${i}_encodedBytes'] = bytes.length;
-      return bytes;
-    }));
-
-    // Upload all shots in parallel now that the user no longer needs to hold.
-    final paths = List<String>.filled(shotCount, '');
-    await Future.wait(
-      List.generate(shotCount, (i) async {
-        final path = '$basePath/secondary_${safeName}_torch_$i.jpg';
-        stageDebug['shot_${i}_uploadStage'] = 'uploading';
-        final uploadStart = DateTime.now();
-        await _uploadWithRetry(encoded[i], path);
-        stageDebug['shot_${i}_uploadMs'] =
-            DateTime.now().difference(uploadStart).inMilliseconds;
-        paths[i] = path;
-      }),
-    );
-    stageDebug['stage'] = 'done';
-    return paths;
-  }
-
-  /// Waits for the secondary camera's own autofocus to actually converge,
-  /// measured via the same peak-normalized, EMA-smoothed Laplacian sharpness
-  /// signal already used for the primary camera's own `_focusValue`/`onTarget`
-  /// gating (`_onFrame`, `_hybrid.offerFrame`) -- reused here rather than
-  /// reinvented, since it's already proven portable (peak-relative, not an
-  /// absolute threshold, so it doesn't need re-tuning per lens). Replaces a
-  /// blind fixed delay that fired the burst regardless of whether AF had
-  /// actually locked (real device report, 2026-07-23: blurry secondary-camera
-  /// captures on some lenses).
-  ///
-  /// Bounded both ways: [minWaitMs] stops a lucky first frame from firing
-  /// before the lens has genuinely started moving; [maxWaitMs] guarantees
-  /// this can never hang longer than a modest safety margin over the old
-  /// fixed delay, even on a sensor whose focus never converges (e.g. a
-  /// genuinely fixed-focus secondary camera) -- same best-effort discipline
-  /// as every other secondary-camera step. Records `focusConvergedMs`/
-  /// `focusScoreAtFire` into the caller's stageDebug so the next real capture
-  /// shows whether convergence is actually happening now, and how long it
-  /// really takes per camera, instead of guessing.
-  Future<void> _waitForSecondaryFocusLock(
-    CameraController active,
-    Map<String, dynamic> stageDebug, {
-    int minWaitMs = 500,
-    int maxWaitMs = 2600,
-    String keyPrefix = '',
-  }) async {
-    const roi = Rect.fromLTWH(0.3, 0.3, 0.4, 0.4);
-    const lockThreshold = 0.45; // same relative threshold as onTarget's gate.
-    var peak = 1.0;
-    var focusEma = 0.0;
-    // Diagnostic only, 2026-08-03 (see the real capture 19184018-be77-4320-
-    // 9648-42f44ba5a35b root-cause: camera "3" reported focusScoreAtFire
-    // 0.943 -- reads as high confidence -- while its actual captured frames
-    // were catastrophically blurry, real Laplacian ~6.5). focusEma is
-    // PURELY self-relative (raw ÷ its own observed peak, starting from a
-    // floor of 1.0) -- a camera whose lens never finds real sharp focus but
-    // stays roughly equally blurry throughout the wait window can satisfy
-    // this convergence check almost immediately, because nothing here ever
-    // checks the ABSOLUTE raw value against a floor the way the backend's
-    // own _SECONDARY_MIN_LAPLACIAN gate does downstream. Not fixed yet --
-    // this project's own established discipline is real data before a new
-    // threshold, and there's no calibrated absolute floor for this specific
-    // client-side metric's scale yet. This just records what the raw,
-    // un-normalized value actually was at lock time, so the next several
-    // real captures build the dataset a real fix would need.
-    var lastRaw = 0.0;
-    var streaming = false;
-    var processingFrame = false; // re-entrancy guard: offerFrame can take
-        // >33ms, so at 30fps the event queue backs up and starves the UI
-        // thread → ANR.  Skip any frame that arrives while one is in flight.
-    final start = DateTime.now();
-    final completer = Completer<void>();
-    void onFrame(CameraImage image) {
-      if (completer.isCompleted || processingFrame) return;
-      processingFrame = true;
-      try {
-        final raw = _hybrid.offerFrame(image, thumbRoi: roi);
-        lastRaw = raw;
-        if (raw > peak) peak = raw;
-        focusEma = HybridCaptureService.ema(
-          focusEma,
-          (raw / (peak + 1e-6)).clamp(0.0, 1.0),
-        );
-        final elapsedMs = DateTime.now().difference(start).inMilliseconds;
-        if (elapsedMs >= minWaitMs && focusEma > lockThreshold) {
-          completer.complete();
-        }
-      } catch (_) {} finally {
-        processingFrame = false;
-      }
-    }
-    try {
-      await active.startImageStream(onFrame);
-      streaming = true;
-      await completer.future.timeout(
-        Duration(milliseconds: maxWaitMs),
-        onTimeout: () {},
-      );
-    } catch (_) {
-    } finally {
-      if (streaming) {
-        try {
-          await active.stopImageStream();
-        } catch (_) {}
-      }
-      stageDebug['${keyPrefix}focusConvergedMs'] =
-          DateTime.now().difference(start).inMilliseconds;
-      stageDebug['${keyPrefix}focusScoreAtFire'] =
-          double.parse(focusEma.toStringAsFixed(3));
-      stageDebug['${keyPrefix}focusRawAtFire'] =
-          double.parse(lastRaw.toStringAsFixed(3));
-      stageDebug['${keyPrefix}focusRawPeak'] =
-          double.parse(peak.toStringAsFixed(3));
-      // true = AF never actually converged; burst fired at the maxWaitMs
-      // bound. Distinguishes "fast lock" from "gave up and fired anyway".
-      stageDebug['${keyPrefix}focusTimedOut'] = !completer.isCompleted;
-    }
-  }
+  // _captureSecondaryBurst and _waitForSecondaryFocusLock removed 2026-08-03
+  // (secondary / IR camera removed -- see CLAUDE.md round-21 notes).
 
   Future<void> _uploadWithRetry(
     Uint8List bytes,
