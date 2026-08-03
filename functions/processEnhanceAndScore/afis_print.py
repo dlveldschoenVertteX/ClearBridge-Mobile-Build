@@ -52,6 +52,17 @@ _STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
 _GABOR_SIGMA_RATIO = 0.65   # was 0.56 -- slightly wider envelope, helped coarser-ridge (larger native wavelength) captures without hurting clean ones
 _GABOR_GAMMA = 0.85         # was 0.60 -- monotonically improved every one of the 5 real test cases as it rose toward 1.0; kept <1.0 to preserve some orientation-selectivity rather than going fully isotropic
 _FEATHER_SIGMA = 2.5        # was 4.0 -- small, uniformly-nonnegative gain across all 5 cases
+_FADE_INSET_PX = 45.0       # 2026-08-03: real visual-QA finding -- a hard mask
+# boundary (even with the thin _FEATHER_SIGMA anti-alias above) reads as an
+# artificial "clipped" thumb silhouette instead of a real scanner print's
+# natural ridge taper, and is also a known real source of spurious ridge-
+# ending minutiae exactly along the crop curve (every ridge simultaneously
+# "ends" on the same geometric boundary -- not how a real contact print
+# looks, and a plausible real hit against AFIS matching, not just cosmetics).
+# Ridges now reach full black only this many px inside the mask and fade
+# toward white over the same distance as they approach the edge, so the
+# print visually thins out and terminates before the crop boundary rather
+# than being sliced by it -- see the distance-transform blend below.
 _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
 # shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
 # native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
@@ -1848,22 +1859,34 @@ def generate(
 
     binimg[mask == 0] = 255   # hard mask FIRST -- background is genuinely
     # pure white here, zero Gabor-noise content, before any blur touches it.
-    # Feather the mask edge instead of leaving a hard cutoff. A real digital
-    # scanner print has no thumb-silhouette outline -- ridges simply fade
-    # out at the contact edge. Blurring `binimg` directly (already masked to
-    # solid white outside the pad) and blending that blur in ONLY near the
-    # boundary softens the transition without ever revealing the unmasked
-    # Gabor response outside the pad -- an earlier version of this blurred
-    # the mask and blended it against the UNMASKED binimg, which leaked a
-    # faint version of the background's own Gabor "ridges" through the fade
-    # (visible as a ghosted second boundary/texture past the real edge).
-    # `mask` itself stays hard-edged below (crop bounding box,
-    # _upright_rotate's PCA) -- only the pixel blend is softened.
-    blurred = cv2.GaussianBlur(binimg, (0, 0), sigmaX=_FEATHER_SIGMA)
-    mask_soft = cv2.GaussianBlur(mask, (0, 0), sigmaX=_FEATHER_SIGMA).astype(np.float32) / 255.0
-    edge_weight = 1.0 - np.abs(2.0 * mask_soft - 1.0)   # peaks at the boundary, ~0 elsewhere
-    binimg = (blurred.astype(np.float32) * edge_weight +
-              binimg.astype(np.float32) * (1.0 - edge_weight)).astype(np.uint8)
+    #
+    # Fade ridges out toward the mask edge instead of leaving a hard cutoff.
+    # A real digital scanner print has no thumb-silhouette outline -- ridges
+    # simply taper off at the contact edge, at slightly different points per
+    # ridge, not all at once along one geometric curve. cv2.distanceTransform
+    # gives each foreground pixel its distance (px) to the nearest background
+    # pixel; normalizing that by _FADE_INSET_PX and clamping to [0, 1] builds
+    # an alpha ramp that's 1.0 (full black ridges) once _FADE_INSET_PX inside
+    # the mask and drops to 0.0 (white) exactly AT the boundary -- so the
+    # print itself visually thins out and disappears before reaching the crop
+    # edge, rather than being sliced by it. This also removes the real
+    # spurious-ridge-ending-minutiae risk a hard boundary creates (every
+    # ridge terminating simultaneously on the same curve is not a real
+    # fingerprint feature). A small Gaussian pass on the alpha ramp itself
+    # (same _FEATHER_SIGMA as before) just keeps the ramp from banding: the
+    # underlying mask shape is already irregular (real segmentation, not a
+    # perfect ellipse), so this reads as an organic taper, not a blurred
+    # oval. Computed entirely from `binimg`/`mask` post-hard-crop, so it can
+    # never reveal the unmasked Gabor response outside the pad the way an
+    # earlier blur-the-mask-then-blend-against-unmasked-binimg version did
+    # (that leaked a faint ghosted second boundary past the real edge).
+    # `mask` itself stays hard-edged below (crop bounding box, _upright_
+    # rotate's PCA) -- only the pixel blend is softened.
+    dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = np.clip(dist / _FADE_INSET_PX, 0.0, 1.0).astype(np.float32)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
+    binimg = (binimg.astype(np.float32) * alpha +
+              255.0 * (1.0 - alpha)).astype(np.uint8)
     if guide_region is not None and guide_mask is not None and 'tipAngleDeg' in guide_region:
         # Deterministic upright from the guide's known tip direction -- the pad
         # silhouette is near-symmetric, so PCA (_upright_rotate) can pick the
