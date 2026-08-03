@@ -52,13 +52,25 @@ _STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
 _GABOR_SIGMA_RATIO = 0.65   # was 0.56 -- slightly wider envelope, helped coarser-ridge (larger native wavelength) captures without hurting clean ones
 _GABOR_GAMMA = 0.85         # was 0.60 -- monotonically improved every one of the 5 real test cases as it rose toward 1.0; kept <1.0 to preserve some orientation-selectivity rather than going fully isotropic
 _FEATHER_SIGMA = 2.5        # was 4.0 -- small, uniformly-nonnegative gain across all 5 cases
-_FADE_INSET_PX = 45.0       # 2026-08-03: real visual-QA finding -- a hard mask
+_AA_SIGMA = 0.0               # 2026-08-03: sub-pixel anti-alias on the hard-
+# binarized ridge edges themselves (not the mask boundary -- see
+# _FADE_INSET_PX above). OFF by default -- measured negative on real NFIQ2,
+# see the real sweep data at the call site below. 0.7 was the visually-best
+# value tested (removes stairstep jaggedness, keeps ridges clearly
+# separated) if this is ever turned on for a look-over-score trade-off.
+_FADE_INSET_PX = 25.0       # 2026-08-03: real visual-QA finding -- a hard mask
 # boundary (even with the thin _FEATHER_SIGMA anti-alias above) reads as an
 # artificial "clipped" thumb silhouette instead of a real scanner print's
 # natural ridge taper, and is also a known real source of spurious ridge-
 # ending minutiae exactly along the crop curve (every ridge simultaneously
 # "ends" on the same geometric boundary -- not how a real contact print
 # looks, and a plausible real hit against AFIS matching, not just cosmetics).
+# Value swept (15/25/35/45/60px) against REAL NFIQ2 (locally built nfiq2
+# binary) on 4 diverse real captures (nfiq2Score 46-95): 25px gave both the
+# best mean score (67.5, vs 60.5 for the old hard-boundary baseline) AND was
+# the only value with a positive real delta on EVERY capture (+10/+9/+8/+1,
+# zero regressions) -- 35-45px looked better on some individual captures but
+# cost real score on cb684c57 specifically (-4/-2). Not a blind guess.
 # Ridges now reach full black only this many px inside the mask and fade
 # toward white over the same distance as they approach the edge, so the
 # print visually thins out and terminates before the crop boundary rather
@@ -1856,6 +1868,28 @@ def generate(
         )
         binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
         params.setdefault('afisEnhance', 'gabor')
+
+    # Sub-pixel anti-alias pass (2026-08-03, visual-QA finding, MEASURED
+    # NEGATIVE on real NFIQ2 -- OFF by default, see below). The hard sign-
+    # threshold binarization above (`enh < 0`) quantizes a smooth Gabor
+    # response straight to 0/255, leaving a visible pixel "staircase" along
+    # every ridge edge -- clearly visible zoomed in, even in the print's
+    # interior, far from any mask boundary. A real scanner print's ridge
+    # edges are naturally anti-aliased, not stair-stepped, so a small
+    # Gaussian blur on binimg looks visually closer to a real print.
+    # Swept sigma 0.0/0.3/0.5/0.7/1.0/1.3/1.6 against REAL NFIQ2 (locally
+    # built nfiq2 binary, not the proxy) on 4 diverse real captures
+    # (nfiq2Score 46-95): mean score fell fairly consistently as sigma rose
+    # (0.0: 66.75 -> 0.7: 64.00 -> 1.6: 59.75) -- confirms this pipeline's
+    # own established finding that NFIQ2 specifically rewards high-frequency
+    # ridge-like texture, and any smoothing directly trades that away. This
+    # is a real look-vs-score conflict, not a bug: unlike the mask-taper fix
+    # above (a clean win on both axes), this one only helps the visual read.
+    # Left OFF (0.0) by default rather than unilaterally trading away score
+    # for looks -- flip _AA_SIGMA to e.g. 0.7 if visual naturalness should
+    # win this specific trade-off instead.
+    if _AA_SIGMA > 0.0:
+        binimg = cv2.GaussianBlur(binimg, (0, 0), sigmaX=_AA_SIGMA)
 
     binimg[mask == 0] = 255   # hard mask FIRST -- background is genuinely
     # pure white here, zero Gabor-noise content, before any blur touches it.
