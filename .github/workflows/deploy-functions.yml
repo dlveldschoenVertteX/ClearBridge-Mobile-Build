@@ -17,6 +17,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # Real failure found 2026-08-03 (first-ever run of this workflow that
+      # got this far): firebase-tools' Python-functions codebase analysis
+      # runs locally (before handing off to Cloud Build) and needs a venv
+      # on disk to introspect the firebase-functions SDK -- it does not
+      # create one itself. Without this step: "Error: Failed to find
+      # location of Firebase Functions SDK: Missing virtual environment at
+      # venv directory." firebase.json already excludes venv/** from the
+      # actual uploaded source (Cloud Build installs requirements.txt
+      # itself), so this venv exists purely for the local CLI's own
+      # pre-flight analysis step.
+      - name: Create venv for Firebase Functions Python SDK detection
+        working-directory: functions/processEnhanceAndScore
+        run: |
+          python3.11 -m venv venv
+          venv/bin/pip install --quiet --upgrade pip
+          venv/bin/pip install --quiet -r requirements.txt
+
       - name: Deploy processEnhanceAndScore to Firebase
         env:
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
