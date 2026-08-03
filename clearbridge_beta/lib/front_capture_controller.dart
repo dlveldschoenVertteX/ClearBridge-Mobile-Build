@@ -197,11 +197,74 @@ class _BurstEncodeArgs {
   final Uint8List luma;
   final int width;
   final int height;
-  const _BurstEncodeArgs(this.luma, this.width, this.height);
+  // Defaults to encodeGrayscaleJpeg's own default (90) -- only the sweep-
+  // zone encode call site passes a lower value (see _sweepZoneJpegQuality)
+  // to keep those single-candidate stills' encode/upload time bounded now
+  // that they're captured at full (unzoomed) frame detail.
+  final int quality;
+  const _BurstEncodeArgs(this.luma, this.width, this.height, {this.quality = 90});
 }
 
+class _BurstEncodeResult {
+  final Uint8List jpeg;
+  final double sharpness;
+  const _BurstEncodeResult(this.jpeg, this.sharpness);
+}
+
+/// REAL BUG, found 2026-08-03 auditing a capture where every one of the 8
+/// main-burst frames' `laplacianScore` came back byte-for-byte identical
+/// (138.2). Root cause: `_fireBurst` calls `_stopStream()` ONCE before the
+/// whole 8-shot loop (line ~2152, to avoid contending with takePicture()),
+/// but each shot's `laplacianScore` was read from `_focusValue`/`_focusPeak`
+/// -- fields only ever updated by the live image-stream callback. With the
+/// stream stopped for the entire burst, those fields are frozen at whatever
+/// they read the instant before the first shot, so every shot recorded the
+/// SAME stale pre-burst value -- not a coincidence, a structural guarantee.
+/// This is very likely the same root cause behind this project's own
+/// already-documented finding that "the CLIENT laplacianScore is an
+/// unreliable whole-preview-frame proxy... observed identical across a
+/// burst" (round 11's rejected ambient-vs-flash priority swap) -- that
+/// symptom was previously treated as an unexplained proxy limitation, never
+/// traced to this specific stream-stopped freeze.
+///
+/// Fixed by computing a REAL per-frame sharpness score from each frame's
+/// own decoded still (the same Welford's-online-variance 4-neighbour
+/// Laplacian already proven in frame_capture_service.dart's
+/// `_computeThumbFocus`, just re-targeted at a decoded still buffer instead
+/// of a live CameraImage plane) -- piggybacked onto the JPEG re-encode's
+/// existing isolate hop (see _encodeBurstWithSharpnessIsolate) so this adds
+/// no extra isolate spawn. Only used for the main burst's own frames; the
+/// sweep-zone/detail-zoom call sites still use the plain _encodeBurstIsolate
+/// since they don't feed this per-frame-ranking metadata.
+double _stillLaplacianVariance(Uint8List luma, int width, int height) {
+  if (width < 4 || height < 4) return 0.0;
+  var mean = 0.0;
+  var m2 = 0.0;
+  var n = 0;
+  for (var y = 1; y < height - 1; y += 2) {
+    final row = y * width;
+    final up = (y - 1) * width;
+    final dn = (y + 1) * width;
+    for (var x = 1; x < width - 1; x += 2) {
+      final c = luma[row + x];
+      final lap = (4 * c - luma[row + x - 1] - luma[row + x + 1] - luma[up + x] - luma[dn + x])
+          .toDouble();
+      n++;
+      final d = lap - mean;
+      mean += d / n;
+      m2 += d * (lap - mean);
+    }
+  }
+  return n > 1 ? m2 / (n - 1) : 0.0;
+}
+
+_BurstEncodeResult _encodeBurstWithSharpnessIsolate(_BurstEncodeArgs args) => _BurstEncodeResult(
+      encodeGrayscaleJpeg(args.luma, args.width, args.height, quality: args.quality),
+      _stillLaplacianVariance(args.luma, args.width, args.height),
+    );
+
 Uint8List _encodeBurstIsolate(_BurstEncodeArgs args) =>
-    encodeGrayscaleJpeg(args.luma, args.width, args.height);
+    encodeGrayscaleJpeg(args.luma, args.width, args.height, quality: args.quality);
 
 class _RawShot {
   final Uint8List jpeg;
@@ -270,7 +333,16 @@ class FrontCaptureController extends ChangeNotifier {
   // to track the motion, same real-time-to-react reasoning as the former
   // video version's 9s full-sweep duration, just now split across 2
   // transitions instead of one continuous motion.
-  static const int _sweepZoneMoveMs = 1400;
+  //
+  // Scaled up proportionally (1400->3100, same ~2.24x ratio as
+  // _sweepGuideShiftFrac's own increase, 2026-08-03) when the left/right
+  // zones were pushed out toward the screen edges -- the guide now travels
+  // ~2.24x farther per hop, so animating it in the same 1400ms would make
+  // it visibly speed up and outrun the user's real thumb movement. Scaling
+  // the duration by the same factor keeps the guide's on-screen VELOCITY
+  // (and therefore how rushed it feels) unchanged even though the distance
+  // covered is much greater.
+  static const int _sweepZoneMoveMs = 3100;
   // Dwell after the guide stops translating, before the shutter fires --
   // real settle time for the user to finish repositioning their thumb at
   // the new zone, same role as the secondary-camera distance-sweep's own
@@ -283,12 +355,14 @@ class FrontCaptureController extends ChangeNotifier {
   // must not block the rest of the capture forever the way an uncaught-hang
   // camera Future would (try/catch alone does not protect against that --
   // same reasoning as every other bounded camera sequence in this file).
-  // Budget: 2 moves (2*1400=2800) + left settle (700) + 2 full count-ins
+  // Budget: 2 moves (2*3100=6200) + left settle (700) + 2 full count-ins
   // (2*3*700=4200) + 3 shots (~500-2000ms each in practice, more with torch
   // AE convergence) + margin. Widened 18000->24000 once center/right zones
-  // each gained their own 3-tick count-in (2026-08-03) -- the original
-  // budget only accounted for a single flat settle per zone.
-  static const int _sweepBurstTimeoutMs = 24000;
+  // each gained their own 3-tick count-in (2026-08-03), then 24000->28000
+  // the same day when _sweepZoneMoveMs grew 1400->3100 for the wider
+  // edge-to-edge sweep travel -- real observed per-zone timings (7 real
+  // captures' zoneDebug) stay well inside this with margin to spare.
+  static const int _sweepBurstTimeoutMs = 28000;
   // Bound the per-zone decode+encode and upload steps separately from the
   // capture loop above -- these run AFTER the shots are already in hand, so
   // a hang here has no camera-hardware excuse and must not silently freeze
@@ -313,6 +387,17 @@ class FrontCaptureController extends ChangeNotifier {
   // already too tight. Both raised well above every real observed value.
   static const int _sweepZoneEncodeTimeoutMs = 20000;
   static const int _sweepZoneUploadTimeoutMs = 30000;
+  // Real data from the 640f563a/fd1da8c1 tests: once zoom-to-fill was
+  // disabled, sweep-zone JPEGs (full, unzoomed frame detail) jumped from
+  // ~1.3-1.4MB to ~4.7-4.8MB at the default quality=90 -- still one zone
+  // (right) missed the upload timeout above. Each sweep zone is a single,
+  // unstacked candidate competing on its own (never fused/averaged the way
+  // the main burst's frames are), so it doesn't need main-burst-grade file
+  // size to carry real ridge detail -- a moderate JPEG quality cut trades
+  // some fine compression detail for a real, substantial encode+upload time
+  // win. Only the sweep-zone encode call site uses this; the main burst and
+  // detail-zoom frames stay at the default quality=90.
+  static const int _sweepZoneJpegQuality = 75;
 
   // Instant kill-switch for the whole sweep-burst step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
@@ -399,13 +484,27 @@ class FrontCaptureController extends ChangeNotifier {
   // centre (cx) left during sweepPositioning and interpolating it left-to-
   // right in sync with sweepProgress during sweepActive -- see
   // _sweepGuideShapeForProgress. Round 2 feedback: "needs more distance...
-  // a little further" -- raised 0.10 -> 0.15 (0.5 ± 0.15, still comfortably
-  // clear of the guide's own rx=0.1346 half-width from either screen edge).
-  // Kept deliberately short of _sweepTrackingRoi's own margin below so the
-  // fire-gate's sharpness measurement (still scoped to the narrower,
-  // already-proven _scoreRoi, not widened this round) has a real chance of
-  // resolving near both extremes, not just the centre.
-  static const double _sweepGuideShiftFrac = 0.15;
+  // a little further" -- raised 0.10 -> 0.15. The "kept deliberately short
+  // of _sweepTrackingRoi's own margin" reasoning that used to live here only
+  // applied to the OLD live centroid-tracked sweep (sweepPositioning/
+  // sweepActive, disabled since round 5 below) -- the ACTIVE burst-hybrid
+  // path (_captureSweepBurst) is a scripted animation with no centroid
+  // fire-gate at all, so that constraint doesn't apply to it.
+  //
+  // CTO request (2026-08-03): left/right were "too close to center to have
+  // real light differences" -- push them as far toward the screen edges as
+  // the guide can go while staying fully on-screen, for a real illumination-
+  // angle difference between zones (the whole point of a left/centre/right
+  // sweep). Derived from the guide's own half-width rather than a second
+  // hardcoded literal, so a future guide resize can't silently drift this
+  // out of sync the way _scoreRoi's manually-copied derivation already has
+  // elsewhere in this file. _sweepEdgeMarginFrac is the only tunable: how
+  // much clear screen space to leave between the guide's outer edge and the
+  // true screen edge at full extension (small margin, not zero -- avoids
+  // the guide visually touching/clipping at the raw edge).
+  static const double _sweepEdgeMarginFrac = 0.03;
+  static const double _sweepGuideShiftFrac =
+      0.5 - PadSilhouetteShape.defaultShape.rx - _sweepEdgeMarginFrac;
 
   // Guided thumb-sweep feature flag. DISABLED as of 2026-07-31 round 5
   // after five real device-test rounds each revealed a different failure
@@ -2450,7 +2549,8 @@ class FrontCaptureController extends ChangeNotifier {
           if (decoded != null) {
             bytes = await compute(
               _encodeBurstIsolate,
-              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height,
+                  quality: _sweepZoneJpegQuality),
             ).timeout(const Duration(milliseconds: _sweepZoneEncodeTimeoutMs));
           }
         } catch (_) {}
@@ -2580,19 +2680,25 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(distanceHint: 'Processing…', activeGuideShape: null));
       final decodedShots = await Future.wait(rawShots.map((r) async {
         var bytes = r.jpeg;
+        // Falls back to the stale stream-frozen r.laplacianScore only if
+        // decode fails -- never worse than before this fix, since that was
+        // already the only value available in that case.
+        var lap = r.laplacianScore;
         try {
           final decoded = await decodeStillJpegToLuma(
             r.jpeg, _sensorOrientation,
             targetWidth: _stillDecodeTargetWidth,
           );
           if (decoded != null) {
-            bytes = await compute(
-              _encodeBurstIsolate,
+            final result = await compute(
+              _encodeBurstWithSharpnessIsolate,
               _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
             );
+            bytes = result.jpeg;
+            lap = result.sharpness;
           }
         } catch (_) {}
-        return (bytes: bytes, flashOn: r.flashOn, lap: r.laplacianScore, ts: r.timestamp, exif: r.exif);
+        return (bytes: bytes, flashOn: r.flashOn, lap: lap, ts: r.timestamp, exif: r.exif);
       }));
 
       // Build upload tasks and Firestore frames metadata from the decoded shots.

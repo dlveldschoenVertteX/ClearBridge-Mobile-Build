@@ -1260,6 +1260,28 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # `if _zs > afis_nfiq` gate every other candidate source above
             # uses, never regress a capture this sweep-burst step doesn't
             # apply to.
+            #
+            # Sharpness-margin guard (2026-08-03): a real capture (fd1da8c1)
+            # had a sweep-zone candidate win selection on proxyScore 58.4 --
+            # narrowly beating whatever the main burst's own best candidate
+            # scored -- backed by a real Laplacian of 1160 (genuinely sharp,
+            # not blown-out/soft the way every sweep-zone still scored before
+            # zoom-to-fill was disabled client-side). Real ground-truth NFIQ2
+            # for the resulting capture still came back 9 -- one of the
+            # lowest real scores this project has recorded, despite a
+            # wavelength (11px) sitting right in the historically-good
+            # 9-14px range. Same lesson as the existing fusion-selection
+            # guard above: a single proxy-driven "just barely won" comparison
+            # isn't enough evidence a sweep-zone single-frame candidate (no
+            # ambient/flash pairing, no multi-frame stacking the way the main
+            # burst's own candidates get) is actually the better print, not
+            # just a sharp-looking but poorly-formed one. Require a real
+            # margin, not just an edge-out, before letting a sweep zone win.
+            # Not yet validated against a larger real sample (n=1) -- same
+            # standing discipline as every other guard in this file: ship on
+            # the strength of the one real regression it directly targets,
+            # revisit if it ever suppresses a genuinely-better sweep zone.
+            _SWEEP_ZONE_MARGIN_REQUIRED = 3.0
             _sweep_burst_debug: dict = {}
             try:
                 _sb_meta = _cap_doc.get('sweepBurstDebug') or {}
@@ -1287,8 +1309,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             _zname = f'sweepBurst_{_zone}'
                             logger.info('AFIS variant %s nfiq=%.1f lap=%.1f',
                                         _zname, _zs, _zlap)
-                            _zone_debug['wonSelection'] = bool(_zs > afis_nfiq)
-                            if _zs > afis_nfiq:
+                            _zone_debug['wonSelection'] = bool(
+                                _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED)
+                            if _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED:
                                 afis_nfiq = _zs
                                 best_afis_img = _zimg_res
                                 afis_params = {**_zp, 'afisNfiq': round(_zs, 2),
