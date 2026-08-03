@@ -296,8 +296,23 @@ class FrontCaptureController extends ChangeNotifier {
   // "flash went off [on the right zone]... it stalled after" -- the capture
   // loop itself had already completed by then, distanceHint was just stuck
   // on the last count-in tick with no update during this unbounded phase).
-  static const int _sweepZoneEncodeTimeoutMs = 6000;
-  static const int _sweepZoneUploadTimeoutMs = 15000;
+  //
+  // REAL BUG, 2026-08-03: the first cut of this fix set
+  // _sweepZoneEncodeTimeoutMs=6000, guessed with no real timing data. The
+  // very next real test's Firestore doc (640f563a) showed EVERY zone's
+  // decode+encode hitting that timeout and silently falling back to the
+  // raw, undecoded ~19MB camera JPEG (the existing catch(_) {} swallows a
+  // TimeoutException same as any other decode error) -- which then blew
+  // straight through the 15000ms upload timeout too, so all 3 zones failed
+  // (`sweepBurstDebug.paths` empty, `sweepBurstCandidates.present: false`).
+  // Real per-zone decode+encode at _stillDecodeTargetWidth=3200 legitimately
+  // takes ~7000-11200ms even for a properly-sized (~1.3-1.4MB) result
+  // (confirmed across 3 real captures' `zoneDebug` timings) -- 6000ms was
+  // simply never achievable. Real per-zone upload of that properly-sized
+  // result took up to 15275ms on real device network -- 15000ms was also
+  // already too tight. Both raised well above every real observed value.
+  static const int _sweepZoneEncodeTimeoutMs = 20000;
+  static const int _sweepZoneUploadTimeoutMs = 30000;
 
   // Instant kill-switch for the whole sweep-burst step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
