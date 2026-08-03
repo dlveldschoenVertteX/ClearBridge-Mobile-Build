@@ -270,6 +270,15 @@ class FrontCaptureController extends ChangeNotifier {
   // blocking the whole capture forever the way an uncaught-hang camera
   // Future would -- try/catch alone does not protect against that.
   static const int _sweepVideoRecordTimeoutMs = 20000;
+  // Real device-test feedback (2026-08-05): the guide started translating
+  // the instant recording began, giving zero time to physically place the
+  // thumb at the starting position first. This pre-roll pause happens
+  // entirely BEFORE svc.startVideoRecording() -- see _captureSweepVideo --
+  // so it costs real wall-clock time but never touches the recorded clip
+  // itself or main.py's zone timestamps. Held-instruction phase, then a
+  // 3-tick haptic count-in ending right as recording/motion begins.
+  static const int _sweepCalibrationHoldMs = 1500;
+  static const int _sweepCalibrationTickMs = 700;
 
   // Instant kill-switch for the whole video-sweep step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
@@ -2263,6 +2272,40 @@ class FrontCaptureController extends ChangeNotifier {
     Timer? guideTimer;
     try {
       await _stopStream();
+
+      // Real device-test feedback (2026-08-05): "needs a moment for user to
+      // get their finger at the right spot before it starts moving" -- the
+      // guide previously started translating the INSTANT recording began,
+      // giving zero real time to physically place the thumb at the
+      // starting (left) position first. Show the guide STATIC at its start
+      // position with an explicit placement instruction, then a short
+      // haptic count-in, entirely BEFORE video recording starts -- so the
+      // recorded clip itself is unchanged (still exactly
+      // _sweepVideoDurationMs of pure sweep motion starting at the first
+      // recorded frame) and main.py's zone timestamps don't need to move
+      // again. videoSweepActive is already true here so the direction
+      // arrows/progress bar render during this static hold too -- a real,
+      // deliberate early hint of the motion about to start, not a bug.
+      _apply(
+        (s) => s.copyWith(
+          distanceHint: 'Place your thumb at the start position',
+          videoSweepActive: true,
+          sweepProgress: 0.0,
+          activeGuideShape: _sweepGuideShapeForProgress(0.0),
+        ),
+        force: true,
+      );
+      unawaited(HapticFeedback.lightImpact());
+      await Future<void>.delayed(const Duration(milliseconds: _sweepCalibrationHoldMs));
+      if (_disposed) return debug;
+      for (final n in const ['Hold still…', '2…', '1…']) {
+        if (_disposed) return debug;
+        _apply((s) => s.copyWith(distanceHint: n));
+        HapticFeedback.lightImpact();
+        await Future<void>.delayed(const Duration(milliseconds: _sweepCalibrationTickMs));
+      }
+      if (_disposed) return debug;
+
       // The actual record-start -> record-stop -> read-bytes sequence is
       // wrapped in its own timeout, separate from the upload below -- a
       // hang anywhere in native video recording must not block the whole
