@@ -276,16 +276,28 @@ class FrontCaptureController extends ChangeNotifier {
   // the new zone, same role as the secondary-camera distance-sweep's own
   // _camera2SweepMoveDelayMs.
   static const int _sweepZoneSettleMs = 700;
-  // Bounds the whole 3-zone sequence (2 guide translations + 3 settle
-  // delays + 3 takePicture() calls) -- NOT the upload after it, which has
-  // its own legitimate retry/backoff. takePicture() is a raw platform-
-  // channel await with no bound of its own; a hang on any one zone must not
-  // block the rest of the capture forever the way an uncaught-hang camera
-  // Future would (try/catch alone does not protect against that -- same
-  // reasoning as every other bounded camera sequence in this file).
-  // Budget: 2 moves (2*1400=2800) + 3 settles (3*700=2100) + 3 shots
-  // (~500ms each in practice) + generous margin for native capture overhead.
-  static const int _sweepBurstTimeoutMs = 18000;
+  // Bounds the whole 3-zone sequence (2 guide translations + settle/count-in
+  // delays + 3 takePicture() calls) -- NOT the decode/upload after it, which
+  // has its own separate per-zone timeouts below. takePicture() is a raw
+  // platform-channel await with no bound of its own; a hang on any one zone
+  // must not block the rest of the capture forever the way an uncaught-hang
+  // camera Future would (try/catch alone does not protect against that --
+  // same reasoning as every other bounded camera sequence in this file).
+  // Budget: 2 moves (2*1400=2800) + left settle (700) + 2 full count-ins
+  // (2*3*700=4200) + 3 shots (~500-2000ms each in practice, more with torch
+  // AE convergence) + margin. Widened 18000->24000 once center/right zones
+  // each gained their own 3-tick count-in (2026-08-03) -- the original
+  // budget only accounted for a single flat settle per zone.
+  static const int _sweepBurstTimeoutMs = 24000;
+  // Bound the per-zone decode+encode and upload steps separately from the
+  // capture loop above -- these run AFTER the shots are already in hand, so
+  // a hang here has no camera-hardware excuse and must not silently freeze
+  // the screen with no feedback (see the 2026-08-03 real-device report:
+  // "flash went off [on the right zone]... it stalled after" -- the capture
+  // loop itself had already completed by then, distanceHint was just stuck
+  // on the last count-in tick with no update during this unbounded phase).
+  static const int _sweepZoneEncodeTimeoutMs = 6000;
+  static const int _sweepZoneUploadTimeoutMs = 15000;
 
   // Instant kill-switch for the whole sweep-burst step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
@@ -2397,10 +2409,20 @@ class FrontCaptureController extends ChangeNotifier {
         return debug;
       }
 
+      // Real, visible feedback that the sweep is still working -- without
+      // this the screen sits on whatever count-in tick last rendered (e.g.
+      // "1…") for the entire decode+upload window below, which reads as a
+      // dead freeze even though the capture loop itself already finished.
+      _apply((s) => s.copyWith(distanceHint: 'Processing…'));
+
       // Downscale + convert to grayscale AFTER the hold, same convention as
       // the main/secondary bursts -- keeps per-shot latency during the
       // actual capture window low; the expensive decode/encode work
-      // happens once the user no longer needs to hold position.
+      // happens once the user no longer needs to hold position. Each zone's
+      // decode+encode is individually timeout-bounded so one stuck isolate
+      // call can't stall the whole batch -- falls back to the raw JPEG
+      // bytes for that zone, same as the existing catch already does for
+      // any other decode/encode failure.
       final zoneNames = rawShots.keys.toList(growable: false);
       final encoded = await Future.wait(zoneNames.map((zone) async {
         final encodeStart = DateTime.now();
@@ -2409,12 +2431,12 @@ class FrontCaptureController extends ChangeNotifier {
           final decoded = await decodeStillJpegToLuma(
             bytes, _sensorOrientation,
             targetWidth: _stillDecodeTargetWidth,
-          );
+          ).timeout(const Duration(milliseconds: _sweepZoneEncodeTimeoutMs));
           if (decoded != null) {
             bytes = await compute(
               _encodeBurstIsolate,
               _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
-            );
+            ).timeout(const Duration(milliseconds: _sweepZoneEncodeTimeoutMs));
           }
         } catch (_) {}
         zoneDebug['${zone}_encodeMs'] =
@@ -2423,15 +2445,26 @@ class FrontCaptureController extends ChangeNotifier {
         return bytes;
       }));
 
+      // Each zone's upload is individually try/caught + timeout-bounded so
+      // one slow/hung network call can't block the others or stall the
+      // whole sweep step forever -- same "one failure only costs that one
+      // candidate" discipline as the capture loop above. A zone that fails
+      // here simply doesn't get a `paths` entry; the backend already
+      // treats a missing sweep zone path as absent data, not an error.
       final paths = <String, String>{};
       await Future.wait(List.generate(zoneNames.length, (i) async {
         final zone = zoneNames[i];
         final path = '$basePath/sweep_burst_$zone.jpg';
         final uploadStart = DateTime.now();
-        await _uploadWithRetry(encoded[i], path);
+        try {
+          await _uploadWithRetry(encoded[i], path)
+              .timeout(const Duration(milliseconds: _sweepZoneUploadTimeoutMs));
+          paths[zone] = path;
+        } catch (e) {
+          zoneDebug['${zone}_uploadError'] = e.toString();
+        }
         zoneDebug['${zone}_uploadMs'] =
             DateTime.now().difference(uploadStart).inMilliseconds;
-        paths[zone] = path;
       }));
 
       // Per-zone guide region: the on-screen guide translated for each
