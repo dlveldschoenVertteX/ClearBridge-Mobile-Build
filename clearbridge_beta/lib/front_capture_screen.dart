@@ -456,7 +456,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               left: ringLeft,
               top: ringTop + ringD + 10,
               width: ringD,
-              child: const _SweepDirectionArrows(),
+              child: _SweepDirectionArrows(progress: s.sweepProgress),
             ),
 
           // Brightness meter — left of ring.
@@ -1326,11 +1326,12 @@ class _ConfirmationBanner extends StatelessWidget {
 // ── Sweep direction arrows ────────────────────────────────────────────────────
 
 /// Row of chevrons with a brightness highlight that sweeps left-to-right in
-/// a continuous loop -- a direct "move this way" cue for the burst+video
-/// hybrid's sweep-video step, alongside the guide itself physically
-/// translating left-to-right (see FrontCaptureController._captureSweepVideo).
+/// a continuous loop — a direct "move this way" cue for the sweep-video step.
+/// When progress reaches 1.0 (guide at far right), switches to a static
+/// "Hold position" cue so the user knows to stop moving.
 class _SweepDirectionArrows extends StatefulWidget {
-  const _SweepDirectionArrows();
+  const _SweepDirectionArrows({required this.progress});
+  final double progress;
 
   @override
   State<_SweepDirectionArrows> createState() => _SweepDirectionArrowsState();
@@ -1357,18 +1358,36 @@ class _SweepDirectionArrowsState extends State<_SweepDirectionArrows>
 
   @override
   Widget build(BuildContext context) {
+    // Once the guide has reached the far-right end, stop asking the user to
+    // keep moving — show a static "hold" cue instead.
+    if (widget.progress >= 0.99) {
+      return Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          Icon(Icons.check_circle_outline_rounded, size: 18, color: CaptureColors.success),
+          const SizedBox(width: 6),
+          Text(
+            'Hold position',
+            style: TextStyle(
+              color: CaptureColors.success,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              letterSpacing: 0.4,
+            ),
+          ),
+        ],
+      );
+    }
+
     const count = 4;
     return AnimatedBuilder(
       animation: _ctrl,
       builder: (_, __) {
-        // A highlight position that sweeps 0..count continuously; each
-        // chevron's brightness peaks as the highlight passes over it.
         final head = _ctrl.value * count;
         return Row(
           mainAxisAlignment: MainAxisAlignment.center,
           children: List.generate(count, (i) {
             final dist = (head - i) % count;
-            // Closer to the highlight (dist near 0, wrapping) = brighter.
             final proximity = (1.0 - (dist / count)).clamp(0.0, 1.0);
             final alpha = 0.25 + 0.65 * math.pow(proximity, 3);
             return Padding(
