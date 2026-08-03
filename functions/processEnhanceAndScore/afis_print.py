@@ -148,6 +148,122 @@ def _orientation_field(img: np.ndarray, bsize: int = _BLOCK, smooth: float = _OR
     return 0.5 * np.arctan2(sn, cs) + np.pi / 2  # ridge direction
 
 
+_FOMFE_ORDER = 4   # basis order in each axis (5x5 (p,q) grid x 4 sin/cos
+# combos - 3 duplicate DC terms = 97 real basis functions). Low on purpose:
+# the whole point is a GLOBAL model with too few degrees of freedom to chase
+# per-block noise, only the overall ridge-flow topology.
+#
+# MEASURED 2026-08-03, NOT WIRED INTO main.py's production variant list --
+# same "quality win, matchability loss" category as gaborPyfingField (see
+# that variant's own docstring above), and by the same discipline, not
+# shipped. Real NFIQ2 (locally built nfiq2 binary) on 8 diverse real
+# captures: 'fomfe' beat the tuned 'gabor' baseline on 7/8 (+2,+4,+1,-6,+10,
+# +7,+5,+6 -- mean +3.6), the first denoise/orientation-hybrid variant this
+# whole session to show a clean net NFIQ2 gain over the baseline (every
+# prior one -- pyfingHybrid, coherenceDiff, nnsHybrid -- was net negative
+# there). But real SourceAFIS matchability on the CTO's own 4 genuine
+# cross-session captures (6 pairs) went the other way: mean 74.2 -> 58.1,
+# driven mostly by one capture (382cc4b2) whose pairs fell sharply (e.g.
+# vs c34911b5: 37.9 -> 2.5). Swept order in {1,2,3,4,5,6,8} specifically
+# looking for a setting that keeps the NFIQ2 gain without the matchability
+# cost: NONE of them did -- lower order reduced the damage (order=2: that
+# same pair recovers to 20.6) but never reached the gabor baseline (37.9),
+# and order=2 also cost real score on a pair that was previously fine
+# (3e54236a vs 722ae3b0: 139.3 -> 127.5). The likely mechanism: a low-order
+# GLOBAL model can't represent the real, legitimately-tight local curvature
+# right at a whorl core/delta, so it warps genuine ridge geometry there
+# toward the smooth global trend precisely where real matching depends on
+# it most -- the model helps exactly where local noise was the problem and
+# actively hurts exactly where local complexity was real signal, not noise.
+# Left here as an available, honestly-negative-result scaffold (same
+# treatment as gaborVarFreq/fidelity/gaborPyfingField/deepFocus*) -- do not
+# re-attempt wiring this into production without a real reason to believe a
+# different order/weighting scheme resolves the core-region distortion.
+
+
+def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
+                              bsize: int = _BLOCK,
+                              order: int = _FOMFE_ORDER) -> Optional[np.ndarray]:
+    """
+    Global 2D-Fourier-series orientation field model (2026-08-03,
+    FOMFE-inspired -- Wang/Hu/Phillips, "A Fingerprint Orientation Model
+    Based on 2D Fourier Expansion", IEEE TPAMI 2007).
+
+    _orientation_field above already fixes noisy per-block orientation with
+    a Gaussian blur on the doubled-angle (cos 2theta, sin 2theta) field --
+    but that's a LOCAL smoother: it can only propagate information a few
+    sigma (_ORIENT_SMOOTH=15px) before falling back to whatever noisy signal
+    is locally present. A real fingerprint's ridge flow is a globally
+    coherent pattern (loops/whorls/deltas all constrain each other) -- CTO's
+    own observation: "points that clearly supposed to go together but
+    segmentation error or something else is distorting flow". A GLOBAL
+    low-order model uses every valid sample across the whole pad to
+    determine the field EVERYWHERE, so it can bridge much larger low-
+    contrast/creased gaps by following the surrounding flow topology,
+    instead of either trusting a locally-noisy estimate or leaving it
+    unconstrained beyond the blur radius.
+
+    Fits cos(2*theta)/sin(2*theta) independently via weighted least squares
+    (weight = local gradient-coherence energy, so noisy/background blocks
+    barely influence the fit) against a small tensor-product cos/sin basis
+    over normalized image coordinates, then evaluates the fitted model
+    densely over the whole image. Returns None (self-skip, same contract as
+    every other optional signal in this module) if too few valid samples
+    exist for a stable fit.
+    """
+    h, w = img.shape
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    vx = cv2.boxFilter(2 * gx * gy, -1, (bsize, bsize))
+    vy = cv2.boxFilter(gx * gx - gy * gy, -1, (bsize, bsize))
+    coherence = np.sqrt(vx * vx + vy * vy)
+    theta_raw = 0.5 * np.arctan2(vx, vy)
+    cs_raw = np.cos(2 * theta_raw)
+    sn_raw = np.sin(2 * theta_raw)
+
+    ys = np.arange(bsize // 2, h, bsize)
+    xs = np.arange(bsize // 2, w, bsize)
+    yy, xx = np.meshgrid(ys, xs, indexing='ij')
+    valid = mask[yy, xx] > 0
+    if int(valid.sum()) < 20:
+        return None
+    yy, xx = yy[valid], xx[valid]
+    w_sample = coherence[yy, xx]
+    cs_sample = cs_raw[yy, xx]
+    sn_sample = sn_raw[yy, xx]
+
+    def _basis(xn: np.ndarray, yn: np.ndarray) -> List[np.ndarray]:
+        cols = [np.ones_like(xn)]
+        for p in range(order + 1):
+            for q in range(order + 1):
+                if p == 0 and q == 0:
+                    continue
+                cols.append(np.cos(p * np.pi * xn) * np.cos(q * np.pi * yn))
+                cols.append(np.cos(p * np.pi * xn) * np.sin(q * np.pi * yn))
+                cols.append(np.sin(p * np.pi * xn) * np.cos(q * np.pi * yn))
+                cols.append(np.sin(p * np.pi * xn) * np.sin(q * np.pi * yn))
+        return cols
+
+    xn_s = (xx.astype(np.float32) - w / 2.0) / (w / 2.0)
+    yn_s = (yy.astype(np.float32) - h / 2.0) / (h / 2.0)
+    A = np.stack(_basis(xn_s, yn_s), axis=1)
+    sw = np.sqrt(np.clip(w_sample, 1e-3, None))
+    Aw = A * sw[:, None]
+    try:
+        coef_cs, *_ = np.linalg.lstsq(Aw, cs_sample * sw, rcond=None)
+        coef_sn, *_ = np.linalg.lstsq(Aw, sn_sample * sw, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    yg, xg = np.mgrid[0:h, 0:w].astype(np.float32)
+    xng = (xg - w / 2.0) / (w / 2.0)
+    yng = (yg - h / 2.0) / (h / 2.0)
+    basis_full = _basis(xng, yng)
+    cs_fit = sum(c * b for c, b in zip(coef_cs, basis_full))
+    sn_fit = sum(c * b for c, b in zip(coef_sn, basis_full))
+    return 0.5 * np.arctan2(sn_fit, cs_fit) + np.pi / 2
+
+
 def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> float:
     h, w = img.shape
     freqs = []
@@ -1854,6 +1970,23 @@ def generate(
             params['afisEnhance'] = 'nnsHybrid'
         else:
             params['afisEnhance'] = 'nnsHybrid_unavailable'
+    elif enhance == 'fomfe':
+        # Global 2D-Fourier orientation-field model instead of a denoise
+        # pre-pass -- see _fomfe_orientation_field's own docstring. No
+        # separate denoise step: this replaces ONLY how the orientation
+        # field itself is estimated (the direction Gabor filters at each
+        # pixel), leaving the actual pixel content (g8/norm) untouched --
+        # a different axis of change than every other hybrid variant above,
+        # which all denoise the IMAGE then re-run the existing local
+        # orientation estimator on the cleaned image.
+        norm = _normalize(g8)
+        orient = _fomfe_orientation_field(norm, mask)
+        if orient is not None:
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'fomfe'
+        else:
+            params['afisEnhance'] = 'fomfe_unavailable'
     if binimg is None:
         # Either enhance == 'gabor', or a pyfing path was requested but the
         # sidecar wasn't configured/reachable -- same non-blocking contract
