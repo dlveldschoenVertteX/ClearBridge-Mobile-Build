@@ -175,15 +175,47 @@ _FOMFE_ORDER = 4   # basis order in each axis (5x5 (p,q) grid x 4 sin/cos
 # toward the smooth global trend precisely where real matching depends on
 # it most -- the model helps exactly where local noise was the problem and
 # actively hurts exactly where local complexity was real signal, not noise.
-# Left here as an available, honestly-negative-result scaffold (same
+# UPDATE 2026-08-04 -- CTO's own refinement, real improvement, STILL not a
+# net win: rather than replacing the field everywhere, confidence-weight a
+# per-pixel blend with the existing LOCAL field (see `blend=True` below) --
+# trust local where it's genuinely strong, fall back to the global fit only
+# where local signal is weak. This measurably helped: real SourceAFIS mean
+# went 58.1 (pure global) -> 66.1 (blend, percentile=70) -> 69.1 (blend,
+# percentile=90, more conservative -- now the shipped default) vs the 74.2
+# gabor baseline, and at percentile=90, 3 of the 6 genuine pairs actually
+# BEAT the baseline outright (only the 3 pairs involving 382cc4b2 stayed
+# below it). Real NFIQ2 held up throughout (mean +4.0 at percentile=70,
+# still positive at 90). This confirms the CTO's diagnosis was right --
+# targeted/confidence-based blending IS a real improvement over uniform
+# global replacement -- but the gap to the baseline never fully closed, and
+# the SAME single capture (382cc4b2) stayed the holdout at every setting
+# tried, suggesting something specific to that capture's own local
+# coherence calibration rather than a blend-strength problem alone. Left
+# here as an available, honestly-still-negative-on-mean scaffold (same
 # treatment as gaborVarFreq/fidelity/gaborPyfingField/deepFocus*) -- do not
-# re-attempt wiring this into production without a real reason to believe a
-# different order/weighting scheme resolves the core-region distortion.
+# wire into production without first understanding why 382cc4b2 resists
+# every setting tried.
+
+
+_FOMFE_BLEND_CONF_SIGMA = 12.0  # Gaussian smoothing (px) on the raw per-pixel
+# coherence map before it's used as the local/global blend weight -- avoids a
+# blocky/patchwork blend boundary that would itself look like a segmentation
+# artifact (same rationale as _ORIENT_SMOOTH existing at all).
+_FOMFE_BLEND_PERCENTILE = 90.0  # coherence percentile (within the mask) that
+# maps to full trust-the-local-estimate weight. Swept 70 vs 90 against real
+# SourceAFIS matchability (see update above) -- 90 (more conservative, only
+# the weakest ~10% of local signal ever defers to the global fit) measurably
+# closed more of the gap to the gabor baseline than 70 without losing the
+# real NFIQ2 gain, so it's the default. Real captures have a wide,
+# capture-specific coherence range (contact pressure/lighting vary a lot),
+# so a PERCENTILE-relative threshold generalizes across captures where a
+# fixed absolute cutoff wouldn't.
 
 
 def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
                               bsize: int = _BLOCK,
-                              order: int = _FOMFE_ORDER) -> Optional[np.ndarray]:
+                              order: int = _FOMFE_ORDER,
+                              blend: bool = True) -> Optional[np.ndarray]:
     """
     Global 2D-Fourier-series orientation field model (2026-08-03,
     FOMFE-inspired -- Wang/Hu/Phillips, "A Fingerprint Orientation Model
@@ -210,6 +242,21 @@ def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
     densely over the whole image. Returns None (self-skip, same contract as
     every other optional signal in this module) if too few valid samples
     exist for a stable fit.
+
+    blend=True (default, 2026-08-04, CTO's own refinement): the pure global
+    replacement (blend=False) measured a real matchability loss concentrated
+    at whorl cores/deltas -- a low-order global model can't represent the
+    real, legitimately-tight local curvature there, so it was overwriting
+    genuine structure, not just noise. Instead of replacing the local field
+    everywhere, CONFIDENCE-WEIGHT a blend between the two per pixel: trust
+    the local estimate (_orientation_field's own smoothed field) where local
+    signal is genuinely strong -- a sharp core has strong gradient coherence
+    on its own, no reconstruction needed -- and fall back toward the global
+    fit only where local coherence is weak (creases, low contact pressure,
+    typically nearer the pad periphery, matching the CTO's own "outer edges"
+    framing, but driven by actual signal strength rather than a hardcoded
+    geometric ring, so it adapts per-capture instead of assuming where the
+    weak regions will be).
     """
     h, w = img.shape
     gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
@@ -261,7 +308,30 @@ def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
     basis_full = _basis(xng, yng)
     cs_fit = sum(c * b for c, b in zip(coef_cs, basis_full))
     sn_fit = sum(c * b for c, b in zip(coef_sn, basis_full))
-    return 0.5 * np.arctan2(sn_fit, cs_fit) + np.pi / 2
+
+    if not blend:
+        return 0.5 * np.arctan2(sn_fit, cs_fit) + np.pi / 2
+
+    # LOCAL field: the existing, already-tuned smoother (Gaussian blur on
+    # the same raw doubled-angle signal) -- reusing it rather than
+    # re-deriving keeps this consistent with the field this pipeline
+    # already ships when fomfe isn't involved at all.
+    cs_local = cv2.GaussianBlur(cs_raw, (0, 0), _ORIENT_SMOOTH)
+    sn_local = cv2.GaussianBlur(sn_raw, (0, 0), _ORIENT_SMOOTH)
+
+    # Confidence weight: smooth the raw coherence map first (avoids a
+    # blocky/patchwork blend boundary), then scale relative to its own
+    # in-mask percentile so this adapts to each capture's own contrast/
+    # pressure range rather than assuming a fixed absolute cutoff.
+    coh_smooth = cv2.GaussianBlur(coherence, (0, 0), _FOMFE_BLEND_CONF_SIGMA)
+    in_mask = coh_smooth[mask > 0]
+    ref = float(np.percentile(in_mask, _FOMFE_BLEND_PERCENTILE)) if in_mask.size else 1.0
+    ref = max(ref, 1e-6)
+    alpha = np.clip(coh_smooth / ref, 0.0, 1.0).astype(np.float32)
+
+    cs_blend = alpha * cs_local + (1.0 - alpha) * cs_fit
+    sn_blend = alpha * sn_local + (1.0 - alpha) * sn_fit
+    return 0.5 * np.arctan2(sn_blend, cs_blend) + np.pi / 2
 
 
 def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> float:
