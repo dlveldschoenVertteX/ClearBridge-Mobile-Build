@@ -495,16 +495,16 @@ class FrontCaptureController extends ChangeNotifier {
   // real light differences" -- push them as far toward the screen edges as
   // the guide can go while staying fully on-screen, for a real illumination-
   // angle difference between zones (the whole point of a left/centre/right
-  // sweep). Derived from the guide's own half-width rather than a second
-  // hardcoded literal, so a future guide resize can't silently drift this
-  // out of sync the way _scoreRoi's manually-copied derivation already has
-  // elsewhere in this file. _sweepEdgeMarginFrac is the only tunable: how
-  // much clear screen space to leave between the guide's outer edge and the
-  // true screen edge at full extension (small margin, not zero -- avoids
-  // the guide visually touching/clipping at the raw edge).
-  static const double _sweepEdgeMarginFrac = 0.03;
-  static const double _sweepGuideShiftFrac =
-      0.5 - PadSilhouetteShape.defaultShape.rx - _sweepEdgeMarginFrac;
+  // sweep). Wanted to derive this from PadSilhouetteShape.defaultShape.rx
+  // directly so a future guide resize couldn't silently drift it out of
+  // sync (the way _scoreRoi's own manually-copied derivation already can) --
+  // but `defaultShape.rx` is NOT a valid const-expression field access in
+  // Dart (confirmed by a real build failure: "Error: Not a constant
+  // expression" / "The property 'rx' can't be accessed... in a constant
+  // expression"), so this has to be a hand-computed literal instead, same
+  // as _scoreRoi. Derivation: 0.5 - rx(0.134604) - margin(0.03) = 0.335396.
+  // If defaultShape.rx is ever re-tuned, this must be recomputed by hand.
+  static const double _sweepGuideShiftFrac = 0.335396;
 
   // Guided thumb-sweep feature flag. DISABLED as of 2026-07-31 round 5
   // after five real device-test rounds each revealed a different failure
