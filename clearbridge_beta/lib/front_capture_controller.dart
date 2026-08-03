@@ -245,17 +245,31 @@ class FrontCaptureController extends ChangeNotifier {
   // can never capture. Fixed duration, not "user confirms sweep complete"
   // (the handoff spec's alternative) -- simplest safe first cut, same
   // reasoning as the disabled guided-sweep feature's own fixed timeout.
-  static const int _sweepVideoDurationMs = 6000;
+  //
+  // 6000 -> 9000, 2026-08-03: real device-test feedback -- "moving too
+  // fast... once it came to the other side it was static" -- and the
+  // screenshots back it up: two frames captured a real 1 second apart both
+  // already showed the guide parked at the fully-right-shifted position
+  // (sweepProgress already at 100% in both). The interpolation math itself
+  // is linear and correct; 6s was simply too short once real human reaction
+  // time (read the cue, start moving) eats into it -- the guide reaches the
+  // far side well before the user's own physical sweep catches up, then
+  // correctly holds there for whatever's left of the window, which reads
+  // as "broken" even though it isn't. _SWEEP_VIDEO_ZONE_TIMESTAMPS_MS in
+  // main.py is rescaled by the same 1.5x factor alongside this -- the two
+  // MUST move together, since the backend's candidate-extraction timestamps
+  // are meaningless if they don't span this same real recording window.
+  static const int _sweepVideoDurationMs = 9000;
   // Bounds the record-start -> record-stop -> read-bytes sequence only
   // (NOT the upload after it, which has its own legitimate retry/backoff
-  // and shouldn't be killed for being slow on a bad connection). 6s
-  // recording + generous margin for native start/stop/flush overhead --
+  // and shouldn't be killed for being slow on a bad connection). Recording
+  // duration + generous margin for native start/stop/flush overhead --
   // same proportion as this file's other camera-operation timeouts (e.g.
   // the secondary-camera path's 28s bound against its own, heavier,
   // multi-shot sequence). A hang here is caught by .timeout() rather than
   // blocking the whole capture forever the way an uncaught-hang camera
   // Future would -- try/catch alone does not protect against that.
-  static const int _sweepVideoRecordTimeoutMs = 15000;
+  static const int _sweepVideoRecordTimeoutMs = 20000;
 
   // Instant kill-switch for the whole video-sweep step, same pattern as
   // the disabled guided-sweep feature's own _sweepEnabled -- if a real
@@ -2257,6 +2271,24 @@ class FrontCaptureController extends ChangeNotifier {
       final bytes = await (() async {
         await svc.startVideoRecording();
         recording = true;
+        // Real device-test finding (2026-08-03): "no flash present on any
+        // angle movement, only on the initial burst" -- confirmed a real
+        // gap, not a device issue: this method never touched _flash at
+        // all, so the sweep video recorded under whatever torch state the
+        // main burst left behind (always OFF -- _fireBurst deactivates the
+        // torch unconditionally when it finishes). Same _flash.isNeeded
+        // gate every other torch-firing path in this file already uses,
+        // so a genuinely bright-ambient capture still correctly skips the
+        // torch here too. Left on for the whole recording (not alternated
+        // like the main burst) -- this step wants one consistent,
+        // well-lit video, not paired ambient/flash variants.
+        final torchCapable = _flash?.isNeeded ?? false;
+        if (torchCapable) {
+          try {
+            await _flash?.activate();
+          } catch (_) {}
+        }
+        debug['torchCapable'] = torchCapable;
         // Distinct start cue -- a real device-test round earlier flagged
         // this step had no audio/haptic differentiation from any other
         // "waiting" moment in the flow, making it easy to miss.
@@ -2293,6 +2325,11 @@ class FrontCaptureController extends ChangeNotifier {
 
         final xfile = await svc.stopVideoRecording();
         recording = false;
+        // Torch only needed for the recording itself, not the upload that
+        // follows -- turn it off as soon as the video is captured.
+        try {
+          await _flash?.deactivate();
+        } catch (_) {}
         return xfile.readAsBytes();
       }()).timeout(const Duration(milliseconds: _sweepVideoRecordTimeoutMs));
       stopwatch.stop();
@@ -2322,6 +2359,12 @@ class FrontCaptureController extends ChangeNotifier {
       }
     } finally {
       guideTimer?.cancel();
+      // Belt-and-suspenders -- idempotent, and covers any error path above
+      // that stopped recording without reaching the deactivate() call
+      // right after it (e.g. the timeout/exception branches).
+      try {
+        await _flash?.deactivate();
+      } catch (_) {}
       _apply(
         (s) => s.copyWith(
           distanceHint: null,

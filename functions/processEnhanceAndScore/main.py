@@ -1945,10 +1945,18 @@ def _download_front_only_frames(capture_id: str, base_path: str):
 # interval-dependent) -- acceptable here since the "5 timestamps per zone"
 # design already exists specifically to tolerate landing near, not exactly
 # on, each target.
+#
+# Rescaled 1.5x (2026-08-03): real device test showed the client-side sweep
+# guide reaching 100% completion within ~1s of two screenshots taken 1s
+# apart -- confirmed via pixel-position analysis, not a broken interpolation,
+# just a 6s window too short for real human reaction time. Client's
+# _sweepVideoDurationMs moved 6000->9000ms in front_capture_controller.dart;
+# these timestamps MUST move together with it (same 1.5x factor) since they
+# encode absolute offsets into the recorded clip, not fractions of it.
 _SWEEP_VIDEO_ZONE_TIMESTAMPS_MS = {
-    'left':   [500, 900, 1300, 1500, 1800],
-    'center': [2000, 2800, 3000, 3200, 4000],
-    'right':  [4200, 4500, 4800, 5200, 5500],
+    'left':   [750, 1350, 1950, 2250, 2700],
+    'center': [3000, 4200, 4500, 4800, 6000],
+    'right':  [6300, 6750, 7200, 7800, 8250],
 }
 
 
