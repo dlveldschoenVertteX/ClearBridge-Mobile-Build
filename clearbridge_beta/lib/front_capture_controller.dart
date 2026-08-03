@@ -2560,14 +2560,24 @@ class FrontCaptureController extends ChangeNotifier {
         return bytes;
       }));
 
-      // Each zone's upload is individually try/caught + timeout-bounded so
-      // one slow/hung network call can't block the others or stall the
-      // whole sweep step forever -- same "one failure only costs that one
-      // candidate" discipline as the capture loop above. A zone that fails
-      // here simply doesn't get a `paths` entry; the backend already
-      // treats a missing sweep zone path as absent data, not an error.
+      // REAL BUG, found 2026-08-03: these 3 uploads used to run concurrently
+      // via Future.wait -- across 3 real tests (640f563a, fd1da8c1,
+      // 0bd23cc2) the SAME zone (whichever ran last/largest) consistently
+      // hit the upload timeout while the other two finished in 18-22s each,
+      // even after the JPEG quality cut. The pattern (every concurrent
+      // upload taking roughly 3x what a similar-sized single upload takes
+      // elsewhere in this file) is consistent with 3 simultaneous uploads
+      // splitting one constrained mobile-network pipe 3 ways rather than
+      // each getting full bandwidth -- not 3 independent slow uploads, one
+      // shared bottleneck. Fixed by uploading zones SEQUENTIALLY instead:
+      // each one gets the full connection to itself, so the total time for
+      // all 3 is expected to drop close to a single zone's own real upload
+      // time x3, not x3 with contention on top. Each zone is still
+      // individually try/caught + timeout-bounded so one failure only costs
+      // that one candidate, same discipline as the capture loop above -- a
+      // zone that fails simply doesn't get a `paths` entry.
       final paths = <String, String>{};
-      await Future.wait(List.generate(zoneNames.length, (i) async {
+      for (var i = 0; i < zoneNames.length; i++) {
         final zone = zoneNames[i];
         final path = '$basePath/sweep_burst_$zone.jpg';
         final uploadStart = DateTime.now();
@@ -2580,7 +2590,7 @@ class FrontCaptureController extends ChangeNotifier {
         }
         zoneDebug['${zone}_uploadMs'] =
             DateTime.now().difference(uploadStart).inMilliseconds;
-      }));
+      }
 
       // Per-zone guide region: the on-screen guide translated for each
       // zone, so the still-space AFIS mask must translate with it --
