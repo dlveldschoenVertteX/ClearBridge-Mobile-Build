@@ -1288,40 +1288,168 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 _sb_paths = _sb_meta.get('paths') or {}
                 _sb_guides = _sb_meta.get('guideRegions') or {}
                 _sweep_burst_debug['present'] = bool(_sb_paths)
-                for _zone, _zpath in _sb_paths.items():
-                    _zone_debug: dict = {'path': _zpath}
+
+                # 2026-08-05: the client now fires an ambient+flash PAIR per
+                # zone (keys '<zone>_amb'/'<zone>_fl') instead of one
+                # flash-only shot ('<zone>' bare) -- real captured images
+                # (b1b5fc67) showed the old flash-only shots consistently
+                # blown out (the client applied zero EV compensation, now
+                # fixed alongside this). Detect which format this capture
+                # used so historical captures keep scoring exactly as
+                # before -- the old branch below is byte-for-byte the prior
+                # logic, untouched.
+                _sb_zone_names = sorted({
+                    k.rsplit('_amb', 1)[0] if k.endswith('_amb') else k.rsplit('_fl', 1)[0]
+                    for k in _sb_paths if k.endswith('_amb') or k.endswith('_fl')
+                })
+
+                if _sb_zone_names:
+                    # NEW format: flash-diff-fuse each zone's ambient+flash
+                    # pair the same already-proven way _fuse_flash_ambient
+                    # fuses the main burst's pair, instead of scoring one
+                    # (previously blown-out) flash shot alone.
+                    _zone_grays: dict = {}   # zone -> (gray, guide) for the cross-zone fusion below
+                    for _zone in _sb_zone_names:
+                        _zone_debug: dict = {}
+                        try:
+                            _amb_path = _sb_paths.get(f'{_zone}_amb')
+                            _fl_path = _sb_paths.get(f'{_zone}_fl')
+                            _zone_debug['ambPath'] = _amb_path
+                            _zone_debug['flPath'] = _fl_path
+                            _zamb = (_decode_image(_download_storage_file(_amb_path))
+                                     if _amb_path else None)
+                            _zfl = (_decode_image(_download_storage_file(_fl_path))
+                                    if _fl_path else None)
+                            _zfused = (afis_print._fuse_flash_ambient(_zamb, _zfl, mode='soft')
+                                       if (_zamb is not None and _zfl is not None) else None)
+                            # Falls back to whichever single frame exists if the
+                            # pair didn't register/fuse -- can only recover an
+                            # otherwise-empty zone, never worse than before.
+                            _zsrc = _zfused if _zfused is not None else (
+                                _zamb if _zamb is not None else _zfl)
+                            _zone_debug['fused'] = _zfused is not None
+                            if _zsrc is None:
+                                _zone_debug['error'] = 'no usable frame'
+                                _sweep_burst_debug[_zone] = _zone_debug
+                                continue
+                            _zlap = float(cv2.Laplacian(_zsrc, cv2.CV_64F).var())
+                            _zone_debug['laplacian'] = round(_zlap, 1)
+                            _zguide = _sb_guides.get(_zone) or _guide_region
+                            _zone_grays[_zone] = (_zsrc, _zguide)
+                            _zimg_res, _zp = afis_print.generate(
+                                [_zsrc], [0.0], [None],
+                                guide_region=_zguide,
+                                freq_normalize=True,
+                                stack_cache={},
+                            )
+                            if _zimg_res is not None:
+                                _zres = _score_nfiq(_zimg_res, sfm_coverage=1.0)
+                                _zs = _zres.get('nfiq_score', 0.0) if not _zres.get('error') else 0.0
+                                _zone_debug['proxyScore'] = round(_zs, 2)
+                                _zname = f'sweepBurst_{_zone}'
+                                logger.info('AFIS variant %s nfiq=%.1f lap=%.1f fused=%s',
+                                            _zname, _zs, _zlap, _zone_debug['fused'])
+                                _zone_debug['wonSelection'] = bool(
+                                    _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED)
+                                if _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED:
+                                    afis_nfiq = _zs
+                                    best_afis_img = _zimg_res
+                                    afis_params = {**_zp, 'afisNfiq': round(_zs, 2),
+                                                   'afisSource': _zname}
+                            else:
+                                _zone_debug['wonSelection'] = False
+                        except Exception as _vz_exc:   # noqa: BLE001
+                            logger.warning('sweep burst zone %s (fused) scoring failed: %s',
+                                            _zone, _vz_exc)
+                            _zone_debug['error'] = str(_vz_exc)
+                        _sweep_burst_debug[_zone] = _zone_debug
+
+                    # Cross-zone fusion (2026-08-05, tested offline against
+                    # real captures before wiring in -- reused-code mosaic
+                    # measured +9 and +1 real NFIQ2 over the best single
+                    # zone on the 2 real captures checked). Mosaic-fuses the
+                    # per-zone (now flash-diff-fused) images together via
+                    # _front_anchored_mosaic (built for the discontinued
+                    # four-angle flow, never wired here before), anchored on
+                    # center since that's the zone closest to the main
+                    # capture's own guideRegion. Purely additive, same
+                    # margin-guard gate as every other sweep candidate.
                     try:
-                        _zbytes = _download_storage_file(_zpath)
-                        _zarr = _decode_image(_zbytes)
-                        _zlap = float(cv2.Laplacian(_zarr, cv2.CV_64F).var()) if _zarr is not None else 0.0
-                        _zone_debug['laplacian'] = round(_zlap, 1)
-                        _zguide = _sb_guides.get(_zone) or _guide_region
-                        _zimg_res, _zp = afis_print.generate(
-                            [_zarr], [0.0], [None],
-                            guide_region=_zguide,
-                            freq_normalize=True,
-                            stack_cache={},
-                        )
-                        if _zimg_res is not None:
-                            _zres = _score_nfiq(_zimg_res, sfm_coverage=1.0)
-                            _zs = _zres.get('nfiq_score', 0.0) if not _zres.get('error') else 0.0
-                            _zone_debug['proxyScore'] = round(_zs, 2)
-                            _zname = f'sweepBurst_{_zone}'
-                            logger.info('AFIS variant %s nfiq=%.1f lap=%.1f',
-                                        _zname, _zs, _zlap)
-                            _zone_debug['wonSelection'] = bool(
-                                _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED)
-                            if _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED:
-                                afis_nfiq = _zs
-                                best_afis_img = _zimg_res
-                                afis_params = {**_zp, 'afisNfiq': round(_zs, 2),
-                                               'afisSource': _zname}
-                        else:
-                            _zone_debug['wonSelection'] = False
-                    except Exception as _vz_exc:   # noqa: BLE001
-                        logger.warning('sweep burst zone %s scoring failed: %s', _zone, _vz_exc)
-                        _zone_debug['error'] = str(_vz_exc)
-                    _sweep_burst_debug[_zone] = _zone_debug
+                        if 'center' in _zone_grays:
+                            _anchor, _anchor_guide = _zone_grays['center']
+                            _sides = [g for z, (g, _) in _zone_grays.items() if z != 'center']
+                            _fusion_debug: dict = {'sidesAvailable': len(_sides)}
+                            if _sides:
+                                _mos, _n_used = afis_print._front_anchored_mosaic(_anchor, _sides)
+                                if _mos is not None:
+                                    _fusion_debug['sidesUsed'] = _n_used
+                                    _mimg_res, _mp = afis_print.generate(
+                                        [_mos], [0.0], [None],
+                                        guide_region=_anchor_guide,
+                                        freq_normalize=True,
+                                        stack_cache={},
+                                    )
+                                    if _mimg_res is not None:
+                                        _mres = _score_nfiq(_mimg_res, sfm_coverage=1.0)
+                                        _ms = (_mres.get('nfiq_score', 0.0)
+                                               if not _mres.get('error') else 0.0)
+                                        _fusion_debug['proxyScore'] = round(_ms, 2)
+                                        logger.info(
+                                            'AFIS variant sweepFusion nfiq=%.1f (sides %d/%d)',
+                                            _ms, _n_used, len(_sides))
+                                        _fusion_debug['wonSelection'] = bool(
+                                            _ms > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED)
+                                        if _ms > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED:
+                                            afis_nfiq = _ms
+                                            best_afis_img = _mimg_res
+                                            afis_params = {**_mp, 'afisNfiq': round(_ms, 2),
+                                                           'afisSource': 'sweepFusion'}
+                                    else:
+                                        _fusion_debug['wonSelection'] = False
+                                else:
+                                    _fusion_debug['error'] = 'mosaic registration failed'
+                            _sweep_burst_debug['fusion'] = _fusion_debug
+                    except Exception as _fu_exc:   # noqa: BLE001
+                        logger.warning('sweep cross-zone fusion failed (non-critical): %s', _fu_exc)
+                        _sweep_burst_debug['fusionError'] = str(_fu_exc)
+                else:
+                    # OLD format (pre-2026-08-05 captures, bare '<zone>'
+                    # keys, one flash-only shot per zone) -- untouched.
+                    for _zone, _zpath in _sb_paths.items():
+                        _zone_debug: dict = {'path': _zpath}
+                        try:
+                            _zbytes = _download_storage_file(_zpath)
+                            _zarr = _decode_image(_zbytes)
+                            _zlap = (float(cv2.Laplacian(_zarr, cv2.CV_64F).var())
+                                     if _zarr is not None else 0.0)
+                            _zone_debug['laplacian'] = round(_zlap, 1)
+                            _zguide = _sb_guides.get(_zone) or _guide_region
+                            _zimg_res, _zp = afis_print.generate(
+                                [_zarr], [0.0], [None],
+                                guide_region=_zguide,
+                                freq_normalize=True,
+                                stack_cache={},
+                            )
+                            if _zimg_res is not None:
+                                _zres = _score_nfiq(_zimg_res, sfm_coverage=1.0)
+                                _zs = _zres.get('nfiq_score', 0.0) if not _zres.get('error') else 0.0
+                                _zone_debug['proxyScore'] = round(_zs, 2)
+                                _zname = f'sweepBurst_{_zone}'
+                                logger.info('AFIS variant %s nfiq=%.1f lap=%.1f',
+                                            _zname, _zs, _zlap)
+                                _zone_debug['wonSelection'] = bool(
+                                    _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED)
+                                if _zs > afis_nfiq + _SWEEP_ZONE_MARGIN_REQUIRED:
+                                    afis_nfiq = _zs
+                                    best_afis_img = _zimg_res
+                                    afis_params = {**_zp, 'afisNfiq': round(_zs, 2),
+                                                   'afisSource': _zname}
+                            else:
+                                _zone_debug['wonSelection'] = False
+                        except Exception as _vz_exc:   # noqa: BLE001
+                            logger.warning('sweep burst zone %s scoring failed: %s', _zone, _vz_exc)
+                            _zone_debug['error'] = str(_vz_exc)
+                        _sweep_burst_debug[_zone] = _zone_debug
             except Exception as _sv_exc:   # noqa: BLE001 -- never block the pipeline
                 logger.warning('sweep burst candidate scoring failed (non-critical): %s', _sv_exc)
                 _sweep_burst_debug['error'] = str(_sv_exc)

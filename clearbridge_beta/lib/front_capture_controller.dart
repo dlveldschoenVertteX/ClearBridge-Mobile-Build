@@ -356,13 +356,18 @@ class FrontCaptureController extends ChangeNotifier {
   // camera Future would (try/catch alone does not protect against that --
   // same reasoning as every other bounded camera sequence in this file).
   // Budget: 2 moves (2*3100=6200) + left settle (700) + 2 full count-ins
-  // (2*3*700=4200) + 3 shots (~500-2000ms each in practice, more with torch
-  // AE convergence) + margin. Widened 18000->24000 once center/right zones
-  // each gained their own 3-tick count-in (2026-08-03), then 24000->28000
-  // the same day when _sweepZoneMoveMs grew 1400->3100 for the wider
-  // edge-to-edge sweep travel -- real observed per-zone timings (7 real
-  // captures' zoneDebug) stay well inside this with margin to spare.
-  static const int _sweepBurstTimeoutMs = 28000;
+  // (2*3*700=4200) + 6 shots -- ambient+flash PER zone now, not 1 shot per
+  // zone (2026-08-05, see the real blowout fix at the flash-activation call
+  // site) -- at ~500-2000ms each in practice (more with torch AE
+  // convergence), plus 2 flash-settle delays per zone (on+off) + margin.
+  // Widened 18000->24000 once center/right zones each gained their own
+  // 3-tick count-in (2026-08-03), 24000->28000 when _sweepZoneMoveMs grew
+  // 1400->3100 for the wider edge-to-edge travel, then 28000->34000 for the
+  // doubled shot count -- real observed per-zone timings before this round
+  // (7 real captures' zoneDebug) stayed well inside 28000 with ~10s to
+  // spare, so the extra 3 shots' worst-case cost (~2000ms each) fits with
+  // real margin still intact.
+  static const int _sweepBurstTimeoutMs = 34000;
   // Bound the per-zone decode+encode and upload steps separately from the
   // capture loop above -- these run AFTER the shots are already in hand, so
   // a hang here has no camera-hardware excuse and must not silently freeze
@@ -2398,6 +2403,13 @@ class FrontCaptureController extends ChangeNotifier {
       MapEntry('center', 0.5),
       MapEntry('right', 1.0),
     ];
+    // Keyed by '${zone}_amb' / '${zone}_fl' (2026-08-05: each zone now
+    // fires an ambient+flash pair, not one flash-only shot -- see the real
+    // bug note at the flash-activation call site below). The downstream
+    // encode/upload loops are already generic over rawShots.keys, so this
+    // widened key space needs no changes there -- only guideRegions (still
+    // keyed by bare zone name, shared by both illuminations of that zone)
+    // stays a 3-entry map.
     final rawShots = <String, Uint8List>{};
     final zoneDebug = <String, dynamic>{};
     try {
@@ -2428,18 +2440,40 @@ class FrontCaptureController extends ChangeNotifier {
       if (_disposed) return debug;
 
       await (() async {
-        // Left on for all 3 zone shots (not alternated like the main
-        // burst) -- same rationale as the video version: this step wants
-        // consistent, well-lit stills, not paired ambient/flash variants.
+        // REAL BUG, found 2026-08-05: this used to leave the flash on
+        // continuously for all 3 zone shots with ZERO EV compensation --
+        // confirmed via real captured images (b1b5fc67): the pad tip was
+        // visibly clipped to near-white in every single zone, the same
+        // torch-blowout failure mode the main burst's own adaptive EV step
+        // (_adaptiveFlashEvStep) was built to prevent, just never applied
+        // here. Also, per the CTO's own request: an ambient+flash PAIR per
+        // zone (not one flash-only shot) lets the backend flash-diff-fuse
+        // each zone the same already-proven way _fuse_flash_ambient does
+        // for the main burst, instead of scoring one blown-out flash shot
+        // alone. Each zone now fires ambient (torch off) THEN flash (torch
+        // on, EV-compensated) -- same alternation convention as the main
+        // burst, just scoped per zone instead of per whole-burst index.
         final torchCapable = _flash?.isNeeded ?? false;
+        final flashEvStep = torchCapable ? _adaptiveFlashEvStep() : 0.0;
+        double? minEv, maxEv;
         if (torchCapable) {
           try {
-            await _flash?.activate();
+            minEv = await cam.getMinExposureOffset();
+            maxEv = await cam.getMaxExposureOffset();
           } catch (_) {}
         }
         debug['torchCapable'] = torchCapable;
+        debug['flashEvStep'] = double.parse(flashEvStep.toStringAsFixed(3));
         unawaited(HapticFeedback.mediumImpact());
         unawaited(_audio.playSweepStart());
+
+        // Tracks whether the immediately preceding shot fired the flash --
+        // same asymmetric-settle discipline as the main burst (round 12):
+        // only the transition AWAY from a real flash shot needs a settle
+        // delay before the next (ambient) shot fires. Every zone after the
+        // first ends on its own flash shot, so this fires between every
+        // zone boundary except before zone 0's first ambient shot.
+        var wasFlashLastShot = false;
 
         for (var i = 0; i < zones.length; i++) {
           final zone = zones[i].key;
@@ -2498,20 +2532,62 @@ class FrontCaptureController extends ChangeNotifier {
             if (_disposed) break;
           }
 
-          final shotStart = DateTime.now();
+          // Ambient shot (torch off). Only waits for the flash-off settle
+          // if the flash was actually on a moment ago -- zone 0's first
+          // ambient shot never waits (nothing to settle from yet).
+          try {
+            await _flash?.deactivate();
+            if (minEv != null && maxEv != null) {
+              await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+            }
+            if (wasFlashLastShot) {
+              await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+            }
+          } catch (_) {}
+          wasFlashLastShot = false;
+          final ambStart = DateTime.now();
           try {
             final xfile = await cam.takePicture();
-            rawShots[zone] = await xfile.readAsBytes();
-            zoneDebug['${zone}_captureMs'] =
-                DateTime.now().difference(shotStart).inMilliseconds;
+            rawShots['${zone}_amb'] = await xfile.readAsBytes();
+            zoneDebug['${zone}_amb_captureMs'] =
+                DateTime.now().difference(ambStart).inMilliseconds;
           } catch (e) {
-            zoneDebug['${zone}_error'] = e.toString();
-            debugPrint('[front] sweep-burst zone $zone capture failed (non-blocking): $e');
+            zoneDebug['${zone}_amb_error'] = e.toString();
+            debugPrint('[front] sweep-burst zone $zone ambient capture failed (non-blocking): $e');
+          }
+
+          // Flash shot (torch on, EV-compensated -- the real fix for the
+          // blowout found in real captured images: every prior sweep-burst
+          // zone fired at full/uncompensated exposure with no EV step at
+          // all).
+          if (torchCapable) {
+            try {
+              await _flash?.activate();
+              if (minEv != null && maxEv != null) {
+                await cam.setExposureOffset(
+                    (_appliedEvOffset + flashEvStep).clamp(minEv, maxEv));
+              }
+              await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+            } catch (_) {}
+          }
+          wasFlashLastShot = torchCapable;
+          final flStart = DateTime.now();
+          try {
+            final xfile = await cam.takePicture();
+            rawShots['${zone}_fl'] = await xfile.readAsBytes();
+            zoneDebug['${zone}_fl_captureMs'] =
+                DateTime.now().difference(flStart).inMilliseconds;
+          } catch (e) {
+            zoneDebug['${zone}_fl_error'] = e.toString();
+            debugPrint('[front] sweep-burst zone $zone flash capture failed (non-blocking): $e');
           }
         }
 
         try {
           await _flash?.deactivate();
+          if (minEv != null && maxEv != null) {
+            await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+          }
         } catch (_) {}
       }()).timeout(const Duration(milliseconds: _sweepBurstTimeoutMs));
       stopwatch.stop();
