@@ -2586,8 +2586,12 @@ class FrontCaptureController extends ChangeNotifier {
         final path = '$basePath/sweep_burst_$zone.jpg';
         final uploadStart = DateTime.now();
         try {
-          await _uploadWithRetry(encoded[i], path)
-              .timeout(const Duration(milliseconds: _sweepZoneUploadTimeoutMs));
+          // Passed IN, not wrapped around the call -- see _uploadWithRetry's
+          // own docs for why an external .timeout() here would silently
+          // leave the real native upload running as a zombie instead of
+          // actually cancelling it.
+          await _uploadWithRetry(encoded[i], path,
+              timeout: const Duration(milliseconds: _sweepZoneUploadTimeoutMs));
           paths[zone] = path;
           consecutiveUploadFailures = 0;
         } catch (e) {
@@ -2847,19 +2851,52 @@ class FrontCaptureController extends ChangeNotifier {
   // _captureSecondaryBurst and _waitForSecondaryFocusLock removed 2026-08-03
   // (secondary / IR camera removed -- see CLAUDE.md round-21 notes).
 
+  /// REAL ROOT CAUSE, found 2026-08-05: `putData()` returns an `UploadTask`
+  /// -- a real, cancellable native upload, not a plain Future. The previous
+  /// version of this method discarded that reference and just awaited it
+  /// directly, so a caller wrapping the whole call in `.timeout(...)` (the
+  /// sweep-zone upload loop) only ever stopped DART from waiting on it --
+  /// the underlying native upload kept running in the background,
+  /// invisibly, indefinitely, still consuming real bandwidth. Every
+  /// "failed" (timed-out) zone upload was actually a zombie task still
+  /// fighting the NEXT zone's fresh upload attempt for the same
+  /// connection -- exactly matching the real cascading-failure pattern
+  /// seen across 2 real captures (one zone succeeds cleanly, then every
+  /// later zone increasingly starved until all subsequent ones hit the
+  /// timeout ceiling too). Timeout-tuning alone (lowering the ceiling,
+  /// bailing out after N failures) could only ever reduce the symptom's
+  /// cost, never fix it -- the pile of zombie uploads was the actual
+  /// disease.
+  ///
+  /// Fixed by taking an optional `timeout` HERE (not at the call site) so
+  /// this method keeps the real `UploadTask` reference in scope and can
+  /// genuinely cancel it -- both on timeout (via `.timeout()`'s own
+  /// `onTimeout` callback, which runs synchronously before the exception
+  /// propagates) and on any other error that triggers a retry (so a failed
+  /// attempt never lingers into the next one).
   Future<void> _uploadWithRetry(
     Uint8List bytes,
     String path, {
     String contentType = 'image/jpeg',
+    Duration? timeout,
   }) async {
     for (var attempt = 0; ; attempt++) {
+      final task = FirebaseStorage.instance
+          .ref()
+          .child(path)
+          .putData(bytes, SettableMetadata(contentType: contentType));
       try {
-        await FirebaseStorage.instance
-            .ref()
-            .child(path)
-            .putData(bytes, SettableMetadata(contentType: contentType));
+        if (timeout != null) {
+          await task.timeout(timeout, onTimeout: () {
+            unawaited(task.cancel().catchError((_) => false));
+            throw TimeoutException('upload timed out after $timeout');
+          });
+        } else {
+          await task;
+        }
         return;
       } catch (e) {
+        unawaited(task.cancel().catchError((_) => false));
         final code = e is FirebaseException ? e.code : null;
         final retryable = code == null || !_uploadNonRetryableCodes.contains(code);
         if (!retryable || attempt >= _uploadRetryDelaysMs.length) rethrow;
