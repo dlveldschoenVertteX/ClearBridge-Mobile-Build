@@ -2488,15 +2488,21 @@ class FrontCaptureController extends ChangeNotifier {
       // Downscale + convert to grayscale AFTER the hold, same convention as
       // the main/secondary bursts -- keeps per-shot latency during the
       // actual capture window low; the expensive decode/encode work
-      // happens once the user no longer needs to hold position. Each zone's
-      // decode+encode is individually timeout-bounded so one stuck isolate
-      // call can't stall the whole batch. On failure/timeout, bytes stays
-      // empty (Uint8List(0)) -- the upload loop below skips empty zones
-      // without counting them as consecutive failures, so a single bad
-      // encode never triggers the bail-out that would drop the remaining
-      // good zones.
+      // happens once the user no longer needs to hold position.
+      //
+      // Encodes run SEQUENTIALLY, not concurrently. 6 simultaneous compute()
+      // isolates on a mobile CPU starve each other -- real measurements
+      // showed 18-22s per zone (vs ~3-4s expected) because each isolate was
+      // waiting for a share of one constrained CPU, then collectively pushing
+      // total encode wall-time close to the per-zone timeout. Sequential
+      // encode gives each isolate the full CPU to itself; total wall-time is
+      // roughly the same (N × single-encode-time either way) but each
+      // individual zone stays well inside the timeout. On failure/timeout,
+      // bytes stays empty (Uint8List(0)) -- the upload loop below skips
+      // empty zones without counting them as consecutive failures.
       final zoneNames = rawShots.keys.toList(growable: false);
-      final encoded = await Future.wait(zoneNames.map((zone) async {
+      final encoded = <Uint8List>[];
+      for (final zone in zoneNames) {
         final encodeStart = DateTime.now();
         var bytes = Uint8List(0);
         try {
@@ -2517,8 +2523,8 @@ class FrontCaptureController extends ChangeNotifier {
         zoneDebug['${zone}_encodeMs'] =
             DateTime.now().difference(encodeStart).inMilliseconds;
         zoneDebug['${zone}_encodedBytes'] = bytes.length;
-        return bytes;
-      }));
+        encoded.add(bytes);
+      }
 
       // REAL BUG, found 2026-08-03: these 3 uploads used to run concurrently
       // via Future.wait -- across 3 real tests (640f563a, fd1da8c1,
