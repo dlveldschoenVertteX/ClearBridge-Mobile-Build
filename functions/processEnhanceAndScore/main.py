@@ -705,10 +705,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         freqnorm_img = None
         # Defined here (not just inside the try below) so the Firestore
         # write further down always finds it, even if an exception in the
-        # AFIS variant loop happens before the detail-zoom block runs --
-        # same defensive pattern this should have applied to
-        # _secondary_cam_scores too, but that one predates this change.
-        _detail_zoom_debug: dict = {}
+        # AFIS variant loop happens before this runs -- same defensive
+        # pattern this should have applied to _secondary_cam_scores too,
+        # but that one predates this change.
         _sweep_burst_debug: dict = {}
         _minutiae_patch_debug: dict = {}
         try:
@@ -1134,104 +1133,6 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 except Exception as _sec_exc:   # noqa: BLE001 — never block the pipeline
                     logger.warning('secondary camera %s scoring failed (non-critical): %s', _spath, _sec_exc)
 
-            # Detail-zoom candidate (Phase 0, 2026-07-30): a supplementary
-            # ~2x-zoom burst targeting the pad CENTER, fired by the client
-            # after the main burst is already safely captured (see
-            # front_capture_controller.dart's _fireDetailBurst). Scored as
-            # one more independent single-frame candidate, same max-of-
-            # variants discipline as secondary cameras above -- can only
-            # replace best_afis_img if it scores higher, never regress what
-            # the main burst / secondary cameras already produced.
-            #
-            # This round is diagnostic-gated, not yet the spec's Phase 1
-            # patch-blending: it only measures whether the higher-res
-            # center crop is independently competitive before that further
-            # investment is made. proxyScore (not nfiq2) since this uses
-            # the same internal ResNet18 proxy every other variant is
-            # selected by -- the real ground-truth nfiq2Score is only ever
-            # computed once, on whichever image ultimately wins overall.
-            _detail_zoom_debug = {}
-            try:
-                _detail_cap = _cap_doc.get('detailZoomCapture') or {}
-                _detail_paths = _detail_cap.get('paths') or []
-                _detail_zoom_level = _detail_cap.get('zoomLevel')
-                _detail_zoom_debug['frameCount'] = len(_detail_paths)
-                _detail_zoom_debug['zoomLevel'] = _detail_zoom_level
-                if _detail_paths and _detail_zoom_level and _detail_zoom_level > 1.0:
-                    def _fetch_detail_frame(p):
-                        b = _download_storage_file(p)
-                        a = _decode_image(b)
-                        s = float(cv2.Laplacian(
-                            cv2.cvtColor(a, cv2.COLOR_BGR2GRAY),
-                            cv2.CV_64F).var())
-                        return p, a, s
-                    _dframes = []
-                    with ThreadPoolExecutor(
-                            max_workers=min(len(_detail_paths), 4)) as _dex:
-                        _dfuts = {_dex.submit(_fetch_detail_frame, p): p
-                                  for p in _detail_paths}
-                        for _dfut in as_completed(_dfuts):
-                            try:
-                                _dframes.append(_dfut.result())
-                            except Exception as _dfe:
-                                logger.warning('detail-zoom frame download failed: %s', _dfe)
-                    if _dframes:
-                        _dframes.sort(key=lambda x: x[2], reverse=True)
-                        _dbest_lap = _dframes[0][2]
-                        _detail_zoom_debug['bestFrameLaplacian'] = round(_dbest_lap, 1)
-                        _all_dimgs = [f[1] for f in _dframes]
-                        _all_dgyros = [0.0] * len(_all_dimgs)
-                        _all_dillums = [None] * len(_all_dimgs)
-
-                        # Remap the full-pad guideRegion into the zoomed
-                        # frame's own coordinate space. Digital zoom crops
-                        # around the SENSOR's own centre (still-normalised
-                        # (0.5, 0.5) post-rotation -- a rotation alone
-                        # doesn't move the centre, regardless of aspect
-                        # ratio), NOT around the guide's own centre -- an
-                        # off-centre guide shifts further off-centre under
-                        # zoom, it doesn't just grow in place.
-                        _detail_guide = None
-                        if _guide_region:
-                            _z = _detail_zoom_level
-                            _detail_guide = {
-                                'cx': (_guide_region['cx'] - 0.5) * _z + 0.5,
-                                'cy': (_guide_region['cy'] - 0.5) * _z + 0.5,
-                                'rx': _guide_region['rx'] * _z,
-                                'ry': _guide_region['ry'] * _z,
-                                'tipAngleDeg': _guide_region.get('tipAngleDeg', 0.0),
-                                'n': _guide_region.get('n', 2.5),
-                            }
-                        _detail_zoom_debug['guideZoom'] = _detail_guide
-
-                        _dimg_res, _dp = afis_print.generate(
-                            _all_dimgs, _all_dgyros, _all_dillums,
-                            guide_region=_detail_guide,
-                            freq_normalize=True,
-                            stack_cache={},
-                        )
-                        if _dimg_res is not None:
-                            _dres = _score_nfiq(_dimg_res, sfm_coverage=1.0)
-                            _ds = _dres.get('nfiq_score', 0.0) if not _dres.get('error') else 0.0
-                            _detail_zoom_debug['proxyScore'] = round(_ds, 2)
-                            logger.info('AFIS variant detailZoom nfiq=%.1f lap=%.1f',
-                                        _ds, _dbest_lap)
-                            _detail_zoom_debug['wonSelection'] = bool(_ds > afis_nfiq)
-                            if _ds > afis_nfiq:
-                                afis_nfiq = _ds
-                                best_afis_img = _dimg_res
-                                afis_params = {**_dp, 'afisNfiq': round(_ds, 2),
-                                               'afisSource': 'detailZoom'}
-                        else:
-                            _detail_zoom_debug['wonSelection'] = False
-                    else:
-                        _detail_zoom_debug['wonSelection'] = False
-                else:
-                    _detail_zoom_debug['wonSelection'] = False
-            except Exception as _dz_exc:   # noqa: BLE001 -- never block the pipeline
-                logger.warning('detail-zoom candidate scoring failed (non-critical): %s', _dz_exc)
-                _detail_zoom_debug['error'] = str(_dz_exc)
-
             # Sweep-burst candidates (2026-08-03, see
             # docs/BURST_VIDEO_HYBRID_SCOPE.md): the client-side sweep step
             # (front_capture_controller.dart, _captureSweepBurst) is
@@ -1634,14 +1535,6 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # completed scoring this run -- diagnostic for comparing cameras
             # without relying solely on which one happened to win the max.
             'secondaryCamScores': _secondary_cam_scores or None,
-            # Phase 0 diagnostic for the two-tier adaptive zoom burst -- see
-            # front_capture_controller.dart's _fireDetailBurst and the
-            # detailZoom candidate scoring block above. Gate for building
-            # the spec's Phase 1 patch-blending: needs frameCount>=2,
-            # bestFrameLaplacian>100, proxyScore competitive, and
-            # wonSelection:true on a real fraction of captures before that
-            # further investment is justified.
-            'detailZoomDebug': _detail_zoom_debug or None,
             # Burst+video hybrid capture, Phase 0 diagnostic (see
             # docs/BURST_VIDEO_HYBRID_SCOPE.md): per-zone real Laplacian +
             # proxy score + whether that zone's video-sourced candidate won
