@@ -871,6 +871,9 @@ class FrontCaptureController extends ChangeNotifier {
 
   CameraController? _camera;
   CameraService? _cameraService;
+  // Guards _transitionToUploading() so the camera-dispose + phase-flip only
+  // ever happens once per capture -- see that method's own docs for why.
+  bool _transitionedToUploading = false;
   String? _userId;
   AdaptiveFlashController? _flash;
   int _sensorOrientation = 0;
@@ -2387,6 +2390,41 @@ class FrontCaptureController extends ChangeNotifier {
   /// Never throws past its own try/catch -- a failure here can't jeopardise
   /// the main burst, which is already safely uploaded via the caller's own
   /// separate path regardless of this method's outcome.
+
+  /// Disposes the camera and flips the UI to the clean, fully-opaque
+  /// "Uploading capture…" screen (_UploadingOverlay) -- idempotent, safe to
+  /// call from multiple places.
+  ///
+  /// REAL BUG, found 2026-08-05 from a real device screenshot: this used to
+  /// happen only once, at the very end of _finishAndUpload, AFTER the sweep
+  /// burst's own decode+encode+upload work (capturingExtra phase, camera +
+  /// guide still visibly live, just showing a "Processing…" text banner on
+  /// top). That work is not fast -- a real capture's sweepBurstDebug showed
+  /// 4 of 6 zone uploads individually burning the full 30s timeout each,
+  /// ~140s total -- so the user was staring at a live camera preview with
+  /// "Processing…" over it for minutes, which reads as a stuck/broken
+  /// capture, not "please wait". The screenshot also showed what looked
+  /// like the camera visibly reinitialising partway through -- plausibly
+  /// the OS reclaiming an idle preview session left running that long.
+  ///
+  /// Fixed by calling this the moment the LAST real shutter press fires
+  /// (end of _captureSweepBurst's own timeout-bounded capture loop) instead
+  /// of after all the background decode/encode/upload work that follows
+  /// it -- nothing after that point ever needs the live camera again
+  /// (_fireDetailBurst, the only other camera-using step, already
+  /// completed earlier in _fireBurst, before _finishAndUpload is even
+  /// called). The original call site in _finishAndUpload is kept as a
+  /// fallback (idempotent via _transitionedToUploading) for
+  /// _sweepBurstHybridEnabled=false, where _captureSweepBurst never runs.
+  Future<void> _transitionToUploading() async {
+    if (_transitionedToUploading) return;
+    _transitionedToUploading = true;
+    try {
+      await _cameraService?.disposeCamera();
+    } catch (_) {}
+    _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
+  }
+
   Future<Map<String, dynamic>> _captureSweepBurst(
     String basePath,
     double tipAngleDeg,
@@ -2593,17 +2631,19 @@ class FrontCaptureController extends ChangeNotifier {
       stopwatch.stop();
       debug['durationMs'] = stopwatch.elapsedMilliseconds;
 
+      // Every real shutter press is done -- nothing below needs the live
+      // camera. Transition to the clean upload screen NOW rather than
+      // after the decode/encode/upload work below, which can take minutes
+      // on a slow connection (see _transitionToUploading's own docs for
+      // the real device report this fixes). Called before the empty-shots
+      // check too, since the camera work is over either way.
+      await _transitionToUploading();
+
       if (rawShots.isEmpty) {
         debug['error'] = 'no zone shots captured';
         debug['zones'] = zoneDebug;
         return debug;
       }
-
-      // Real, visible feedback that the sweep is still working -- without
-      // this the screen sits on whatever count-in tick last rendered (e.g.
-      // "1…") for the entire decode+upload window below, which reads as a
-      // dead freeze even though the capture loop itself already finished.
-      _apply((s) => s.copyWith(distanceHint: 'Processing…'));
 
       // Downscale + convert to grayscale AFTER the hold, same convention as
       // the main/secondary bursts -- keeps per-shot latency during the
@@ -2756,14 +2796,20 @@ class FrontCaptureController extends ChangeNotifier {
       // Sweep burst: 3 zone stills (left/centre/right) on the same main camera
       // session, before the camera is disposed. Gated on _sweepBurstHybridEnabled
       // -- flip that flag to disable instantly without touching anything else.
+      // _captureSweepBurst itself transitions to the uploading screen right
+      // after its own last real shutter press -- the fallback call below
+      // (_transitionedToUploading-guarded, so a no-op when that already
+      // ran) only actually does anything when the flag is off.
       final sweepBurstDebug = _sweepBurstHybridEnabled
           ? await _captureSweepBurst(basePath, tipAngleDeg)
           : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
+      await _transitionToUploading();
 
-      // Decode and encode all burst frames now (deferred until after the sweep
-      // so the user never saw "Processing…" mid-session). Each raw JPEG is
-      // converted to grayscale + downscaled, same as before but moved here.
-      _apply((s) => s.copyWith(distanceHint: 'Processing…', activeGuideShape: null));
+      // Decode and encode all burst frames now (deferred until after the
+      // sweep so the user never saw a live-camera "Processing…" banner
+      // mid-session -- now happens under the clean uploading screen
+      // instead, see _transitionToUploading). Each raw JPEG is converted to
+      // grayscale + downscaled, same as before but moved here.
       final decodedShots = await Future.wait(rawShots.map((r) async {
         var bytes = r.jpeg;
         // Falls back to the stale stream-frozen r.laplacianScore only if
@@ -2826,17 +2872,10 @@ class FrontCaptureController extends ChangeNotifier {
       }
 
       // Real upload begins here -- the actual Firestore write + main burst
-      // upload below, not the best-effort extra-camera work above. This is
-      // the honest point to switch the UI to "Uploading…". Stop the camera
-      // FIRST (real device test, 2026-07-23: the live preview kept running
-      // visibly behind the uploading screen -- nothing here needs the
-      // camera again; `uploading` only ever transitions to `complete`/
-      // `error`), so by the time the UI actually shows "Uploading…" the
-      // camera has genuinely stopped, not just been painted over.
-      try {
-        await _cameraService?.disposeCamera();
-      } catch (_) {}
-      _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
+      // upload below. Fallback transition only (see _transitionToUploading
+      // docs) -- the normal path already switched the UI over right after
+      // the sweep burst's last real shutter press, well before this point.
+      await _transitionToUploading();
 
       // Single Firestore write for the whole capture -- evaluated by the
       // security rules as `create` (the doc doesn't exist yet), which is
