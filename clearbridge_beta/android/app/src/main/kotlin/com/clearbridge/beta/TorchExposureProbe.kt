@@ -1,6 +1,8 @@
 package com.clearbridge.beta
 
+import android.Manifest
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
@@ -14,6 +16,7 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
+import androidx.core.content.ContextCompat
 import io.flutter.plugin.common.MethodChannel
 
 /**
@@ -109,6 +112,17 @@ class TorchExposureProbe(private val context: Context) {
             }
         }, 6000)
 
+        // Guard before openCamera(): a SecurityException here gets cached
+        // permanently by the Dart side, blocking every future probe attempt.
+        // Returning skipped/reason here instead of error lets Dart detect
+        // the transient state (permission not yet granted) and retry on the
+        // next screen open rather than treating it as a permanent failure.
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
+                != PackageManager.PERMISSION_GRANTED) {
+            finishWith(mapOf("skipped" to true, "reason" to "camera_permission_not_granted"))
+            return
+        }
+
         try {
             val r = ImageReader.newInstance(320, 240, ImageFormat.YUV_420_888, 2)
             reader = r
@@ -129,7 +143,11 @@ class TorchExposureProbe(private val context: Context) {
                 }
             }, bgHandler)
         } catch (e: SecurityException) {
-            out["error"] = "camera permission denied"
+            // openCamera() threw despite our pre-check (OEM race or revoked
+            // mid-call). Use skipped/reason (not error) so the Dart cache
+            // logic can detect permission issues and allow retry.
+            out["skipped"] = true
+            out["reason"] = "camera_permission_security_exception"
             finish()
         } catch (e: Exception) {
             out["error"] = "probe setup failed: ${e.message}"

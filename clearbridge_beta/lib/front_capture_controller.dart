@@ -686,6 +686,11 @@ class FrontCaptureController extends ChangeNotifier {
 
   static Future<Map<String, dynamic>?> probeTorchExposureCompat() async {
     if (_torchExposureProbeQueried) return torchExposureProbeCache;
+    // Set the lock immediately to prevent concurrent probe attempts (e.g.,
+    // two rapid screen opens before the first probe returns). Cleared below
+    // if the result is a permission-denied skip so the NEXT screen open can
+    // retry -- camera permission can be granted between app sessions, so a
+    // "not granted yet" result must never be cached as a permanent failure.
     _torchExposureProbeQueried = true;
     try {
       final result = await _cameraCapabilitiesChannel
@@ -694,7 +699,16 @@ class FrontCaptureController extends ChangeNotifier {
           // platform channel call itself somehow never returns, this must
           // still not block the real camera init that follows.
           .timeout(const Duration(seconds: 8), onTimeout: () => null);
-      if (result != null) torchExposureProbeCache = result;
+      if (result != null) {
+        torchExposureProbeCache = result;
+        // Permission-denied skips are transient: if the user hasn't granted
+        // camera permission yet, the probe can't open a Camera2 session.
+        // Reset the queried flag so the next screen open retries instead of
+        // returning a stale unavailable result every time.
+        final isPermissionSkip = result['skipped'] == true &&
+            (result['reason'] as String? ?? '').contains('permission');
+        if (isPermissionSkip) _torchExposureProbeQueried = false;
+      }
     } catch (e) {
       debugPrint('[front] torch-exposure probe failed (non-fatal): $e');
     }
@@ -969,6 +983,24 @@ class FrontCaptureController extends ChangeNotifier {
   String? _wavelengthAxis;
   DateTime? _lastWavelengthEstimateAt;
   static const int _wavelengthEstimateIntervalMs = 250;
+  // "Move back slightly" fires when liveWavelengthStillPx exceeds this
+  // threshold, even if the coverage/brightness proxy says "in range". Root
+  // cause: brightness is an imperfect distance proxy -- the thumb can be in
+  // the luma sweet spot [_coverageMin, _coverageMax] while the actual ridge
+  // scale (the thing that directly drives NFIQ2) is already too high.
+  //
+  // 25px is calibrated against n=1 real data point: liveWavelengthStillPx
+  // 49.1px on a capture confirmed too close (flash blown out 4-10x, both
+  // blowout AND high wavelength caused by thumb proximity). The NFIQ2 sweet
+  // spot is afisWavelengthPx 9-14px; 25px leaves real margin to avoid false
+  // positives before the paired calibration data is collected. DO NOT reduce
+  // this threshold without real (liveWavelengthStillPx, afisWavelengthPx)
+  // pairs from several captures at known distances.
+  static const double _liveWavelengthTooHighPx = 25.0;
+  // Minimum wavelength EMA samples before the hint can fire, to guard
+  // against a transient first-frame estimate triggering "Move back" on a
+  // correctly-positioned thumb.
+  static const int _liveWavelengthMinSamples = 3;
   Map<String, dynamic> _wavelengthDebug = {};
 
   // Guided thumb-sweep state (see the constants block above for the
@@ -1253,9 +1285,18 @@ class FrontCaptureController extends ChangeNotifier {
     // does not. Only fall back to the "Move closer" hint once zoom is
     // already maxed out and genuinely can't help further.
     final zoomMaxedOut = _maybeAdjustZoom(tooFar);
+    // Wavelength-based "too close" guard: fires even when coverage/brightness
+    // is in the nominal [_coverageMin, _coverageMax] range, because luma is
+    // an imperfect distance proxy. Uses the EMA estimate from the previous
+    // frame (updated a few lines below) -- fine since the EMA is stable
+    // across 250ms intervals; a per-frame race would add noise without value.
+    final wavelengthTooHigh = inCoverageRange &&
+        _liveWavelengthStillPx != null &&
+        _wavelengthSampleCount >= _liveWavelengthMinSamples &&
+        _liveWavelengthStillPx! > _liveWavelengthTooHighPx;
     final hint = (tooFar && zoomMaxedOut)
         ? 'Move closer'
-        : tooClose
+        : (tooClose || wavelengthTooHigh)
             ? 'Move back slightly'
             : null;
     if (hint != _state.distanceHint) {
@@ -2061,6 +2102,12 @@ class FrontCaptureController extends ChangeNotifier {
           : null,
       'sampleCount': _wavelengthSampleCount,
       'axis': _wavelengthAxis,
+      // Whether the wavelength-based distance hint ever fired during the
+      // hold (i.e. liveWavelengthStillPx exceeded _liveWavelengthTooHighPx).
+      // If true on a capture, the user moved back after seeing the hint --
+      // correlate the final afisWavelengthPx against captures where this
+      // was false to validate whether 25px is the right threshold.
+      'wavelengthHintThresholdPx': _liveWavelengthTooHighPx,
     };
 
     double? minEv, maxEv;
