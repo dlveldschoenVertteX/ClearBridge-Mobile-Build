@@ -2490,16 +2490,18 @@ class FrontCaptureController extends ChangeNotifier {
       // actual capture window low; the expensive decode/encode work
       // happens once the user no longer needs to hold position. Each zone's
       // decode+encode is individually timeout-bounded so one stuck isolate
-      // call can't stall the whole batch -- falls back to the raw JPEG
-      // bytes for that zone, same as the existing catch already does for
-      // any other decode/encode failure.
+      // call can't stall the whole batch. On failure/timeout, bytes stays
+      // empty (Uint8List(0)) -- the upload loop below skips empty zones
+      // without counting them as consecutive failures, so a single bad
+      // encode never triggers the bail-out that would drop the remaining
+      // good zones.
       final zoneNames = rawShots.keys.toList(growable: false);
       final encoded = await Future.wait(zoneNames.map((zone) async {
         final encodeStart = DateTime.now();
-        var bytes = rawShots[zone]!;
+        var bytes = Uint8List(0);
         try {
           final decoded = await decodeStillJpegToLuma(
-            bytes, _sensorOrientation,
+            rawShots[zone]!, _sensorOrientation,
             targetWidth: _stillDecodeTargetWidth,
           ).timeout(const Duration(milliseconds: _sweepZoneEncodeTimeoutMs));
           if (decoded != null) {
@@ -2509,7 +2511,9 @@ class FrontCaptureController extends ChangeNotifier {
                   quality: _sweepZoneJpegQuality),
             ).timeout(const Duration(milliseconds: _sweepZoneEncodeTimeoutMs));
           }
-        } catch (_) {}
+        } catch (e) {
+          zoneDebug['${zone}_encodeError'] = e.toString();
+        }
         zoneDebug['${zone}_encodeMs'] =
             DateTime.now().difference(encodeStart).inMilliseconds;
         zoneDebug['${zone}_encodedBytes'] = bytes.length;
@@ -2551,6 +2555,14 @@ class FrontCaptureController extends ChangeNotifier {
           continue;
         }
         final zone = zoneNames[i];
+        if (encoded[i].isEmpty) {
+          // Encode failed for this zone -- skip without counting as a
+          // consecutive upload failure (a bad encode on zone N shouldn't
+          // cause the bail-out to drop zones N+1 and N+2 whose encodes
+          // may have succeeded fine).
+          zoneDebug['${zone}_uploadSkipped'] = 'encode failed';
+          continue;
+        }
         final path = '$basePath/sweep_burst_$zone.jpg';
         final uploadStart = DateTime.now();
         try {
@@ -2879,7 +2891,11 @@ class FrontCaptureController extends ChangeNotifier {
         unawaited(task.cancel().catchError((_) => false));
         final code = e is FirebaseException ? e.code : null;
         final retryable = code == null || !_uploadNonRetryableCodes.contains(code);
-        if (!retryable || attempt >= _uploadRetryDelaysMs.length) rethrow;
+        // TimeoutException has no Firebase code (code == null → retryable by
+        // default), but a timed-out upload should never be retried -- the
+        // cancel() above already fired, and re-trying immediately would just
+        // queue another full-timeout attempt (3 retries × 18s = 54s extra).
+        if (e is TimeoutException || !retryable || attempt >= _uploadRetryDelaysMs.length) rethrow;
         await Future.delayed(Duration(milliseconds: _uploadRetryDelaysMs[attempt]));
       }
     }
