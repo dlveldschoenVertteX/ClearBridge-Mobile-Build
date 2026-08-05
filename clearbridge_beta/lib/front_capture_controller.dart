@@ -391,7 +391,27 @@ class FrontCaptureController extends ChangeNotifier {
   // result took up to 15275ms on real device network -- 15000ms was also
   // already too tight. Both raised well above every real observed value.
   static const int _sweepZoneEncodeTimeoutMs = 20000;
-  static const int _sweepZoneUploadTimeoutMs = 30000;
+  // Lowered 30000->18000 (2026-08-05): now that each zone uploads an
+  // ambient+flash PAIR (6 zones total, not 3), 2 real tests in a row showed
+  // the SAME shape -- one zone succeeds in 8-14s, then every subsequent
+  // zone burns the full 30s and fails (5c3eaa9b: 5 of 6 uploads timed out
+  // at exactly 30000ms, ~150s wasted on uploads that were never going to
+  // succeed). Every real SUCCESSFUL upload observed so far has finished in
+  // 8-14s, so 18000ms still gives ~30% margin over the slowest real success
+  // while cutting the cost of each failure by 40%. Paired with
+  // _sweepZoneMaxConsecutiveUploadFailures below, which stops trying
+  // further zones once the failure pattern shows up instead of paying this
+  // reduced-but-still-real cost 5 more times.
+  static const int _sweepZoneUploadTimeoutMs = 18000;
+  // 2026-08-05: both real ambient+flash-pair tests so far show the exact
+  // same shape -- once one zone's upload fails, every later zone fails too
+  // (network degradation doesn't recover mid-session on this evidence).
+  // After this many CONSECUTIVE failures, stop attempting the remaining
+  // zones entirely -- they're already-uploaded bytes (kept in `encoded`,
+  // just never sent), so nothing is lost that a retry could have saved,
+  // and the user isn't stuck waiting through failures that were already
+  // near-certain.
+  static const int _sweepZoneMaxConsecutiveUploadFailures = 2;
   // Real data from the 640f563a/fd1da8c1 tests: once zoom-to-fill was
   // disabled, sweep-zone JPEGs (full, unzoomed frame detail) jumped from
   // ~1.3-1.4MB to ~4.7-4.8MB at the default quality=90 -- still one zone
@@ -2544,8 +2564,24 @@ class FrontCaptureController extends ChangeNotifier {
       // individually try/caught + timeout-bounded so one failure only costs
       // that one candidate, same discipline as the capture loop above -- a
       // zone that fails simply doesn't get a `paths` entry.
+      // 2026-08-05: once each zone started uploading an ambient+flash PAIR
+      // (6 uploads, not 3), 2 real tests in a row showed the same shape --
+      // one zone succeeds, then every later zone fails at the full
+      // timeout (5c3eaa9b: 5 of 6 failed at exactly 18-30s each, ~150s
+      // wasted on uploads that were never going to succeed). Bail out of
+      // the remaining zones after _sweepZoneMaxConsecutiveUploadFailures
+      // in a row -- their encoded bytes stay in `encoded`/rawShots, just
+      // never sent, so this can only ever save time, never lose a zone
+      // that would otherwise have succeeded (the whole point is that the
+      // evidence says it wouldn't have).
       final paths = <String, String>{};
+      var consecutiveUploadFailures = 0;
       for (var i = 0; i < zoneNames.length; i++) {
+        if (consecutiveUploadFailures >= _sweepZoneMaxConsecutiveUploadFailures) {
+          zoneDebug['${zoneNames[i]}_uploadSkipped'] =
+              'bailed after $consecutiveUploadFailures consecutive failures';
+          continue;
+        }
         final zone = zoneNames[i];
         final path = '$basePath/sweep_burst_$zone.jpg';
         final uploadStart = DateTime.now();
@@ -2553,8 +2589,10 @@ class FrontCaptureController extends ChangeNotifier {
           await _uploadWithRetry(encoded[i], path)
               .timeout(const Duration(milliseconds: _sweepZoneUploadTimeoutMs));
           paths[zone] = path;
+          consecutiveUploadFailures = 0;
         } catch (e) {
           zoneDebug['${zone}_uploadError'] = e.toString();
+          consecutiveUploadFailures++;
         }
         zoneDebug['${zone}_uploadMs'] =
             DateTime.now().difference(uploadStart).inMilliseconds;
