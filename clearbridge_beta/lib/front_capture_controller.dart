@@ -2593,6 +2593,18 @@ class FrontCaptureController extends ChangeNotifier {
       unawaited(_audio.playSweepComplete());
     } catch (e) {
       debug['error'] = e.toString();
+      // Diagnostic only (2026-08-05 audit): the zone loop's takePicture()/
+      // flash calls above have no real cancellation path if
+      // _sweepBurstTimeoutMs actually fires -- unlike probeTorchExposureCompat
+      // (a native-side hard-bounded throwaway Camera2 session) or
+      // CameraService.initializeCamera() (which awaits its own pending
+      // initialization before disposing), there's no evidence yet this
+      // specific timeout has ever fired on a real device, so widening it
+      // further or adding forced-dispose logic would be tuning blind. This
+      // flag lets the next real capture confirm whether it's a live risk
+      // before spending effort on it, same discipline as every other
+      // diagnostic-before-fix change in this project.
+      if (e is TimeoutException) debug['timedOut'] = true;
       debugPrint('[front] sweep burst capture failed (non-fatal): $e');
     } finally {
       try {
