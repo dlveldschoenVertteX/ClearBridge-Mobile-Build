@@ -121,9 +121,9 @@ class FrontCaptureState {
   // Normalised 0..1 brightness read from the ROI (torch-off samples only),
   // for the lighting meter alongside the focus meter.
   final double lightingValue;
-  // Overrides the on-screen guide shape during capturingExtra's secondary-
-  // camera turns (see _secondaryCameraGuideShape) -- null means "use
-  // PadSilhouetteShape.defaultShape".
+  // Overrides the on-screen guide shape during the sweep-burst zone
+  // sequence (see FrontCaptureController._sweepGuideShapeForProgress) --
+  // null means "use PadSilhouetteShape.defaultShape".
   final PadSilhouetteShape? activeGuideShape;
   // True only while the burst+sweep hybrid capture's zone sequence is
   // actively moving/capturing (see FrontCaptureController._captureSweepBurst
@@ -903,7 +903,6 @@ class FrontCaptureController extends ChangeNotifier {
   bool _streamRunning = false;
   bool _burstInFlight = false;
 
-  bool _focusLocked = false;
   bool _refocusing = false;
   // True once a fresh auto->lock cycle has run for the CURRENT hold attempt.
   // Mirrors OscillatingCaptureController's _refocusedThisStep: focus is
@@ -1012,8 +1011,6 @@ class FrontCaptureController extends ChangeNotifier {
 
   FrontCaptureState _state = const FrontCaptureState();
   FrontCaptureState get state => _state;
-
-  CameraController? get cameraController => _camera;
 
   Future<void> start({
     required CameraController camera,
@@ -1892,7 +1889,6 @@ class FrontCaptureController extends ChangeNotifier {
   Future<void> _beginAutofocus() async {
     final cam = _camera;
     if (cam == null) return;
-    _focusLocked = false;
     final cx = (_scoreRoi.left + _scoreRoi.right) / 2;
     final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
     final pt = Offset(cx, cy);
@@ -1912,7 +1908,6 @@ class FrontCaptureController extends ChangeNotifier {
     if (cam == null) return;
     try {
       await cam.setFocusMode(FocusMode.locked);
-      _focusLocked = true;
     } catch (_) {}
   }
 
@@ -2014,38 +2009,11 @@ class FrontCaptureController extends ChangeNotifier {
     return false;
   }
 
-  static double _lumaSharpness(Uint8List luma, int w, int h) {
-    if (w < 8 || h < 8 || luma.length < w * h) return 0.0;
-    final x0 = w ~/ 4, x1 = 3 * w ~/ 4;
-    final y0 = h ~/ 4, y1 = 3 * h ~/ 4;
-    const stepPx = 3;
-    double sum = 0.0, sumSq = 0.0;
-    int n = 0;
-    for (var y = y0 + 1; y < y1 - 1; y += stepPx) {
-      final row = y * w;
-      for (var x = x0 + 1; x < x1 - 1; x += stepPx) {
-        final c = luma[row + x];
-        final lap = (4 * c -
-                luma[row + x - 1] -
-                luma[row + x + 1] -
-                luma[row - w + x] -
-                luma[row + w + x])
-            .toDouble();
-        sum += lap;
-        sumSq += lap * lap;
-        n++;
-      }
-    }
-    if (n == 0) return 0.0;
-    final mean = sum / n;
-    return sumSq / n - mean * mean;
-  }
-
   /// Fires (or finishes processing) the main 8-shot burst. When
   /// [preCollectedShots] is supplied (the guided-sweep path -- see
   /// _completeSweep), the shots are already captured; this skips straight to
   /// the shared post-collection work (torch-off restore, decode/encode,
-  /// detail-zoom burst, success feedback, upload). When null, falls back to
+  /// success feedback, upload). When null, falls back to
   /// the original static collection loop (stream stopped, all 8 shots fired
   /// back-to-back) -- kept for structural completeness, though the only
   /// active caller is now _completeSweep.

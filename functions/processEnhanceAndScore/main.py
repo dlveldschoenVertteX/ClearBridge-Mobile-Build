@@ -8,11 +8,8 @@ Output: Firestore captures/{captureId} updated with scoring result
 
 from __future__ import annotations
 
-import io
-import json
 import logging
 import os
-import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -1229,6 +1226,27 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             _zsrc = _zfused if _zfused is not None else (
                                 _zamb if _zamb is not None else _zfl)
                             _zone_debug['fused'] = _zfused is not None
+                            # REAL BUG, found 2026-08-05 (code audit): _fuse_
+                            # flash_ambient's own output is already grayscale,
+                            # but the fallback path above (_zamb/_zfl) is raw
+                            # _decode_image() output, always BGR. That BGR
+                            # image flowed into _zone_grays and, when the
+                            # CENTER zone hit this exact fallback, into
+                            # _front_anchored_mosaic below as `front` --
+                            # which calls cv2 CLAHE .apply() on it directly
+                            # with no channel check, throwing cv2.error
+                            # (confirmed by direct reproduction). That
+                            # exception was silently swallowed by the
+                            # cross-zone fusion block's own broad except and
+                            # logged identically to a genuine registration
+                            # failure -- so every time a zone's ambient+flash
+                            # pair failed to fuse, the real 'sweepFusion'
+                            # candidate this session built could crash
+                            # invisibly instead of ever running. Normalising
+                            # to grayscale here (once, at the source) fixes
+                            # every downstream consumer at once.
+                            if _zsrc is not None and _zsrc.ndim != 2:
+                                _zsrc = cv2.cvtColor(_zsrc, cv2.COLOR_BGR2GRAY)
                             if _zsrc is None:
                                 _zone_debug['error'] = 'no usable frame'
                                 _sweep_burst_debug[_zone] = _zone_debug
