@@ -980,6 +980,12 @@ class FrontCaptureController extends ChangeNotifier {
   double? _liveWavelengthPx;
   double? _liveWavelengthStillPx;
   int _wavelengthSampleCount = 0;
+  // Consecutive-outlier counter for the EMA guard below. A single rejected
+  // sample is assumed to be frame noise; two in a row in the SAME direction
+  // are assumed to be a genuine, sustained change (the user actually moved)
+  // and get accepted instead of permanently anchoring the EMA to a stale
+  // value. See the outlier-rejection block in _onFrame.
+  int _wavelengthOutlierStreak = 0;
   String? _wavelengthAxis;
   DateTime? _lastWavelengthEstimateAt;
   static const int _wavelengthEstimateIntervalMs = 250;
@@ -1319,15 +1325,44 @@ class FrontCaptureController extends ChangeNotifier {
           final est =
               HybridCaptureService.estimateRidgeWavelengthPx(image, roi: roi);
           if (est != null) {
-            _liveWavelengthPx = HybridCaptureService.ema(
-              _liveWavelengthPx ?? est.medianLagPx,
-              est.medianLagPx,
-            );
-            final scale = _wavelengthScaleToStill(image);
-            _liveWavelengthStillPx =
-                scale != null ? _liveWavelengthPx! * scale : null;
-            _wavelengthAxis = est.axis;
-            _wavelengthSampleCount++;
+            // Outlier guard, added 2026-08-06: once a prior EMA value
+            // exists, reject a raw sample that's wildly different (>2.5x
+            // either direction) rather than folding it straight in. Root
+            // cause this addresses: a single spurious frame -- most often
+            // the coarse whole-ROI axis pick (rows vs cols, see
+            // estimateRidgeWavelengthPx's docs) flipping near a whorl core,
+            // where ridge orientation isn't uniform across the ROI -- could
+            // otherwise swing the reported number on its own, which is
+            // exactly the "not consistent" pattern a real user reported
+            // despite visually identical thumb placement across captures.
+            // Can't reject the very first sample (nothing to compare
+            // against yet) -- that's an inherent bootstrapping limit, not a
+            // regression versus the old unconditional-fold behaviour.
+            //
+            // Two rejections in a row are accepted anyway (streak counter
+            // below) -- otherwise a genuine sustained change (the user
+            // actually moving closer/farther mid-hold) would permanently
+            // wedge the EMA on a stale value once one outlier is rejected,
+            // since nothing would ever update `prior` again.
+            final prior = _liveWavelengthPx;
+            final isOutlier = prior != null &&
+                prior > 0 &&
+                (est.medianLagPx > prior * 2.5 ||
+                    est.medianLagPx < prior / 2.5);
+            if (isOutlier && _wavelengthOutlierStreak < 1) {
+              _wavelengthOutlierStreak++;
+            } else {
+              _wavelengthOutlierStreak = 0;
+              _liveWavelengthPx = HybridCaptureService.ema(
+                prior ?? est.medianLagPx,
+                est.medianLagPx,
+              );
+              final scale = _wavelengthScaleToStill(image);
+              _liveWavelengthStillPx =
+                  scale != null ? _liveWavelengthPx! * scale : null;
+              _wavelengthAxis = est.axis;
+              _wavelengthSampleCount++;
+            }
           }
         } catch (_) {}
       }
@@ -2094,13 +2129,24 @@ class FrontCaptureController extends ChangeNotifier {
     // Snapshot the running live-wavelength estimate at the moment the burst
     // actually fires (same convention as _flashEvDebug above), not at
     // doc-write time -- the hold could end slightly before upload.
+    //
+    // Gated on _liveWavelengthMinSamples, added 2026-08-06: a 1-2-sample
+    // EMA is barely smoothed at all (alpha=0.3 on the very first sample IS
+    // the first sample, unfiltered) -- writing that as if it were a
+    // reliable measurement is exactly what made cross-capture wavelength
+    // comparisons look "inconsistent" to a real user, since several real
+    // captures logged this field off a single noisy frame. Below the
+    // threshold, report null + the real sample count instead of a
+    // misleadingly precise-looking number.
+    final wlReliable = _wavelengthSampleCount >= _liveWavelengthMinSamples;
     _wavelengthDebug = {
-      'liveWavelengthPx': _liveWavelengthPx,
-      'liveWavelengthStillPx': _liveWavelengthStillPx,
+      'liveWavelengthPx': wlReliable ? _liveWavelengthPx : null,
+      'liveWavelengthStillPx': wlReliable ? _liveWavelengthStillPx : null,
       'scaleToStill': _liveWavelengthPx != null && _liveWavelengthPx! > 0
           ? (_liveWavelengthStillPx ?? 0) / _liveWavelengthPx!
           : null,
       'sampleCount': _wavelengthSampleCount,
+      'belowMinSamples': !wlReliable,
       'axis': _wavelengthAxis,
       // Whether the wavelength-based distance hint ever fired during the
       // hold (i.e. liveWavelengthStillPx exceeded _liveWavelengthTooHighPx).

@@ -400,6 +400,72 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
     return float(np.clip(np.median(freqs), 5, 20))
 
 
+def _ridge_wavelength_robust(
+    img: np.ndarray, orient: np.ndarray, bsize: int = 32,
+) -> Tuple[float, int]:
+    """Diagnostic-only companion to `_ridge_wavelength` above -- same block
+    grid/rotation-to-vertical alignment, but two changes aimed specifically
+    at the two real, data-confirmed weaknesses of the production estimator
+    (found 2026-08-06 investigating a real-user report that the reported
+    wavelength "isn't consistent" across captures with visually identical
+    thumb placement):
+
+    1. **No [5, 20] clip.** `_ridge_wavelength`'s own hard clip means every
+       real capture whose native wavelength is actually 22px, 40px, or 90px
+       all get reported identically as 20.0 -- confirmed directly against
+       real Firestore data (2026-08-06): 12+ of the 40 most recent captures
+       share the exact literal value `afisWavelengthPx: 20.0`, while the
+       (separately measured, unclipped) live on-device estimate for a
+       handful of those same captures spans 20.6px to 123.1px -- a 6x real
+       spread the clipped number can't distinguish at all. The clip is left
+       untouched on `_ridge_wavelength` itself (still feeds `freq_normalize`
+       scale math this project has real-device-tuned `_FREQ_SCALE_MIN`
+       against -- changing that input distribution blind is exactly the
+       "measure one variable at a time" violation this project's whole
+       history warns against) -- this is a SEPARATE, diagnostic-only value.
+    2. **Average peak spacing, not first-peak-only.** `_ridge_wavelength`
+       trusts only `peaks[0]` -- the very first local autocorrelation
+       maximum -- which is the single most noise-sensitive statistic
+       available (one spurious/missed peak from JPEG blocking, torch
+       specular texture, or curvature near a whorl core silently changes
+       the whole block's contribution). The standard fingerprint-literature
+       fix (Hong/Wan/Jain-style x-signature ridge counting; corroborated by
+       a 2026-08-06 web search on ridge-frequency estimation) is to detect
+       ALL local maxima in a block and average the spacing between
+       consecutive ones -- errors in any single cycle get diluted across
+       the others instead of solely determining the estimate.
+
+    Returns (median_wavelength_px, contributing_block_count) -- the block
+    count is a real confidence signal (few contributing blocks = a mostly
+    flat/low-texture crop, e.g. thumb barely in frame), not a magic number.
+    """
+    h, w = img.shape
+    freqs = []
+    for y in range(0, h - bsize, bsize):
+        for x in range(0, w - bsize, bsize):
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks) >= 2:
+                # Average spacing across every consecutive peak pair, not
+                # just the first cycle -- see docstring point 2.
+                freqs.append(float(np.mean(np.diff(peaks))))
+            elif len(peaks) == 1:
+                freqs.append(float(peaks[0]))
+    if not freqs:
+        return 9.0, 0
+    return float(np.median(freqs)), len(freqs)
+
+
 def _gabor_enhance(
     img: np.ndarray, orient: np.ndarray, wavelength: float,
     *,
@@ -1951,8 +2017,16 @@ def generate(
     # sees the resampled version). Grid search over real captures: consistent
     # NFIQ gain when the estimate is reliable.
     norm0 = _normalize(g8)
-    native_wl = _ridge_wavelength(norm0, _orientation_field(norm0))
+    orient0 = _orientation_field(norm0)
+    native_wl = _ridge_wavelength(norm0, orient0)
     params['afisWavelengthPx'] = float(round(native_wl, 1))
+    # Diagnostic-only, unclipped, multi-peak-averaged companion measurement
+    # -- see _ridge_wavelength_robust's docstring. Does NOT feed the
+    # freq_normalize scale below; native_wl (clipped, first-peak) is the
+    # only value that ever drives enhancement, unchanged from before.
+    raw_wl, raw_wl_blocks = _ridge_wavelength_robust(norm0, orient0)
+    params['afisWavelengthPxRaw'] = float(round(raw_wl, 1))
+    params['afisWavelengthPxRawBlocks'] = raw_wl_blocks
     wl = native_wl
     if freq_normalize and native_wl > 1.0:
         scale = float(np.clip(_TARGET_PERIOD / native_wl, _FREQ_SCALE_MIN, 2.5))

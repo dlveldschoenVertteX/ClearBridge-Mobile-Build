@@ -565,27 +565,64 @@ class HybridCaptureService {
         ac[lag] = sum;
       }
 
-      // First local maximum via sign-change in the discrete derivative,
+      // ALL local maxima via sign-change in the discrete derivative,
       // rejecting lag <= minLagPx (mirrors afis_print.py's peaks[peaks>3],
       // scaled down since live-preview pixels are coarser than still pixels
       // -- see class docs). The search is bounded to maxLagSubsampled to
       // prevent spurious peaks from low-frequency lighting gradients.
-      int? peakLag;
+      //
+      // Real bug found + fixed 2026-08-06: trusting only the FIRST local
+      // maximum makes this whole estimate hinge on a single autocorrelation
+      // cycle -- one spurious/missed peak from sensor noise, JPEG-adjacent
+      // preview compression, or curvature near a whorl core silently
+      // determines the strip's entire contribution. A real user report
+      // ("wavelength system is not consistent" despite visually identical
+      // thumb placement) plus real Firestore data (single-sample reads
+      // 20.6px-123.1px across captures with similar backend
+      // afisWavelengthPx) traced partly to this. Standard fingerprint-
+      // literature fix (Hong/Wan/Jain-style x-signature ridge counting):
+      // detect every local maximum and average the spacing between
+      // consecutive ones, so one bad cycle gets diluted by the others
+      // instead of solely determining the result. Falls back to the old
+      // single-peak behaviour when only one maximum is found (a clean,
+      // low-noise signal), so this is a strict improvement, never a
+      // regression, on the cases the old code already handled well.
+      final peakLags = <int>[];
       for (var lag = 1; lag < ac.length - 1; lag++) {
         if (lag <= minLagPx) continue;
         if (ac[lag] > ac[lag - 1] && ac[lag] >= ac[lag + 1]) {
-          peakLag = lag;
-          break;
+          peakLags.add(lag);
         }
       }
-      if (peakLag == null) continue;
+      if (peakLags.isEmpty) continue;
 
-      // Subpixel parabolic interpolation around the integer peak.
-      final yPrev = ac[peakLag - 1], yPeak = ac[peakLag], yNext = ac[peakLag + 1];
-      final denom = yPrev - 2 * yPeak + yNext;
-      final refinedLag = denom.abs() > 1e-9
-          ? peakLag + 0.5 * (yPrev - yNext) / denom
-          : peakLag.toDouble();
+      double refinedLag;
+      if (peakLags.length == 1) {
+        // Single peak: subpixel parabolic interpolation, same as before.
+        final peakLag = peakLags[0];
+        final yPrev = ac[peakLag - 1], yPeak = ac[peakLag], yNext = ac[peakLag + 1];
+        final denom = yPrev - 2 * yPeak + yNext;
+        refinedLag = denom.abs() > 1e-9
+            ? peakLag + 0.5 * (yPrev - yNext) / denom
+            : peakLag.toDouble();
+      } else {
+        // Multiple peaks: subpixel-refine each, then average the spacing
+        // between consecutive ones -- averages across cycles instead of
+        // trusting the first alone.
+        final refined = <double>[];
+        for (final peakLag in peakLags) {
+          final yPrev = ac[peakLag - 1], yPeak = ac[peakLag], yNext = ac[peakLag + 1];
+          final denom = yPrev - 2 * yPeak + yNext;
+          refined.add(denom.abs() > 1e-9
+              ? peakLag + 0.5 * (yPrev - yNext) / denom
+              : peakLag.toDouble());
+        }
+        var spacingSum = 0.0;
+        for (var i = 1; i < refined.length; i++) {
+          spacingSum += refined[i] - refined[i - 1];
+        }
+        refinedLag = spacingSum / (refined.length - 1);
+      }
       // Convert the subsampled-signal lag back to raw preview pixels.
       lags.add(refinedLag * sampleStride);
     }
