@@ -200,6 +200,19 @@ class MainActivity : FlutterActivity() {
             val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
             val focusCalib = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)
             val minFocusDistanceDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
+            // Optical image stabilization support, added 2026-08-06 while
+            // investigating real blurry captures: OIS (if present and
+            // active) is the actual hardware-level defense against hand
+            // shake during a still exposure -- distinct from the digital
+            // gyro-gated steadiness check already done client-side, which
+            // only stops the shutter from firing while shaking, but can't
+            // correct for shake that happens within a single exposure's own
+            // integration time. Read-only, same precedent as every other
+            // probe here -- informational for now, not wired into any
+            // capture-time decision.
+            val ois = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
+                ?: IntArray(0)
+            val hasOis = ois.any { it != CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_OFF }
             info[id] = mapOf(
                 "focalLengthMm" to focalLengths?.firstOrNull()?.toDouble(),
                 "sensorWidthMm" to sensorSize?.width?.toDouble(),
@@ -209,6 +222,7 @@ class MainActivity : FlutterActivity() {
                 "hasOwnFlash" to hasFlash,
                 "focusDistanceCalibration" to focusDistanceCalibrationName(focusCalib),
                 "minFocusDistanceDiopters" to minFocusDistanceDiopters?.toDouble(),
+                "hasOpticalStabilization" to hasOis,
             )
         }
         return info

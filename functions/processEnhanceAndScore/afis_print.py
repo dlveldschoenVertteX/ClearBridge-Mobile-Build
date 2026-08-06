@@ -41,6 +41,15 @@ _TARGET_PERIOD = 9.0      # ridge period (px) to normalise to — ~500 DPI domai
 _STACK_MAX = 4            # max same-pose frames to align+average (denoise)
 _STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
 
+# Reference gyro magnitude (deg/s) for the gentle per-frame down-weighting in
+# _focus_stack_face_on, added 2026-08-06. Mirrors the CLIENT's own
+# _maxSteadyDegPerSec (front_capture_controller.dart) -- the burst only ever
+# fires once the hold reads below this at completion, so individual in-burst
+# frames should mostly sit near or under it already. Not independently
+# calibrated backend-side; it's a reference point for differentiating among a
+# single burst's OWN frames, not an absolute severity scale.
+_GYRO_STEADY_REF_DEG_PER_SEC = 6.0
+
 # Gabor/CLAHE tuning (2026-07-15): swept against the local ResNet18 proxy on 5
 # real captures whose actual nfiq2Score is known (2 good/72, 2 bad/7, 1
 # worst-case/1 — see Notion session log), reproducing main.py's scoring
@@ -681,7 +690,10 @@ def _coherence_diffusion(img: np.ndarray, orient: np.ndarray) -> np.ndarray:
 _STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
 
 
-def _align_face_on_stack(cand: List[Optional[np.ndarray]]) -> Optional[List[np.ndarray]]:
+def _align_face_on_stack(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+) -> Optional[Tuple[List[np.ndarray], List[Optional[float]]]]:
     """ECC-affine align near-identical same-pose frames to the sharpest
     (cand[0]) reference and return the aligned float32 stack (reference first).
 
@@ -689,13 +701,24 @@ def _align_face_on_stack(cand: List[Optional[np.ndarray]]) -> Optional[List[np.n
     speed, then scaled up and applied at full resolution -- ECC on full-res
     burst stills is far too slow for the Cloud Function budget. Returns None if
     fewer than 2 usable frames survive the correlation guard, so the caller
-    keeps the single sharpest frame (stacking must never degrade the print)."""
-    grays = [c if c is None or c.ndim == 2 else cv2.cvtColor(c, cv2.COLOR_BGR2GRAY)
-             for c in cand]
-    grays = [g for g in grays if g is not None]
+    keeps the single sharpest frame (stacking must never degrade the print).
+
+    `gyros`, if given, must be index-aligned to `cand` (per-frame device
+    rotation rate in deg/s at capture time -- added 2026-08-06, client now
+    writes this per shot). Returns (stack, stack_gyros): the second list is
+    re-aligned to the frames that actually survived alignment (reference
+    first, then each accepted frame in the order appended), so it stays
+    correct even though some candidates get dropped along the way. Callers
+    that don't need gyro weighting (_stack_face_on) simply discard it."""
+    pairs = list(zip(cand, gyros if gyros is not None else [None] * len(cand)))
+    grays = [
+        (c if c is None or c.ndim == 2 else cv2.cvtColor(c, cv2.COLOR_BGR2GRAY), gy)
+        for c, gy in pairs
+    ]
+    grays = [(g, gy) for g, gy in grays if g is not None]
     if len(grays) < 2:
         return None
-    ref = grays[0]
+    ref, ref_gyro = grays[0]
     h, w = ref.shape[:2]
     s = _STACK_ALIGN_PX / max(h, w)
     small = (max(1, int(w * s)), max(1, int(h * s)))
@@ -706,7 +729,8 @@ def _align_face_on_stack(cand: List[Optional[np.ndarray]]) -> Optional[List[np.n
     dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
     crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
     stack = [ref.astype(np.float32)]
-    for g in grays[1:]:
+    stack_gyros = [ref_gyro]
+    for g, gy in grays[1:]:
         gg = g if g.shape[:2] == (h, w) else cv2.resize(g, (w, h))
         try:
             warp = np.eye(2, 3, dtype=np.float32)
@@ -718,24 +742,42 @@ def _align_face_on_stack(cand: List[Optional[np.ndarray]]) -> Optional[List[np.n
             aligned = cv2.warpAffine(gg, warp_full, (w, h), flags=cv2.INTER_LINEAR)
             if float(np.corrcoef(aligned.ravel(), ref.ravel())[0, 1]) > 0.5:
                 stack.append(aligned.astype(np.float32))
+                stack_gyros.append(gy)
         except cv2.error:
             continue
     if len(stack) < 2:
         return None
-    return stack
+    return stack, stack_gyros
 
 
-def _stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+def _stack_face_on(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+) -> Optional[np.ndarray]:
     """Align (ECC affine) and AVERAGE near-identical same-pose frames -> a
     denoised full-resolution grayscale (pure noise reduction). Returns None if
-    fewer than 2 usable frames survive."""
-    stack = _align_face_on_stack(cand)
-    if stack is None:
+    fewer than 2 usable frames survive.
+
+    `gyros` accepted for call-site symmetry with `_focus_stack_face_on` (both
+    are invoked polymorphically via one `_stack_fn` variable elsewhere in this
+    module) but deliberately UNUSED here -- this project already measured
+    (2026-07-24, median/trimmed-mean combine-swap experiments) that outlier-
+    reweighting this specific flat-mean function is a net-negative on real
+    data: at this pipeline's small burst depth (2-4 frames), any per-pixel
+    reweighting trades away more noise-averaging benefit than it recovers on
+    the majority of captures that don't have a genuine outlier frame. Kept as
+    a plain, unweighted mean on purpose."""
+    result = _align_face_on_stack(cand)
+    if result is None:
         return None
+    stack, _stack_gyros = result
     return np.mean(np.stack(stack), axis=0).astype(np.uint8)
 
 
-def _focus_stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+def _focus_stack_face_on(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+) -> Optional[np.ndarray]:
     """Align (ECC affine) same-pose frames, then combine by LOCAL SHARPNESS
     rather than a flat mean -- classic focus stacking. Each output pixel is a
     sharpness-weighted blend across the aligned frames, so the region that was
@@ -746,16 +788,33 @@ def _focus_stack_face_on(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarra
 
     Weighted blend (not hard per-pixel argmax) to avoid seam artifacts where
     the sharpest-frame index would flip abruptly. Returns None if fewer than 2
-    frames align, so the caller falls back to the single sharpest frame."""
-    stack = _align_face_on_stack(cand)
-    if stack is None:
+    frames align, so the caller falls back to the single sharpest frame.
+
+    `gyros`, if provided (index-aligned to `cand`), gently down-weights
+    frames captured during more device rotation -- added 2026-08-06, real
+    per-frame motion context the backend previously had no access to at all.
+    Deliberately GENTLE (caps at a 40% weight reduction, never fully zeroes a
+    frame's contribution): this function ALREADY does per-pixel reweighting
+    by design (unlike _stack_face_on, where the equivalent experiment
+    measured net-negative -- see that function's docstring), so adding a
+    second real quality factor into an existing weighted combine is a much
+    smaller, better-justified change than introducing weighting where none
+    existed. Missing/None gyro values default to full (1.0) weight, so
+    callers without gyro data see byte-identical behaviour to before this."""
+    result = _align_face_on_stack(cand, gyros=gyros)
+    if result is None:
         return None
+    stack, stack_gyros = result
     # Local sharpness energy per frame: |Laplacian| smoothed to a small window
     # so the weight reflects neighbourhood focus, not single-pixel noise.
     weights = []
-    for g in stack:
+    for g, gy in zip(stack, stack_gyros):
         lap = np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3))
-        weights.append(cv2.GaussianBlur(lap, (0, 0), 4.0) + 1e-3)
+        w_map = cv2.GaussianBlur(lap, (0, 0), 4.0) + 1e-3
+        if gy is not None and gy > 0:
+            gyro_factor = 1.0 - min(gy / (2.0 * _GYRO_STEADY_REF_DEG_PER_SEC), 0.4)
+            w_map = w_map * gyro_factor
+        weights.append(w_map)
     w = np.stack(weights)                      # (N, H, W)
     w /= w.sum(axis=0, keepdims=True)
     out = (w * np.stack(stack)).sum(axis=0)
@@ -1565,6 +1624,8 @@ def generate(
     flash_frames: Optional[List[Optional[np.ndarray]]] = None,
     ambient_burst: Optional[List[np.ndarray]] = None,
     flash_burst: Optional[List[np.ndarray]] = None,
+    ambient_burst_gyros: Optional[List[Optional[float]]] = None,
+    flash_burst_gyros: Optional[List[Optional[float]]] = None,
     freq_normalize: bool = False,
     stack: bool = False,
     focus_stack: bool = False,
@@ -1596,6 +1657,13 @@ def generate(
     ambient_burst  : optional flat list of RAW near-face-on ambient shots (the
     flash_burst      preserved front burst, before binning) for each
                      illumination. Enables fuse='deep'.
+    ambient_burst_gyros : optional per-frame device rotation rate (deg/s),
+    flash_burst_gyros     index-aligned to ambient_burst/flash_burst
+                     respectively -- added 2026-08-06. Gently down-weights
+                     individual frames in _focus_stack_face_on's combine
+                     (see that function's docstring); has no effect when
+                     omitted or when `focus_stack`/`fuse` doesn't route
+                     through that function.
     fuse           : 'maxc' | 'avg' — fuse the sharpest face-on bin's ambient +
                      flash exposures instead of using a single source (uses
                      ambient_frames/flash_frames);
@@ -1724,8 +1792,24 @@ def generate(
         _use_focus_stack = fuse.startswith('deepFocus')
         _stack_fn = _focus_stack_face_on if _use_focus_stack else _stack_face_on
         _cache_key = ('da_focus', 'df_focus') if _use_focus_stack else ('da', 'df')
-        ab = [g for g in (ambient_burst or []) if g is not None]
-        fb = [g for g in (flash_burst or []) if g is not None]
+        # Paired filtering (image, gyro) so the gyro list stays index-aligned
+        # to `ab`/`fb` after dropping None entries -- see _focus_stack_face_on
+        # docstring for what the gyro values feed into (_stack_face_on itself
+        # ignores them).
+        _ab_pairs = [
+            (g, gy) for g, gy in
+            zip(ambient_burst or [], ambient_burst_gyros or [None] * len(ambient_burst or []))
+            if g is not None
+        ]
+        ab = [p[0] for p in _ab_pairs]
+        ab_gyros = [p[1] for p in _ab_pairs]
+        _fb_pairs = [
+            (g, gy) for g, gy in
+            zip(flash_burst or [], flash_burst_gyros or [None] * len(flash_burst or []))
+            if g is not None
+        ]
+        fb = [p[0] for p in _fb_pairs]
+        fb_gyros = [p[1] for p in _fb_pairs]
         if not ab and not fb:
             return None, params
         # _stack_face_on/_focus_stack_face_on do ECC-affine registration
@@ -1745,13 +1829,13 @@ def generate(
         if stack_cache is not None and _cache_key[0] in stack_cache:
             da = stack_cache[_cache_key[0]]
         else:
-            da = _stack_fn(ab) if len(ab) >= 2 else (ab[0] if ab else None)
+            da = _stack_fn(ab, gyros=ab_gyros) if len(ab) >= 2 else (ab[0] if ab else None)
             if stack_cache is not None:
                 stack_cache[_cache_key[0]] = da
         if stack_cache is not None and _cache_key[1] in stack_cache:
             df = stack_cache[_cache_key[1]]
         else:
-            df = _stack_fn(fb) if len(fb) >= 2 else (fb[0] if fb else None)
+            df = _stack_fn(fb, gyros=fb_gyros) if len(fb) >= 2 else (fb[0] if fb else None)
             if stack_cache is not None:
                 stack_cache[_cache_key[1]] = df
         if da is not None and da.ndim != 2:
@@ -1864,6 +1948,11 @@ def generate(
         same_pose = [i for i in order
                      if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
         same_frames = [frames[i] for i in same_pose[:_STACK_MAX]]
+        # `frames` has no associated per-frame gyro source, so the primary
+        # path above has none available -- same_gyros stays None (neutral
+        # weighting) unless the starvation fallback below populates it from
+        # ambient_burst_gyros/flash_burst_gyros.
+        same_gyros: Optional[List[Optional[float]]] = None
         # Real bug found 2026-07-24: for front_only_v1 (this project's own
         # active capture mode), main.py's _download_front_only_frames hands
         # this function exactly ONE pre-selected frame -- `frames` (and
@@ -1884,13 +1973,25 @@ def generate(
         # material (four-angle/oscillating capture modes, which don't hit
         # this starvation), so it can't regress those.
         if len(same_frames) < 2:
-            _burst_pool = [g for g in ((ambient_burst or []) + (flash_burst or []))
-                           if g is not None]
-            if len(_burst_pool) >= 2:
-                same_frames = sorted(_burst_pool, key=lambda g: -_ridge_energy(g))[:_STACK_MAX]
+            # Paired (image, gyro) so sorting by ridge energy below can't
+            # desynchronize the two lists -- see _focus_stack_face_on's
+            # docstring for what the gyro values feed into.
+            _burst_pool_pairs = [
+                (g, gy) for g, gy in
+                list(zip(ambient_burst or [],
+                         ambient_burst_gyros or [None] * len(ambient_burst or []))) +
+                list(zip(flash_burst or [],
+                         flash_burst_gyros or [None] * len(flash_burst or [])))
+                if g is not None
+            ]
+            if len(_burst_pool_pairs) >= 2:
+                _burst_pool_pairs.sort(key=lambda pair: -_ridge_energy(pair[0]))
+                _burst_pool_pairs = _burst_pool_pairs[:_STACK_MAX]
+                same_frames = [p[0] for p in _burst_pool_pairs]
+                same_gyros = [p[1] for p in _burst_pool_pairs]
         # focus_stack: sharpness-weighted combine (keep the best-focused region
         # of each frame -- targets soft pad edges); stack: flat average (denoise).
-        stacked = (_focus_stack_face_on(same_frames) if focus_stack
+        stacked = (_focus_stack_face_on(same_frames, gyros=same_gyros) if focus_stack
                    else _stack_face_on(same_frames))
         if stacked is not None:
             gray = stacked

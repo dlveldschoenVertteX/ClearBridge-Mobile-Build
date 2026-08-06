@@ -320,6 +320,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         flash_frames   = None
         ambient_burst  = None
         flash_burst    = None
+        ambient_burst_gyros = None
+        flash_burst_gyros   = None
         arc_frame_wts  = None
         osc_theta_deg  = None
         if is_arc:
@@ -344,7 +346,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # angleDeg/flashOn/type/laplacianScore/path), just never wired in
             # for this capture mode. Without this, deepFuse always self-skips
             # for front_only_v1 despite being worth +2.5-8.5 NFIQ elsewhere.
-            ambient_burst, flash_burst = _download_front_burst(capture_id)
+            ambient_burst, flash_burst, ambient_burst_gyros, flash_burst_gyros = \
+                _download_front_burst(capture_id)
             _update_firestore(capture_id, {'captureMode': 'front_only_v1'})
         elif is_oscillating:
             (frames, frame_meta, osc_angles, osc_stats,
@@ -362,7 +365,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             osc_theta_deg = min(120.0, max(40.0, _range_half + 15.0))
             # Preserve the raw near-face-on front burst (in addition to the
             # binned frames) for the deep-fusion superprint variant.
-            ambient_burst, flash_burst = _download_front_burst(capture_id)
+            ambient_burst, flash_burst, ambient_burst_gyros, flash_burst_gyros = \
+                _download_front_burst(capture_id)
             _update_firestore(capture_id, {
                 'captureMode':    'oscillating_8phase',
                 'oscAnglesDeg':   [round(a, 1) for a in osc_angles],
@@ -892,6 +896,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         frames, angles_for_sfm, _laps,
                         ambient_frames=ambient_frames, flash_frames=_fl_frames,
                         ambient_burst=ambient_burst, flash_burst=flash_burst,
+                        ambient_burst_gyros=ambient_burst_gyros,
+                        flash_burst_gyros=flash_burst_gyros,
                         guide_region=_guide_region,
                         stack_cache=_stack_cache,
                         **_vkw)
@@ -1426,6 +1432,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 flash_frames=flash_frames,
                                 ambient_burst=ambient_burst,
                                 flash_burst=flash_burst,
+                                ambient_burst_gyros=ambient_burst_gyros,
+                                flash_burst_gyros=flash_burst_gyros,
                                 guide_region=_pguide,
                                 freq_normalize=True,
                                 stack_cache=_stack_cache,
@@ -2290,10 +2298,18 @@ def _download_front_burst(capture_id: str, face_yaw_deg: float = 8.0,
     and every same-pose flash shot, denoises each illumination before they're
     fused, worth +2.5–8.5 NFIQ over the single sharpest shot.
 
-    Returns (ambient_shots, flash_shots): two flat lists of centre-cropped
-    grayscale arrays for the sharpest `top_k` near-face-on shots per
-    illumination (burst-anchor stills preferred, then client laplacianScore).
-    Returns ([], []) on any error — the deep-fuse variant then self-skips."""
+    Returns (ambient_shots, flash_shots, ambient_gyros, flash_gyros): the
+    first two are flat lists of centre-cropped grayscale arrays for the
+    sharpest `top_k` near-face-on shots per illumination (burst-anchor stills
+    preferred, then client laplacianScore); the gyro lists are index-aligned
+    device-rotation-rate (deg/s) readings for those same shots, added
+    2026-08-06 (client now writes `gyroMagnitudeDegPerSec` per frame entry --
+    see front_capture_controller.dart) so afis_print.generate()'s fusion
+    functions have real per-frame motion context, not just pixels. `None` per
+    entry on older captures from before this field existed -- every consumer
+    treats that as neutral/unweighted, never an error.
+    Returns ([], [], [], []) on any error — the deep-fuse variant then
+    self-skips."""
     try:
         db, _ = _get_firebase()
         doc = db.collection('captures').document(capture_id).get()
@@ -2306,7 +2322,7 @@ def _download_front_burst(capture_id: str, face_yaw_deg: float = 8.0,
                 if int(e.get('phaseNumber', 0)) not in top_pn
                 and abs(float(e.get('angleDeg', 0.0))) <= face_yaw_deg]
         if not face:
-            return [], []
+            return [], [], [], []
 
         def _rank(e):
             return (e.get('type') == 'burst', float(e.get('laplacianScore') or 0.0))
@@ -2314,22 +2330,26 @@ def _download_front_burst(capture_id: str, face_yaw_deg: float = 8.0,
         def _collect(flash_on: bool):
             cell = sorted([e for e in face if bool(e.get('flashOn', False)) == flash_on],
                           key=_rank, reverse=True)[:top_k]
-            out = []
+            imgs, gyros = [], []
             for e in cell:
                 try:
                     arr = _decode_image(_download_storage_file(e['path']))
                     h, w = arr.shape[:2]
                     side = min(h, w)
-                    out.append(arr[(h - side) // 2:(h - side) // 2 + side,
-                                   (w - side) // 2:(w - side) // 2 + side])
+                    imgs.append(arr[(h - side) // 2:(h - side) // 2 + side,
+                                     (w - side) // 2:(w - side) // 2 + side])
+                    gy = e.get('gyroMagnitudeDegPerSec')
+                    gyros.append(float(gy) if gy is not None else None)
                 except Exception as e2:                       # noqa: BLE001
                     logger.warning('front-burst shot download failed: %s', e2)
-            return out
+            return imgs, gyros
 
-        return _collect(False), _collect(True)
+        amb_imgs, amb_gyros = _collect(False)
+        fla_imgs, fla_gyros = _collect(True)
+        return amb_imgs, fla_imgs, amb_gyros, fla_gyros
     except Exception as exc:                                  # noqa: BLE001
         logger.warning('front-burst preservation skipped: %s', exc)
-        return [], []
+        return [], [], [], []
 
 
 def _extract_orbit_angles(capture_id: str) -> dict:

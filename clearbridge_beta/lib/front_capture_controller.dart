@@ -275,12 +275,22 @@ class _RawShot {
   // EXIF (see JpegExposureExif) -- what the auto-exposure pipeline actually
   // did, not anything the app requested.
   final JpegExposureExif exif;
+  // Per-shot device rotation rate (deg/s, EMA-smoothed), sampled at the
+  // moment THIS shot fired -- added 2026-08-06. Previously only one gyro
+  // value reached the backend, snapshotted once at hold-completion
+  // (gyroMagnitudeDegPerSec at the top level of the capture doc), which
+  // says nothing about whether any INDIVIDUAL shot inside the 8-shot burst
+  // was captured mid-shake. The backend's fusion functions (ECC alignment
+  // in _stack_face_on/_focus_stack_face_on) currently have no per-frame
+  // motion signal at all -- they only ever see the pixels themselves.
+  final double? gyroMagnitudeDegPerSec;
   const _RawShot({
     required this.jpeg,
     required this.flashOn,
     required this.laplacianScore,
     required this.timestamp,
     this.exif = const JpegExposureExif(),
+    this.gyroMagnitudeDegPerSec,
   });
 }
 
@@ -924,6 +934,33 @@ class FrontCaptureController extends ChangeNotifier {
   // near the lens, which was locking onto empty background) -- it's
   // re-acquired fresh the moment the thumb is first confirmed on-target.
   bool _refocusedThisHold = false;
+  // _refocus() convergence-polling constants, added 2026-08-06. The
+  // original 600ms auto->settle->lock cycle was a BLIND fixed wait with no
+  // verification that AF had actually converged before locking -- a real
+  // capture (a2943016) showed all 8 burst frames uniformly soft (Laplacian
+  // 8-12 vs the hundreds-to-thousands seen on healthy captures), consistent
+  // with focus having been locked mid-hunt rather than at a genuinely
+  // settled position. _refocusMinMs preserves the original proven floor
+  // (350ms was documented as "re-locking mid-hunt" for the oscillating
+  // flow's own RIGHT-angle fix, so 600ms is not shortened here) --
+  // _refocusMaxMs adds real headroom for slower-converging cases instead of
+  // locking blind at exactly 600ms regardless of what the lens is doing.
+  static const int _refocusMinMs = 600;
+  static const int _refocusMaxMs = 1200;
+  static const int _refocusPollIntervalMs = 150;
+  // "Converged" = the live absolute-sharpness EMA (_liveAbsSharpness, the
+  // same signal already tracked every frame) has stopped moving -- two
+  // consecutive polls agreeing within this relative band, rather than
+  // comparing against any externally-calibrated absolute threshold (no real
+  // device data yet ties this live-preview signal to a calibrated floor,
+  // same caveat _liveAbsSharpness's own field docs already state).
+  static const double _refocusStableRatio = 0.12;
+  static const int _refocusStableStreakRequired = 2;
+  // Diagnostic snapshot of the most recent _refocus() call -- see field
+  // docs above. Written to the capture doc alongside _flashEvDebug/
+  // _wavelengthDebug so real convergence behaviour (or its absence) is
+  // visible on every capture going forward, not just this investigation.
+  Map<String, dynamic> _refocusDebug = {};
   // Tracks whether the thumb was in coverage range on the previous frame so
   // we can detect the entry transition and immediately point AF at the thumb.
   bool _wasInCoverageRange = false;
@@ -2022,15 +2059,59 @@ class FrontCaptureController extends ChangeNotifier {
 
   /// Re-acquire then re-lock focus at the pad's actual current distance,
   /// instead of trusting whatever the lens converged to before the thumb was
-  /// in frame. Same 600ms auto->settle->lock cycle already proven for the
-  /// oscillating flow's RIGHT-angle blur fix (350ms was re-locking mid-hunt).
+  /// in frame. Waits at least `_refocusMinMs` (the original proven floor)
+  /// before ever locking, same as before -- but now VERIFIES the live
+  /// absolute-sharpness signal has genuinely stopped changing (real
+  /// convergence, not a guess) before locking, up to a bounded
+  /// `_refocusMaxMs` ceiling, rather than always locking blind at exactly
+  /// the floor regardless of whether AF is still hunting.
+  ///
+  /// Real bug this fixes, found 2026-08-06: the old version was a fixed
+  /// 600ms sleep with zero verification -- if autofocus hunting genuinely
+  /// took longer (plausible at close macro distance / low light), the lens
+  /// got locked wherever it happened to be at the 600ms mark. A real
+  /// capture (a2943016) showed exactly this signature: all 8 burst frames
+  /// uniformly soft (Laplacian 8-12, a narrow low range -- not the wider
+  /// spread classic per-shot hand-shake would produce, which the burst's
+  /// own max-of-variants selection already defends against).
+  ///
+  /// `_onFrame`'s own focus-tracking block keeps updating `_liveAbsSharpness`
+  /// on every incoming preview frame regardless of `_refocusing`, so polling
+  /// it here needs no separate frame subscription -- it reuses the stream
+  /// that's already running.
   Future<void> _refocus() async {
     if (_refocusing) return;
     _refocusing = true;
+    final sw = Stopwatch()..start();
+    double? lastSample;
+    var stableStreak = 0;
+    var converged = false;
     try {
       await _beginAutofocus();
-      await Future<void>.delayed(const Duration(milliseconds: 600));
+      while (sw.elapsedMilliseconds < _refocusMaxMs) {
+        await Future<void>.delayed(
+            const Duration(milliseconds: _refocusPollIntervalMs));
+        if (_disposed) break;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample > 0) {
+          if (lastSample != null && lastSample! > 0) {
+            final change = (sample - lastSample!).abs() / lastSample!;
+            stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+          }
+          lastSample = sample;
+        }
+        if (sw.elapsedMilliseconds >= _refocusMinMs &&
+            stableStreak >= _refocusStableStreakRequired) {
+          converged = true;
+          break;
+        }
+      }
       await _lockFocusOnly();
+      _refocusDebug = {
+        'waitedMs': sw.elapsedMilliseconds,
+        'converged': converged,
+        'finalSharpness': lastSample,
+      };
     } catch (e) {
       debugPrint('[front] refocus failed (non-fatal): $e');
     } finally {
@@ -2284,6 +2365,7 @@ class FrontCaptureController extends ChangeNotifier {
               laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
               timestamp: DateTime.now(),
               exif: exif,
+              gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
             ));
             // MAC3D capture-UX-polish mockup dev-handoff note: "fire a light
             // haptic tick on each burst frame, stronger buzz on capture
@@ -2856,7 +2938,14 @@ class FrontCaptureController extends ChangeNotifier {
             lap = result.sharpness;
           }
         } catch (_) {}
-        return (bytes: bytes, flashOn: r.flashOn, lap: lap, ts: r.timestamp, exif: r.exif);
+        return (
+          bytes: bytes,
+          flashOn: r.flashOn,
+          lap: lap,
+          ts: r.timestamp,
+          exif: r.exif,
+          gyro: r.gyroMagnitudeDegPerSec,
+        );
       }));
 
       // Build upload tasks and Firestore frames metadata from the decoded shots.
@@ -2886,6 +2975,15 @@ class FrontCaptureController extends ChangeNotifier {
             'shutterSpeedReadable': s.exif.exposureTimeReadable,
           if (s.exif.isoValue != null) 'isoValue': s.exif.isoValue,
           'isLockedShutter': false,
+          // Per-shot device rotation rate at capture time (deg/s), added
+          // 2026-08-06 -- lets the backend's fusion functions (ECC
+          // alignment in _stack_face_on/_focus_stack_face_on) down-weight
+          // or diagnose individual frames captured mid-shake, instead of
+          // only ever seeing the pixels with no motion context. Additive;
+          // the single top-level gyroMagnitudeDegPerSec field (captured at
+          // hold-completion, not per-shot) is unchanged.
+          if (s.gyro != null)
+            'gyroMagnitudeDegPerSec': double.parse(s.gyro!.toStringAsFixed(2)),
         });
       }
 
@@ -2920,6 +3018,7 @@ class FrontCaptureController extends ChangeNotifier {
         'burstFrameCount': decodedShots.where((s) => s.bytes.isNotEmpty).length,
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
+        'refocusDebug': _refocusDebug,
         if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
         'zoomDebug': {
           'zoomApplied': _zoomEverApplied,
