@@ -154,6 +154,39 @@ class MainActivity : FlutterActivity() {
         else -> null
     }
 
+    // Focus-distance-calibration name, added 2026-08-06 as part of the
+    // wavelength-hybrid investigation: `LENS_INFO_FOCUS_DISTANCE_CALIBRATION`
+    // is the one Camera2 field that says whether this device's
+    // LENS_FOCUS_DISTANCE readback is in real, physically-meaningful
+    // diopters (CALIBRATED), an uncalibrated-but-monotonic per-device unit
+    // (APPROXIMATE), or not usable as a distance signal at all
+    // (UNCALIBRATED) -- static, read-only, same precedent as every other
+    // probe in this file.
+    //
+    // IMPORTANT, checked before promising this as a live guidance signal:
+    // even a CALIBRATED result here only says the VALUE would be
+    // physically meaningful if read -- it does NOT mean this app can
+    // actually read it live during the capture hold. This project's own
+    // CameraX plugin (camera_android_camerax) exposes no path to live
+    // Camera2 CaptureResult data through its public Dart API (confirmed
+    // when Item C / native noise-reduction override was investigated and
+    // declined: Camera2CameraControlProxyApi/CaptureRequestOptionsProxyApi
+    // are internal-only). Reaching LENS_FOCUS_DISTANCE live would need
+    // either forking that plugin or opening a second, parallel native
+    // Camera2 session alongside the live CameraX one -- the same class of
+    // camera-session-churn risk this project has already traced to real
+    // ANRs multiple times (see the round-17/19 sweep-timeout and
+    // secondary-camera-timeout history) and already explicitly declined
+    // for the noise-reduction case. So this field is informational only
+    // for now (does this device even support it in principle) -- not
+    // wired into any live hint.
+    private fun focusDistanceCalibrationName(value: Int?): String? = when (value) {
+        CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_UNCALIBRATED -> "UNCALIBRATED"
+        CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_APPROXIMATE -> "APPROXIMATE"
+        CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION_CALIBRATED -> "CALIBRATED"
+        else -> null
+    }
+
     private fun cameraLensInfoByCameraId(): Map<String, Map<String, Any?>> {
         val cameraManager = applicationContext
             .getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -165,6 +198,8 @@ class MainActivity : FlutterActivity() {
             val facing = chars.get(CameraCharacteristics.LENS_FACING)
             val cfa = chars.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
             val hasFlash = chars.get(CameraCharacteristics.FLASH_INFO_AVAILABLE)
+            val focusCalib = chars.get(CameraCharacteristics.LENS_INFO_FOCUS_DISTANCE_CALIBRATION)
+            val minFocusDistanceDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE)
             info[id] = mapOf(
                 "focalLengthMm" to focalLengths?.firstOrNull()?.toDouble(),
                 "sensorWidthMm" to sensorSize?.width?.toDouble(),
@@ -172,6 +207,8 @@ class MainActivity : FlutterActivity() {
                 "lensFacing" to facing,
                 "colorFilterArrangement" to colorFilterArrangementName(cfa),
                 "hasOwnFlash" to hasFlash,
+                "focusDistanceCalibration" to focusDistanceCalibrationName(focusCalib),
+                "minFocusDistanceDiopters" to minFocusDistanceDiopters?.toDouble(),
             )
         }
         return info

@@ -1041,6 +1041,33 @@ class FrontCaptureController extends ChangeNotifier {
   double _focusPeak = 1.0;
   double get focusValue => _focusValue;
 
+  // Absolute (NOT peak-normalized) live sharpness EMA, added 2026-08-06.
+  // _focusValue above is relative to THIS session's own running peak, which
+  // hides a real failure mode: a capture whose thumb never produces strong
+  // texture anywhere in the whole hold (near-flat/underexposed/out-of-focus
+  // throughout) can still read _focusValue near 1.0, since the peak itself
+  // is just as low as everything else -- a ratio near 1 says nothing about
+  // whether the underlying signal was ever good. Confirmed via a real
+  // cross-capture investigation: 3 of 5 real captures that scored
+  // catastrophic NFIQ2 (5-9) despite an otherwise-unremarkable wavelength
+  // reading shared one real trait -- their raw ambient burst frame's
+  // Laplacian variance was near background-noise level (9-39, vs 300-2000+
+  // on captures that scored well), i.e. genuinely flat/textureless frames,
+  // not a distance problem at all.
+  //
+  // Diagnostic-only for now, deliberately NOT wired to a live hint yet --
+  // unlike the wavelength estimator (which already has a real still-space
+  // scale factor via _wavelengthScaleToStill), this raw preview-resolution
+  // Laplacian value has no established scale relationship to the backend's
+  // still-resolution amb_lap numbers above yet. Inventing an absolute
+  // threshold now would repeat the exact mistake the wavelength hint's own
+  // history already warns against (its 25px threshold is explicitly
+  // flagged as "first-cut, don't reduce without real calibration pairs") --
+  // this field exists so the next several real captures give real
+  // (liveAbsSharpness, backend amb_lap) pairs to calibrate one properly.
+  double? _liveAbsSharpness;
+  int _sharpnessSampleCount = 0;
+
   DateTime? _holdStart;
   DateTime? _lastEmitAt;
 
@@ -1396,6 +1423,12 @@ class FrontCaptureController extends ChangeNotifier {
         _focusValue,
         (rawFocus / (_focusPeak + 1e-6)).clamp(0.0, 1.0),
       );
+      // Absolute sharpness EMA (diagnostic-only) -- see field docs above.
+      if (inCoverageRange) {
+        _liveAbsSharpness =
+            HybridCaptureService.ema(_liveAbsSharpness ?? rawFocus, rawFocus);
+        _sharpnessSampleCount++;
+      }
     } catch (_) {}
     _wasInCoverageRange = inCoverageRange;
 
@@ -2154,6 +2187,14 @@ class FrontCaptureController extends ChangeNotifier {
       // correlate the final afisWavelengthPx against captures where this
       // was false to validate whether 25px is the right threshold.
       'wavelengthHintThresholdPx': _liveWavelengthTooHighPx,
+      // Absolute (non-peak-normalized) live sharpness -- see field docs
+      // above _liveAbsSharpness. Not gated on a minimum sample count the
+      // way liveWavelengthStillPx is (it's an EMA fed every in-range frame,
+      // not a low-frequency 250ms-interval sample, so it converges much
+      // faster) -- written whenever any samples exist, real sample count
+      // included so a genuinely short hold is still identifiable.
+      'liveAbsSharpness': _liveAbsSharpness,
+      'sharpnessSampleCount': _sharpnessSampleCount,
     };
 
     double? minEv, maxEv;
