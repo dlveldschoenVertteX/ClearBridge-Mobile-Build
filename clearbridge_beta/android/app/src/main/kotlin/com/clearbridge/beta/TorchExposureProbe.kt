@@ -55,8 +55,20 @@ class TorchExposureProbe(private val context: Context) {
     private var session: CameraCaptureSession? = null
     private var reader: ImageReader? = null
     private var finished = false
+    // Separate from `finished`: `finished` means "stop probing", while this
+    // means "the Flutter side has been answered". They are no longer the same
+    // instant -- see finish()/deliverResult() for the camera-release race
+    // this separation fixes.
+    private var resultDelivered = false
     private val out = mutableMapOf<String, Any?>()
     private lateinit var flutterResult: MethodChannel.Result
+
+    companion object {
+        // Upper bound on waiting for CameraDevice.onClosed before answering
+        // Dart anyway. Generous enough to cover a slow real release, short
+        // enough that a stuck HAL only briefly delays the capture screen.
+        private const val DEVICE_CLOSE_TIMEOUT_MS = 1500L
+    }
 
     fun run(result: MethodChannel.Result) {
         flutterResult = result
@@ -140,6 +152,13 @@ class TorchExposureProbe(private val context: Context) {
                 override fun onError(cam: CameraDevice, error: Int) {
                     out["error"] = "camera open error $error"
                     finish()
+                }
+                // The signal that the camera is ACTUALLY released and safe for
+                // CameraX to open -- close() alone does not guarantee this.
+                // See finish()/deliverResult() for the crash this prevents.
+                override fun onClosed(cam: CameraDevice) {
+                    out["deviceClosedCleanly"] = true
+                    deliverResult()
                 }
             }, bgHandler)
         } catch (e: SecurityException) {
@@ -256,18 +275,89 @@ class TorchExposureProbe(private val context: Context) {
         }
     }
 
-    private fun finish() {
-        if (finished) return
-        finished = true
-        try { session?.close() } catch (e: Exception) {}
-        try { device?.close() } catch (e: Exception) {}
+    /**
+     * REAL RACE CONDITION found + fixed 2026-08-06, after a real device test
+     * reported the app crashing on entry to the capture screen ("crashed in
+     * the beginning, had to restart it").
+     *
+     * `CameraDevice.close()` is ASYNCHRONOUS -- it returns immediately, but
+     * the camera is not actually released until `StateCallback.onClosed()`
+     * fires. The previous version of finish() called close() and then posted
+     * the Flutter result on the very next line, so Dart resumed and called
+     * `CameraService.initializeCamera()` (see FrontCaptureScreen._init, which
+     * awaits this probe and then opens the camera immediately) while this
+     * probe's own CameraDevice handle was very often still open on the same
+     * physical camera. Android does not permit two concurrent handles on one
+     * camera -- the second open throws CameraAccessException/CAMERA_IN_USE.
+     *
+     * That also explains why it was intermittent rather than every launch:
+     * it is a timing race against however long the HAL takes to release, so
+     * it lands differently per device, per boot, and per thermal state.
+     *
+     * Fixed by delivering the Flutter result only once the camera is
+     * genuinely closed (`onClosed`), with a hard fallback timer so a HAL that
+     * never reports closure can still never hang the capture flow -- the same
+     * "bounded wait, never an unbounded await" discipline this file's own 6s
+     * probe timeout already follows.
+     */
+    private fun deliverResult() {
+        if (resultDelivered) return
+        resultDelivered = true
         try { reader?.close() } catch (e: Exception) {}
         try { thread.quitSafely() } catch (e: Exception) {}
         mainHandler.post { flutterResult.success(out) }
     }
 
+    private fun finish() {
+        if (finished) return
+        finished = true
+        try { session?.close() } catch (e: Exception) {}
+        val cam = device
+        if (cam == null) {
+            // Never got as far as opening the device -- nothing to wait for.
+            deliverResult()
+            return
+        }
+        // Hard fallback: deliver anyway if onClosed never arrives. Bounded so
+        // a misbehaving HAL degrades to the OLD (racy) behaviour at worst,
+        // rather than blocking the capture screen forever.
+        mainHandler.postDelayed({ deliverResult() }, DEVICE_CLOSE_TIMEOUT_MS)
+        try {
+            cam.close()
+        } catch (e: Exception) {
+            deliverResult()
+        }
+    }
+
+    /**
+     * REAL CRASH found + fixed 2026-08-06 (introduced by this file's own
+     * permission pre-check, commit 0c4fc1c).
+     *
+     * A MethodChannel.Result may be answered EXACTLY once -- replying twice
+     * throws IllegalStateException("Reply already submitted") and takes the
+     * app down. The permission-skip branch calls finishWith() from a point
+     * AFTER the 6s probe timeout has already been armed (thread.start() and
+     * the postDelayed sit above it in run()), and the old finishWith neither
+     * set `finished` nor consulted `resultDelivered`. So on a launch where
+     * camera permission was not yet granted, this replied once immediately,
+     * then ~6s later the timeout found `!finished`, ran finish(), and replied
+     * a SECOND time -- crashing the app shortly after the capture screen
+     * opened. That matches the reported "crashed in the beginning, had to
+     * restart it" (and why a restart cleared it: by then permission was
+     * granted, so the branch no longer fired).
+     *
+     * Now routes through the same single-delivery guard as every other exit
+     * path, and marks the probe finished so the timeout becomes a no-op.
+     */
     private fun finishWith(result: Map<String, Any?>) {
+        if (resultDelivered) return
+        finished = true
+        resultDelivered = true
         out.putAll(result)
+        // Nothing is open on these paths (all of them return before
+        // openCamera), but quitting the thread if it was started keeps the
+        // early-exit paths from leaking a live HandlerThread.
+        try { if (thread.isAlive) thread.quitSafely() } catch (e: Exception) {}
         mainHandler.post { flutterResult.success(out) }
     }
 }

@@ -42,6 +42,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   // transition check below.
   late final AnimationController _popCtrl;
   late final Animation<double> _popScale;
+  late final AnimationController _blinkCtrl;
+  late final Animation<double> _blinkOpacity;
   bool _ready = false;
   bool _navigated = false;
   String? _initError;
@@ -86,6 +88,19 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     );
     _popScale = Tween(begin: 0.9, end: 1.0)
         .animate(CurvedAnimation(parent: _popCtrl, curve: Curves.elasticOut));
+    // Blinking brightness warning shown ABOVE the guide (CTO request,
+    // 2026-08-06: the existing bottom warning row was easy to miss while
+    // looking at the thumb inside the mask). Repeats indefinitely and is
+    // only ever ticked while a brightness warning is actually on screen --
+    // see the _brightnessBlink usage in build(). Driven by opacity rather
+    // than a hard on/off toggle so it reads as a pulse, not a flicker.
+    _blinkCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 900),
+    );
+    _blinkOpacity = Tween(begin: 1.0, end: 0.25).animate(
+      CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut),
+    );
     _init();
   }
 
@@ -200,6 +215,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     _cameraService.disposeCamera();
     _scanAnim.dispose();
     _popCtrl.dispose();
+    _blinkCtrl.dispose();
     super.dispose();
   }
 
@@ -324,6 +340,32 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     final brightWarn = lowQuality && s.lightingValue < 0.30;
     final focusWarn = lowQuality && focusVal < 0.30;
 
+    // Blinking above-guide brightness warning (CTO request 2026-08-06).
+    // Deliberately NOT gated on _isLowQuality: that helper also requires the
+    // focus signal to be settled, but an over/under-exposed frame is worth
+    // flagging the moment it's true -- it's the one problem the user can fix
+    // instantly by moving. Gated on `showGuide` only, so it can't fire
+    // before the thumb is being framed at all.
+    //
+    // Thresholds, both stated in the same units as `lightingValue`
+    // (ROI mean luma / 255):
+    //   * 0.30 low  -- reuses the exact cutoff the existing bottom warning
+    //     row and guide-outline warning state already use, so the two cues
+    //     can never disagree with each other.
+    //   * 0.85 high -- deliberately matched to the controller's own
+    //     _coverageMax (0.85), which is already this project's established
+    //     "ROI is saturating" boundary on the same measured signal, rather
+    //     than a fresh invented number. Real supporting data: ambient frames
+    //     from good captures measure mean luma 126-151 (~0.49-0.59 here),
+    //     comfortably inside this band, while the torch-blowout failures
+    //     this project has documented repeatedly sit far above it.
+    // UI-only -- no capture-pipeline threshold is touched by either.
+    const double kBrightLow = 0.30;
+    const double kBrightHigh = 0.85;
+    final tooDark = showGuide && s.lightingValue < kBrightLow;
+    final tooBright = showGuide && s.lightingValue > kBrightHigh;
+    final showBrightnessBlink = tooDark || tooBright;
+
     final silhouetteState = (s.isCapturingBurst ||
             s.phase == FrontCapturePhase.capturingExtra ||
             s.phase == FrontCapturePhase.sweepActive)
@@ -373,6 +415,22 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       warningColor = CaptureColors.warning;
     }
 
+    // Run the blink only while the warning is actually on screen -- an
+    // always-repeating controller would keep the widget tree animating (and
+    // burning frames) for the entire session. Scheduled post-frame because
+    // build() must not mutate animation state synchronously.
+    if (showBrightnessBlink != _blinkCtrl.isAnimating) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (showBrightnessBlink && !_blinkCtrl.isAnimating) {
+          _blinkCtrl.repeat(reverse: true);
+        } else if (!showBrightnessBlink && _blinkCtrl.isAnimating) {
+          _blinkCtrl.stop();
+          _blinkCtrl.value = 0.0;
+        }
+      });
+    }
+
     final headline = _headlineText(s);
 
     return Scaffold(
@@ -418,6 +476,36 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
               left: ringLeft,
               top: ringTop,
               child: _CaptureProgressRing(progress: ringProgress, color: ringColor),
+            ),
+
+          // Blinking brightness warning, sited directly ABOVE the guide ring
+          // (CTO request 2026-08-06) so it lands in the same eyeline as the
+          // thumb being framed -- the pre-existing warning row sits far below
+          // the mask and was easy to miss while looking at the guide.
+          // Colour-coded from the existing CaptureColors semantic palette:
+          // amber `warning` for too-dark (recoverable by moving to better
+          // light) and red `error` for too-bright, which is the torch-blowout
+          // regime this project has repeatedly measured as the more damaging
+          // of the two. 28px above the ring keeps it clear of the ring stroke
+          // at every screen size used so far.
+          if (showBrightnessBlink)
+            Positioned(
+              left: 0,
+              right: 0,
+              top: ringTop - 28,
+              child: IgnorePointer(
+                child: FadeTransition(
+                  opacity: _blinkOpacity,
+                  child: _BrightnessWarningPill(
+                    text: tooBright
+                        ? 'TOO BRIGHT — move out of direct light'
+                        : 'TOO DARK — move to better light',
+                    color: tooBright
+                        ? CaptureColors.error
+                        : CaptureColors.warning,
+                  ),
+                ),
+              ),
             ),
 
           // Sweep Step 1 (positioning) needs no separate highlight overlay --
@@ -1151,6 +1239,50 @@ class _MeterPainter extends CustomPainter {
 }
 
 // ── Capture progress ring ─────────────────────────────────────────────────────
+
+/// Blinking exposure warning shown above the pad guide. Styled to match the
+/// existing capture-screen chips (translucent steel fill + coloured border +
+/// uppercase letter-spaced label), taking its accent colour from the caller
+/// so the same widget serves both the too-dark (amber) and too-bright (red)
+/// cases without duplicating layout.
+class _BrightnessWarningPill extends StatelessWidget {
+  final String text;
+  final Color color;
+  const _BrightnessWarningPill({required this.text, required this.color});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+        decoration: BoxDecoration(
+          color: CaptureColors.void_.withValues(alpha: 0.72),
+          borderRadius: BorderRadius.circular(999),
+          border: Border.all(color: color, width: 1.5),
+          boxShadow: [
+            BoxShadow(color: color.withValues(alpha: 0.35), blurRadius: 12),
+          ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(Icons.warning_amber_rounded, size: 15, color: color),
+            const SizedBox(width: 7),
+            Text(
+              text,
+              style: TextStyle(
+                color: color,
+                fontSize: 11,
+                fontWeight: FontWeight.w700,
+                letterSpacing: 0.8,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
 
 class _CaptureProgressRing extends StatelessWidget {
   const _CaptureProgressRing({required this.progress, required this.color});
