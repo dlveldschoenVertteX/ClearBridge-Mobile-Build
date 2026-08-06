@@ -202,7 +202,13 @@ class _BurstEncodeArgs {
   // to keep those single-candidate stills' encode/upload time bounded now
   // that they're captured at full (unzoomed) frame detail.
   final int quality;
-  const _BurstEncodeArgs(this.luma, this.width, this.height, {this.quality = 90});
+  // Still-space (normalized 0-1) crop to restrict _stillLaplacianVariance
+  // to, added 2026-08-06 -- see that function's docstring for the real bug
+  // this fixes. Null means whole-frame (the original, still-confounded
+  // behaviour) -- only the main-burst call site passes one.
+  final Rect? sharpnessRoi;
+  const _BurstEncodeArgs(this.luma, this.width, this.height,
+      {this.quality = 90, this.sharpnessRoi});
 }
 
 class _BurstEncodeResult {
@@ -236,16 +242,43 @@ class _BurstEncodeResult {
 /// no extra isolate spawn. Only used for the main burst's own frames; the
 /// sweep-zone/detail-zoom call sites still use the plain _encodeBurstIsolate
 /// since they don't feed this per-frame-ranking metadata.
-double _stillLaplacianVariance(Uint8List luma, int width, int height) {
+///
+/// SECOND real bug found + fixed 2026-08-06, same family as the one above:
+/// this scanned the WHOLE decoded still with no ROI restriction at all --
+/// unlike the LIVE preview meter (frame_capture_service.dart's
+/// estimateRidgeWavelengthPx/_computeThumbFocus, both take a `thumbRoi`),
+/// this final-still metric was confounded by whatever's in the BACKGROUND,
+/// not just the thumb. Confirmed via two real captures scored catastrophic
+/// NFIQ2 (3 and 5) with `refocusDebug.converged: false`: downloading and
+/// visually inspecting the raw frames showed the thumb pad ridges were
+/// actually reasonably visible in both, while a real capture that scored 95
+/// had a comparably-small thumb in frame but a heavily textured background
+/// (patterned fabric) -- the two failing captures' backgrounds were a plain
+/// painted wall. A richly-textured background can inflate this score
+/// regardless of thumb sharpness; a plain one can sink it regardless of how
+/// sharp the thumb actually is -- and this score is what the app uses
+/// throughout to pick "sharpest ambient"/"sharpest flash" per shot. `roi`
+/// (still-space, normalized 0-1, same convention as guideRegion) restricts
+/// the scan to the guide's own bounding box when supplied; null preserves
+/// the original whole-frame behaviour for callers that don't have a guide
+/// region available.
+double _stillLaplacianVariance(Uint8List luma, int width, int height, {Rect? roi}) {
   if (width < 4 || height < 4) return 0.0;
+  var x0 = 1, y0 = 1, x1 = width - 1, y1 = height - 1;
+  if (roi != null) {
+    x0 = (roi.left * width).clamp(1, width - 2).round();
+    y0 = (roi.top * height).clamp(1, height - 2).round();
+    x1 = (roi.right * width).clamp(x0 + 1, width - 1).round();
+    y1 = (roi.bottom * height).clamp(y0 + 1, height - 1).round();
+  }
   var mean = 0.0;
   var m2 = 0.0;
   var n = 0;
-  for (var y = 1; y < height - 1; y += 2) {
+  for (var y = y0; y < y1; y += 2) {
     final row = y * width;
     final up = (y - 1) * width;
     final dn = (y + 1) * width;
-    for (var x = 1; x < width - 1; x += 2) {
+    for (var x = x0; x < x1; x += 2) {
       final c = luma[row + x];
       final lap = (4 * c - luma[row + x - 1] - luma[row + x + 1] - luma[up + x] - luma[dn + x])
           .toDouble();
@@ -260,7 +293,7 @@ double _stillLaplacianVariance(Uint8List luma, int width, int height) {
 
 _BurstEncodeResult _encodeBurstWithSharpnessIsolate(_BurstEncodeArgs args) => _BurstEncodeResult(
       encodeGrayscaleJpeg(args.luma, args.width, args.height, quality: args.quality),
-      _stillLaplacianVariance(args.luma, args.width, args.height),
+      _stillLaplacianVariance(args.luma, args.width, args.height, roi: args.sharpnessRoi),
     );
 
 Uint8List _encodeBurstIsolate(_BurstEncodeArgs args) =>
@@ -2918,6 +2951,22 @@ class FrontCaptureController extends ChangeNotifier {
       // mid-session -- now happens under the clean uploading screen
       // instead, see _transitionToUploading). Each raw JPEG is converted to
       // grayscale + downscaled, same as before but moved here.
+      //
+      // Sharpness ROI, added 2026-08-06 -- see _stillLaplacianVariance's
+      // docstring for the real background-confound bug this fixes. Built
+      // once (the guide region is fixed for the whole capture, not
+      // per-frame) from the same still-space _guideCx/_guideCy/_guideRx/
+      // _guideRy already used for the AFIS mask sent to the backend. A
+      // modest 1.2x dilation -- smaller than the backend's own 1.3x
+      // _MASK_COVER_DILATE -- so a real ridge-bearing pad near the guide's
+      // edge isn't clipped by a too-tight ROI; this is a sharpness METRIC,
+      // not a hard content mask, so erring slightly generous costs nothing.
+      final sharpnessRoi = Rect.fromLTRB(
+        _guideCx - _guideRx * 1.2,
+        _guideCy - _guideRy * 1.2,
+        _guideCx + _guideRx * 1.2,
+        _guideCy + _guideRy * 1.2,
+      );
       final decodedShots = await Future.wait(rawShots.map((r) async {
         var bytes = r.jpeg;
         // Falls back to the stale stream-frozen r.laplacianScore only if
@@ -2932,7 +2981,8 @@ class FrontCaptureController extends ChangeNotifier {
           if (decoded != null) {
             final result = await compute(
               _encodeBurstWithSharpnessIsolate,
-              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+              _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height,
+                  sharpnessRoi: sharpnessRoi),
             );
             bytes = result.jpeg;
             lap = result.sharpness;
