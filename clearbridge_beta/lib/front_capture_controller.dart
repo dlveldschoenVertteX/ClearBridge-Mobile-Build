@@ -476,7 +476,41 @@ class FrontCaptureController extends ChangeNotifier {
   // no sweepBurstDebug paths were uploaded, so this one flag fully controls
   // the feature's real-world effect regardless of what's deployed
   // backend-side.
-  static const bool _sweepBurstHybridEnabled = true;
+  // DISABLED 2026-08-06 after a full real-data audit. Every number below is
+  // measured from real Firestore/Storage captures, not estimated:
+  //
+  //   * WIN RATE: across 137 real scored captures, a sweep ZONE candidate won
+  //     selection exactly ONCE (fd1da8c1) -- and that capture's real NFIQ2
+  //     came back 9, one of the worst on record. The cross-zone mosaic
+  //     ('sweepFusion') ran 3 times and won 0.
+  //   * MINUTIAE comparison (the other additive candidate family, kept on):
+  //     2 wins / 30 scored -- low, but an order of magnitude better than this
+  //     AND effectively free, since it reuses already-downloaded frames.
+  //   * REAL USER TIME COST: 76-316s per capture, mean 161s (n=13, summing
+  //     the zone loop + this feature's own sequential per-zone encode and
+  //     upload). That is minutes of post-shutter waiting for a candidate
+  //     family that has never once produced a good winning print.
+  //   * CAPTURE LOSS: since it went live (2026-08-03), 3 of 17 real captures
+  //     (17%) are permanently stuck at pending/enhancing and were never
+  //     scored at all. Stuck captures averaged 204s of sweep time vs 148s
+  //     for ones that completed -- consistent with the long post-shutter
+  //     window giving far more opportunity for the app to be backgrounded/
+  //     killed before it can fire the processEnhanceAndScore trigger, and
+  //     for the backend to run out its own request budget scoring 6 extra
+  //     downloaded images on top of the main variant loop.
+  //
+  // Structurally, this was always fighting uphill: each zone contributes a
+  // SINGLE unstacked frame at reduced JPEG quality (_sweepZoneJpegQuality
+  // 75) of the same pad the main burst already covers with 8 frames plus
+  // stacking and ambient/flash fusion at full quality. It is duplicative
+  // rather than additive.
+  //
+  // Left as a one-line flag (not deleted) so it is trivially revivable, and
+  // because the capture machinery itself is sound and well-hardened -- the
+  // problem is the cost/benefit, not the implementation. If revived, fix the
+  // economics first: fewer zones, parallel or deferred upload, and a real
+  // reason to expect a single unstacked frame to beat the main burst.
+  static const bool _sweepBurstHybridEnabled = false;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -773,7 +807,50 @@ class FrontCaptureController extends ChangeNotifier {
   // than this on-screen shape implies):
   //   cx=0.5, cy=0.37, rx=0.134604*(1+0.20)=0.161525, ry=0.111195
   //   -> [0.338475,0.258805,0.661525,0.481195]
-  static const Rect _scoreRoi = Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
+  //
+  // REAL, MAJOR BUG found + fixed 2026-08-06 -- the value above is stated in
+  // SCREEN space, but every consumer below applies it to a raw `CameraImage`
+  // buffer, which arrives in the sensor's own (unrotated) orientation. Those
+  // two spaces differ by exactly the (u,v) -> (1-v, u) rotation that
+  // `_computeGuideRegion`/`_stillSpaceRegionForShape` already apply when
+  // deriving the backend's `guideRegion` -- so the metering ROI was never
+  // actually pointed at the thumb pad.
+  //
+  // Proven three independent ways before changing anything:
+  //  1. ARITHMETIC: the old constant is EXACTLY the un-rotated form. Its
+  //     x-span [0.3385, 0.6615] equals the correct y-span, and 1 minus its
+  //     y-span [0.2588, 0.4812] equals the correct x-span [0.5188, 0.7412].
+  //     That is the precise signature of a missing (u,v) -> (1-v, u).
+  //  2. AGAINST REAL DATA: every real capture writes `guideRegion` with
+  //     cx=0.63, cy=0.5 -- which is exactly this corrected centre, and which
+  //     the backend has always used successfully as the AFIS mask.
+  //  3. VISUALLY: cropping a real capture (19184018, real NFIQ2 95) by the
+  //     OLD rect yields knuckle skin plus background with essentially no pad
+  //     ridges at all; cropping the same frame by `guideRegion` yields a
+  //     cleanly-framed, ridge-filled thumb pad.
+  //
+  // Why this plausibly caused the intermittent soft captures being chased:
+  // the knuckle sits at a visibly DIFFERENT depth from the pad, so the hold
+  // gate could read "sharp" off the knuckle and fire the burst while the pad
+  // itself was still out of focus -- matching the observed pattern of the
+  // same device producing both excellent (real NFIQ2 72-95) and catastrophic
+  // (3-21) captures, with guide-ROI sharpness differing 10-100x while
+  // `afisMaskCoverPx` (distance) stayed effectively constant. It also
+  // explains the recurring `liveWavelengthDebug.sampleCount: 0` -- the
+  // sampled region genuinely had no ridges to measure.
+  //
+  // NOTE this is the CameraImage/sensor-space ROI only. `setFocusPoint`/
+  // `setExposurePoint` take PREVIEW-space coordinates and therefore keep the
+  // original screen-space centre -- see `_focusPointScreenSpace` below.
+  static const Rect _scoreRoi =
+      Rect.fromLTRB(0.518805, 0.338475, 0.741195, 0.661525);
+
+  // Pre-fix screen-space rect, retained ONLY for the two AF/AE point call
+  // sites, which take preview-space (not sensor-space) coordinates and were
+  // therefore always correct. Kept as its own named constant so the two
+  // spaces can never be silently conflated again.
+  static const Rect _focusPointScreenSpace =
+      Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
   // Row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
   // window used by the guided sweep's own CENTROID tracking only. Named
@@ -813,7 +890,16 @@ class FrontCaptureController extends ChangeNotifier {
   // two focus call sites, _sweepTrackingRoi (narrow, _scoreRoi) for
   // centroid/zone detection only. Never let one constant silently serve two
   // independently-tuned purposes again.
-  static const Rect _sweepTrackingRoi = _scoreRoi;
+  // Deliberately pinned to the PRE-2026-08-06 literal values rather than
+  // following _scoreRoi's rotation fix: the guided thumb-sweep is disabled
+  // (_sweepEnabled = false) and its centroid math was tuned/validated
+  // against these exact numbers on real hardware. Re-pointing a disabled
+  // feature's tracker as a side effect of fixing the ACTIVE static-hold path
+  // would silently invalidate that tuning with no way to re-test it. If the
+  // sweep is ever revived, re-derive this against _scoreRoi's corrected
+  // space first -- do not assume these values are still right.
+  static const Rect _sweepTrackingRoi =
+      Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
   // Wide row-axis window used ONLY for the sweep's focus re-aim point
   // (_refocusForSweepPositioning / _beginSweepActive) -- this exact span is
@@ -1065,14 +1151,31 @@ class FrontCaptureController extends ChangeNotifier {
   // the luma sweet spot [_coverageMin, _coverageMax] while the actual ridge
   // scale (the thing that directly drives NFIQ2) is already too high.
   //
-  // 25px is calibrated against n=1 real data point: liveWavelengthStillPx
-  // 49.1px on a capture confirmed too close (flash blown out 4-10x, both
-  // blowout AND high wavelength caused by thumb proximity). The NFIQ2 sweet
-  // spot is afisWavelengthPx 9-14px; 25px leaves real margin to avoid false
-  // positives before the paired calibration data is collected. DO NOT reduce
-  // this threshold without real (liveWavelengthStillPx, afisWavelengthPx)
-  // pairs from several captures at known distances.
-  static const double _liveWavelengthTooHighPx = 25.0;
+  // Retuned 2026-08-06 alongside the _scoreRoi rotation fix, which this
+  // value is directly coupled to and MUST move with.
+  //
+  // The old 25.0 was calibrated against readings inflated ~1.45x by that
+  // same bug: _wavelengthScaleToStill divides by `_scoreRoi.width`, and the
+  // old (un-rotated) rect's width was 0.3230 where the correct, guide-
+  // matching width is 0.2224 -- a 1.4524x over-estimate on every live
+  // wavelength reading ever recorded. Leaving 25.0 in place after the fix
+  // would have silently killed the hint: a genuinely too-close capture that
+  // used to read 30.8 now reads ~21.2, i.e. below the old threshold.
+  //
+  // Real paired validation of the corrected scale (the calibration data the
+  // old comment here asked for, now actually available): capture f799bb74
+  // read liveWavelengthStillPx 30.8 under the bug -> 21.2 corrected, and its
+  // sibling capture 3841b287 (same user, ~4.5 min later) measured backend
+  // afisWavelengthPx 20.0 (raw 22.0). So after the fix the live estimate
+  // tracks the backend's own authoritative value to within ~1px, which is
+  // what it was always supposed to do.
+  //
+  // 16.0 therefore sits in the SAME units as afisWavelengthPx and is chosen
+  // against this project's own established real-data finding: 9-14px is the
+  // NFIQ2 sweet spot and >=15px correlates with catastrophic real scores.
+  // 16.0 keeps a 1px margin above that boundary to avoid firing on captures
+  // sitting right at the edge.
+  static const double _liveWavelengthTooHighPx = 16.0;
   // Minimum wavelength EMA samples before the hint can fire, to guard
   // against a transient first-frame estimate triggering "Move back" on a
   // correctly-positioned thumb.
@@ -2068,8 +2171,12 @@ class FrontCaptureController extends ChangeNotifier {
   Future<void> _beginAutofocus() async {
     final cam = _camera;
     if (cam == null) return;
-    final cx = (_scoreRoi.left + _scoreRoi.right) / 2;
-    final cy = (_scoreRoi.top + _scoreRoi.bottom) / 2;
+    // Preview-space, NOT sensor-space -- setFocusPoint/setExposurePoint take
+    // coordinates relative to the camera preview, so these keep the original
+    // screen-space centre (0.5, 0.37). See _scoreRoi's own docs for why the
+    // two spaces are now separate named constants.
+    final cx = (_focusPointScreenSpace.left + _focusPointScreenSpace.right) / 2;
+    final cy = (_focusPointScreenSpace.top + _focusPointScreenSpace.bottom) / 2;
     final pt = Offset(cx, cy);
     try {
       await cam.setFocusMode(FocusMode.auto);
