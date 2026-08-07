@@ -813,7 +813,31 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # plausible-but-generic structure instead of preserving
                 # person-specific minutiae. Gated below, same discipline as
                 # the fusion-selection sharpness guard.
-                ('pyfingHybridFreqNorm', dict(enhance='pyfingHybrid', freq_normalize=True)),
+                #
+                # Followed up same day with two real levers, both measured
+                # against the identical 22-capture/15-pair gate (scratchpad):
+                # (1) pyfing_blend (alpha-blend pyfing's output back toward
+                # the pre-denoise image) tested alone -- 0.3/0.5/0.7, all
+                # NET NEGATIVE: separation dropped (28-35 vs 39.33) AND the
+                # risky pair's false-match score barely moved (120-142 vs
+                # 150.58 baseline). Diluting pyfing's own output does not
+                # fix this. (2) freq_scale_min=0.9 (this variant's own
+                # per-call override, NOT the shared _FREQ_SCALE_MIN=0.7 used
+                # by freqNorm/deepFuse/deepMaxc/mosaicFreq -- those stay
+                # untouched) tested alone and combined with blend: 0.9 alone
+                # roughly HALVED the risky pair's score (150.58 -> 11.82) for
+                # a small separation cost. Combined with pyfing_blend=0.7,
+                # separation came back to essentially the unguarded baseline
+                # (39.02 vs 39.33) while KEEPING most of 0.9's risk reduction
+                # (76.11 vs 150.58) and posting the best genuine-beats-
+                # impostor-max rate of any variant tried all session (5/15,
+                # vs 2/15 for the raw pyfing_blend=1.0/freq_scale_min=0.7
+                # config). Shipped as the real config below; the two-lever
+                # combination is real, not additive luck -- freq_scale_min
+                # does the risk reduction, pyfing_blend recovers the
+                # separation freq_scale_min alone gives up.
+                ('pyfingHybridFreqNorm', dict(enhance='pyfingHybrid', freq_normalize=True,
+                                              pyfing_blend=0.7, freq_scale_min=0.9)),
                 # Coherence-enhancing diffusion (oriented smoothing along
                 # ridge direction, classical, no sidecar dependency) as a
                 # denoise pre-pass ahead of the same Gabor+binarize chain --
@@ -881,9 +905,14 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # margin applies every time this variant is even considered. Higher
             # than the fusion guard's 3.0 given the worse real evidence: a
             # near-4x-recommended-threshold false-match spike, not just a
-            # proxy-overestimate. Same guarantee as every other guard in this
-            # loop: can only withhold a variant from winning, never invent a
-            # worse result than the best already found.
+            # proxy-overestimate. Kept at 5.0 even after the freq_scale_min
+            # =0.9/pyfing_blend=0.7 tune below roughly halved the measured
+            # risk (150.58 -> 76.11 on the pair that motivated this) --
+            # 76.11 is still well above SourceAFIS's own ~40 recommended
+            # threshold, so the risk is reduced, not eliminated; the margin
+            # stays the real backstop. Same guarantee as every other guard
+            # in this loop: can only withhold a variant from winning, never
+            # invent a worse result than the best already found.
             _PYFING_HYBRID_MARGIN_REQUIRED = 5.0
             try:
                 # front_only_v1 can supply [None] (no ambient/flash frame was

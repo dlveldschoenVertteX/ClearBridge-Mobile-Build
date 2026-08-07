@@ -1639,6 +1639,7 @@ def generate(
     gabor_gamma: Optional[float] = None,
     mirror: bool = False,
     pyfing_blend: float = 1.0,
+    freq_scale_min: Optional[float] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -1700,6 +1701,21 @@ def generate(
                      signal at their current first-guess thresholds; they need
                      the paired dataset to tune before they can win, so they
                      stay unwired for now. gaborPyfingField not yet measured.
+    freq_scale_min : per-call override of _FREQ_SCALE_MIN (module default
+                     0.7 when None), same per-call-override pattern as
+                     gabor_sigma_ratio/gabor_gamma -- deliberately NOT a
+                     module-level change, since _FREQ_SCALE_MIN=0.7 is
+                     itself real-Firestore-validated for freqNorm/deepFuse/
+                     deepMaxc/mosaicFreq and this override must not touch
+                     those. Added 2026-08-07 specifically for
+                     pyfingHybridFreqNorm: real SourceAFIS gate (22
+                     captures, 15 genuine pairs) found 0.9 here roughly
+                     halves the worst-case false-match risk (150.58 ->
+                     76.11 on the specific pair that motivated this) for
+                     essentially no separation cost (39.33 -> 39.02) and
+                     the best genuine-beats-impostor-max rate of any
+                     variant tried all session (5/15). See main.py's
+                     pyfingHybridFreqNorm entry for the production config.
     pyfing_blend   : enhance='pyfingHybrid' only -- alpha-blend pyfing's
                      denoised output with the pre-denoise image before the
                      Gabor bank runs (1.0 = pure pyfing output, the only
@@ -2150,7 +2166,8 @@ def generate(
     params['afisWavelengthPxRawBlocks'] = raw_wl_blocks
     wl = native_wl
     if freq_normalize and native_wl > 1.0:
-        scale = float(np.clip(_TARGET_PERIOD / native_wl, _FREQ_SCALE_MIN, 2.5))
+        _scale_min = freq_scale_min if freq_scale_min is not None else _FREQ_SCALE_MIN
+        scale = float(np.clip(_TARGET_PERIOD / native_wl, _scale_min, 2.5))
         if abs(scale - 1.0) > 0.05:
             interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
             g8 = cv2.resize(g8, None, fx=scale, fy=scale, interpolation=interp)
