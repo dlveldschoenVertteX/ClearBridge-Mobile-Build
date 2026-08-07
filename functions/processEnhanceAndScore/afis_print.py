@@ -1580,40 +1580,58 @@ def _nns_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
     docstring and `_postprocess`'s contrast-stretch, which assume the same
     polarity `_gabor_enhance`'s binarization does) -- no invert needed here.
 
-    Crops to the mask's own bounding box and grey-fills outside it (same
-    pattern as `_pyfing_denoise`) before calling `enhancement_pipeline.enhance()`,
-    which internally resizes to its fixed 512x512 NNS input and returns a
-    512x512 result -- resized back to the crop's own size afterward. Returns
-    None on any failure (missing dependency, degenerate crop, or the NNS
-    weights not being resolvable) -- same non-blocking contract as every
-    other optional signal in this module."""
+    REAL BUG FOUND + FIXED 2026-08-07: this used to crop to the mask's bbox
+    and grey-fill OUTSIDE it (same pattern as `_pyfing_denoise`) BEFORE
+    calling `enhancement_pipeline.enhance()` -- but unlike pyfing's SNFEN,
+    this project's own trained FingerprintUNet was never trained on masked/
+    neutral-filled input, and feeding it a hard edge between real content
+    and a flat fill makes it ring on that edge (visible concentric halo
+    artefacts, confirmed both visually and numerically this session: 5/5
+    real captures scored WORSE masked-then-enhanced than left unmasked,
+    mean real NFIQ2 21.9 vs 32.5 -- this is likely the SAME root cause
+    behind `main.py`'s own already-documented "don't blank the background
+    before Gabor/NNS enhancement" lesson for the SfM single-frame fallback
+    path, just rediscovered independently here). Also confirmed this
+    session (5/5 real captures) that the RAW NNS output is essentially
+    unscoreable by real NFIQ2 regardless of masking -- every one was
+    rejected outright ("Fingerprint area is too small") -- while running
+    that SAME unmasked-enhanced output through this module's own Gabor+
+    hard-binarize chain (exactly what the `nnsHybrid` branch below already
+    does) produced a real, valid score on 5/5. So both halves of this
+    function's original design were subtly broken by one bug: enhance
+    the FULL unmasked image first (matches how the model was actually
+    exercised when it scored competitively, per the 2026-07-16 CTO
+    motivation above), THEN composite the mask onto the RESULT with a
+    feathered edge (never a hard cut) -- exact same
+    resize/GaussianBlur(31,31)/alpha-blend pattern main.py's own
+    fallback_mask compositing already uses for this exact problem.
+    Returns None on any failure (missing dependency, degenerate mask, or
+    the NNS weights not being resolvable) -- same non-blocking contract as
+    every other optional signal in this module."""
     try:
         import enhancement_pipeline
     except ImportError:
         return None
 
-    ys, xs = np.where(mask > 0)
-    if len(ys) < 200:
+    if (mask > 0).sum() < 200:
         return None
-    y0, x0 = max(0, ys.min() - 10), max(0, xs.min() - 10)
-    y1, x1 = min(g8.shape[0], ys.max() + 10), min(g8.shape[1], xs.max() + 10)
-    crop = g8[y0:y1, x0:x1].copy()
-    crop_mask = mask[y0:y1, x0:x1]
-    crop[crop_mask == 0] = 128
 
     try:
-        enhanced_512, _params = enhancement_pipeline.enhance(crop, sfm_coverage=1.0)
+        enhanced_full, _params = enhancement_pipeline.enhance(g8, sfm_coverage=1.0)
     except Exception as e:   # noqa: BLE001 -- must never block the pipeline
         logger.warning('NNS denoise pre-pass failed (non-critical): %s', e)
         return None
-    if enhanced_512 is None:
+    if enhanced_full is None:
         return None
-    enhanced = cv2.resize(enhanced_512, (crop.shape[1], crop.shape[0]),
-                           interpolation=cv2.INTER_CUBIC) if enhanced_512.shape != crop.shape else enhanced_512
+    if enhanced_full.shape != g8.shape:
+        enhanced_full = cv2.resize(enhanced_full, (g8.shape[1], g8.shape[0]),
+                                   interpolation=cv2.INTER_CUBIC)
 
-    full = g8.copy()
-    full[y0:y1, x0:x1] = enhanced
-    return full
+    mask_f = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    bg = np.full_like(enhanced_full, 245)
+    composited = (enhanced_full.astype(np.float32) * mask_f
+                 + bg.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+    return composited
 
 
 def generate(
