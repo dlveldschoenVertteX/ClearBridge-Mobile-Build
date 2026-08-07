@@ -753,9 +753,29 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             #               flat mean: targets the pad's curved edges going soft
             #               under shallow macro depth-of-field. Self-skips (falls
             #               back to single frame) when <2 same-pose frames align.
+            # freq_scale_min=0.9 (2026-08-07) -- shared by every freq_normalize
+            # variant below. Real finding, same session as pyfingHybridFreqNorm:
+            # mindtct's own per-minutia quality metric sits at 68-82 on ANY
+            # freq_normalize output vs 19.7-40.9 across 20 real baseline
+            # captures' native variant -- freq_normalize's resample (not
+            # pyfing) is what drives the over-regularization, and it was
+            # NEVER gated because production selection has only ever used
+            # NFIQ2/proxy, which can't see this. Confirmed via SourceAFIS on
+            # freqNorm's own real worst-case impostor pair (fcfa2e93 x
+            # 2bd4986a, visually confirmed different users): unguarded
+            # (scale floor 0.7) scored 76.39, nearly 2x SourceAFIS's ~40
+            # recommended threshold. Same 22-capture/15-pair gate used all
+            # session: floor=0.9 cuts that pair to 9.61 (floor=1.0 cuts it
+            # further but that value clamps the resample to a no-op for
+            # this population's real wavelength range, killing essentially
+            # all of freqNorm's separation gain too -- 0.9 is the real
+            # middle ground, not 1.0). Aggregate cost is real but modest:
+            # separation 29.17->24.28, while genuine-beats-impostor-max rate
+            # actually IMPROVES (2/15->3/15). See the matching margin guard
+            # below, same discipline as pyfingHybridFreqNorm's.
             _afis_variants = (
                 ('native',     dict()),
-                ('freqNorm',   dict(freq_normalize=True)),
+                ('freqNorm',   dict(freq_normalize=True, freq_scale_min=0.9)),
                 ('stack',      dict(stack=True)),
                 ('focusStack', dict(focus_stack=True)),
                 ('fuseAvg',    dict(fuse='avg')),
@@ -768,9 +788,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # 4->6). Max-of-variants, so purely additive.
                 ('fuseMaxc',   dict(fuse='maxc')),
                 ('fuseSoft',   dict(fuse='soft')),
-                ('mosaicFreq', dict(mosaic=True, freq_normalize=True)),
-                ('deepFuse',   dict(fuse='deep', freq_normalize=True)),
-                ('deepMaxc',   dict(fuse='deepMaxc', freq_normalize=True)),
+                ('mosaicFreq', dict(mosaic=True, freq_normalize=True, freq_scale_min=0.9)),
+                ('deepFuse',   dict(fuse='deep', freq_normalize=True, freq_scale_min=0.9)),
+                ('deepMaxc',   dict(fuse='deepMaxc', freq_normalize=True, freq_scale_min=0.9)),
                 # pyfing (SNFEN, pretrained neural enhancement) as an
                 # alternative to the classical Gabor bank -- self-skips
                 # (falls back to Gabor) if the pyfing_service sidecar isn't
@@ -914,6 +934,21 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # in this loop: can only withhold a variant from winning, never
             # invent a worse result than the best already found.
             _PYFING_HYBRID_MARGIN_REQUIRED = 5.0
+
+            # freqNorm-family risk guard (2026-08-07) -- see this variant
+            # group's own comment in _afis_variants above for the real
+            # evidence. Same unconditional-margin pattern as the pyfing
+            # guard above (no cheap per-request signal predicts this
+            # failure mode either), lower margin than pyfing's 5.0: this
+            # family's own real risk reduction from the freq_scale_min
+            # tune (64.30 -> 56.05 on freqNorm's worst pair) was smaller
+            # than pyfing's (150.58 -> 76.11), and these are established,
+            # frequently-winning production variants (unlike the brand-new
+            # pyfingHybridFreqNorm) -- a large margin would suppress them
+            # on a meaningful fraction of otherwise-good real captures.
+            # 3.0 matches the existing fusion-sharpness guard's own margin.
+            _FREQNORM_RISK_VARIANT_NAMES = {'freqNorm', 'mosaicFreq', 'deepFuse', 'deepMaxc'}
+            _FREQNORM_RISK_MARGIN_REQUIRED = 3.0
             try:
                 # front_only_v1 can supply [None] (no ambient/flash frame was
                 # uploaded) -- a one-element list is still truthy, so `if
@@ -1002,6 +1037,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         'AFIS variant %s suppressed by pyfing false-match guard '
                         '(needed >= native(%.1f)+%.1f, got %.1f)',
                         _vname, _native_nfiq, _PYFING_HYBRID_MARGIN_REQUIRED, _s)
+                    continue
+                if (_vname in _FREQNORM_RISK_VARIANT_NAMES and _native_nfiq is not None
+                        and _s < _native_nfiq + _FREQNORM_RISK_MARGIN_REQUIRED):
+                    logger.info(
+                        'AFIS variant %s suppressed by freqNorm false-match guard '
+                        '(needed >= native(%.1f)+%.1f, got %.1f)',
+                        _vname, _native_nfiq, _FREQNORM_RISK_MARGIN_REQUIRED, _s)
                     continue
                 if _s > afis_nfiq:
                     afis_nfiq = _s
