@@ -1613,19 +1613,48 @@ def _nns_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
     except ImportError:
         return None
 
-    if (mask > 0).sum() < 200:
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+
+    # SCALE: enhancement_pipeline.enhance() hard-resizes whatever it is given
+    # to 512x512. Handed a full ~3200px frame whose pad occupies only ~900px,
+    # the pad lands small enough that the dominant periodicity the net locks
+    # onto is background / finger-edge structure rather than ridges -- measured
+    # on a real capture with the unclipped estimator: pad at native res 15.0px,
+    # but full-frame-resized-to-512 reads 29.0px, and the NNS OUTPUT from that
+    # input also reads 29.0px (which is exactly what thick, merged, blobby
+    # ridges look like). Cropping to the pad first restores it: the same
+    # capture reads 16.5px in, 16.0px out. So crop -- but crop RECTANGULARLY,
+    # to REAL surrounding image content, with NO neutral fill: the fill is
+    # what the original version of this function got wrong (a hard edge
+    # between content and flat grey, which this net -- never trained on
+    # masked input -- rings on, producing concentric halo artefacts; 5/5 real
+    # captures scored worse that way, mean real NFIQ2 21.9 vs 32.5). Margin is
+    # ~30% of the pad's own bbox: enough real context for the net's internal
+    # CLAHE/segmentation, while the pad still dominates the 512x512 budget.
+    y0r, y1r, x0r, x1r = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    mh = max(8, int(0.30 * (y1r - y0r)))
+    mw = max(8, int(0.30 * (x1r - x0r)))
+    y0, y1 = max(0, y0r - mh), min(g8.shape[0], y1r + mh)
+    x0, x1 = max(0, x0r - mw), min(g8.shape[1], x1r + mw)
+    crop = g8[y0:y1, x0:x1]
+    if crop.shape[0] < 32 or crop.shape[1] < 32:
         return None
 
     try:
-        enhanced_full, _params = enhancement_pipeline.enhance(g8, sfm_coverage=1.0)
+        enhanced_crop, _params = enhancement_pipeline.enhance(crop, sfm_coverage=1.0)
     except Exception as e:   # noqa: BLE001 -- must never block the pipeline
         logger.warning('NNS denoise pre-pass failed (non-critical): %s', e)
         return None
-    if enhanced_full is None:
+    if enhanced_crop is None:
         return None
-    if enhanced_full.shape != g8.shape:
-        enhanced_full = cv2.resize(enhanced_full, (g8.shape[1], g8.shape[0]),
+    if enhanced_crop.shape != crop.shape:
+        enhanced_crop = cv2.resize(enhanced_crop, (crop.shape[1], crop.shape[0]),
                                    interpolation=cv2.INTER_CUBIC)
+
+    enhanced_full = g8.copy()
+    enhanced_full[y0:y1, x0:x1] = enhanced_crop
 
     mask_f = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
     bg = np.full_like(enhanced_full, 245)

@@ -933,6 +933,24 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # stays the real backstop. Same guarantee as every other guard
             # in this loop: can only withhold a variant from winning, never
             # invent a worse result than the best already found.
+            # nnsHybrid joins this guard 2026-08-07. Its _nns_denoise input
+            # bug was fixed the same day (pre-mask ringing + the 512-resize
+            # scale collapse), which took it from rarely-functional to a real
+            # contender: mean real NFIQ2 on 5 real captures went ~broken ->
+            # 51.0 -> 57.8, high enough to actually WIN selection now. But
+            # every NNS-based variant measured against the real SourceAFIS
+            # gate this session came in BELOW the pyfingHybridFreqNorm
+            # baseline on separation (NNS+Gabor at 1.3x crop: 28.28, at 1.6x:
+            # 20.57, vs baseline 39.02) while matching or beating it on
+            # NFIQ2 -- the exact "high NFIQ2 hides worse matchability"
+            # pattern that showed up five separate times this session. The
+            # specific nnsHybrid config has NOT itself been SourceAFIS-gated
+            # yet, so this margin is PRECAUTIONARY, not measured: it stops a
+            # newly-strong-on-NFIQ2 neural variant from quietly displacing a
+            # more matchable one before that measurement exists. Revisit
+            # (and drop the margin if warranted) once nnsHybrid has its own
+            # real genuine/impostor numbers.
+            _NEURAL_GUARDED_VARIANT_NAMES = {'pyfingHybridFreqNorm', 'nnsHybrid'}
             _PYFING_HYBRID_MARGIN_REQUIRED = 5.0
 
             # freqNorm-family risk guard (2026-08-07) -- see this variant
@@ -1031,10 +1049,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _vname, (_amb_lap / _fl_lap) if _fl_lap else 0.0,
                         _native_nfiq, _FUSION_MARGIN_REQUIRED, _s)
                     continue
-                if (_vname == 'pyfingHybridFreqNorm' and _native_nfiq is not None
+                if (_vname in _NEURAL_GUARDED_VARIANT_NAMES and _native_nfiq is not None
                         and _s < _native_nfiq + _PYFING_HYBRID_MARGIN_REQUIRED):
                     logger.info(
-                        'AFIS variant %s suppressed by pyfing false-match guard '
+                        'AFIS variant %s suppressed by neural-enhancer false-match guard '
                         '(needed >= native(%.1f)+%.1f, got %.1f)',
                         _vname, _native_nfiq, _PYFING_HYBRID_MARGIN_REQUIRED, _s)
                     continue
