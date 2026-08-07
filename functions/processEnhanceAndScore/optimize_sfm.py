@@ -332,7 +332,7 @@ def run_sfm_config(
     imgs, angles = frames_to_list(frames_dict)
 
     try:
-        unwrapped, coverage, _, diag = sfm_pipeline.reconstruct_and_unwrap(
+        unwrapped, coverage, _, diag, _ = sfm_pipeline.reconstruct_and_unwrap(
             imgs,
             angles_deg=angles,
             sfm_config=sfm_cfg,

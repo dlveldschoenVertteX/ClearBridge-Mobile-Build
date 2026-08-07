@@ -538,7 +538,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             if is_front_only:
                 raise CaptureQualityError('front_only_v1: single-frame AFIS only, no SfM')
             sfm_cfg = {'out_theta_deg': osc_theta_deg} if osc_theta_deg is not None else None
-            unwrapped, sfm_coverage, sfm_refined_angles, sfm_diagnostics = (
+            unwrapped, sfm_coverage, sfm_refined_angles, sfm_diagnostics, sfm_valid_mask = (
                 sfm_pipeline.reconstruct_and_unwrap(
                     frames, angles_deg=angles_for_sfm, max_angle_gap_deg=gap_limit,
                     thumb_width_fraction=thumb_width_fraction,
@@ -547,6 +547,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     sfm_config=sfm_cfg,
                 )
             )
+            # Same gap-fill periphery this project already found causes ridge-
+            # filter ringing when fed to enhancement unmasked (see the
+            # single-frame fallback's own fallback_mask below) — a successful
+            # multi-frame reconstruction has exactly the same defect and never
+            # got the same treatment until now. Reuse fallback_mask as the
+            # carrier so the one compositing block below covers both paths.
+            fallback_mask = (sfm_valid_mask.astype(np.uint8) * 255) if not sfm_valid_mask.all() else None
             if is_oscillating:
                 sfm_status = 'success_oscillating'
             elif is_arc:
@@ -642,9 +649,12 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         unwrapped_d = cv2.bilateralFilter(unwrapped, d=5, sigmaColor=20, sigmaSpace=20)
         enhanced, enhancement_params = enhancement_pipeline.enhance(unwrapped_d, sfm_coverage=sfm_coverage)
         if fallback_mask is not None and 0.0 < sfm_coverage < 1.0:
-            # Composite the background out now that ridge filtering is done,
-            # with a feathered edge (not a hard cut) so no new ringing gets
-            # introduced at this stage either.
+            # Composite the background/gap-filled periphery out now that ridge
+            # filtering is done, with a feathered edge (not a hard cut) so no
+            # new ringing gets introduced at this stage either. Covers BOTH the
+            # single-frame fallback's own segmentation mask and a successful
+            # multi-frame SfM reconstruction's gap-fill mask (sfm_valid_mask,
+            # set above) — the same class of defect, same fix, two sources.
             mask_rs = cv2.resize(fallback_mask, (enhanced.shape[1], enhanced.shape[0]),
                                   interpolation=cv2.INTER_NEAREST)
             mask_f  = cv2.GaussianBlur(mask_rs, (31, 31), 0).astype(np.float32) / 255.0

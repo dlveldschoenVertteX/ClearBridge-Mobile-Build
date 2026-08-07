@@ -221,7 +221,7 @@ def _get_unwrapped(capture: dict, bkt, cache_dir: Path) -> Optional[np.ndarray]:
     gap_limit = 185.0 if len(frames) == 3 else None
 
     try:
-        unwrapped, _, _, _ = sfm_pipeline.reconstruct_and_unwrap(
+        unwrapped, _, _, _, _ = sfm_pipeline.reconstruct_and_unwrap(
             frames, angles_deg=actual_angles,
             max_angle_gap_deg=gap_limit,
             thumb_width_fraction=thumb_width_fraction,

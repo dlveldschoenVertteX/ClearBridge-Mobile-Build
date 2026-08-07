@@ -157,7 +157,7 @@ def reconstruct_and_unwrap(
     ambient_frames: Optional[List[Optional[np.ndarray]]] = None,
     flash_frames: Optional[List[Optional[np.ndarray]]] = None,
     frame_weights: Optional[List[float]] = None,
-) -> Tuple[np.ndarray, float, List[float], dict]:
+) -> Tuple[np.ndarray, float, List[float], dict, np.ndarray]:
     """
     Project each view onto a virtual cylinder and return the cylindrical
     superprint of the fingerprint-bearing surface.
@@ -194,12 +194,18 @@ def reconstruct_and_unwrap(
 
     Returns
     -------
-    (texture, coverage, refined_angles_deg, diagnostics)
+    (texture, coverage, refined_angles_deg, diagnostics, valid_mask)
       texture is a square uint8 grayscale cylindrical map;
       coverage is the fraction [0, 1] of the output texture that was populated;
       refined_angles_deg are the per-frame angles actually used (after phase
       correlation refinement, or the input angles if refinement was skipped);
-      diagnostics is a dict of internal SfM metrics for Firestore logging.
+      diagnostics is a dict of internal SfM metrics for Firestore logging;
+      valid_mask is a bool array, same shape as texture, True where a real
+      camera-covered texel landed (False where _fill_gaps synthesised the
+      value) — NOT Firestore-safe, caller's responsibility, mirrors the
+      single-frame fallback path's own `fallback_mask` so the same
+      composite-after-enhancement treatment can be applied to a successful
+      multi-frame reconstruction too.
     Raises CaptureQualityError on failure.
     """
     if angles_deg is None:
@@ -462,7 +468,7 @@ def reconstruct_and_unwrap(
         'texelsFilled':   int(texels_filled),
     }
 
-    return np.clip(result, 0, 255).astype(np.uint8), covered, refined_deg, diagnostics
+    return np.clip(result, 0, 255).astype(np.uint8), covered, refined_deg, diagnostics, valid
 
 
 # ─────────────────────────────────────────────────────────────────────────────
