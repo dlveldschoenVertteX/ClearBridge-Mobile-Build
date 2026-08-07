@@ -1638,6 +1638,7 @@ def generate(
     gabor_sigma_ratio: Optional[float] = None,
     gabor_gamma: Optional[float] = None,
     mirror: bool = False,
+    pyfing_blend: float = 1.0,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -1699,6 +1700,25 @@ def generate(
                      signal at their current first-guess thresholds; they need
                      the paired dataset to tune before they can win, so they
                      stay unwired for now. gaborPyfingField not yet measured.
+    pyfing_blend   : enhance='pyfingHybrid' only -- alpha-blend pyfing's
+                     denoised output with the pre-denoise image before the
+                     Gabor bank runs (1.0 = pure pyfing output, the only
+                     behaviour this ever had before 2026-08-07; lower values
+                     retain more original fine detail). RESEARCH LEVER, not
+                     yet validated: pyfingHybrid+freq_normalize's real
+                     SourceAFIS gate (22 captures, 15 genuine pairs) found
+                     the best raw genuine-vs-impostor separation of any
+                     variant tried this session, but also the worst false-
+                     match spike (one impostor pair scored ~4x SourceAFIS's
+                     own recommended threshold) -- visually confirmed as
+                     generic, boundary-driven ridge structure shared between
+                     two different real users, the same over-synthesis
+                     failure this module's own gaborPyfingField finding
+                     already documented. Blending back toward the original
+                     is a plausible way to keep pyfing's continuity repair
+                     while diluting its tendency to invent generic structure
+                     where the true signal is weak -- untested until swept
+                     against the same gate.
     stack_cache    : optional caller-owned dict, reused across repeated calls
                      within ONE request (e.g. main.py's max-of-variants loop
                      calling generate() once per fuse mode) to avoid redoing
@@ -2201,6 +2221,12 @@ def generate(
         # conventions aren't interchangeable via a simple invert.
         denoised = _pyfing_denoise(g8, mask, wl)
         if denoised is not None:
+            if pyfing_blend < 1.0:
+                alpha = float(np.clip(pyfing_blend, 0.0, 1.0))
+                denoised = cv2.addWeighted(
+                    denoised.astype(np.float32), alpha,
+                    g8.astype(np.float32), 1.0 - alpha, 0.0
+                ).astype(np.uint8)
             norm = _normalize(denoised)
             orient = _orientation_field(norm)
             enh = _gabor_enhance(norm, orient, wl)

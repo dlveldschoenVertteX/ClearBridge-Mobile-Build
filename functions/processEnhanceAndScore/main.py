@@ -788,6 +788,32 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # does the final black-ridge/white-background conversion,
                 # instead of a raw intensity invert of pyfing's output.
                 ('pyfingHybrid', dict(enhance='pyfingHybrid')),
+                # pyfingHybrid + freq_normalize -- 2026-08-07. pyfingHybrid
+                # was NEVER called with freq_normalize=True in production:
+                # pyfing was always denoising at native (often too-close,
+                # too-coarse) resolution before this module's own Gabor bank
+                # got a chance to run at its tuned ~9px sweet spot. Checked
+                # the scale math doesn't double-resample (_pyfing_denoise's
+                # own internal 500dpi rescale is undone before it returns,
+                # so freq_normalize's resample is the only one that survives
+                # into the Gabor stage) before trying this combination.
+                #
+                # Real result, 22-capture / 15-genuine-pair SourceAFIS gate
+                # (scratchpad, not committed): genuine mean 57.49 vs ~30-40
+                # for every other candidate tried the same night -- the best
+                # raw separation found all session. But ALSO the worst
+                # impostor false-match spike found all session: 150.58,
+                # nearly 4x SourceAFIS's own documented ~40 "recommended
+                # threshold" -- and NOT a fluke. Pulled the actual pair
+                # (two different real users) and visually confirmed both
+                # prints share a suspiciously generic, boundary-driven ridge
+                # flow near the core, consistent with this project's already
+                # -documented `gaborPyfingField` failure mode: a neural
+                # front-end can win on visual/NFIQ2 quality by synthesizing
+                # plausible-but-generic structure instead of preserving
+                # person-specific minutiae. Gated below, same discipline as
+                # the fusion-selection sharpness guard.
+                ('pyfingHybridFreqNorm', dict(enhance='pyfingHybrid', freq_normalize=True)),
                 # Coherence-enhancing diffusion (oriented smoothing along
                 # ridge direction, classical, no sidecar dependency) as a
                 # denoise pre-pass ahead of the same Gabor+binarize chain --
@@ -845,6 +871,20 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _FUSION_VARIANT_NAMES = {'fuseAvg', 'fuseMaxc', 'fuseSoft', 'deepFuse', 'deepMaxc'}
             _SHARPNESS_RATIO_GUARD = 4.0
             _FUSION_MARGIN_REQUIRED = 3.0
+
+            # pyfingHybridFreqNorm guard (2026-08-07) -- see the variant's own
+            # comment above for the real SourceAFIS evidence. UNLIKE the fusion
+            # guard above, this is not conditional on a raw-signal trigger --
+            # there is no cheap per-request signal available that predicts the
+            # over-regularization failure mode found (it showed up on a normal-
+            # looking capture, not an unusually soft/blown-out one), so the
+            # margin applies every time this variant is even considered. Higher
+            # than the fusion guard's 3.0 given the worse real evidence: a
+            # near-4x-recommended-threshold false-match spike, not just a
+            # proxy-overestimate. Same guarantee as every other guard in this
+            # loop: can only withhold a variant from winning, never invent a
+            # worse result than the best already found.
+            _PYFING_HYBRID_MARGIN_REQUIRED = 5.0
             try:
                 # front_only_v1 can supply [None] (no ambient/flash frame was
                 # uploaded) -- a one-element list is still truthy, so `if
@@ -926,6 +966,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         '(amb/fl lap ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
                         _vname, (_amb_lap / _fl_lap) if _fl_lap else 0.0,
                         _native_nfiq, _FUSION_MARGIN_REQUIRED, _s)
+                    continue
+                if (_vname == 'pyfingHybridFreqNorm' and _native_nfiq is not None
+                        and _s < _native_nfiq + _PYFING_HYBRID_MARGIN_REQUIRED):
+                    logger.info(
+                        'AFIS variant %s suppressed by pyfing false-match guard '
+                        '(needed >= native(%.1f)+%.1f, got %.1f)',
+                        _vname, _native_nfiq, _PYFING_HYBRID_MARGIN_REQUIRED, _s)
                     continue
                 if _s > afis_nfiq:
                     afis_nfiq = _s
