@@ -57,7 +57,9 @@ def ssim(x: torch.Tensor, y: torch.Tensor, win: torch.Tensor) -> torch.Tensor:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--data-root', default='data/sd302d')
+    ap.add_argument('--data-root', default='data/sd302d',
+                    help='comma-separated list of directories to mix as '
+                         'training sources, e.g. "data/sd302d,data/real_captures_cropped"')
     ap.add_argument('--out', default='runs/v1')
     ap.add_argument('--epochs', type=int, default=150)
     ap.add_argument('--batch', type=int, default=16)
@@ -74,7 +76,8 @@ def main() -> None:
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    train_paths, val_paths = make_splits(args.data_root)
+    data_roots = [r.strip() for r in args.data_root.split(',') if r.strip()]
+    train_paths, val_paths = make_splits(data_roots)
     print(f'train prints={len(train_paths)} val prints={len(val_paths)} '
           f'data_root={args.data_root} device={dev}')
     train_ds = CurriculumRestoreDataset(train_paths, augment=True)

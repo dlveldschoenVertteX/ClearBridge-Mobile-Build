@@ -20,15 +20,29 @@ from degrade import degrade
 _SIZE = 384
 
 
-def make_splits(data_root: str, val_frac: float = 0.15, seed: int = 0
+def make_splits(data_root, val_frac: float = 0.15, seed: int = 0
                 ) -> Tuple[List[str], List[str]]:
-    paths = sorted(str(p) for p in Path(data_root).glob('*.png'))
-    if not paths:
-        raise RuntimeError(f'no .png prints found under {data_root}')
-    rng = random.Random(seed)
-    rng.shuffle(paths)
-    n_val = max(1, int(len(paths) * val_frac))
-    return paths[n_val:], paths[:n_val]
+    """`data_root` may be a single directory or a list of directories --
+    the latter mixes multiple source domains into one training pool (e.g.
+    clean SD302 scans + real project-capture crops, added 2026-08-08 to
+    close the real generalization gap a SD302-only model showed on actual
+    fingerphoto content). Each source directory's own split is computed
+    independently then concatenated, so a small source (59 real captures)
+    can't have its few val examples swamped by a big source's (300 SD302)
+    much larger one, and so both sources contribute real train+val
+    coverage rather than one dominating by sheer count."""
+    roots = [data_root] if isinstance(data_root, (str, Path)) else list(data_root)
+    train_all, val_all = [], []
+    for root in roots:
+        paths = sorted(str(p) for p in Path(root).glob('*.png'))
+        if not paths:
+            raise RuntimeError(f'no .png prints found under {root}')
+        rng = random.Random(seed)
+        rng.shuffle(paths)
+        n_val = max(1, int(len(paths) * val_frac))
+        val_all.extend(paths[:n_val])
+        train_all.extend(paths[n_val:])
+    return train_all, val_all
 
 
 def _load_clean(path: str) -> np.ndarray:
