@@ -27,6 +27,12 @@ def main() -> int:
     ap.add_argument('--epochs', type=int, default=150)
     ap.add_argument('--batch', type=int, default=16)
     ap.add_argument('--curriculum-epochs', type=int, default=60)
+    ap.add_argument('--data-root-subdirs', default=None,
+                    help='comma-separated subdirectory names under the '
+                         'mounted images channel to mix as training '
+                         'sources, e.g. "sd302d,real_captures_cropped" -- '
+                         'omit to use the channel root directly (single '
+                         'source, matches v1)')
     ap.add_argument('--job-name', default='ridge-restore-curriculum-v1')
     ap.add_argument('--go', action='store_true')
     args = ap.parse_args()
@@ -61,7 +67,11 @@ def main() -> int:
         framework_version='2.3',
         py_version='py311',
         hyperparameters={
-            'data-root': '/opt/ml/input/data/images',
+            'data-root': (
+                ','.join(f'/opt/ml/input/data/images/{s.strip()}'
+                         for s in args.data_root_subdirs.split(','))
+                if args.data_root_subdirs else '/opt/ml/input/data/images'
+            ),
             'epochs': args.epochs,
             'batch': args.batch,
             'curriculum-epochs': args.curriculum_epochs,
