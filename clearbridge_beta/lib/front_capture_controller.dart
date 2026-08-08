@@ -385,7 +385,12 @@ class FrontCaptureController extends ChangeNotifier {
   // the duration by the same factor keeps the guide's on-screen VELOCITY
   // (and therefore how rushed it feels) unchanged even though the distance
   // covered is much greater.
-  static const int _sweepZoneMoveMs = 3100;
+  //
+  // Scaled back down 3100->1400, 2026-08-09, following _sweepGuideShiftFrac's
+  // own reversal (0.335396->0.15, ~2.24x smaller -- see that constant's own
+  // comment) -- same velocity-consistency reasoning as above, just applied in
+  // the opposite direction now that the hop distance has shrunk back down.
+  static const int _sweepZoneMoveMs = 1400;
   // Dwell after the guide stops translating, before the shutter fires --
   // real settle time for the user to finish repositioning their thumb at
   // the new zone, same role as the secondary-camera distance-sweep's own
@@ -398,18 +403,27 @@ class FrontCaptureController extends ChangeNotifier {
   // must not block the rest of the capture forever the way an uncaught-hang
   // camera Future would (try/catch alone does not protect against that --
   // same reasoning as every other bounded camera sequence in this file).
-  // Budget: 2 moves (2*3100=6200) + left settle (700) + 2 full count-ins
-  // (2*3*700=4200) + 6 shots -- ambient+flash PER zone now, not 1 shot per
-  // zone (2026-08-05, see the real blowout fix at the flash-activation call
-  // site) -- at ~500-2000ms each in practice (more with torch AE
-  // convergence), plus 2 flash-settle delays per zone (on+off) + margin.
-  // Widened 18000->24000 once center/right zones each gained their own
-  // 3-tick count-in (2026-08-03), 24000->28000 when _sweepZoneMoveMs grew
+  // Budget (as originally sized): 2 moves (2*3100=6200) + left settle (700)
+  // + 2 full count-ins (2*3*700=4200) + 6 shots -- ambient+flash PER zone
+  // now, not 1 shot per zone (2026-08-05, see the real blowout fix at the
+  // flash-activation call site) -- at ~500-2000ms each in practice (more
+  // with torch AE convergence), plus 2 flash-settle delays per zone (on+off)
+  // + margin. Widened 18000->24000 once center/right zones each gained their
+  // own 3-tick count-in (2026-08-03), 24000->28000 when _sweepZoneMoveMs grew
   // 1400->3100 for the wider edge-to-edge travel, then 28000->34000 for the
   // doubled shot count -- real observed per-zone timings before this round
   // (7 real captures' zoneDebug) stayed well inside 28000 with ~10s to
   // spare, so the extra 3 shots' worst-case cost (~2000ms each) fits with
   // real margin still intact.
+  //
+  // _sweepZoneMoveMs shrank back 3100->1400 (2026-08-09, see that constant's
+  // own comment) -- the move-time component of this budget drops to
+  // 2*1400=2800, freeing ~2700ms of extra real margin against an unchanged
+  // timeout ceiling below. Left as-is rather than tightened: real margin is
+  // strictly safer than before, and this project's own AF-timing findings
+  // this same session (real device waits routinely running 2-2.5x past
+  // their own nominal bound) are a live reason not to shave capture-side
+  // timeout headroom on the strength of a still-device-unverified change.
   static const int _sweepBurstTimeoutMs = 34000;
   // Bound the per-zone decode+encode and upload steps separately from the
   // capture loop above -- these run AFTER the shots are already in hand, so
@@ -604,9 +618,40 @@ class FrontCaptureController extends ChangeNotifier {
   // Dart (confirmed by a real build failure: "Error: Not a constant
   // expression" / "The property 'rx' can't be accessed... in a constant
   // expression"), so this has to be a hand-computed literal instead, same
-  // as _scoreRoi. Derivation: 0.5 - rx(0.134604) - margin(0.03) = 0.335396.
-  // If defaultShape.rx is ever re-tuned, this must be recomputed by hand.
-  static const double _sweepGuideShiftFrac = 0.335396;
+  // as _scoreRoi. Original derivation: 0.5 - rx(0.134604) - margin(0.03) =
+  // 0.335396.
+  //
+  // SHRUNK 0.335396 -> 0.15, 2026-08-09, superseding the 2026-08-03 max-
+  // spacing rationale above. Real data from a same-day sweep-burst-
+  // standalone capture (6cda7689) traced why `_front_anchored_mosaic_zones`
+  // (afis_print.py's classical cross-zone stitcher) failed with "mosaic
+  // registration failed": measured the ACTUAL thumb-pad position/size in
+  // each real zone still (guide geometry + direct visual inspection,
+  // corroborated by automated segmentation) and found real pad-to-pad
+  // spacing was 1.2-1.7x the pad's own diameter -- the zones share NO
+  // overlapping ridge content at all, not just weak overlap, which is
+  // exactly what starves ECC of anything to register on (confirmed: one
+  // side's homography solve doesn't converge at all, the other "succeeds"
+  // but its post-warp correlation against the anchor is ~0.01, correctly
+  // rejected by the existing 0.45 guard). Reliable stitching needs roughly
+  // 50%+ overlap; back-solving from the real measured pad size against that
+  // target gives a still-space guide-cy delta of ~0.10-0.19 depending on
+  // measurement method, which (via this capture's own real screen-shift-to-
+  // still-cy calibration) maps to a shiftFrac of roughly 0.12-0.23 -- 0.15
+  // lands in the conservative (safer, more-overlap) end of that range.
+  //
+  // The illumination-diversity goal the wide spacing was originally FOR is
+  // separately confirmed not achievable by spacing alone regardless of this
+  // value: the torch is one fixed light source rigidly mounted to the
+  // camera, so no zone spacing can produce genuine multi-directional
+  // lighting on a shared patch (see the 2026-08-08 photometric-stereo
+  // finding) -- widening this constant was never going to deliver on that
+  // original rationale, so trading it for real stitchability is a net gain,
+  // not a pure sacrifice. Not yet device-tested -- same standing discipline
+  // as every other capture-side change this project; needs a real APK
+  // build + real sweep capture to confirm the zones now actually overlap
+  // and `_front_anchored_mosaic_zones` produces a non-None mosaic.
+  static const double _sweepGuideShiftFrac = 0.15;
 
   // Guided thumb-sweep feature flag. DISABLED as of 2026-07-31 round 5
   // after five real device-test rounds each revealed a different failure
