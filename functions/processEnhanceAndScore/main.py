@@ -1060,7 +1060,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     _ci, _cp = _pair_result
                     if _ci is None:
                         continue
-                    _cr = _score_nfiq(_ci, sfm_coverage=1.0)
+                    _cr = _score_ground_truth(_ci)
                     _cs = _cr.get('nfiq_score', 0.0) if not _cr.get('error') else 0.0
                     if _cs > _s:
                         _img, _p, _s = _ci, _cp, _cs
@@ -1103,6 +1103,26 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     best_afis_img = _img
                     afis_params = {**_p, 'afisNfiq': round(_s, 2)}
 
+            # Own deadline for every candidate source below (secondary camera,
+            # sweep zones, cross-zone mosaic, minutiae patches) -- 2026-08-08,
+            # added alongside the _score_ground_truth swap above. Before that
+            # swap, none of these blocks needed a time budget: the ResNet18
+            # proxy they called was a fast local ONNX inference with no real
+            # failure-hang mode. Now every one of their scoring calls is a
+            # real HTTP round trip to the NFIQ2 sidecar (bounded per-call by
+            # _GROUND_TRUTH_SCORE_TIMEOUT_SEC, but with NO existing budget
+            # across the whole sequence of them) -- without this, a slow or
+            # degraded sidecar could let each block run to its own full
+            # per-call timeout in turn, compounding well past the request's
+            # 300s Cloud Run ceiling. A fresh deadline (not reusing
+            # _variants_deadline, which the main loop above is already
+            # allowed to consume right up to its own limit) gives these
+            # blocks their own bounded window regardless of how much the
+            # main loop used. Same "graceful early exit, never a hang"
+            # contract as _variants_deadline: skips remaining candidates,
+            # scores with whatever already won.
+            _post_variant_deadline = time.monotonic() + 90.0
+
             # Secondary-camera candidates: independent single-frame renderings
             # from any OTHER back camera the device captured alongside the main
             # sweep (see OscillatingCaptureController's best-effort secondary
@@ -1127,6 +1147,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _fl_main = (_lens_info.get('0') or {}).get('focalLengthMm')
             _secondary_cam_scores = {}
             for _cam in _cap_doc.get('secondaryCameras', []) or []:
+                if time.monotonic() > _post_variant_deadline:
+                    logger.warning('secondary camera scoring: time budget exceeded, '
+                                    'skipping remaining cameras')
+                    break
                 # 'paths' (a short per-camera burst, ranked by Laplacian
                 # variance below) is the current schema; 'path' (a single
                 # shot) is kept for backward compatibility with captures
@@ -1244,7 +1268,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     )
                     if _simg_res is None:
                         continue
-                    _sres = _score_nfiq(_simg_res, sfm_coverage=1.0)
+                    _sres = _score_ground_truth(_simg_res)
                     _ss = _sres.get('nfiq_score', 0.0) if not _sres.get('error') else 0.0
                     _secondary_cam_scores[_cam.get('name', '?')] = round(_ss, 2)
                     logger.info('AFIS variant %s nfiq=%.1f lap=%.1f', _sname, _ss, _best_lap)
@@ -1292,7 +1316,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 gabor_sigma_ratio=_IR_GABOR_SIGMA_RATIO,
                             )
                             if _ir_img is not None:
-                                _ir_res = _score_nfiq(_ir_img, sfm_coverage=1.0)
+                                _ir_res = _score_ground_truth(_ir_img)
                                 _ir_ss = (_ir_res.get('nfiq_score', 0.0)
                                           if not _ir_res.get('error') else 0.0)
                                 _ir_sname = f'{_sname}_ir_sigma'
@@ -1385,6 +1409,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # (previously blown-out) flash shot alone.
                     _zone_grays: dict = {}   # zone -> (gray, guide) for the cross-zone fusion below
                     for _zone in _sb_zone_names:
+                        if time.monotonic() > _post_variant_deadline:
+                            logger.warning('sweep zone scoring: time budget exceeded, '
+                                            'skipping remaining zones from %s onward', _zone)
+                            break
                         _zone_debug: dict = {}
                         try:
                             _amb_path = _sb_paths.get(f'{_zone}_amb')
@@ -1439,7 +1467,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 stack_cache={},
                             )
                             if _zimg_res is not None:
-                                _zres = _score_nfiq(_zimg_res, sfm_coverage=1.0)
+                                _zres = _score_ground_truth(_zimg_res)
                                 _zs = _zres.get('nfiq_score', 0.0) if not _zres.get('error') else 0.0
                                 _zone_debug['proxyScore'] = round(_zs, 2)
                                 _zname = f'sweepBurst_{_zone}'
@@ -1508,6 +1536,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # an already-failing mosaic or match the old one, never
                     # regress it.
                     try:
+                        if time.monotonic() > _post_variant_deadline:
+                            raise TimeoutError('time budget exceeded before cross-zone mosaic')
                         _mos, _mosaic_guide, _n_used = afis_print._front_anchored_mosaic_zones(_zone_grays)
                         if 'center' in _zone_grays:
                             _sides = [g for z, (g, _) in _zone_grays.items() if z != 'center']
@@ -1523,7 +1553,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                         stack_cache={},
                                     )
                                     if _mimg_res is not None:
-                                        _mres = _score_nfiq(_mimg_res, sfm_coverage=1.0)
+                                        _mres = _score_ground_truth(_mimg_res)
                                         _ms = (_mres.get('nfiq_score', 0.0)
                                                if not _mres.get('error') else 0.0)
                                         _fusion_debug['proxyScore'] = round(_ms, 2)
@@ -1549,6 +1579,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # OLD format (pre-2026-08-05 captures, bare '<zone>'
                     # keys, one flash-only shot per zone) -- untouched.
                     for _zone, _zpath in _sb_paths.items():
+                        if time.monotonic() > _post_variant_deadline:
+                            logger.warning('sweep zone scoring (old format): time budget '
+                                            'exceeded, skipping remaining zones from %s onward',
+                                            _zone)
+                            break
                         _zone_debug: dict = {'path': _zpath}
                         try:
                             _zbytes = _download_storage_file(_zpath)
@@ -1564,7 +1599,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 stack_cache={},
                             )
                             if _zimg_res is not None:
-                                _zres = _score_nfiq(_zimg_res, sfm_coverage=1.0)
+                                _zres = _score_ground_truth(_zimg_res)
                                 _zs = _zres.get('nfiq_score', 0.0) if not _zres.get('error') else 0.0
                                 _zone_debug['proxyScore'] = round(_zs, 2)
                                 _zname = f'sweepBurst_{_zone}'
@@ -1629,6 +1664,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         },
                     }
                     for _pname, _pguide in _patch_subguides.items():
+                        if time.monotonic() > _post_variant_deadline:
+                            logger.warning('minutiae patch scoring: time budget exceeded, '
+                                            'skipping remaining patches from %s onward', _pname)
+                            break
                         _pdebug: dict = {
                             'guide': {k: round(v, 4) for k, v in _pguide.items()
                                       if isinstance(v, (int, float))}
@@ -1647,7 +1686,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 stack_cache=_stack_cache,
                             )
                             if _pimg is not None:
-                                _pres = _score_nfiq(_pimg, sfm_coverage=1.0)
+                                _pres = _score_ground_truth(_pimg)
                                 _ps = (_pres.get('nfiq_score', 0.0)
                                        if not _pres.get('error') else 0.0)
                                 _pdebug['proxyScore'] = round(_ps, 2)
@@ -2796,6 +2835,60 @@ def _call_with_hard_deadline(fn, *args, timeout_sec: float, **kwargs):
         return None
     finally:
         ex.shutdown(wait=False)
+
+
+_GROUND_TRUTH_SCORE_TIMEOUT_SEC = 12.0  # nfiq2_client's own requests timeout
+# is 10s; this adds a small buffer since the ID-token fetch ahead of the
+# HTTP request has no timeout of its own -- same defense-in-depth reasoning
+# as _call_with_hard_deadline's own docstring (a library's advertised
+# timeout does not always cover every step before the bounded call starts).
+
+
+def _score_ground_truth(image: np.ndarray, sfm_coverage: float = 1.0) -> dict:
+    """AFIS candidate-selection scorer. CTO directive 2026-08-08: the local
+    ResNet18 proxy (_score_nfiq, a six-way TTA ensemble trained to
+    APPROXIMATE NFIQ2) is not ground truth and must not drive which AFIS
+    candidate wins. Real evidence from this exact session: capture
+    14674391's fuseSoft variant scored real NFIQ2 84 -- 12 points above the
+    72 that was actually delivered -- because the proxy-driven selection
+    loop picked a different, lower-scoring candidate. Every AFIS-path
+    candidate (main variant loop, secondary camera, IR second-pass, sweep
+    zones, cross-zone mosaic, minutiae patches) now scores directly against
+    the real NIST NFIQ2 sidecar (nfiq2_client.score_nfiq2) instead.
+
+    `sfm_coverage` is accepted for call-site compatibility with the old
+    _score_nfiq signature but unused: every AFIS-path call site already
+    passed sfm_coverage=1.0, which made _score_nfiq's own coverage-aware
+    crop a guaranteed no-op there (crop_frac = min(1.0, max(0.75,
+    1.0**0.5+0.05)) = 1.0 -- crop never fires) -- so dropping it here changes
+    nothing about what gets scored.
+
+    Same {'nfiq_score': float, 'error': str|None} contract the old
+    call sites already unpack, so every surrounding guard/threshold/margin
+    check is untouched. No 'best_image' key: that was the proxy's own
+    six-way TTA pre-processing pick, a proxy-only mechanism no AFIS-path
+    caller ever reads (confirmed: only the non-AFIS cylindrical/NNS path,
+    which still uses the original _score_nfiq unchanged, reads it).
+
+    Wrapped in _call_with_hard_deadline for the same reason that function
+    now exists at all: this is a real HTTP call inside a tight per-
+    candidate loop (main.py, same day this function was added to fix a
+    live stuck capture from an analogous unbounded-call gap), and
+    nfiq2_client's own 10s `requests` timeout does not cover the ID-token
+    fetch that happens before the request is even sent.
+
+    Never raises: on any failure (sidecar not configured, timeout,
+    unreachable, bad response) this returns a 0-scoring result, same
+    "an optional signal going missing can only cost that one candidate its
+    shot at winning, never block the request" contract as score_nfiq2()
+    itself and every other candidate source in this file.
+    """
+    score = _call_with_hard_deadline(
+        nfiq2_client.score_nfiq2, image,
+        timeout_sec=_GROUND_TRUTH_SCORE_TIMEOUT_SEC)
+    if score is None:
+        return {'nfiq_score': 0.0, 'error': 'nfiq2 ground truth unavailable'}
+    return {'nfiq_score': float(score), 'error': None}
 
 
 # ── Extended Henry Classification ─────────────────────────────────────────────
