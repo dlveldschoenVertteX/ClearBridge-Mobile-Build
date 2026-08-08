@@ -40,6 +40,12 @@ ml/**/dataset/
 ml/**/runs/
 ml/**/*.onnx
 ml/**/*.pt
+# mosaic_register/data holds real user capture-derived print images (pulled
+# from Firestore/Storage as its training corpus), not named "dataset/" but
+# the exact same real-biometric-image risk the comment above describes.
+ml/mosaic_register/data/
+ml/mosaic_register/*.log
+ml/mosaic_register/manifest.json
 
 # Session scratchpad -- experiments, harness runs, raw design-tool exports,
 # any working files that shouldn't end up in the deployed repo. This project
