@@ -2621,6 +2621,83 @@ class FrontCaptureController extends ChangeNotifier {
     _apply((s) => s.copyWith(phase: FrontCapturePhase.uploading, uploadProgress: 0), force: true);
   }
 
+  /// Real-motion check between two sweep-burst zone shots -- built to
+  /// answer a question raised by real backend data (2026-08-08): the
+  /// backend's cross-zone mosaic fusion has been failing/underperforming on
+  /// real captures, and a direct pixel comparison of real uploaded zone
+  /// stills (2 real captures) found the left/center/right shots showing the
+  /// SAME core/whorl feature in nearly the same on-screen position --
+  /// phase-correlation offset only ~10-50px on a ~450-550px crop, with a
+  /// weak/noisy correlation response (0.003-0.15, where ~1.0 is a
+  /// confident single dominant shift). The guide's on-screen position
+  /// animates and the countdown/settle timing is fixed, but nothing has
+  /// ever confirmed the user's actual thumb followed it -- unlike every
+  /// other position-dependent capture in this file (focus convergence,
+  /// distance zones), which measure before firing.
+  ///
+  /// Deliberately does NOT reuse the live camera stream for this check.
+  /// This project hit a real ANR (2026-07-30, "app isn't responding") from
+  /// repeatedly restarting `startImageStream` during an earlier sweep
+  /// design, root-caused to camera-session contention between ImageAnalysis
+  /// and ImageCapture -- the fix was the current stream-off, timer-only
+  /// design `_captureSweepBurst` still uses. Reopening the stream mid-loop
+  /// to re-check position would risk reintroducing exactly that failure
+  /// category. Instead this compares the ALREADY-CAPTURED still JPEGs
+  /// directly -- `decodeStillJpegToLuma` is a pure `dart:ui` image decode,
+  /// not a camera-session operation, so it carries none of that risk.
+  ///
+  /// Decodes both JPEGs at a small target width (cheap: tens of ms, not the
+  /// ~2048px decode the real upload path uses) and returns a normalized
+  /// cross-correlation in [-1, 1] -- ~1.0 means near-duplicate framing,
+  /// well below that means the content genuinely differs. Returns null on
+  /// any decode failure or dimension mismatch (caller treats that as "can't
+  /// tell", never blocks the sweep on it).
+  Future<double?> _zoneFramingSimilarity(Uint8List a, Uint8List b) async {
+    try {
+      final da = await decodeStillJpegToLuma(a, _sensorOrientation, targetWidth: 80);
+      final db = await decodeStillJpegToLuma(b, _sensorOrientation, targetWidth: 80);
+      if (da == null || db == null) return null;
+      if (da.width != db.width || da.height != db.height) return null;
+      final n = da.luma.length;
+      if (n == 0) return null;
+      double sumA = 0, sumB = 0;
+      for (var i = 0; i < n; i++) {
+        sumA += da.luma[i];
+        sumB += db.luma[i];
+      }
+      final meanA = sumA / n, meanB = sumB / n;
+      double cov = 0, varA = 0, varB = 0;
+      for (var i = 0; i < n; i++) {
+        final da_ = da.luma[i] - meanA;
+        final db_ = db.luma[i] - meanB;
+        cov += da_ * db_;
+        varA += da_ * da_;
+        varB += db_ * db_;
+      }
+      final denom = math.sqrt(varA * varB);
+      if (denom < 1e-6) return null;
+      return (cov / denom).clamp(-1.0, 1.0);
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Threshold above which two zones' flash shots are treated as
+  // "essentially unchanged" -- the user very likely didn't reposition.
+  // FIRST-CUT VALUE, not yet validated against real device data: chosen
+  // conservatively high (only flags genuinely near-duplicate framing) so
+  // this can't false-positive on a real, modest repositioning and force an
+  // unnecessary extra wait. The next real device test's own
+  // `zoneFramingSimilarity` diagnostics (recorded regardless of whether
+  // this threshold trips) are the real tuning signal -- same "measure
+  // first" discipline as every other first-cut threshold in this file.
+  static const double _sweepZoneSimilarityThreshold = 0.90;
+  // Extra move-animation time granted to the NEXT zone transition when the
+  // PREVIOUS one came back too similar -- bounded (one extension per
+  // transition, not a retry loop) so this can only ever add a fixed, known
+  // amount of latency, never hang.
+  static const int _sweepExtraMoveMs = 1800;
+
   Future<Map<String, dynamic>> _captureSweepBurst(
     String basePath,
     double tipAngleDeg,
@@ -2708,6 +2785,11 @@ class FrontCaptureController extends ChangeNotifier {
         // first ends on its own flash shot, so this fires between every
         // zone boundary except before zone 0's first ambient shot.
         var wasFlashLastShot = false;
+        // Previous zone's flash JPEG + framing-similarity diagnostics --
+        // see _zoneFramingSimilarity's own docstring for why this compares
+        // already-captured stills instead of touching the live stream.
+        Uint8List? prevZoneFlashBytes;
+        var extraMoveMs = 0;
 
         for (var i = 0; i < zones.length; i++) {
           final zone = zones[i].key;
@@ -2725,17 +2807,28 @@ class FrontCaptureController extends ChangeNotifier {
             // time for the user's eye + thumb to track the motion, same
             // reasoning as the video version's continuous translation, now
             // paced per-hop instead of over one long continuous window.
+            // Widened by extraMoveMs (bounded, one-shot) when the PREVIOUS
+            // zone transition's framing-similarity check came back too high
+            // -- see _zoneFramingSimilarity/_sweepZoneSimilarityThreshold.
             final fromProgress = zones[i - 1].value;
+            final moveMs = _sweepZoneMoveMs + extraMoveMs;
+            final grantedExtra = extraMoveMs > 0;
+            if (grantedExtra) {
+              zoneDebug['${zone}_extraMoveMsGranted'] = extraMoveMs;
+              extraMoveMs = 0;
+            }
             _apply((s) => s.copyWith(
-                  distanceHint: zone == 'right'
-                      ? 'Slowly move right'
-                      : 'Slowly move to the middle',
+                  distanceHint: grantedExtra
+                      ? 'Move further this time'
+                      : (zone == 'right'
+                          ? 'Slowly move right'
+                          : 'Slowly move to the middle'),
                 ));
             final moveStart = DateTime.now();
             while (true) {
               final elapsedMs =
                   DateTime.now().difference(moveStart).inMilliseconds;
-              final t = (elapsedMs / _sweepZoneMoveMs).clamp(0.0, 1.0);
+              final t = (elapsedMs / moveMs).clamp(0.0, 1.0);
               final progress = fromProgress + (target - fromProgress) * t;
               _apply((s) => s.copyWith(
                     sweepProgress: progress,
@@ -2815,6 +2908,26 @@ class FrontCaptureController extends ChangeNotifier {
             zoneDebug['${zone}_fl_error'] = e.toString();
             debugPrint('[front] sweep-burst zone $zone flash capture failed (non-blocking): $e');
           }
+
+          // Real-motion check against the PREVIOUS zone's flash shot -- see
+          // _zoneFramingSimilarity's docstring. Diagnostic-only on its own
+          // (always recorded, regardless of outcome, so the next real
+          // device test's data can validate/tune the threshold); the one
+          // corrective action it can take is granting the NEXT zone
+          // transition extra move time (bounded, see extraMoveMs above).
+          // Never blocks or retries THIS zone -- the shot is already taken.
+          final thisFlash = rawShots['${zone}_fl'];
+          if (thisFlash != null && prevZoneFlashBytes != null) {
+            final sim = await _zoneFramingSimilarity(prevZoneFlashBytes, thisFlash);
+            if (sim != null) {
+              zoneDebug['${zone}_framingSimilarityToPrev'] =
+                  double.parse(sim.toStringAsFixed(3));
+              if (sim >= _sweepZoneSimilarityThreshold) {
+                extraMoveMs = _sweepExtraMoveMs;
+              }
+            }
+          }
+          if (thisFlash != null) prevZoneFlashBytes = thisFlash;
         }
 
         try {

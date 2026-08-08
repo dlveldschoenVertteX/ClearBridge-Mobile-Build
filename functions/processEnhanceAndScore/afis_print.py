@@ -957,6 +957,95 @@ def _front_anchored_mosaic(front: np.ndarray,
     return (acc / np.maximum(wsum, 1e-6)).astype(np.uint8), used
 
 
+_ZONE_MOSAIC_MARGIN = 2.6   # x guide rx/ry -- real registration search room
+                            # around the union of all zones' own guide bounds
+
+
+def _front_anchored_mosaic_zones(
+    zone_grays: dict,
+) -> Tuple[Optional[np.ndarray], Optional[dict], int]:
+    """Zone-sweep variant of `_front_anchored_mosaic`.
+
+    `_front_anchored_mosaic` was built for the (discontinued) four-angle
+    flow, where the camera itself yaws around a frame-filling thumb -- the
+    whole frame IS pad-dominated, so whole-frame ECC registration finds the
+    real pad-to-pad relationship. The sweep-burst flow is different: the
+    guide asks the FINGER to translate across several zones while the
+    camera stays fixed and wide, so each zone's raw still is mostly a large,
+    static, in-focus ROOM (wall, desk, keyboard) with the pad occupying a
+    small fraction of the frame. Real measurement against 2 real captures
+    (2026-08-08): full-frame phase-correlation between adjacent zones gave
+    a weak/noisy response (0.003-0.15, where ~1.0 is a confident single
+    dominant shift) -- whole-frame ECC has no reliable pad-to-pad signal to
+    lock onto and is easily dominated by the huge static background instead,
+    which explains both the real 'mosaic registration failed' cases and why
+    even a "successful" registration didn't win selection (it was very
+    likely aligning the room, not the ridge content).
+
+    Fix: crop every zone to the SAME generous still-space region derived
+    from the real union of all zones' own guide masks (`_superellipse_mask`,
+    the same conversion `generate()` itself uses) before ECC ever runs, so
+    the registration signal is dominated by pad content. Also returns the
+    ADJUSTED guide_region (re-expressed in the crop's own coordinate frame)
+    that the caller must use for the final `generate()` call on the mosaic
+    result -- the original guide_region's cx/cy are fractions of the FULL
+    frame, meaningless once the image has been cropped.
+
+    zone_grays: {zone_name: (gray_image, guide_region_dict)}, must include
+    'center' (the anchor). Returns (mosaic, adjusted_center_guide, n_used);
+    (None, None, 0) if 'center' is missing, no zone mask is derivable, or
+    the mosaic itself fails (caller falls back to the single-zone results
+    exactly as before -- purely additive, cannot regress)."""
+    if 'center' not in zone_grays:
+        return None, None, 0
+    anchor, anchor_guide = zone_grays['center']
+    h, w = anchor.shape[:2]
+
+    boxes = []
+    for _zone, (_g, _region) in zone_grays.items():
+        m = _superellipse_mask((h, w), _region)
+        if m is None:
+            continue
+        ys, xs = np.where(m > 0)
+        rx_px = float(_region['rx']) * w
+        ry_px = float(_region['ry']) * h
+        pad_x = rx_px * (_ZONE_MOSAIC_MARGIN - 1.0)
+        pad_y = ry_px * (_ZONE_MOSAIC_MARGIN - 1.0)
+        boxes.append((xs.min() - pad_x, xs.max() + pad_x,
+                      ys.min() - pad_y, ys.max() + pad_y))
+    if not boxes:
+        return None, None, 0
+
+    x0 = max(0, int(min(b[0] for b in boxes)))
+    x1 = min(w, int(max(b[1] for b in boxes)))
+    y0 = max(0, int(min(b[2] for b in boxes)))
+    y1 = min(h, int(max(b[3] for b in boxes)))
+    if x1 - x0 < 64 or y1 - y0 < 64:
+        return None, None, 0
+
+    anchor_crop = anchor[y0:y1, x0:x1]
+    sides_crop = [g[y0:y1, x0:x1] for zone, (g, _r) in zone_grays.items()
+                  if zone != 'center' and g.shape[:2] == (h, w)]
+    if not sides_crop:
+        return None, None, 0
+
+    mos, used = _front_anchored_mosaic(anchor_crop, sides_crop)
+    if mos is None:
+        return None, None, 0
+
+    # Re-express the anchor's own guide region in the crop's coordinate
+    # frame -- same cx/cy/rx/ry SHAPE (the pad's own size/taper is a
+    # property of the pad, not the crop), just re-centred/re-scaled onto
+    # the new (smaller) image dimensions instead of the original full frame.
+    cw, ch = (x1 - x0), (y1 - y0)
+    adj_guide = dict(anchor_guide)
+    adj_guide['cx'] = float(anchor_guide['cx']) * w / cw - x0 / cw
+    adj_guide['cy'] = float(anchor_guide['cy']) * h / ch - y0 / ch
+    adj_guide['rx'] = float(anchor_guide['rx']) * w / cw
+    adj_guide['ry'] = float(anchor_guide['ry']) * h / ch
+    return mos, adj_guide, used
+
+
 def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
     """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
     try:

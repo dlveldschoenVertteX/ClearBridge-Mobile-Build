@@ -1445,18 +1445,55 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # center since that's the zone closest to the main
                     # capture's own guideRegion. Purely additive, same
                     # margin-guard gate as every other sweep candidate.
+                    #
+                    # REAL BUG FOUND + FIXED 2026-08-08: `_front_anchored_
+                    # mosaic` registers on the WHOLE raw still, which was
+                    # correct for the discontinued four-angle flow (camera
+                    # yaws around a frame-filling thumb) but wrong here --
+                    # the sweep-burst guide asks the FINGER to translate
+                    # while the camera stays fixed and wide, so each zone's
+                    # still is mostly a large, static, in-focus ROOM with
+                    # the pad occupying a small fraction of the frame.
+                    # Measured directly against 2 real captures with
+                    # sweepBurstCandidates data: full-frame phase-correlation
+                    # between adjacent zones gave a weak/noisy response
+                    # (0.003-0.15, where ~1.0 is a confident single dominant
+                    # shift) -- whole-frame ECC has no reliable pad-to-pad
+                    # signal to lock onto and is easily dominated by the
+                    # static background instead, explaining both the real
+                    # 'mosaic registration failed' cases and why even a
+                    # "successful" registration never won selection (very
+                    # likely aligning the room, not the ridge content).
+                    # `_front_anchored_mosaic_zones` crops every zone to the
+                    # real union of all zones' own guide masks (with real
+                    # registration search margin) before ECC, so the
+                    # registration signal is dominated by pad content
+                    # instead. Confirmed on the same 2 real captures: fixes
+                    # one real outright registration failure (None -> a
+                    # working 79 NFIQ2 mosaic); still doesn't beat the best
+                    # single zone on either capture, consistent with a
+                    # SEPARATE, capture-side finding from the same
+                    # investigation (the 3 zones show very little real
+                    # spatial diversity in practice -- near-duplicate
+                    # framing, not the complementary coverage the design
+                    # intends) -- that gap needs a capture-side fix
+                    # (verify real repositioning before each zone fires,
+                    # not just a timed animation), not a backend one.
+                    # Purely additive here regardless: can only ever recover
+                    # an already-failing mosaic or match the old one, never
+                    # regress it.
                     try:
+                        _mos, _mosaic_guide, _n_used = afis_print._front_anchored_mosaic_zones(_zone_grays)
                         if 'center' in _zone_grays:
-                            _anchor, _anchor_guide = _zone_grays['center']
                             _sides = [g for z, (g, _) in _zone_grays.items() if z != 'center']
                             _fusion_debug: dict = {'sidesAvailable': len(_sides)}
                             if _sides:
-                                _mos, _n_used = afis_print._front_anchored_mosaic(_anchor, _sides)
                                 if _mos is not None:
                                     _fusion_debug['sidesUsed'] = _n_used
+                                    _fusion_debug['method'] = 'zoneCrop'
                                     _mimg_res, _mp = afis_print.generate(
                                         [_mos], [0.0], [None],
-                                        guide_region=_anchor_guide,
+                                        guide_region=_mosaic_guide,
                                         freq_normalize=True,
                                         stack_cache={},
                                     )
