@@ -1,5 +1,92 @@
 # ClearBridge Mobile — persistent context
 
+## Two new ML lines tried, both real negatives: mosaic registration net + curriculum-blur ridge restoration (2026-08-08, round 22)
+CTO proposed two training ideas in the same session: (1) a puzzle-piece
+registration net for stitching multi-angle captures into a mosaic, and (2) a
+curriculum-training scheme using the real NIST SD302 dataset — feed a
+ridge-restoration model increasingly-blurred/degraded prints in stages and
+train it to reconstruct clean ridges, on the theory this would improve
+`pyfingHybrid`'s matchability without sacrificing `freqNorm`'s continuity.
+Built and real-GPU-trained both. **Both are real, honest negatives — neither
+is wired into production, and per the CTO's explicit call, none of this
+session's commits were pushed.**
+
+**`ml/mosaic_register/`** — `TwoCropRegistrationNet` (global-avg-pool ->
+regress rigid-transform params (cos,sin,tx,ty) between a reference crop and a
+side crop). Two real bugs found and fixed along the way (a units mismatch in
+synthetic training-pair generation; a BatchNorm2d NaN-gradient failure on
+near-zero-variance batches, fixed via GroupNorm — though the deeper root
+cause turned out to be the orientation-loss sqrt-epsilon bug below, found
+right after). **Real 200-epoch SageMaker run: val loss frozen at
+0.1728-0.1730 across every single epoch — zero learning on the real diverse
+dataset.** Root cause diagnosed architecturally, not a tuning problem:
+global-average-pooling discards all spatial correspondence between the two
+crops before the network ever compares them — it has no mechanism to learn
+"where do these overlap." Would need a correlation/cost-volume layer to be
+viable at all; not rebuilt this session. Real SageMaker cost: ~$0.03-0.10.
+
+**`ml/ridge_restore_curriculum/`** — `RidgeRestoreUNet` (copied from
+`ml/mac3d_enhance/model.py`, GroupNorm not BatchNorm2d, applied preemptively
+this time) trained via `degrade.py`'s synthetic pipeline (blur, specular
+blowout, low contrast, uneven illumination, noise) ramped in severity over a
+curriculum schedule, loss = L1 + SSIM + orientation-field similarity. **Real
+bug found via `torch.autograd.set_detect_anomaly`**: the orientation loss's
+`norm = sqrt(cs**2+sn**2) + 1e-6` protects the forward value but not the
+backward gradient at exactly-zero input — routine on binarized/uniform-region
+images (unlike deform_correct's original continuous-tone photo domain, which
+never tripped this). Fixed by moving epsilon inside the sqrt (0/150 seeds
+NaN afterward, was ~25-40% before). Wired into `afis_print.py` as
+`enhance='ridgeRestoreHybrid'` (denoise-pre-pass pattern, same shape as
+`pyfingHybrid`/`nnsHybrid`) — **present but NOT added to `main.py`'s
+production `_afis_variants`**, same "measured, not shipped" treatment as
+`gaborVarFreq`/`fidelity`.
+
+Trained two checkpoints, both measured honestly against real local NFIQ2 on
+the same 13-real-capture sample used elsewhere this session (production-
+accurate: real `guideRegion` + full ambient/flash burst through
+`afis_print.generate()`, scored via the real local NFIQ2 binary):
+
+| variant | mean NFIQ2 (n=13) | wins vs freqNorm |
+|---|---|---|
+| **native** (plain single frame, no fusion/denoise) | **64.9** | — |
+| freqNorm | 54.2 | — |
+| ridgeRestoreHybrid **v1** (SD302d only, 300 prints) | 55.7 | 7/13 (54%) |
+| ridgeRestoreHybrid **v2** (v1 + 59 real project captures mixed in) | 52.6 | 4/13 (31%) |
+
+v1 barely edges freqNorm — statistically indistinguishable from a coin flip
+at this sample size, not a real effect. **v2, the "mix in real capture data
+to close the domain gap" iteration, is a clear regression from v1** (mean
+-3.1, win rate 54%->31%) despite looking visually better on the single
+capture spot-checked before the broader test — plausible cause: the 59 real
+crops (looser `guideRegion`-based framing vs SD302's clean scanner captures)
+diluted the model's clean ridge-restoration signal without teaching it
+anything that transfers, at this small a mixing volume. **Neither checkpoint
+comes within 9 points of plain `native`** — consistent with every other
+denoise-pre-pass variant tried this project (`pyfingHybrid`, `nnsHybrid`,
+`coherenceDiff`): an extra restoration/smoothing stage ahead of this
+pipeline's own tuned Gabor+binarize chain is not automatically additive, and
+none of the four tried so far have beaten a plain single frame on this
+pipeline's real captures.
+
+**Not pushed, per explicit CTO direction**: "do not push if it was a net
+negative." Both modules stay local-only (3 commits: mosaic_register,
+ridge_restore_curriculum, the unwired `ridgeRestoreHybrid` branch in
+`afis_print.py`) — not merged to the remote branch, not deployed.
+
+**CTO's own conclusion, and the real state of this project's fidelity axis
+after tonight**: parameter/architecture tuning on synthetic data has hit a
+real ceiling — four independent denoise-pre-pass techniques (pyfing, NNS,
+coherence-diffusion, now curriculum-blur restoration) and one registration
+architecture have all measured negative or noise-level this project. The
+missing unlock is not more synthetic-data cleverness; it's **a real ≥500-DPI
+ground-truth scanner reference and a beta cohort test group** — matches the
+prime directive's own standing diagnosis (no reliable numeric fidelity
+target exists yet without better ground truth) and is a CTO-side blocker,
+not something further solo ML iteration can substitute for. Do not re-attempt
+either mosaic registration (global-pool architecture) or ridge-restoration
+curriculum training (this exact data mix) expecting a different result
+without changing one of those two root inputs first.
+
 ## Sweep-video replaced with sweep-burst stills; minutiae-patch sub-guide candidates added (2026-08-03/2026-08-05, round 21)
 CTO asked whether the burst+video hybrid sweep ("prime directive" fusion
 architecture) actually works, and — once shown the real Phase 0 data said no
