@@ -2219,6 +2219,29 @@ class FrontCaptureController extends ChangeNotifier {
   /// on every incoming preview frame regardless of `_refocusing`, so polling
   /// it here needs no separate frame subscription -- it reuses the stream
   /// that's already running.
+  /// Diagnostic split added 2026-08-09: real Firestore data across 9 recent
+  /// front_only_v1 captures showed `refocusDebug.waitedMs` landing 2090-3140ms
+  /// on EVERY single one -- 2-2.5x above `_refocusMaxMs=1200`'s intended
+  /// ceiling, with `finalSharpness: null` (zero valid samples ever read) in
+  /// 6/9. `sw` (the field the ceiling is checked against) starts before the
+  /// awaited `_beginAutofocus()` call -- three sequential native platform-
+  /// channel round trips (setFocusMode/setFocusPoint/setExposurePoint) whose
+  /// real on-device latency was never measured separately from the poll
+  /// loop's own budget. Two competing real explanations fit the aggregate
+  /// symptom equally well from the combined number alone: (a) those native
+  /// calls themselves are slow enough to already exceed the ceiling before
+  /// the poll loop's first check, silently starving it of any iterations, or
+  /// (b) the loop DOES run but individual `Future.delayed(150ms)` polls are
+  /// each taking far longer than 150ms under real-device isolate contention
+  /// (camera image-stream processing, GC, frame pacing). These call for
+  /// different fixes (restructure the budget vs. investigate why polling
+  /// itself runs slow) -- guessing at either without knowing which is real
+  /// risks fixing nothing or making the hold-to-capture wait longer for no
+  /// benefit. Splitting the timing here is purely diagnostic: `sw` and the
+  /// ceiling check are UNCHANGED, so real-device behavior/timing is
+  /// identical to before -- only `refocusDebug` gains enough detail
+  /// (`beginAutofocusMs`, `pollIterations`, `sampleCount`, `maxIterGapMs`)
+  /// for the next real capture to show which hypothesis is actually true.
   Future<void> _refocus() async {
     if (_refocusing) return;
     _refocusing = true;
@@ -2226,14 +2249,26 @@ class FrontCaptureController extends ChangeNotifier {
     double? lastSample;
     var stableStreak = 0;
     var converged = false;
+    var pollIterations = 0;
+    var sampleCount = 0;
+    var maxIterGapMs = 0;
+    var lastIterMs = 0;
     try {
       await _beginAutofocus();
+      final beginAutofocusMs = sw.elapsedMilliseconds;
+      lastIterMs = beginAutofocusMs;
       while (sw.elapsedMilliseconds < _refocusMaxMs) {
         await Future<void>.delayed(
             const Duration(milliseconds: _refocusPollIntervalMs));
         if (_disposed) break;
+        pollIterations++;
+        final nowMs = sw.elapsedMilliseconds;
+        final gap = nowMs - lastIterMs;
+        if (gap > maxIterGapMs) maxIterGapMs = gap;
+        lastIterMs = nowMs;
         final sample = _liveAbsSharpness;
         if (sample != null && sample > 0) {
+          sampleCount++;
           if (lastSample != null && lastSample! > 0) {
             final change = (sample - lastSample!).abs() / lastSample!;
             stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
@@ -2249,6 +2284,10 @@ class FrontCaptureController extends ChangeNotifier {
       await _lockFocusOnly();
       _refocusDebug = {
         'waitedMs': sw.elapsedMilliseconds,
+        'beginAutofocusMs': beginAutofocusMs,
+        'pollIterations': pollIterations,
+        'sampleCount': sampleCount,
+        'maxIterGapMs': maxIterGapMs,
         'converged': converged,
         'finalSharpness': lastSample,
       };
