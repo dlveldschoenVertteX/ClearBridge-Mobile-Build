@@ -47,6 +47,15 @@ ml/mosaic_register/data/
 ml/mosaic_register/*.log
 ml/mosaic_register/manifest.json
 
+# ridge_restore_curriculum/data holds a real NIST SD302 sample pulled from
+# S3 (public research data, not privacy-sensitive like the real_prints
+# above, but still a large local dataset this project's own convention
+# keeps out of git -- reuploaded/redownloaded from S3 whenever needed, not
+# stored in the repo).
+ml/ridge_restore_curriculum/data/
+ml/ridge_restore_curriculum/*.log
+ml/ridge_restore_curriculum/*.png
+
 # Session scratchpad -- experiments, harness runs, raw design-tool exports,
 # any working files that shouldn't end up in the deployed repo. This project
 # has always used scratchpad/ this way (see harness.py, sourceafis/ etc.
