@@ -1719,13 +1719,30 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         nfiq_pass  = nfiq_score >= _PASS_THRESHOLD
 
         # ── 4d. Real NFIQ2 ground-truth score (additive, non-blocking) ─────────
-        # nfiqScore above is the ResNet18 proxy -- fast, used as the training/
-        # ranking signal throughout this pipeline, but a learned proxy, not the
-        # NIST ground-truth algorithm. Score the SAME image that won nfiqScore
-        # (mirrors the nfiqSource selection below) through the real NFIQ2
-        # binary via the sidecar service. Never blocks or fails the pipeline:
-        # score_nfiq2() itself never raises, and nfiq2Score is simply null in
-        # Firestore if the sidecar is unreachable, unconfigured, or times out.
+        # When the AFIS path wins (afis_nfiq >= cyl_nfiq), afis_nfiq is ALREADY
+        # a real NFIQ2 score, not the old ResNet18 proxy: _score_ground_truth
+        # (the AFIS candidate-selection scorer used throughout the loop above,
+        # CTO directive 2026-08-08) calls this exact sidecar
+        # (nfiq2_client.score_nfiq2) directly. This block used to blindly
+        # re-call score_nfiq2() a SECOND time on the identical image regardless.
+        #
+        # Real bug found from a live capture (6cda7689, 2026-08-08): that
+        # redundant second call is a second, unnecessary chance to fail
+        # (timeout/transient sidecar error) that the first, already-successful
+        # call had already cleared -- and on failure this returns None, which
+        # unconditionally loses to any successful freqNorm fallback score below
+        # regardless of its value. Production wrote nfiq2Score=4 (via the
+        # freqNorm fallback) for a capture whose own selection loop had just
+        # found a real 72-scoring AFIS candidate. Reproduced locally: re-
+        # downloading the exact same raw burst and regenerating that winning
+        # candidate scores a consistent 69 across repeated real-NFIQ2 calls
+        # (including a disk round-trip) via the local calibrated binary --
+        # confirming this is redundant-call fragility, not scoring
+        # nondeterminism or image corruption. Reusing the already-known-good
+        # afis_nfiq value removes the redundant call entirely for the dominant
+        # AFIS-wins case; only the cylindrical path (cyl_nfiq is still the
+        # ResNet18 proxy, never scored against real NFIQ2 anywhere above)
+        # still needs a fresh real-NFIQ2 call here.
         #
         # Do NOT "fix" this to always score best_enhanced instead -- a real
         # production oscillating capture has scored 70% NFIQ2 via the
@@ -1738,8 +1755,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # scores traced to real capture-quality problems on those two
         # captures (AF-lock timing, camera shake, red ambient-light cast) --
         # not to which image type NFIQ2 was scoring.
-        winning_image = best_afis_img if (afis_nfiq >= cyl_nfiq and afis_nfiq > 0) else best_enhanced
-        nfiq2_score = nfiq2_client.score_nfiq2(winning_image)
+        _afis_won = afis_nfiq >= cyl_nfiq and afis_nfiq > 0
+        winning_image = best_afis_img if _afis_won else best_enhanced
+        nfiq2_score = int(round(afis_nfiq)) if _afis_won else nfiq2_client.score_nfiq2(winning_image)
         nfiq2_source = 'winner'
 
         # Additive experiment: the ResNet18 proxy above doesn't appear to
