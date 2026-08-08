@@ -1752,6 +1752,111 @@ def _nns_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
     return composited
 
 
+_RIDGE_RESTORE_CKPT_PATH = '/tmp/ridge_restore_curriculum_best.pt'
+_ridge_restore_model_cache: dict = {}
+
+
+def _get_ridge_restore_model():
+    """Lazy-loads the ml/ridge_restore_curriculum checkpoint via raw torch
+    (research/validation only -- unlike every other model this file loads,
+    this one has NOT been exported to ONNX or uploaded to Storage models/,
+    so it self-skips via a plain file-existence check, same non-blocking
+    contract as a missing sidecar). Caches in-process once loaded."""
+    if 'model' in _ridge_restore_model_cache:
+        return _ridge_restore_model_cache['model']
+    import os
+    if not os.path.exists(_RIDGE_RESTORE_CKPT_PATH):
+        _ridge_restore_model_cache['model'] = None
+        return None
+    try:
+        import torch
+        import sys
+        sys.path.insert(0, '/home/user/ClearBridge-Mobile-Build/ml/ridge_restore_curriculum')
+        from model import RidgeRestoreUNet
+        ckpt = torch.load(_RIDGE_RESTORE_CKPT_PATH, map_location='cpu')
+        model = RidgeRestoreUNet()
+        model.load_state_dict(ckpt['model'])
+        model.eval()
+        _ridge_restore_model_cache['model'] = model
+        return model
+    except Exception as e:   # noqa: BLE001
+        logger.warning('ridge_restore_curriculum model load failed (non-critical): %s', e)
+        _ridge_restore_model_cache['model'] = None
+        return None
+
+
+def _ridge_restore_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    """Runs the CURRICULUM-DEGRADATION-TRAINED ridge restoration network
+    (ml/ridge_restore_curriculum, 2026-08-08 -- CTO's own idea: real NIST
+    SD302 prints, synthetic blur/specular-blowout/low-contrast/uneven-
+    illumination degradation ramped up over training, network learns to
+    reconstruct clean ridges) as a denoise PRE-PASS -- same role and same
+    "crop with real-content margin, no neutral fill, feathered composite
+    back" pattern as `_nns_denoise` (this project's own already-hard-won
+    lesson: hard-masked flat-fill input makes a net never trained on masked
+    content ring on the edge, 5/5 real captures scored worse that way).
+
+    Output convention already matches this project's own (ridges dark,
+    background light -- trained directly on SD302 grayscale scans, which
+    use that same polarity) -- no invert needed, same as `_nns_denoise`.
+
+    Research/validation status, not production-proven: trained ONLY on
+    clean NIST SD302 CONTACT-SCANNER prints (no real fingerphoto capture
+    content, no background/uneven-lighting/skin-texture domain), so a real
+    generalization gap to actual captures is expected and was directly
+    observed in this project's own real-capture spot check (visible
+    banding/background artefacts on a raw unbinarized test) -- this
+    function exists to let that gap be measured PROPERLY, through the same
+    real guideRegion + Gabor + binarize + real-NFIQ2 path every other
+    candidate goes through, not to assert it already works.
+
+    Returns None on any failure (checkpoint not present locally, degenerate
+    mask, torch not available) -- same non-blocking contract as every
+    other optional denoise pre-pass in this module."""
+    model = _get_ridge_restore_model()
+    if model is None:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+    y0r, y1r, x0r, x1r = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    mh = max(8, int(0.30 * (y1r - y0r)))
+    mw = max(8, int(0.30 * (x1r - x0r)))
+    y0, y1 = max(0, y0r - mh), min(g8.shape[0], y1r + mh)
+    x0, x1 = max(0, x0r - mw), min(g8.shape[1], x1r + mw)
+    crop = g8[y0:y1, x0:x1]
+    if crop.shape[0] < 32 or crop.shape[1] < 32:
+        return None
+
+    try:
+        import torch
+        # Pad to a multiple of 8 (three MaxPool2d(2) stages -> skip-
+        # connection concat requires exact dims) -- reflect padding, not a
+        # flat fill, same "no hard edge for a net that never saw one"
+        # discipline as the crop margin above.
+        ch, cw = crop.shape
+        ph = (8 - ch % 8) % 8
+        pw = (8 - cw % 8) % 8
+        padded = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT)
+        x = torch.from_numpy(padded.astype(np.float32) / 255.0)[None, None]
+        with torch.no_grad():
+            restored = model(x)[0, 0].numpy()
+        restored_u8 = np.clip(restored[:ch, :cw] * 255, 0, 255).astype(np.uint8)
+    except Exception as e:   # noqa: BLE001
+        logger.warning('ridge_restore denoise pre-pass failed (non-critical): %s', e)
+        return None
+
+    enhanced_full = g8.copy()
+    enhanced_full[y0:y1, x0:x1] = restored_u8
+
+    mask_f = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    bg = np.full_like(enhanced_full, 245)
+    composited = (enhanced_full.astype(np.float32) * mask_f
+                 + bg.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+    return composited
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -2421,6 +2526,20 @@ def generate(
             params['afisEnhance'] = 'nnsHybrid'
         else:
             params['afisEnhance'] = 'nnsHybrid_unavailable'
+    elif enhance == 'ridgeRestoreHybrid':
+        # ml/ridge_restore_curriculum's curriculum-degradation-trained net
+        # as a denoise pre-pass, same pattern as pyfingHybrid/nnsHybrid.
+        # Research/validation only -- see _ridge_restore_denoise's own
+        # docstring for the real, not-yet-closed domain-gap caveat.
+        denoised = _ridge_restore_denoise(g8, mask)
+        if denoised is not None:
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'ridgeRestoreHybrid'
+        else:
+            params['afisEnhance'] = 'ridgeRestoreHybrid_unavailable'
     elif enhance == 'fomfe':
         # Global 2D-Fourier orientation-field model instead of a denoise
         # pre-pass -- see _fomfe_orientation_field's own docstring. No
