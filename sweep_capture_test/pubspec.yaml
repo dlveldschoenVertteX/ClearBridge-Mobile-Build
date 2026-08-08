@@ -1,0 +1,44 @@
+name: sweep_capture_test
+description: >
+  Standalone test app for the sweep-burst capture architecture, isolated
+  from clearbridge_beta on purpose. Sweep-burst was disabled in the main
+  app 2026-08-06 after real data showed it net-negative (1/137 wins, 0/3
+  cross-zone mosaic wins, 17% of captures permanently stuck) -- the working
+  hypothesis is that its own economics never got a fair test because it was
+  always layered in AFTER the main 8-shot burst, sharing that capture
+  session's fatigue and that Cloud Function request's own time budget. This
+  app runs sweep-burst as the WHOLE capture (not an add-on), with its own
+  full-budget backend request, so the architecture can be judged on its own
+  terms without any risk to the main app if the experiment doesn't pan out.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mac_capture:
+    path: ../packages/mac_capture
+  path_provider: ^2.1.5
+  uuid: ^4.5.3
+  image: ^4.2.0
+  # Upper-bounded: see capture_harness/pubspec.yaml's own note -- 4.12.0
+  # broke compile compat with the coordinated firebase_auth/firestore/
+  # storage/functions bumps resolved alongside it.
+  firebase_core: '>=4.5.0 <4.12.0'
+  firebase_auth: ^6.2.0
+  cloud_firestore: ^6.1.3
+  firebase_storage: ^13.1.0
+  cloud_functions: ^6.0.7
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/audio/

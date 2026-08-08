@@ -103,6 +103,105 @@ jobs:
             print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
           PYEOF
 
+  build-sweep-test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    # Standalone sweep-burst architecture test build (sweep_capture_test/) --
+    # isolated on purpose from clearbridge_beta (where sweep-burst was
+    # disabled 2026-08-06 as net-negative -- see db1a94e) so the CTO's own
+    # hypothesis (it never got a fair trial layered after the main 8-shot
+    # burst, sharing that request's time budget and the user's hand fatigue)
+    # can be tested with zero risk to the shipping beta app. If this
+    # experiment fails, it doesn't touch clearbridge_beta at all.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-sweeptest-${{ runner.os }}-${{ hashFiles('sweep_capture_test/android/**/*.gradle*', 'sweep_capture_test/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-sweeptest-${{ runner.os }}-
+
+      - run: flutter pub get
+        working-directory: sweep_capture_test
+
+      - run: flutter build apk --release --target-platform android-arm64
+        working-directory: sweep_capture_test
+
+      - name: Delete old sweep-test artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "sweep-test-apk" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        # See the "build" job's four-angle upload-artifact step for why this
+        # is best-effort: it's not a dependency of the publish steps below.
+        continue-on-error: true
+        with:
+          name: sweep-test-apk
+          path: sweep_capture_test/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+
+      - name: Publish sweep-test APK to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-sweep-test-apk --yes 2>/dev/null || true
+          git push --delete origin latest-sweep-test-apk 2>/dev/null || true
+          gh release create latest-sweep-test-apk \
+            --title "Latest Sweep Test APK (build ${{ github.run_number }})" \
+            --notes "Commit: ${{ github.sha }}" \
+            "sweep_capture_test/build/app/outputs/flutter-apk/app-release.apk#clearbridge-sweep-test.apk"
+          echo "Sweep test: https://github.com/${{ github.repository }}/releases/download/latest-sweep-test-apk/clearbridge-sweep-test.apk"
+
+      - name: Upload sweep-test APK to Firebase Storage
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        run: |
+          pip install google-auth requests --quiet
+          python3 - <<'PYEOF'
+          import json, os, requests, google.auth.transport.requests as gtr
+          from google.oauth2 import service_account
+
+          sa = json.loads(os.environ['FIREBASE_SA_KEY'])
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=['https://www.googleapis.com/auth/cloud-platform'])
+          creds.refresh(gtr.Request())
+          token = creds.token
+          bucket = 'clearbridge-dc699.firebasestorage.app'
+          name = 'clearbridge-sweep-test-latest.apk'
+          path = 'sweep_capture_test/build/app/outputs/flutter-apk/app-release.apk'
+
+          with open(path, 'rb') as f:
+            data = f.read()
+          r = requests.post(
+            f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
+            f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
+            headers={'Authorization': f'Bearer {token}',
+                     'Content-Type': 'application/vnd.android.package-archive'},
+            data=data, timeout=120)
+          if r.status_code in (200, 201):
+            print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
+          else:
+            print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
+          PYEOF
+
   build-clearbridge-beta:
     runs-on: ubuntu-latest
     permissions:
