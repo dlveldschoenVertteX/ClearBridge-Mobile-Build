@@ -998,6 +998,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # already consume flash_burst for internal stacking, so they don't
             # need this inner sweep.
             _FUSE_PAIR_NAMES = {'fuseAvg', 'fuseMaxc', 'fuseSoft'}
+            # Hard per-pair cap, real bug found 2026-08-08 (see
+            # _call_with_hard_deadline's docstring): the ORIGINAL 2026-07-16
+            # deepFuse/deepMaxc outage was 15+ minutes for one variant on a
+            # poorly-correlated burst; this project's real logs show that
+            # exact failure mode recurring through a different code path
+            # (a single fuseAvg flash-bracket pair blocking ~144s). 40s is
+            # generous against every real per-pair time this session's own
+            # logs have shown for a WORKING alignment (single-digit to
+            # low-double-digit seconds), while still bounding the true
+            # pathological case far below the request's own harder 300s
+            # Cloud Run ceiling.
+            _FUSE_PAIR_HARD_TIMEOUT_SEC = 40.0
 
             for _vname, _vkw in _afis_variants:
                 if time.monotonic() > _variants_deadline:
@@ -1024,7 +1036,16 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 for _fl_frames in _fuse_fl_list:
                     if time.monotonic() > _variants_deadline:
                         break
-                    _ci, _cp = afis_print.generate(
+                    # Hard per-pair deadline (2026-08-08) -- see
+                    # _call_with_hard_deadline's own docstring for the real
+                    # live stuck-capture this closes. A fixed, absolute cap,
+                    # not "whatever's left of _variants_deadline": that
+                    # relative budget can still legitimately be the better
+                    # part of 70s for an early pair, which is exactly how
+                    # one poorly-correlated pair blocked the request for
+                    # ~144s despite the existing between-pairs check.
+                    _pair_result = _call_with_hard_deadline(
+                        afis_print.generate,
                         frames, angles_for_sfm, _laps,
                         ambient_frames=ambient_frames, flash_frames=_fl_frames,
                         ambient_burst=ambient_burst, flash_burst=flash_burst,
@@ -1032,7 +1053,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         flash_burst_gyros=flash_burst_gyros,
                         guide_region=_guide_region,
                         stack_cache=_stack_cache,
+                        timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
                         **_vkw)
+                    if _pair_result is None:
+                        continue
+                    _ci, _cp = _pair_result
                     if _ci is None:
                         continue
                     _cr = _score_nfiq(_ci, sfm_coverage=1.0)
@@ -2721,6 +2746,56 @@ def _score_nfiq(image: np.ndarray, sfm_coverage: float = 1.0) -> dict:
     except Exception as e:
         logger.error(f"NFIQ error: {e}")
         return {'nfiq_score': 0.0, 'error': str(e)}
+
+
+def _call_with_hard_deadline(fn, *args, timeout_sec: float, **kwargs):
+    """Runs `fn(*args, **kwargs)` but stops WAITING on it after `timeout_sec`
+    -- returns None on timeout instead of blocking forever, same "can only
+    skip a candidate, never hang the request" contract as every other
+    optional signal in this pipeline.
+
+    REAL BUG this fixes (found 2026-08-08 from a live stuck capture,
+    219939d0): the AFIS variant loop's own `_variants_deadline` wall-clock
+    budget (2026-07-16, closed out the ORIGINAL deepFuse/deepMaxc 15-minute
+    outage) only ever checks elapsed time BETWEEN variants -- it cannot
+    interrupt a single variant's `afis_print.generate()` call that is
+    already in progress. `fuseAvg`/`fuseMaxc`/`fuseSoft`'s own per-pair
+    sweep (added after that fix, calling `_fuse_flash_ambient`'s own ECC
+    alignment once per flash-bracket frame) has the exact same structural
+    gap one level deeper: its per-pair deadline check (main.py, the
+    `_fuse_fl_list` loop) can only skip a pair BEFORE it starts, not abort
+    one already running. A single poorly-correlated pair reproduced this
+    project's original failure mode through a code path the original fix
+    never covered -- confirmed via Cloud Logging on the live capture: focus
+    Stack finished at 44:38, nothing else logged until "time budget
+    exceeded" fired (naming fuseMaxc, i.e. right after fuseAvg) at 47:02 --
+    a single ~144s gap, consistent with one or more of fuseAvg's flash-
+    bracket pairs blocking well past its share of the 70s budget, pushing
+    the WHOLE request (which has its own separate, harder 300s Cloud Run
+    ceiling) past that hard limit with no graceful failure -- the capture
+    is silently killed mid-flight and stuck at status=enhancing forever.
+
+    Runs `fn` in a single-worker background thread and calls `.result()`
+    with a timeout instead of a bare (blocking-forever) call. On timeout,
+    does NOT wait for the thread to actually finish (`shutdown(wait=False)`)
+    -- Python cannot forcibly kill a running thread, but the caller no
+    longer blocks on it; the orphaned thread's result is simply discarded
+    once it eventually completes. This mirrors the same "abandon, don't
+    wait forever" pattern already used capture-side for uploads
+    (`_uploadWithRetry`'s cancellable UploadTask) and is the standard way
+    to bound a call to code with no cooperative-cancellation hook of its
+    own (`afis_print.generate()`/OpenCV are synchronous, CPU-bound, and
+    have no internal timeout parameter to pass through)."""
+    ex = ThreadPoolExecutor(max_workers=1)
+    fut = ex.submit(fn, *args, **kwargs)
+    try:
+        return fut.result(timeout=max(0.1, timeout_sec))
+    except Exception as e:   # noqa: BLE001 — TimeoutError or any exception from fn itself
+        logger.warning('_call_with_hard_deadline: %s did not complete within %.1fs (%s)',
+                        getattr(fn, '__name__', repr(fn)), timeout_sec, e)
+        return None
+    finally:
+        ex.shutdown(wait=False)
 
 
 # ── Extended Henry Classification ─────────────────────────────────────────────
