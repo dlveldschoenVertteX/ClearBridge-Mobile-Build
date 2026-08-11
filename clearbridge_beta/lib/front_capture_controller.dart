@@ -2794,6 +2794,97 @@ class FrontCaptureController extends ChangeNotifier {
   // amount of latency, never hang.
   static const int _sweepExtraMoveMs = 1800;
 
+  /// Real gap found + fixed 2026-08-11: neither the zone-0 settle delay nor
+  /// the zone-1/2 count-in verified two things this project has already
+  /// found and fixed for OTHER capture paths -- that focus actually
+  /// reconverges after a reposition (round 15's fix for the secondary-
+  /// camera distance sweep, never applied to this main-camera sweep) and
+  /// that the thumb has actually reached the new zone (already flagged in
+  /// `_front_anchored_mosaic_zones`'s own comments as needing "a capture-
+  /// side fix... not a backend one"). Both zone transitions were pure timed
+  /// animations with zero live verification. Real data from tonight's
+  /// sweep captures showed both side zones scoring far softer (Laplacian
+  /// ~12-14) than the main capture's own pairs, and the left zone still
+  /// failing to register even after fixing a real backend warp-direction
+  /// bug -- consistent with a shot firing before focus/position had
+  /// actually settled.
+  ///
+  /// Redirects continuous AF to the zone's OWN on-screen point (not the
+  /// fixed main-hold point, via the already-existing `_sweepFocusPointFor`)
+  /// and polls `_liveAbsSharpness` for genuine convergence -- the same
+  /// mechanism `_refocus()` already established earlier tonight.
+  /// `_liveAbsSharpness` only updates while `_onFrame` considers the thumb
+  /// in coverage range, so requiring several converging samples doubles as
+  /// a real, if indirect, signal that the thumb is actually present near
+  /// the new guide position, not just that AF happened to settle on
+  /// whatever's in frame regardless of where that is.
+  ///
+  /// Deliberately does NOT shorten the existing countdown -- `ticks`/
+  /// `tickMs` reproduce the exact same haptic/text cadence the UI already
+  /// showed before this fix, so normal-case timing is unchanged; polling
+  /// just happens underneath instead of a blind sleep. Only grants a
+  /// bounded, one-shot extra wait (`extraMaxMs`) if convergence still
+  /// hasn't happened by the end of that window -- same "fixed, known,
+  /// one-time extension" discipline already used for the framing-
+  /// similarity check just below this call site.
+  Future<void> _verifyZoneReady(
+    String zone,
+    double targetScreenX,
+    Map<String, dynamic> zoneDebug, {
+    required List<String> ticks,
+    required int tickMs,
+    int extraMaxMs = 900,
+  }) async {
+    final cam = _camera;
+    if (cam != null) {
+      final pt = _sweepFocusPointFor(targetScreenX);
+      try {
+        await cam.setFocusMode(FocusMode.auto);
+      } catch (_) {}
+      try {
+        await cam.setFocusPoint(pt);
+      } catch (_) {}
+      try {
+        await cam.setExposurePoint(pt);
+      } catch (_) {}
+    }
+    final pollSw = Stopwatch()..start();
+    double? lastSample;
+    var stableStreak = 0;
+    var converged = false;
+
+    Future<void> pollFor(int ms) async {
+      final until = pollSw.elapsedMilliseconds + ms;
+      while (pollSw.elapsedMilliseconds < until) {
+        await Future<void>.delayed(
+            const Duration(milliseconds: _refocusPollIntervalMs));
+        if (_disposed) return;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample > 0) {
+          if (lastSample != null && lastSample! > 0) {
+            final change = (sample - lastSample!).abs() / lastSample!;
+            stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+          }
+          lastSample = sample;
+        }
+        if (stableStreak >= _refocusStableStreakRequired) converged = true;
+      }
+    }
+
+    for (final n in ticks) {
+      if (_disposed) break;
+      _apply((s) => s.copyWith(distanceHint: n));
+      unawaited(HapticFeedback.lightImpact());
+      await pollFor(tickMs);
+    }
+    if (!converged && !_disposed) {
+      await pollFor(extraMaxMs);
+    }
+    zoneDebug['${zone}_focusConverged'] = converged;
+    zoneDebug['${zone}_focusWaitedMs'] = pollSw.elapsedMilliseconds;
+    zoneDebug['${zone}_focusScoreAtFire'] = lastSample;
+  }
+
   Future<Map<String, dynamic>> _captureSweepBurst(
     String basePath,
     double tipAngleDeg,
@@ -2939,19 +3030,18 @@ class FrontCaptureController extends ChangeNotifier {
           // enough. Center and right zones get a full count-in so the user
           // knows each shot is about to fire, not just the start of the sweep.
           if (i == 0) {
-            unawaited(HapticFeedback.lightImpact());
-            _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zone'));
-            await Future<void>.delayed(
-                const Duration(milliseconds: _sweepZoneSettleMs));
+            await _verifyZoneReady(
+              zone, target, zoneDebug,
+              ticks: ['Hold still — capturing $zone'],
+              tickMs: _sweepZoneSettleMs,
+            );
             if (_disposed) break;
           } else {
-            for (final n in const ['Hold still…', '2…', '1…']) {
-              if (_disposed) break;
-              _apply((s) => s.copyWith(distanceHint: n));
-              unawaited(HapticFeedback.lightImpact());
-              await Future<void>.delayed(
-                  const Duration(milliseconds: _sweepCalibrationTickMs));
-            }
+            await _verifyZoneReady(
+              zone, target, zoneDebug,
+              ticks: const ['Hold still…', '2…', '1…'],
+              tickMs: _sweepCalibrationTickMs,
+            );
             if (_disposed) break;
           }
 
