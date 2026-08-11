@@ -42,12 +42,27 @@ class SweepCaptureController extends ChangeNotifier {
   static const double _guideN = 2.5;
   // Matches front_capture_controller.dart's _sweepGuideShiftFrac exactly --
   // re-derive by hand only if that project's own guide is re-tuned.
-  static const double _sweepGuideShiftFrac = 0.335396;
+  //
+  // REAL GAP FOUND 2026-08-11: this standalone app has its OWN independent
+  // copy of this constant -- when front_capture_controller.dart's own
+  // value was fixed (0.335396 -> 0.15, real measurement showed the old
+  // spacing left ZERO overlap between adjacent zones, guaranteeing
+  // `_front_anchored_mosaic_zones` registration failure) this file's copy
+  // was missed, since this app is what the CTO has actually been testing
+  // ("sweep_burst_standalone" captureMethod, confirmed via real Firestore
+  // docs) -- so every real device test since that fix still ran the OLD,
+  // too-wide spacing. Kept in sync by hand now; re-derive both together if
+  // the guide is ever re-tuned again.
+  static const double _sweepGuideShiftFrac = 0.15;
 
   // ─── Zone timing (ported from _captureSweepBurst's own constants) ────────
   static const int _calibrationHoldMs = 1500;
   static const int _calibrationTickMs = 700;
-  static const int _zoneMoveMs = 3100;
+  // Scaled back down 3100->1400 alongside the spacing fix above -- same
+  // velocity-consistency reasoning as front_capture_controller.dart's own
+  // _sweepZoneMoveMs (keep the guide's on-screen translation speed
+  // constant even though the distance it travels shrank).
+  static const int _zoneMoveMs = 1400;
   static const int _zoneSettleMs = 700;
   static const int _burstFlashSettleMs = 70;
   static const int _sweepTimeoutMs = 34000;
@@ -192,6 +207,14 @@ class SweepCaptureController extends ChangeNotifier {
               await Future<void>.delayed(const Duration(milliseconds: 60));
             }
           }
+
+          // Real fix, 2026-08-11: redirect focus/exposure to THIS zone's own
+          // on-screen point before firing -- see _redirectZoneFocus's own
+          // docstring for why this app never did this before (real device
+          // feedback: left/right zones had no focus at all).
+          await _redirectZoneFocus(cam, target);
+          zoneDebug['${zone}_focusRedirected'] = true;
+          if (_disposed) break;
 
           if (i == 0) {
             unawaited(HapticFeedback.lightImpact());
@@ -376,6 +399,56 @@ class SweepCaptureController extends ChangeNotifier {
       rx: (xs.reduce(math.max) - xs.reduce(math.min)) / 2,
       ry: (ys.reduce(math.max) - ys.reduce(math.min)) / 2,
     );
+  }
+
+  // Raw-buffer focus ROI, ported verbatim from front_capture_controller.dart
+  // (same rotation convention: screen-space horizontal maps to buffer-space
+  // vertical, per this device's confirmed 90°CW raw-buffer-to-screen
+  // rotation). Column axis fixed at the ROI's own centre; row axis carries
+  // the zone's screen-X position, inverted per the same rotation.
+  static const Rect _sweepFocusRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
+
+  Offset _sweepFocusPointFor(double targetScreenX) {
+    final rawBufferX = (_sweepFocusRoi.left + _sweepFocusRoi.right) / 2;
+    final rawBufferY = (_sweepFocusRoi.top +
+            (1.0 - targetScreenX) * _sweepFocusRoi.height)
+        .clamp(0.0, 1.0);
+    return Offset(rawBufferX, rawBufferY);
+  }
+
+  /// Real gap found 2026-08-11: this app's `_calibrate()` sets continuous
+  /// AF once, before the sweep even starts, and NEVER redirects focus
+  /// again for the rest of the run -- unlike front_capture_controller.dart,
+  /// this file never even had the (unused) infrastructure to target a
+  /// per-zone focus point. Real device feedback: "sweep struggles to focus
+  /// on left and right sweep, only center has focus" -- exactly what
+  /// "focus never re-targeted after the initial calibration point" would
+  /// produce, since center is the zone closest to wherever that initial
+  /// point happened to land.
+  ///
+  /// Deliberately does NOT poll a live image-stream signal to verify
+  /// convergence the way front_capture_controller.dart's `_verifyZoneReady`
+  /// does -- this file's own header comment already documents a real ANR
+  /// from reopening `startImageStream` mid-sweep (2026-07-30), which is
+  /// exactly what a live poll would require. Redirects focus/exposure to
+  /// the zone's own point instead, then waits a fixed, bounded settle
+  /// time -- same class of fix as `_refocus()`'s ORIGINAL version before
+  /// its own verification upgrade, chosen here specifically because the
+  /// stream-free constraint rules out the more rigorous polling approach.
+  static const int _zoneFocusSettleMs = 500;
+
+  Future<void> _redirectZoneFocus(CameraController cam, double targetScreenX) async {
+    final pt = _sweepFocusPointFor(targetScreenX);
+    try {
+      await cam.setFocusMode(FocusMode.auto);
+    } catch (_) {}
+    try {
+      await cam.setFocusPoint(pt);
+    } catch (_) {}
+    try {
+      await cam.setExposurePoint(pt);
+    } catch (_) {}
+    await Future<void>.delayed(const Duration(milliseconds: _zoneFocusSettleMs));
   }
 
   Map<String, dynamic>? _guideRegionForSweepZone(double progress) {
