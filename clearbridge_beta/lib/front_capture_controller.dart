@@ -2264,29 +2264,41 @@ class FrontCaptureController extends ChangeNotifier {
   /// on every incoming preview frame regardless of `_refocusing`, so polling
   /// it here needs no separate frame subscription -- it reuses the stream
   /// that's already running.
-  /// Diagnostic split added 2026-08-09: real Firestore data across 9 recent
-  /// front_only_v1 captures showed `refocusDebug.waitedMs` landing 2090-3140ms
-  /// on EVERY single one -- 2-2.5x above `_refocusMaxMs=1200`'s intended
-  /// ceiling, with `finalSharpness: null` (zero valid samples ever read) in
-  /// 6/9. `sw` (the field the ceiling is checked against) starts before the
-  /// awaited `_beginAutofocus()` call -- three sequential native platform-
-  /// channel round trips (setFocusMode/setFocusPoint/setExposurePoint) whose
-  /// real on-device latency was never measured separately from the poll
-  /// loop's own budget. Two competing real explanations fit the aggregate
-  /// symptom equally well from the combined number alone: (a) those native
-  /// calls themselves are slow enough to already exceed the ceiling before
-  /// the poll loop's first check, silently starving it of any iterations, or
-  /// (b) the loop DOES run but individual `Future.delayed(150ms)` polls are
-  /// each taking far longer than 150ms under real-device isolate contention
-  /// (camera image-stream processing, GC, frame pacing). These call for
-  /// different fixes (restructure the budget vs. investigate why polling
-  /// itself runs slow) -- guessing at either without knowing which is real
-  /// risks fixing nothing or making the hold-to-capture wait longer for no
-  /// benefit. Splitting the timing here is purely diagnostic: `sw` and the
-  /// ceiling check are UNCHANGED, so real-device behavior/timing is
-  /// identical to before -- only `refocusDebug` gains enough detail
-  /// (`beginAutofocusMs`, `pollIterations`, `sampleCount`, `maxIterGapMs`)
-  /// for the next real capture to show which hypothesis is actually true.
+  /// Diagnostic split added 2026-08-09, structural fix added 2026-08-11:
+  /// real Firestore data across 9 recent front_only_v1 captures showed
+  /// `refocusDebug.waitedMs` landing 2090-3140ms on EVERY single one --
+  /// 2-2.5x above `_refocusMaxMs=1200`'s intended ceiling, with
+  /// `finalSharpness: null` (zero valid samples ever read) in 6/9. Root
+  /// cause, confirmed by a second real capture (f67a3ba8, 2026-08-11, same
+  /// signature even on an 85-scoring capture -- reproducible regardless of
+  /// outcome quality): the ORIGINAL version measured the whole
+  /// `_refocusMaxMs` ceiling from a stopwatch started BEFORE the awaited
+  /// `_beginAutofocus()` call -- three sequential native platform-channel
+  /// round trips (setFocusMode/setFocusPoint/setExposurePoint). If those
+  /// calls alone take long enough on real hardware (plausible; this
+  /// codebase has repeated real-device evidence native camera calls run
+  /// far slower than their trivial-looking Dart call site suggests), the
+  /// poll loop's own bound check could already be past its ceiling on the
+  /// very first iteration -- starving it of ANY real polling, which is
+  /// exactly what `finalSharpness: null` in 6/9 real captures shows.
+  ///
+  /// Fixed by giving the poll loop its OWN stopwatch (`pollSw`), started
+  /// only after `_beginAutofocus()` returns -- `_refocusMaxMs`/
+  /// `_refocusMinMs` now bound the poll loop's own real polling time,
+  /// never eaten by however long the native redirect call took. `sw`
+  /// (unbounded, started at the very top) is kept only for the overall
+  /// `waitedMs` diagnostic, so the true end-to-end cost is still visible.
+  /// Real, deliberate tradeoff: worst-case total wait can now be LONGER
+  /// than before (beginAutofocusMs + up to _refocusMaxMs, instead of being
+  /// silently capped at whatever beginAutofocus's own latency happened to
+  /// be) -- but the alternative is convergence-checking providing none of
+  /// its intended value, which is the state every recent real capture was
+  /// already in. `refocusDebug` keeps `beginAutofocusMs`, `pollIterations`,
+  /// `sampleCount`, `maxIterGapMs` (now measured against `pollSw`) so the
+  /// next real capture confirms whether this actually closes the gap or
+  /// whether individual polls are ALSO running long under isolate
+  /// contention -- same diagnostic value as before, just no longer
+  /// silently defeated by the bug it was built to catch.
   Future<void> _refocus() async {
     if (_refocusing) return;
     _refocusing = true;
@@ -2301,13 +2313,13 @@ class FrontCaptureController extends ChangeNotifier {
     try {
       await _beginAutofocus();
       final beginAutofocusMs = sw.elapsedMilliseconds;
-      lastIterMs = beginAutofocusMs;
-      while (sw.elapsedMilliseconds < _refocusMaxMs) {
+      final pollSw = Stopwatch()..start();
+      while (pollSw.elapsedMilliseconds < _refocusMaxMs) {
         await Future<void>.delayed(
             const Duration(milliseconds: _refocusPollIntervalMs));
         if (_disposed) break;
         pollIterations++;
-        final nowMs = sw.elapsedMilliseconds;
+        final nowMs = pollSw.elapsedMilliseconds;
         final gap = nowMs - lastIterMs;
         if (gap > maxIterGapMs) maxIterGapMs = gap;
         lastIterMs = nowMs;
@@ -2320,7 +2332,7 @@ class FrontCaptureController extends ChangeNotifier {
           }
           lastSample = sample;
         }
-        if (sw.elapsedMilliseconds >= _refocusMinMs &&
+        if (pollSw.elapsedMilliseconds >= _refocusMinMs &&
             stableStreak >= _refocusStableStreakRequired) {
           converged = true;
           break;

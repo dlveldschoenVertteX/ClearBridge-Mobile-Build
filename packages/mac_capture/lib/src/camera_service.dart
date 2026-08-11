@@ -443,20 +443,40 @@ class CameraService {
     return matching.first;
   }
 
+  // Real ANR reported 2026-08-11: "ClearBridge Beta isn't responding" on the
+  // static BetaThankYouScreen, right after a successful capture -- a screen
+  // with no polling/listeners of its own (StatelessWidget, plain
+  // buttons), so the hang had to be residual background work from the
+  // capture flow it navigated away from. front_capture_screen.dart's own
+  // dispose() calls disposeCamera() fire-and-forget (State.dispose() can't
+  // be async), which was fine -- but the two native platform-channel calls
+  // this eventually reaches, controller.stopImageStream() and
+  // controller.dispose(), were both RAW unbounded awaits with zero timeout
+  // protection -- the exact same risk category this project has already
+  // found and fixed repeatedly elsewhere (secondary-camera capture,
+  // distance-sweep bursts, the sweep-burst zone sequence), just never
+  // applied to the disposal path itself. If the native Camera2 teardown
+  // genuinely hangs or is slow under contention right after a multi-shot
+  // burst + uploads (plausible, matching this project's own documented
+  // history of camera-session-teardown ANRs), nothing here could ever
+  // recover -- the await just never returns. Bounded the same way every
+  // other unbounded native camera call in this codebase already is.
+  static const Duration _disposeCallTimeout = Duration(seconds: 5);
+
   Future<void> _disposeController(CameraController controller) async {
     try {
       if (controller.value.isStreamingImages) {
         try {
-          await controller.stopImageStream();
+          await controller.stopImageStream().timeout(_disposeCallTimeout);
         } catch (error) {
-          debugPrint('CameraService: Error stopping image stream: $error');
+          debugPrint('CameraService: Error/timeout stopping image stream: $error');
         }
       }
 
-      await controller.dispose();
+      await controller.dispose().timeout(_disposeCallTimeout);
       debugPrint('CameraService: Camera disposed');
     } catch (error) {
-      debugPrint('CameraService: Error disposing controller: $error');
+      debugPrint('CameraService: Error/timeout disposing controller: $error');
     }
   }
 }
