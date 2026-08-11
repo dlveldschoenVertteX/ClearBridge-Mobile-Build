@@ -942,7 +942,30 @@ def _front_anchored_mosaic(front: np.ndarray,
                 ref_small, cl.apply(cv2.resize(g, small)), warp,
                 cv2.MOTION_HOMOGRAPHY, crit, None, 5)
             warp_full = (up @ warp @ dn).astype(np.float32)
-            reg = cv2.warpPerspective(g, warp_full, (fw, fh), flags=cv2.INTER_LINEAR)
+            # REAL BUG, found 2026-08-11: findTransformECC's own documented
+            # convention is that `warp` maps TEMPLATE (ref) coordinates to
+            # INPUT (g) coordinates -- warping `g` to align with `ref`
+            # therefore requires the INVERSE of the solved warp, which
+            # OpenCV expects you to request via WARP_INVERSE_MAP rather than
+            # inverting the matrix yourself. That flag was missing here,
+            # so `reg` was always warped in the wrong direction. Confirmed
+            # directly: on a real sweep-burst capture (6cda7689/d471498f),
+            # the solved translation matched the real, independently-known
+            # zone-to-zone shift almost exactly, yet the post-warp
+            # correlation against the anchor was ~0.20 (correctly rejected
+            # by the 0.45 guard below) -- applying the SAME solved warp with
+            # WARP_INVERSE_MAP raised it to ~0.65-0.67 on the same data.
+            # This bug meant every zone pair with genuine, deliberate
+            # translation between them (i.e. every real sweep zone, the
+            # whole point of the feature) was structurally guaranteed to
+            # fail registration regardless of spacing -- likely also why
+            # the OLDER "near-duplicate framing" cases only ever looked
+            # like they "worked": a near-identity warp looks similar
+            # applied in either direction, so those cases weren't actually
+            # validating the direction convention at all.
+            reg = cv2.warpPerspective(
+                g, warp_full, (fw, fh),
+                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
         except cv2.error:
             continue
         if float(np.corrcoef(reg.ravel(), front.ravel())[0, 1]) < 0.45:
