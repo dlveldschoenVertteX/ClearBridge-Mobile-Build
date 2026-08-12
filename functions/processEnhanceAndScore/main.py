@@ -104,19 +104,36 @@ _SECONDARY_MAX_WAVELENGTH_PX_IR = 16.0
 _IR_GABOR_SIGMA_RATIO = 0.3
 _TARGET_SIZE    = (500, 500)
 _SCORE_PRESCALE_PX = 700   # two-step downscale waypoint before the 500x500 LANCZOS
-# Guide-radius multiplier for the matchability-only mosaic render. 1.5 was
-# the widest factor measured (2026-08-12) and captured a mean 72.9% of the
-# real U-Net-detected pad, against 47.0% at the production 1.0 -- i.e. it
-# roughly halves the pad area the scored print throws away. Deliberately NOT
-# applied to the scored variant: the same sweep showed NFIQ2 falling
-# monotonically as the mask widened (mean delta vs the best single zone
-# -4.00 at 1.0 -> -15.33 at 1.5), because the recovered ring is genuinely
-# weaker imagery -- pad periphery curving away from the lens, measured at
-# 77.9% of core sharpness on 4a1c4d89 -- and NOT a resolution artifact
-# (ridge scale in the real 500x500 NFIQ2 input stays 9-10px at every
-# factor). A matcher can use imperfect peripheral minutiae; a quality
-# metric cannot. See _save_matchability_mosaic.
-_MATCHABILITY_MOSAIC_GUIDE_SCALE = 1.5
+# Guide expansion for the matchability-only mosaic render. ASYMMETRIC by
+# anatomy (corrected 2026-08-12 after the first version scaled rx and ry
+# together): a fingerprint is the distal phalanx pad only -- the friction
+# ridge area from the tip down to the distal flexion crease. Real scanner
+# thumb prints are an oval, tighter at the tip and fuller at the base, and
+# never extend past that crease into the joint. Ridges below it are real
+# ridges but are NOT part of the print, and no reference print in any AFIS
+# gallery contains them -- feeding a matcher structure the gallery can never
+# hold risks adding unmatchable minutiae, the same mechanism that plausibly
+# drove raw pyfingHybrid's impostor-score inflation.
+#
+# LATERAL growth is the part worth having and is exactly what the sweep
+# buys: the pad's sides curve away from a face-on lens and are only ever
+# resolved by the left/right zones. rx=1.5 does take effect (measured:
+# output width tracks it).
+#
+# HONEST LIMITATION, measured not assumed: ry does NOT currently bind. The
+# rendered height stayed at 864px across ry scales of 1.5 / 1.15 / 0.9 /
+# 0.7, so the vertical extent is being set by generate()'s own mask
+# machinery -- the U-Net thumb segmentation (which segments the whole
+# finger, joint included, not the fingerprint pad) combined with
+# _MASK_COVER_DILATE -- rather than by this guide. ry/anchorBottom are kept
+# because they are anatomically the right intent and cost nothing, but they
+# do NOT yet enforce the crease boundary. Doing that properly needs explicit
+# distal-flexion-crease detection (a strong low-frequency transverse edge
+# below the pad) and cropping the FINAL print there; that is real work and
+# is deliberately NOT faked here.
+_MATCHABILITY_MOSAIC_RX_SCALE = 1.5
+_MATCHABILITY_MOSAIC_RY_SCALE = 1.15
+_MATCHABILITY_MOSAIC_ANCHOR_BOTTOM = True
 
 _RATE_LIMIT_SEC = 60   # minimum seconds between pipeline calls per user
 
@@ -1694,10 +1711,20 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                     # decided just above.
                                     try:
                                         _wide_guide = dict(_mosaic_guide)
+                                        _ry0 = float(_mosaic_guide['ry'])
+                                        _ry1 = _ry0 * _MATCHABILITY_MOSAIC_RY_SCALE
                                         _wide_guide['rx'] = (float(_mosaic_guide['rx'])
-                                                             * _MATCHABILITY_MOSAIC_GUIDE_SCALE)
-                                        _wide_guide['ry'] = (float(_mosaic_guide['ry'])
-                                                             * _MATCHABILITY_MOSAIC_GUIDE_SCALE)
+                                                             * _MATCHABILITY_MOSAIC_RX_SCALE)
+                                        _wide_guide['ry'] = _ry1
+                                        if _MATCHABILITY_MOSAIC_ANCHOR_BOTTOM:
+                                            # Hold the lower edge where the
+                                            # scored mask put it (at/above
+                                            # the distal flexion crease) and
+                                            # send the extra height toward
+                                            # the tip instead, so the mask
+                                            # never grows into the joint.
+                                            _wide_guide['cy'] = (
+                                                float(_mosaic_guide['cy']) - (_ry1 - _ry0))
                                         _wimg, _wp = afis_print.generate(
                                             [_mos], [0.0], [None],
                                             guide_region=_wide_guide,
@@ -1709,8 +1736,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                                 _wimg, user_id, capture_id)
                                             if _wpath:
                                                 _fusion_debug['matchabilityMosaicPath'] = _wpath
-                                                _fusion_debug['matchabilityGuideScale'] = \
-                                                    _MATCHABILITY_MOSAIC_GUIDE_SCALE
+                                                _fusion_debug['matchabilityGuideScale'] = {
+                                                    'rx': _MATCHABILITY_MOSAIC_RX_SCALE,
+                                                    'ry': _MATCHABILITY_MOSAIC_RY_SCALE,
+                                                    'anchorBottom': _MATCHABILITY_MOSAIC_ANCHOR_BOTTOM,
+                                                }
                                     except Exception as _wm_exc:   # noqa: BLE001
                                         logger.warning('matchability mosaic failed '
                                                        '(non-critical): %s', _wm_exc)
