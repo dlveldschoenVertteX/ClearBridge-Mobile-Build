@@ -890,6 +890,11 @@ _MOSAIC_YAW_DEG   = 12.0   # only borrow from THIS-lightly-yawed neighbours
 _MOSAIC_YAW_MIN   = 4.0    # ...but far enough to add genuine edge coverage
 _MOSAIC_MAX_SIDE  = 6      # cap side frames (registration cost)
 _MOSAIC_REG_PX    = 640    # ECC registration resolution (warp applied full-res)
+# Feathering of each side frame's contribution at its own warp boundary --
+# see the blend block in _front_anchored_mosaic for the real artifact this
+# fixes and the measurements behind these values.
+_MOSAIC_FEATHER_SIGMA = 64.0
+_MOSAIC_FEATHER_ERODE = 15
 
 
 def _block_coherence(gray: np.ndarray, blur: float = 8.0) -> np.ndarray:
@@ -970,7 +975,42 @@ def _front_anchored_mosaic(front: np.ndarray,
             continue
         if float(np.corrcoef(reg.ravel(), front.ravel())[0, 1]) < 0.45:
             continue
-        valid = (reg > 0).astype(np.float32)
+        # Feathered blend weights. The old `valid = (reg > 0)` had two real
+        # defects, both visible as a hard line cutting across the finished
+        # print (CTO report 2026-08-12, "there is an oval line passing
+        # through the mosaic capture"):
+        #
+        # 1. It is a BINARY step. Where the warped side image's rectangular
+        #    boundary crosses the pad, the blend weight jumps discontinuously,
+        #    so the composite switches sources mid-ridge. Measured on the
+        #    real capture that produced that report: the weight field's
+        #    gradient spiked to 3.96 against a field mean of 0.04 -- a ~100x
+        #    step. Feathering drops the same measurement to 0.49 (8.5x
+        #    lower), i.e. the weights now vary only as fast as the coherence
+        #    field itself, which is what the blend was always meant to
+        #    follow.
+        # 2. It tested the WARPED PIXELS rather than the warp's own
+        #    footprint, so any genuinely black pixel inside the side image
+        #    was misread as "no data" -- punching weight holes in real
+        #    content. Warping an explicit all-ones mask asks the question
+        #    actually being asked ("did this pixel come from the source
+        #    image?").
+        #
+        # Erode before blurring so the ~1px interpolation fringe at the warp
+        # boundary is excluded rather than smeared inward. Real NFIQ2 on the
+        # capture above: 73 -> 74-75 across sigma 16-96, i.e. a small
+        # consistent gain on top of removing the artifact; sigma is not a
+        # sensitive parameter here, so 64 is chosen as the middle of the
+        # flat region rather than tuned to a single capture.
+        ones = np.full(g.shape[:2], 255, np.uint8)
+        vm = cv2.warpPerspective(ones, warp_full, (fw, fh),
+                                 flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP)
+        vb = (vm > 127).astype(np.uint8)
+        if _MOSAIC_FEATHER_ERODE > 0:
+            vb = cv2.erode(vb, np.ones((_MOSAIC_FEATHER_ERODE,
+                                        _MOSAIC_FEATHER_ERODE), np.uint8))
+        valid = cv2.GaussianBlur(vb.astype(np.float32), (0, 0),
+                                 _MOSAIC_FEATHER_SIGMA)
         cs = _block_coherence(reg) * valid
         acc += reg.astype(np.float32) * cs
         wsum += cs
