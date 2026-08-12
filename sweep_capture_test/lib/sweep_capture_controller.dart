@@ -151,6 +151,23 @@ class SweepCaptureController extends ChangeNotifier {
       activeGuideShape: _sweepGuideShapeForProgress(0.0),
     ));
     unawaited(HapticFeedback.lightImpact());
+    // Real bug found 2026-08-12: real device data across 3 post-fix captures
+    // showed the LEFT zone consistently blurred (no visible ridge detail)
+    // while center was reliably sharp -- even after the progress-vs-cx unit
+    // fix above. Root cause: 'left' is the FIRST zone processed, so its own
+    // _redirectZoneFocus call is the very first real AF rack of the whole
+    // capture (calibrate() never sets an explicit focus point), competing
+    // for convergence against only 500ms of settle time -- a materially
+    // bigger rack than center->right's much shorter re-converge. This exact
+    // "first rack needs more time" pattern is why the main app's sweep
+    // (front_capture_controller.dart)'s validated round-2 fix redirects
+    // focus toward the left-shifted target during its own multi-second
+    // "place your thumb" positioning phase, not just a short post-move
+    // settle -- ported that same head-start here: kick off the left zone's
+    // focus redirect in parallel with this pre-roll delay instead of after
+    // it, so AF gets real, uninterrupted convergence time before the zone
+    // loop's own (much shorter) settle window even starts.
+    unawaited(_redirectZoneFocus(cam, 0.0));
     await Future<void>.delayed(const Duration(milliseconds: _calibrationHoldMs));
 
     try {
@@ -435,7 +452,18 @@ class SweepCaptureController extends ChangeNotifier {
   /// time -- same class of fix as `_refocus()`'s ORIGINAL version before
   /// its own verification upgrade, chosen here specifically because the
   /// stream-free constraint rules out the more rigorous polling approach.
-  static const int _zoneFocusSettleMs = 500;
+  //
+  // Widened 500->900ms, 2026-08-12: real device data showed the RIGHT zone
+  // intermittently blurred (sharp in 1 of 3 post-fix test captures, blurred
+  // in the other 2) -- consistent with a rack that's usually, but not
+  // reliably, done converging within 500ms, rather than a systematic
+  // targeting error (which would fail every time, the way LEFT did -- see
+  // the left-zone pre-roll fix above). A blind bound can't guarantee
+  // convergence the way real polling would, but 900ms roughly matches the
+  // main app's own real-device-tuned ticks+extraMaxMs budget for the same
+  // per-zone re-converge step, without reintroducing the image-stream ANR
+  // risk this function is deliberately built to avoid.
+  static const int _zoneFocusSettleMs = 900;
 
   // Real ANR reported 2026-08-11, the very next real device test after this
   // function shipped ("Sweep Test isn't responding"): three raw, unbounded

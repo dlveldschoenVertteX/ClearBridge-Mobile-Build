@@ -2957,6 +2957,29 @@ class FrontCaptureController extends ChangeNotifier {
         force: true,
       );
       unawaited(HapticFeedback.lightImpact());
+      // Real bug found 2026-08-12 on the standalone sweep test app (same
+      // _captureSweepBurst design, currently disabled here via
+      // _sweepBurstHybridEnabled): real device data showed the LEFT zone
+      // consistently blurred even after fixing _verifyZoneReady's cx/
+      // progress unit mismatch above, because 'left' is the first zone
+      // processed -- its own AF rack is the very first real one of the
+      // whole capture, competing against a short per-zone budget. Give it
+      // the same head start this file's own round-2 fix already proved
+      // works for the earlier sweepPositioning flow: kick off the left
+      // zone's focus redirect in parallel with this pre-roll wait, not
+      // just after the (much shorter) per-zone settle that follows it.
+      unawaited(() async {
+        final pt = _sweepFocusPointFor(_sweepGuideShapeForProgress(0.0).cx);
+        try {
+          await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
+        } catch (_) {}
+        try {
+          await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
+        } catch (_) {}
+        try {
+          await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
+        } catch (_) {}
+      }());
       await Future<void>.delayed(const Duration(milliseconds: _sweepCalibrationHoldMs));
       if (_disposed) return debug;
       for (final n in const ['Hold still…', '2…', '1…']) {
