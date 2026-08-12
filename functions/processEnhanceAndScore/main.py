@@ -1762,6 +1762,52 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             'n': _gr.get('n', 2.5),
                             'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
                         },
+                        # Added 2026-08-12. Minutiae patches have quietly
+                        # become the strongest candidate family in this
+                        # pipeline -- 'minutiae_left' won two real captures
+                        # outright (39eb41dd at 77, d1f3153a at 83), beating
+                        # every sweep zone AND the cross-zone mosaic on both,
+                        # with no tuning since the family was first added.
+                        # The three above only ever sample the HORIZONTAL
+                        # axis (cx shifts, cy fixed), so the pad's tip and
+                        # base were never given their own crop even though
+                        # the guide covers them.
+                        #
+                        # Deliberately appended AFTER the three proven
+                        # patches: this loop breaks on _post_variant_deadline
+                        # and dicts preserve insertion order, so if the time
+                        # budget bites it costs these NEW patches rather than
+                        # the ones already winning real captures. Same
+                        # ordering discipline as the sweep's own 'tip' zone.
+                        'tip': {
+                            'cx': _gr['cx'],
+                            'cy': _gr['cy'] - _gr['ry'] * 0.35,
+                            'rx': _gr['rx'],
+                            'ry': _gr['ry'] * 0.70,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'base': {
+                            'cx': _gr['cx'],
+                            'cy': _gr['cy'] + _gr['ry'] * 0.35,
+                            'rx': _gr['rx'],
+                            'ry': _gr['ry'] * 0.70,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        # Size sweep, not a position: a tighter crop than
+                        # 'core' concentrates the AFIS mask on the ridge-
+                        # densest region around the delta/core. Cheap to try
+                        # since it reuses the same cached stacks, and purely
+                        # additive like every other entry here.
+                        'coreTight': {
+                            'cx': _gr['cx'],
+                            'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.55,
+                            'ry': _gr['ry'] * 0.55,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
                     }
                     for _pname, _pguide in _patch_subguides.items():
                         if time.monotonic() > _post_variant_deadline:

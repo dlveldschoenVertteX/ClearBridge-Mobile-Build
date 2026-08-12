@@ -14,6 +14,17 @@ import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
 
+/// One sweep zone. `progress` is the 0..1 horizontal sweep position (fed to
+/// _sweepGuideShapeForProgress, which converts it to the guide's on-screen
+/// cx); `dyFrac` offsets the guide VERTICALLY as a fraction of screen height,
+/// which the original three horizontal-only zones never varied.
+class _SweepZone {
+  final String name;
+  final double progress;
+  final double dyFrac;
+  const _SweepZone(this.name, this.progress, {this.dyFrac = 0.0});
+}
+
 /// Standalone test of the sweep-burst capture architecture -- deliberately
 /// NOT layered after a main burst the way clearbridge_beta's
 /// FrontCaptureController runs it (real data, commit db1a94e 2026-08-06:
@@ -64,6 +75,22 @@ class SweepCaptureController extends ChangeNotifier {
   // constant even though the distance it travels shrank).
   static const int _zoneMoveMs = 1400;
   static const int _zoneSettleMs = 700;
+
+  // Vertical offset for the 'tip' zone, as a fraction of screen height,
+  // applied to the guide's cy. Sized at roughly half the guide's own ry
+  // (defaultShape.ry = 0.137275) so the tip zone still overlaps the centre
+  // zone across most of its area -- the mosaic registers it against
+  // 'center', so overlap is exactly what makes it usable rather than a
+  // fourth orphan frame. Negative = toward the top of the screen = toward
+  // the fingertip, which is the direction the horizontal sweep can never
+  // reach.
+  static const double _tipZoneDyFrac = 0.07;
+
+  // Ambient luma at or above which the sweep declines the torch outright.
+  // See the gate's own comment at the call site for the measurement behind
+  // it and why this reuses AdaptiveFlashController's night-mode boundary
+  // (80) rather than a value fitted to a single capture.
+  static const double _sweepTorchMaxAmbient = 100.0;
   static const int _burstFlashSettleMs = 70;
   // Widened 34000->40000, 2026-08-12, alongside the second ambient shot per
   // zone: that adds 3 more takePicture() calls (~0.5-0.9s each on this
@@ -146,11 +173,29 @@ class SweepCaptureController extends ChangeNotifier {
     await _flash!.calibrate(calib.brightness);
 
     // ─ Sweep zones: the WHOLE capture ────────────────────────────────────
+    // FOURTH ZONE ADDED 2026-08-12. The first three sweep only HORIZONTALLY
+    // (cx varies, cy is fixed at PadSilhouetteShape.defaultShape.cy), so no
+    // amount of left/right movement can reach the pad's vertical curvature
+    // toward the tip -- that region is structurally unreachable by the
+    // existing design, not merely under-sampled. 'tip' re-uses the centre
+    // column and offsets the guide UP instead, which is the one direction
+    // that adds genuinely new pad area.
+    //
+    // Deliberately anchored at the centre column rather than a corner: the
+    // mosaic registers every side against 'center' (see
+    // _front_anchored_mosaic_zones, which REQUIRES a 'center' key), and a
+    // tip zone sharing the centre's own column keeps maximum overlap with
+    // that anchor -- the condition registration actually needs. This is now
+    // the safest of the three sides to register, not the riskiest.
+    //
+    // Ordered last so that if the loop's own timeout ever bites, it costs
+    // the NEW zone rather than any of the three already proven to work.
     final basePath = 'captures/$userId/${_uuid.v4()}';
-    final zones = <MapEntry<String, double>>[
-      const MapEntry('left', 0.0),
-      const MapEntry('center', 0.5),
-      const MapEntry('right', 1.0),
+    final zones = <_SweepZone>[
+      const _SweepZone('left', 0.0),
+      const _SweepZone('center', 0.5),
+      const _SweepZone('right', 1.0),
+      const _SweepZone('tip', 0.5, dyFrac: -_tipZoneDyFrac),
     ];
     final rawShots = <String, Uint8List>{};
     final guideRegions = <String, Map<String, dynamic>>{};
@@ -185,7 +230,29 @@ class SweepCaptureController extends ChangeNotifier {
 
     try {
       await (() async {
-        final torchCapable = _flash!.isNeeded;
+        // Brightness gate on the torch (CTO's own proposal, 2026-08-12).
+        // AdaptiveFlashController only declines the torch above 185 luma,
+        // which is far too permissive here: the real capture that prompted
+        // this calibrated at 136.5 (flashMode 'normal', torch fired) and
+        // every one of its flash frames was measurably useless -- pad-crop
+        // high-frequency energy at 0.31-0.63 of the ambient frame's, with
+        // anisotropy of only 1.06-1.21x (so not motion blur) and no
+        // clipping at all (so not blowout). That signature is the on-axis
+        // torch flooding the valley micro-shadows that MAKE ridge contrast,
+        // which no exposure or focus tuning can undo -- confirmed by the
+        // focus-lock fix landing zero change on those ratios.
+        //
+        // So the torch only earns its slot when ambient genuinely cannot
+        // carry the exposure. Threshold reuses AdaptiveFlashController's
+        // OWN already-calibrated night-mode boundary (isNightMode < 80,
+        // and its intensity curve steps at 30/80/180) rather than a number
+        // fitted to the single capture above -- deliberately, because n=1
+        // threshold-fitting is this project's own documented anti-pattern.
+        // 100 sits just above that boundary: torch fires in genuinely dim
+        // scenes where it is the only light, and stands down in the
+        // moderately-lit ones where it only washes ridges out.
+        final _ambientCarriesIt = _calibBrightness >= _sweepTorchMaxAmbient;
+        final torchCapable = _flash!.isNeeded && !_ambientCarriesIt;
         final flashEvStep = torchCapable ? -0.6 : 0.0; // fixed EV step -- see README
         double? minEv, maxEv;
         if (torchCapable) {
@@ -203,6 +270,7 @@ class SweepCaptureController extends ChangeNotifier {
         zoneDebug['flashEvStep'] = flashEvStep;
         zoneDebug['calibBrightness'] = double.parse(_calibBrightness.toStringAsFixed(1));
         zoneDebug['flashMode'] = _flash!.modeName;
+        zoneDebug['torchSkippedForAmbient'] = _ambientCarriesIt;
         unawaited(HapticFeedback.mediumImpact());
 
         var wasFlashLastShot = false;
@@ -210,17 +278,19 @@ class SweepCaptureController extends ChangeNotifier {
         var extraMoveMs = 0;
 
         for (var i = 0; i < zones.length; i++) {
-          final zone = zones[i].key;
-          final target = zones[i].value;
+          final zone = zones[i].name;
+          final target = zones[i].progress;
+          final dy = zones[i].dyFrac;
           if (_disposed) break;
 
           if (i == 0) {
             _emit(_state.copyWith(
               sweepProgress: target,
-              activeGuideShape: _sweepGuideShapeForProgress(target),
+              activeGuideShape: _sweepGuideShapeForProgress(target, dyFrac: dy),
             ));
           } else {
-            final fromProgress = zones[i - 1].value;
+            final fromProgress = zones[i - 1].progress;
+            final fromDy = zones[i - 1].dyFrac;
             final moveMs = _zoneMoveMs + extraMoveMs;
             final grantedExtra = extraMoveMs > 0;
             if (grantedExtra) {
@@ -230,16 +300,25 @@ class SweepCaptureController extends ChangeNotifier {
             _emit(_state.copyWith(
               distanceHint: grantedExtra
                   ? 'Move further this time'
-                  : (zone == 'right' ? 'Slowly move right' : 'Slowly move to the middle'),
+                  : (zone == 'tip'
+                      ? 'Slowly move down — showing the tip'
+                      : (zone == 'right'
+                          ? 'Slowly move right'
+                          : 'Slowly move to the middle')),
             ));
             final moveStart = DateTime.now();
             while (true) {
               final elapsedMs = DateTime.now().difference(moveStart).inMilliseconds;
               final t = (elapsedMs / moveMs).clamp(0.0, 1.0);
               final progress = fromProgress + (target - fromProgress) * t;
+              // Animate the vertical offset alongside the horizontal one so
+              // the 'tip' hop reads as one continuous guide movement rather
+              // than a jump -- same reasoning as the horizontal tween.
+              final dyNow = fromDy + (dy - fromDy) * t;
               _emit(_state.copyWith(
                 sweepProgress: progress,
-                activeGuideShape: _sweepGuideShapeForProgress(progress),
+                activeGuideShape:
+                    _sweepGuideShapeForProgress(progress, dyFrac: dyNow),
               ));
               if (t >= 1.0) break;
               await Future<void>.delayed(const Duration(milliseconds: 60));
@@ -337,7 +416,7 @@ class SweepCaptureController extends ChangeNotifier {
             zoneDebug['${zone}_fl_error'] = e.toString();
           }
 
-          final region = _guideRegionForSweepZone(target);
+          final region = _guideRegionForSweepZone(target, dyFrac: dy);
           if (region != null) guideRegions[zone] = region;
 
           // Real-motion check against the PREVIOUS zone's flash shot --
@@ -421,12 +500,13 @@ class SweepCaptureController extends ChangeNotifier {
 
   // ─── Guide geometry (ported verbatim from front_capture_controller.dart) ─
 
-  PadSilhouetteShape _sweepGuideShapeForProgress(double progress) {
+  PadSilhouetteShape _sweepGuideShapeForProgress(double progress,
+      {double dyFrac = 0.0}) {
     const base = PadSilhouetteShape.defaultShape;
     final cx = (0.5 - _sweepGuideShiftFrac) + (2 * _sweepGuideShiftFrac) * progress.clamp(0.0, 1.0);
     return PadSilhouetteShape(
       cx: cx,
-      cy: base.cy,
+      cy: (base.cy + dyFrac).clamp(0.0, 1.0),
       rx: base.rx,
       ry: base.ry,
       n: base.n,
@@ -600,8 +680,10 @@ class SweepCaptureController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Map<String, dynamic>? _guideRegionForSweepZone(double progress) {
-    final region = _stillSpaceRegionForShape(_sweepGuideShapeForProgress(progress));
+  Map<String, dynamic>? _guideRegionForSweepZone(double progress,
+      {double dyFrac = 0.0}) {
+    final region = _stillSpaceRegionForShape(
+        _sweepGuideShapeForProgress(progress, dyFrac: dyFrac));
     if (region == null) return null;
     return {
       'cx': region.cx,
