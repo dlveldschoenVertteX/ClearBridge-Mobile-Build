@@ -2846,7 +2846,7 @@ class FrontCaptureController extends ChangeNotifier {
 
   Future<void> _verifyZoneReady(
     String zone,
-    double targetScreenX,
+    double zoneProgress,
     Map<String, dynamic> zoneDebug, {
     required List<String> ticks,
     required int tickMs,
@@ -2854,7 +2854,20 @@ class FrontCaptureController extends ChangeNotifier {
   }) async {
     final cam = _camera;
     if (cam != null) {
-      final pt = _sweepFocusPointFor(targetScreenX);
+      // Real bug found 2026-08-12 (device feedback: "left/right zones out
+      // of focus, front zone is perfect"): this used to pass zoneProgress
+      // (0.0/0.5/1.0) straight into _sweepFocusPointFor, whose parameter is
+      // actually the guide's on-screen CX fraction (~0.35-0.65 range, see
+      // _refocusForSweepPositioning/_beginSweepActive's own real-device-
+      // validated calls, which correctly pass
+      // _sweepGuideShapeForProgress(...).cx). Progress and cx only coincide
+      // at progress=0.5 (cx=0.5 too) -- exactly why the CENTER zone focused
+      // correctly while LEFT (progress 0.0, true cx 0.35) and RIGHT
+      // (progress 1.0, true cx 0.65) both aimed at the wrong point. Fixed
+      // by converting through the same guide-shape lookup every other real
+      // call site already uses.
+      final cx = _sweepGuideShapeForProgress(zoneProgress).cx;
+      final pt = _sweepFocusPointFor(cx);
       try {
         await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
       } catch (_) {}

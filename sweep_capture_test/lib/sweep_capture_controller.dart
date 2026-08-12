@@ -445,8 +445,17 @@ class SweepCaptureController extends ChangeNotifier {
   // the other two's budget either.
   static const Duration _zoneFocusCallTimeout = Duration(seconds: 3);
 
-  Future<void> _redirectZoneFocus(CameraController cam, double targetScreenX) async {
-    final pt = _sweepFocusPointFor(targetScreenX);
+  Future<void> _redirectZoneFocus(CameraController cam, double zoneProgress) async {
+    // Real bug found 2026-08-12 (device feedback: "left/right zones out of
+    // focus, front zone is perfect" -- ported fix, see
+    // front_capture_controller.dart's _verifyZoneReady for the full
+    // diagnosis): _sweepFocusPointFor's parameter is the guide's on-screen
+    // CX fraction (~0.35-0.65), not the raw zone progress (0.0/0.5/1.0) --
+    // they only coincide at progress=0.5, which is exactly why center
+    // focused fine while left/right did not. Convert through the guide
+    // shape lookup, same as every other real call site.
+    final cx = _sweepGuideShapeForProgress(zoneProgress).cx;
+    final pt = _sweepFocusPointFor(cx);
     try {
       await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
