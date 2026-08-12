@@ -2213,6 +2213,14 @@ class FrontCaptureController extends ChangeNotifier {
     _apply((s) => s.copyWith(phase: FrontCapturePhase.holding), force: true);
   }
 
+  // Real ANR reported 2026-08-11 ("ClearBridge Beta isn't responding"),
+  // same night this function's own sibling calls (_verifyZoneReady) were
+  // found to need the same fix. This is the highest-traffic of the three
+  // unguarded native-focus-call sites in this file -- fires on every
+  // capture's hold phase (via _refocus and on thumb-entry in _onFrame), not
+  // just sweep zones -- so it's the more likely real culprit behind a
+  // report seen on a plain front-capture run. Same bound, same reasoning:
+  // a single slow native call can no longer hang indefinitely.
   Future<void> _beginAutofocus() async {
     final cam = _camera;
     if (cam == null) return;
@@ -2224,13 +2232,13 @@ class FrontCaptureController extends ChangeNotifier {
     final cy = (_focusPointScreenSpace.top + _focusPointScreenSpace.bottom) / 2;
     final pt = Offset(cx, cy);
     try {
-      await cam.setFocusMode(FocusMode.auto);
+      await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     try {
-      await cam.setFocusPoint(pt);
+      await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     try {
-      await cam.setExposurePoint(pt);
+      await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
   }
 
@@ -2238,7 +2246,7 @@ class FrontCaptureController extends ChangeNotifier {
     final cam = _camera;
     if (cam == null) return;
     try {
-      await cam.setFocusMode(FocusMode.locked);
+      await cam.setFocusMode(FocusMode.locked).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
   }
 
@@ -2827,6 +2835,15 @@ class FrontCaptureController extends ChangeNotifier {
   /// hasn't happened by the end of that window -- same "fixed, known,
   /// one-time extension" discipline already used for the framing-
   /// similarity check just below this call site.
+  // Real ANR reported 2026-08-11, the very next real device test after this
+  // function shipped: three more raw, unbounded native platform-channel
+  // calls (setFocusMode/setFocusPoint/setExposurePoint), added by this same
+  // function, in the same unguarded pattern already found and fixed twice
+  // elsewhere tonight (camera disposal, _beginAutofocus's own three calls).
+  // Each one gets its own bound here rather than wrapping the whole block,
+  // so a single slow call can't silently eat the other two's budget either.
+  static const Duration _zoneFocusCallTimeout = Duration(seconds: 3);
+
   Future<void> _verifyZoneReady(
     String zone,
     double targetScreenX,
@@ -2839,13 +2856,13 @@ class FrontCaptureController extends ChangeNotifier {
     if (cam != null) {
       final pt = _sweepFocusPointFor(targetScreenX);
       try {
-        await cam.setFocusMode(FocusMode.auto);
+        await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
       } catch (_) {}
       try {
-        await cam.setFocusPoint(pt);
+        await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
       } catch (_) {}
       try {
-        await cam.setExposurePoint(pt);
+        await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
       } catch (_) {}
     }
     final pollSw = Stopwatch()..start();

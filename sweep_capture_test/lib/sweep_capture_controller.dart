@@ -437,16 +437,24 @@ class SweepCaptureController extends ChangeNotifier {
   /// stream-free constraint rules out the more rigorous polling approach.
   static const int _zoneFocusSettleMs = 500;
 
+  // Real ANR reported 2026-08-11, the very next real device test after this
+  // function shipped ("Sweep Test isn't responding"): three raw, unbounded
+  // native platform-channel calls, the exact same class of bug already
+  // found and fixed for camera disposal in the shared CameraService this
+  // same night. Each call gets its own bound so one slow call can't eat
+  // the other two's budget either.
+  static const Duration _zoneFocusCallTimeout = Duration(seconds: 3);
+
   Future<void> _redirectZoneFocus(CameraController cam, double targetScreenX) async {
     final pt = _sweepFocusPointFor(targetScreenX);
     try {
-      await cam.setFocusMode(FocusMode.auto);
+      await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     try {
-      await cam.setFocusPoint(pt);
+      await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     try {
-      await cam.setExposurePoint(pt);
+      await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     await Future<void>.delayed(const Duration(milliseconds: _zoneFocusSettleMs));
   }
