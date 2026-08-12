@@ -946,13 +946,27 @@ class FrontCaptureController extends ChangeNotifier {
   static const Rect _sweepTrackingRoi =
       Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
 
-  // Wide row-axis window used ONLY for the sweep's focus re-aim point
-  // (_refocusForSweepPositioning / _beginSweepActive) -- this exact span is
-  // what round 2's real device test confirmed fixes "focus locked on
-  // background, not thumb". Kept deliberately separate from
-  // _sweepTrackingRoi (see its docs above) so a future centroid-math tweak
-  // can never again silently regress this independently-validated value.
-  static const Rect _sweepFocusRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
+  // REAL BUG FOUND 2026-08-12 on the standalone sweep test app (this exact
+  // design, currently disabled here via _sweepBurstHybridEnabled -- see
+  // sweep_capture_test/lib/sweep_capture_controller.dart's
+  // _sweepFocusPointFor for the full writeup): the round-2 "validated" ROI
+  // above assumed setFocusPoint/setExposurePoint take raw sensor-buffer
+  // coordinates requiring a 90°CW rotation. Two further real-device rounds
+  // on the standalone app (fixing a progress/cx unit mismatch, then adding
+  // a pre-roll head-start + wider settle) both left left/right zones
+  // consistently blurred -- ruling out timing and confirming the TARGET
+  // POINT itself, not just its timing, was wrong. Both hypotheses are
+  // mathematically identical at cx=0.5 (why "center always worked" was
+  // never actually evidence for the rotated theory), and round 2's own
+  // "fix" most plausibly worked simply because it was the first time this
+  // path ever re-triggered continuous AF at all (previously permanently
+  // locked) -- not because its exact point was correct. The officially
+  // documented `camera` plugin contract, and this file's OWN
+  // `_focusPointScreenSpace`/`_beginAutofocus` (the main hold's own focus
+  // call, fired on every real capture this whole project, never once
+  // reported broken), both confirm these calls take direct preview-space
+  // coordinates -- no rotation. _sweepFocusRoi removed; see the new
+  // _sweepFocusPointFor below.
 
   // Guide region in landscape-still coords (the space afis_print.generate()
   // receives after decodeStillJpegToLuma's 90°-CW rotation). Computed at
@@ -1824,20 +1838,21 @@ class FrontCaptureController extends ChangeNotifier {
     unawaited(_refocusForSweepPositioning());
   }
 
-  /// Converts a SCREEN-space left(0)-right(1) fraction into the raw
-  /// CameraImage buffer point setFocusPoint/setExposurePoint expect, via
-  /// _sweepFocusRoi -- the ONE constant every sweep focus-targeting call
-  /// site must share (see _sweepFocusRoi's own docs for why this was split
-  /// out from _sweepTrackingRoi after a real round-4 regression). Column
-  /// axis fixed at the ROI's own centre ("centre Y fixed" per the sweep
-  /// spec); row axis inverted per this project's confirmed 90°CW
-  /// raw-buffer-to-screen rotation (see _sweepScreenXFraction).
-  Offset _sweepFocusPointFor(double targetScreenX) {
-    final rawBufferX = (_sweepFocusRoi.left + _sweepFocusRoi.right) / 2;
-    final rawBufferY = (_sweepFocusRoi.top +
-            (1.0 - targetScreenX) * _sweepFocusRoi.height)
-        .clamp(0.0, 1.0);
-    return Offset(rawBufferX, rawBufferY);
+  /// Returns the guide's own on-screen (cx, cy) directly as the
+  /// setFocusPoint/setExposurePoint target -- preview-space, no rotation,
+  /// same convention as _beginAutofocus's _focusPointScreenSpace. See the
+  /// real-bug note above _sweepTrackingRoi/(former)_sweepFocusRoi for why
+  /// the previous rotated-ROI formula was replaced 2026-08-12: it never
+  /// actually moved the target horizontally as zones shifted left/right
+  /// (X was pinned to the ROI's own centre), and real device testing on
+  /// the standalone sweep test app (this exact design) confirmed left/right
+  /// zones stayed consistently out of focus under it even after fixing
+  /// unit mismatches and timing. `cx` here is the guide's actual on-screen
+  /// centre for the target zone (e.g. `_sweepGuideShapeForProgress(progress)
+  /// .cx`), not the raw progress fraction -- every call site must pass cx.
+  Offset _sweepFocusPointFor(double cx) {
+    final cy = _sweepGuideShapeForProgress(0.0).cy;
+    return Offset(cx.clamp(0.0, 1.0), cy);
   }
 
   /// Re-aims CONTINUOUS autofocus (not locked) at the sweep-positioning

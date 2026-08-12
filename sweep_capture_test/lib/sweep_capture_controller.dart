@@ -418,19 +418,44 @@ class SweepCaptureController extends ChangeNotifier {
     );
   }
 
-  // Raw-buffer focus ROI, ported verbatim from front_capture_controller.dart
-  // (same rotation convention: screen-space horizontal maps to buffer-space
-  // vertical, per this device's confirmed 90°CW raw-buffer-to-screen
-  // rotation). Column axis fixed at the ROI's own centre; row axis carries
-  // the zone's screen-X position, inverted per the same rotation.
-  static const Rect _sweepFocusRoi = Rect.fromLTRB(0.3385, 0.17, 0.6615, 0.57);
-
-  Offset _sweepFocusPointFor(double targetScreenX) {
-    final rawBufferX = (_sweepFocusRoi.left + _sweepFocusRoi.right) / 2;
-    final rawBufferY = (_sweepFocusRoi.top +
-            (1.0 - targetScreenX) * _sweepFocusRoi.height)
-        .clamp(0.0, 1.0);
-    return Offset(rawBufferX, rawBufferY);
+  // REAL BUG FOUND 2026-08-12, second round: the previous "raw-buffer,
+  // 90°CW-rotated" formula (ROI-based, X fixed at ~0.5, Y swept with the
+  // zone) was carried over from front_capture_controller.dart's
+  // sweepPositioning phase under the assumption that setFocusPoint/
+  // setExposurePoint take raw sensor-buffer coordinates. Fixing the
+  // progress-vs-cx unit mismatch (previous commit) and adding a left-zone
+  // pre-roll + wider settle (also previous commit) BOTH assumed that
+  // rotated formula was fundamentally correct and just needed better
+  // inputs/timing -- but real device data after BOTH fixes still showed
+  // left AND right consistently blurred, only center sharp, across 2 more
+  // real captures. That rules out a timing/unit explanation: the target
+  // POINT itself must be wrong.
+  //
+  // Re-examined the assumption itself: this exact file's `camera` package
+  // (and every other real call site in front_capture_controller.dart, e.g.
+  // `_beginAutofocus`'s `_focusPointScreenSpace` -- the MAIN hold's own
+  // focus point, fired on every single real capture this whole project and
+  // never once reported broken) already documents, and the official
+  // `camera`/`camera_android_camerax` plugin API itself specifies, that
+  // setFocusPoint/setExposurePoint take PREVIEW-space coordinates: (0,0)
+  // top-left, (1,1) bottom-right of what's actually rendered on screen --
+  // the SAME space the on-screen guide itself is drawn in, no rotation.
+  // The "raw buffer" theory was never actually validated against this --
+  // it only ever needed to explain a single always-centred point
+  // (_focusPointScreenSpace) or a case (sweepPositioning's real device
+  // test) where simply re-triggering continuous AF at all, after it had
+  // been stuck locked, was itself already a big enough improvement to look
+  // like confirmation regardless of whether the exact point was right.
+  // Both hypotheses are mathematically IDENTICAL at cx=0.5 (center) --
+  // which is exactly the one zone that has ever focused correctly here,
+  // so "center works" was never evidence either way.
+  //
+  // Fix: return the guide's own on-screen (cx, cy) directly, no ROI/
+  // rotation math at all -- the same convention `_beginAutofocus` already
+  // uses successfully.
+  Offset _sweepFocusPointFor(double cx) {
+    const base = PadSilhouetteShape.defaultShape;
+    return Offset(cx.clamp(0.0, 1.0), base.cy);
   }
 
   /// Real gap found 2026-08-11: this app's `_calibrate()` sets continuous
