@@ -968,6 +968,26 @@ _MOSAIC_REG_PX    = 640    # ECC registration resolution (warp applied full-res)
 # fixes and the measurements behind these values.
 _MOSAIC_FEATHER_SIGMA = 64.0
 _MOSAIC_FEATHER_ERODE = 15
+# How much sharper than the anchor a side frame must be, at a given pixel,
+# before it fully takes that pixel over. 1.0 disables the gate (restoring
+# the old plain-average behaviour). See the block in _front_anchored_mosaic
+# for the measurements; 1.5 was the best of 1.2/1.5/2.0 on mean real-NFIQ2
+# delta across 6 real captures, and all three recovered essentially all of
+# the anchor sharpness the ungated average was destroying.
+_MOSAIC_ANCHOR_DOMINANT_T = 1.5
+_MOSAIC_ANCHOR_RAMP_BLUR = 24.0
+
+
+def _block_sharpness(gray: np.ndarray) -> np.ndarray:
+    """Local high-frequency energy, as a smooth per-pixel field.
+
+    Deliberately Laplacian ENERGY rather than _block_coherence: coherence
+    measures how consistently ORIENTED a neighbourhood is, which a blurred
+    ridge pattern still scores highly on -- that is precisely why the
+    coherence-only blend could not tell a sharp side frame from a soft one.
+    """
+    lap = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F, ksize=3)
+    return cv2.GaussianBlur(lap * lap, (0, 0), 8.0)
 
 
 def _block_coherence(gray: np.ndarray, blur: float = 8.0) -> np.ndarray:
@@ -1085,6 +1105,44 @@ def _front_anchored_mosaic(front: np.ndarray,
         valid = cv2.GaussianBlur(vb.astype(np.float32), (0, 0),
                                  _MOSAIC_FEATHER_SIGMA)
         cs = _block_coherence(reg) * valid
+        # ANCHOR-DOMINANT gate (2026-08-12). This function's own docstring
+        # above has always promised it "only BORROWS ridge detail from
+        # lightly-yawed side frames in the regions where they register well
+        # AND resolve ridges better than the front" -- but the code did not
+        # implement the second half at all. A plain coherence-weighted
+        # average hands a side whose coherence merely MATCHES the anchor
+        # ~50% of every pixel, and on real sweep captures the side frames
+        # overlap 94-97% of the crop, so virtually the whole print was an
+        # average of warped frames. Averaging frames misregistered by even a
+        # fraction of a ridge period smears ridges: measured across 6 real
+        # captures, the mosaic retained a mean of only 58.6% of the anchor's
+        # own pad-crop Laplacian (as low as 37%).
+        #
+        # Scaling each side's weight by how much SHARPER it is than the
+        # anchor delivers the documented behaviour: zero contribution at
+        # parity (so the output IS the anchor wherever the anchor is as good
+        # or better), ramping to full where a side genuinely resolves better
+        # -- the pad edge that rotated into view for that zone, which is the
+        # entire reason the sweep exists. Same 6 captures: retention rises
+        # 58.6% -> 105.2% (>100% because borrowed edge detail is genuinely
+        # sharper than the anchor there), with mean real-NFIQ2 delta against
+        # the best single zone moving -1.50 -> +0.00.
+        #
+        # NOT the same as the sharpness gate tried and rejected earlier the
+        # same day: that one multiplied by clip(side/anchor, 0, 1), which
+        # still gives a side near-full weight at parity and only punishes
+        # badly-blurred sides -- it measured net negative. This gates at
+        # ratio > 1, so parity contributes nothing.
+        if _MOSAIC_ANCHOR_DOMINANT_T > 1.0:
+            _ratio = _block_sharpness(reg) / (_block_sharpness(front) + 1e-6)
+            _gain = np.clip((_ratio - 1.0) / (_MOSAIC_ANCHOR_DOMINANT_T - 1.0),
+                            0.0, 1.0)
+            # Smooth the gain field so the handover between anchor and side
+            # is gradual -- an abrupt gain edge would reintroduce exactly
+            # the kind of weight discontinuity the feathering above exists
+            # to remove.
+            _gain = cv2.GaussianBlur(_gain, (0, 0), _MOSAIC_ANCHOR_RAMP_BLUR)
+            cs = cs * _gain
         acc += reg.astype(np.float32) * cs
         wsum += cs
         used += 1
