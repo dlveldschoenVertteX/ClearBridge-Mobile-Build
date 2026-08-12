@@ -692,6 +692,33 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         cyl_nfiq    = nfiq_result['nfiq_score']
         best_enhanced = nfiq_result.get('best_image', enhanced)
 
+        # Real bug found 2026-08-11, from a real capture (6fff70d1): the
+        # CTO's 2026-08-08 directive ("the local ResNet18 proxy is not
+        # ground truth and must not drive which AFIS candidate wins") only
+        # converted the AFIS-path candidate loop to real NFIQ2
+        # (_score_ground_truth) -- cyl_nfiq here was left on the OLD proxy
+        # (_score_nfiq), so the TOP-LEVEL afis-vs-cylindrical decision
+        # (`nfiq_score = max(cyl_nfiq, afis_nfiq)` below) was comparing a
+        # real value against a proxy value, not real-vs-real. On this real
+        # capture the proxy read cyl_nfiq=44.35 (inflated, foolable -- this
+        # project's own established finding) against a REAL afis_nfiq=34,
+        # so cylindrical wrongly won the top-level pick; its own real
+        # NFIQ2 then turned out catastrophically low, and the final
+        # reported nfiq2Score=3 (via the freqNorm fallback) -- worse than
+        # the real 34 a fairly-judged AFIS candidate already had in hand.
+        # Fixed the same way the AFIS path already was: rescore the single
+        # TTA-winning image (best_enhanced) against real NFIQ2 once (not
+        # all 6 TTA variants -- keeps this to one extra real call, same
+        # cost class as every other _score_ground_truth call site) and use
+        # that for cyl_nfiq from here on. Fails closed to 0.0 on any sidecar
+        # error (same contract as _score_ground_truth), so an unverified
+        # cylindrical candidate can never beat a verified AFIS one by
+        # default -- it can only ever lose ties it used to win on a
+        # proxy's say-so.
+        _cyl_ground_truth = _score_ground_truth(best_enhanced)
+        cyl_nfiq = (_cyl_ground_truth.get('nfiq_score', 0.0)
+                    if not _cyl_ground_truth.get('error') else 0.0)
+
         # ── 4b. Save enhanced flat print ──────────────────────────────────────
         # Scoring/classification below run on `best_enhanced` unmodified; the
         # ink/livescan contrast curve is cosmetic and only applied to the copy
@@ -1739,10 +1766,14 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # (including a disk round-trip) via the local calibrated binary --
         # confirming this is redundant-call fragility, not scoring
         # nondeterminism or image corruption. Reusing the already-known-good
-        # afis_nfiq value removes the redundant call entirely for the dominant
-        # AFIS-wins case; only the cylindrical path (cyl_nfiq is still the
-        # ResNet18 proxy, never scored against real NFIQ2 anywhere above)
-        # still needs a fresh real-NFIQ2 call here.
+        # afis_nfiq value removes the redundant call entirely for the AFIS-
+        # wins case. cyl_nfiq is now ALSO a real NFIQ2 value (see the
+        # 2026-08-11 fix right after nfiq_result['nfiq_score'] is read
+        # above -- cyl_nfiq used to still be the ResNet18 proxy here, its
+        # own redundant-call bug just hadn't been noticed yet since the
+        # proxy-vs-real comparison it fed usually didn't flip the winner)
+        # -- reuse it the same way for the cylindrical-wins case instead of
+        # a second fresh call on the identical image.
         #
         # Do NOT "fix" this to always score best_enhanced instead -- a real
         # production oscillating capture has scored 70% NFIQ2 via the
@@ -1757,7 +1788,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # not to which image type NFIQ2 was scoring.
         _afis_won = afis_nfiq >= cyl_nfiq and afis_nfiq > 0
         winning_image = best_afis_img if _afis_won else best_enhanced
-        nfiq2_score = int(round(afis_nfiq)) if _afis_won else nfiq2_client.score_nfiq2(winning_image)
+        nfiq2_score = int(round(afis_nfiq)) if _afis_won else int(round(cyl_nfiq))
         nfiq2_source = 'winner'
 
         # Additive experiment: the ResNet18 proxy above doesn't appear to
