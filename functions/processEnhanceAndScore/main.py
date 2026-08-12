@@ -104,6 +104,20 @@ _SECONDARY_MAX_WAVELENGTH_PX_IR = 16.0
 _IR_GABOR_SIGMA_RATIO = 0.3
 _TARGET_SIZE    = (500, 500)
 _SCORE_PRESCALE_PX = 700   # two-step downscale waypoint before the 500x500 LANCZOS
+# Guide-radius multiplier for the matchability-only mosaic render. 1.5 was
+# the widest factor measured (2026-08-12) and captured a mean 72.9% of the
+# real U-Net-detected pad, against 47.0% at the production 1.0 -- i.e. it
+# roughly halves the pad area the scored print throws away. Deliberately NOT
+# applied to the scored variant: the same sweep showed NFIQ2 falling
+# monotonically as the mask widened (mean delta vs the best single zone
+# -4.00 at 1.0 -> -15.33 at 1.5), because the recovered ring is genuinely
+# weaker imagery -- pad periphery curving away from the lens, measured at
+# 77.9% of core sharpness on 4a1c4d89 -- and NOT a resolution artifact
+# (ridge scale in the real 500x500 NFIQ2 input stays 9-10px at every
+# factor). A matcher can use imperfect peripheral minutiae; a quality
+# metric cannot. See _save_matchability_mosaic.
+_MATCHABILITY_MOSAIC_GUIDE_SCALE = 1.5
+
 _RATE_LIMIT_SEC = 60   # minimum seconds between pipeline calls per user
 
 # Beta phase flag — retains ALL raw frames globally for pipeline training.
@@ -1669,6 +1683,38 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                                            'afisSource': 'sweepFusion'}
                                     else:
                                         _fusion_debug['wonSelection'] = False
+
+                                    # WIDE-mask render, stored for the
+                                    # matchability gate only -- see
+                                    # _save_matchability_mosaic's docstring
+                                    # for the measurements behind keeping
+                                    # this out of NFIQ2 selection entirely.
+                                    # Wrapped separately so a failure here
+                                    # can never disturb the scored candidate
+                                    # decided just above.
+                                    try:
+                                        _wide_guide = dict(_mosaic_guide)
+                                        _wide_guide['rx'] = (float(_mosaic_guide['rx'])
+                                                             * _MATCHABILITY_MOSAIC_GUIDE_SCALE)
+                                        _wide_guide['ry'] = (float(_mosaic_guide['ry'])
+                                                             * _MATCHABILITY_MOSAIC_GUIDE_SCALE)
+                                        _wimg, _wp = afis_print.generate(
+                                            [_mos], [0.0], [None],
+                                            guide_region=_wide_guide,
+                                            freq_normalize=True,
+                                            stack_cache={},
+                                        )
+                                        if _wimg is not None:
+                                            _wpath = _save_matchability_mosaic(
+                                                _wimg, user_id, capture_id)
+                                            if _wpath:
+                                                _fusion_debug['matchabilityMosaicPath'] = _wpath
+                                                _fusion_debug['matchabilityGuideScale'] = \
+                                                    _MATCHABILITY_MOSAIC_GUIDE_SCALE
+                                    except Exception as _wm_exc:   # noqa: BLE001
+                                        logger.warning('matchability mosaic failed '
+                                                       '(non-critical): %s', _wm_exc)
+                                        _fusion_debug['matchabilityMosaicError'] = str(_wm_exc)
                                 else:
                                     _fusion_debug['error'] = 'mosaic registration failed'
                             _sweep_burst_debug['fusion'] = _fusion_debug
@@ -1995,6 +2041,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # much harder, currently-unproven registration/stitching work
             # is justified.
             'sweepBurstCandidates': _sweep_burst_debug or None,
+            # Top-level pointer to the wide-mask mosaic kept for the
+            # matchability gate (see _save_matchability_mosaic). Surfaced
+            # here as well as inside sweepBurstCandidates.fusion so it can
+            # be queried directly without walking the debug blob.
+            'matchabilityMosaicPath':
+                ((_sweep_burst_debug or {}).get('fusion') or {}).get(
+                    'matchabilityMosaicPath'),
             # Minutiae-patch candidates diagnostic (2026-08-03): per-patch
             # sub-guide, proxy score, and whether that patch won selection.
             # Gate for deciding whether to invest further in patch-level
@@ -3297,6 +3350,49 @@ def _save_enhanced_flat(image: np.ndarray, user_id: str, capture_id: str) -> str
         return path
     except Exception as exc:
         logger.warning('Failed to save enhanced_flat.jpg (non-critical): %s', exc)
+        return None
+
+
+def _save_matchability_mosaic(image: np.ndarray, user_id: str,
+                              capture_id: str) -> str | None:
+    """Store the WIDE-mask cross-zone mosaic as its own artifact, kept
+    deliberately OUTSIDE the NFIQ2 selection that produces
+    superprint_afis.png.
+
+    Why a separate artifact rather than another max-of-variants candidate
+    (2026-08-12): the sweep exists to reconstruct pad area no single frame
+    can see, and it demonstrably does -- measured against the real U-Net pad
+    segmentation, the mosaic carries 45-116% MORE genuine pad than the
+    scored guide ellipse captures. But NFIQ2 cannot value that, and this was
+    measured rather than assumed: widening the mask across 6 real captures
+    moved pad capture 47%->73% while NFIQ2 fell monotonically (mean delta
+    -4.00 -> -15.33 vs the best single zone, 1/6 wins -> 0/6). Ruled out the
+    obvious confound too -- ridge scale in the actual 500x500 NFIQ2 input
+    stays at 9-10px either way, right on NFIQ2's own calibration, so this is
+    NOT a resolution/fit artifact. The added ring is simply weaker imagery
+    (77.9% of core sharpness on 4a1c4d89): real pad periphery curving away
+    from the lens, which a quality metric must mark down and a MATCHER can
+    still use.
+
+    So routing the wide mosaic through NFIQ2 selection would guarantee it
+    loses, permanently discarding the one thing the sweep is for. Saved
+    unconditionally instead, for the matchability gate (SourceAFIS per
+    CLAUDE.md's standing instruction, cross-checked with NBIS bozorth3)
+    which is the prime directive's own criterion. Purely additive: writes an
+    extra object and a Firestore field, touches no selection path, so it
+    cannot change any capture's score."""
+    try:
+        _, bucket = _get_firebase()
+        ok, buf = cv2.imencode('.png', image)
+        if not ok:
+            logger.warning('cv2.imencode failed for mosaic_matchability.png')
+            return None
+        path = f'captures/{user_id}/{capture_id}/mosaic_matchability.png'
+        bucket.blob(path).upload_from_string(buf.tobytes(), content_type='image/png')
+        logger.info('matchability mosaic saved → %s', path)
+        return path
+    except Exception as exc:
+        logger.warning('Failed to save mosaic_matchability.png (non-critical): %s', exc)
         return None
 
 
