@@ -1450,8 +1450,35 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                      if _amb_path else None)
                             _zfl = (_decode_image(_download_storage_file(_fl_path))
                                     if _fl_path else None)
+                            # Resolved BEFORE fusion (was below) so the
+                            # sharpness guard can measure the pad crop rather
+                            # than the whole background-dominated still.
+                            _zguide = _sb_guides.get(_zone) or _guide_region
+                            # Flash-softness guard, 2026-08-12. Real measured
+                            # regression: on the first sweep captures where
+                            # every zone was genuinely in focus, EVERY zone
+                            # whose pair actually fused scored lower than its
+                            # own plain ambient frame (5/5 zones, 2/2 mosaics,
+                            # up to -13 NFIQ2) -- the flash frames were
+                            # 2.8-17.8x softer than ambient, so 'soft' fusion
+                            # was averaging real ridge detail away. See
+                            # afis_print._FLASH_PAIR_MAX_SHARPNESS_RATIO for
+                            # the full table and why 2.0 rather than the main
+                            # burst's 4x. Skips only the FUSION; the zone
+                            # still scores via its ambient frame below, so
+                            # this can never drop a zone candidate entirely.
+                            _zratio = afis_print.flash_pair_sharpness_ratio(
+                                _zamb, _zfl, _zguide)
+                            if _zratio is not None and _zratio != float('inf'):
+                                _zone_debug['ambFlashSharpnessRatio'] = round(_zratio, 2)
+                            _zflash_usable = (
+                                _zratio is None
+                                or _zratio <= afis_print._FLASH_PAIR_MAX_SHARPNESS_RATIO)
+                            if not _zflash_usable:
+                                _zone_debug['fusionSkipped'] = 'flash too soft vs ambient'
                             _zfused = (afis_print._fuse_flash_ambient(_zamb, _zfl, mode='soft')
-                                       if (_zamb is not None and _zfl is not None) else None)
+                                       if (_zamb is not None and _zfl is not None
+                                           and _zflash_usable) else None)
                             # Falls back to whichever single frame exists if the
                             # pair didn't register/fuse -- can only recover an
                             # otherwise-empty zone, never worse than before.
@@ -1485,7 +1512,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                 continue
                             _zlap = float(cv2.Laplacian(_zsrc, cv2.CV_64F).var())
                             _zone_debug['laplacian'] = round(_zlap, 1)
-                            _zguide = _sb_guides.get(_zone) or _guide_region
+                            # _zguide already resolved above (needed by the
+                            # flash-softness guard before fusion runs).
                             _zone_grays[_zone] = (_zsrc, _zguide)
                             _zimg_res, _zp = afis_print.generate(
                                 [_zsrc], [0.0], [None],

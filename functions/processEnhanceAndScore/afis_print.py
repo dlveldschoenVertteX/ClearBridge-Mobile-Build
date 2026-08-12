@@ -821,6 +821,79 @@ def _focus_stack_face_on(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+_FLASH_PAIR_MAX_SHARPNESS_RATIO = 2.0
+# Above this ambient:flash pad-crop sharpness ratio, an ambient+flash pair is
+# NOT worth fusing -- the flash frame is so much softer that blending it in
+# costs more ridge detail than its complementary illumination buys back.
+#
+# Real measurement, 2026-08-12, on the 3 sweep captures taken right after the
+# per-zone focus fix landed (the first real sweep data where every zone was
+# genuinely in focus, so zone quality was finally limited by illumination
+# rather than by focus). Every zone whose ambient+flash pair actually fused
+# scored LOWER than that same zone's plain ambient frame, and every mosaic
+# built from fused zones scored lower than the same mosaic built from ambient
+# frames -- 5/5 zone cases and 2/2 mosaic cases, zero counter-examples:
+#
+#   capture   zone    amb:fl ratio   fused   ambient-only
+#   4a1c4d89  left        3.7x         62         75   (+13)
+#   d1f3153a  left        2.8x         72         77   (+5)
+#   d1f3153a  center      4.9x         72         75   (+3)
+#   4a1c4d89  mosaic        -          64         73   (+9)
+#   d1f3153a  mosaic        -          67         79   (+12)
+#
+# (22a27f67's three pairs all failed _fuse_flash_ambient's own registration
+# gate, so its fused and ambient-only paths were byte-identical at 60/60 --
+# a useful null control confirming the difference above is real, not harness
+# variance.) Measured flash frames on these captures ran Laplacian 3.2-31.8
+# against ambient's 30.0-105.2, i.e. the same recurring torch-blowout pattern
+# _FLASH_DIFF_MIN_FLASH_LAPLACIAN above documents for the segmentation path.
+#
+# 2.0 rather than the main burst's own 4x guard: every real fused case here
+# lost at ratios of only 2.8-4.9x, so a 4x threshold would still have let the
+# two worst regressions (-13, -5) through. Deliberately kept as a ratio gate
+# (not an outright removal of zone fusion) so a genuinely comparable flash
+# frame -- the case the feature was designed for, and the case a future
+# adaptive-EV fix on the sweep's torch would produce -- still fuses.
+def flash_pair_sharpness_ratio(ambient: np.ndarray, flash: np.ndarray,
+                               guide_region: Optional[dict] = None) -> Optional[float]:
+    """ambient:flash sharpness ratio over the guide's own pad crop.
+
+    Deliberately measured on the PAD CROP, not the whole still: a sweep-zone
+    frame is mostly a large static in-focus room with the pad occupying a
+    small fraction of the frame (the same whole-frame-vs-pad distinction that
+    `_front_anchored_mosaic_zones` exists to handle), so a whole-frame
+    Laplacian is dominated by background texture and says almost nothing
+    about the ridge content the fusion actually operates on.
+
+    Returns None when the ratio can't be measured (missing input, no usable
+    guide region, or a degenerate crop) -- callers treat None as "no evidence
+    to withhold fusion" and proceed exactly as before."""
+    if ambient is None or flash is None:
+        return None
+    ga = ambient if ambient.ndim == 2 else cv2.cvtColor(ambient, cv2.COLOR_BGR2GRAY)
+    gf = flash if flash.ndim == 2 else cv2.cvtColor(flash, cv2.COLOR_BGR2GRAY)
+    if gf.shape[:2] != ga.shape[:2]:
+        gf = cv2.resize(gf, (ga.shape[1], ga.shape[0]))
+    h, w = ga.shape[:2]
+    if guide_region:
+        try:
+            cx = float(guide_region['cx']); cy = float(guide_region['cy'])
+            rx = float(guide_region['rx']); ry = float(guide_region['ry'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        x0 = max(0, int((cx - rx) * w)); x1 = min(w, int((cx + rx) * w))
+        y0 = max(0, int((cy - ry) * h)); y1 = min(h, int((cy + ry) * h))
+    else:
+        x0, x1, y0, y1 = w // 4, 3 * w // 4, h // 4, 3 * h // 4
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    la = float(cv2.Laplacian(ga[y0:y1, x0:x1], cv2.CV_64F).var())
+    lf = float(cv2.Laplacian(gf[y0:y1, x0:x1], cv2.CV_64F).var())
+    if lf <= 1e-6:
+        return float('inf')     # flash carries no detail at all
+    return la / lf
+
+
 def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
                         mode: str = 'maxc') -> Optional[np.ndarray]:
     """Fuse a SAME-POSE ambient+flash pair into one enhanced grayscale.
