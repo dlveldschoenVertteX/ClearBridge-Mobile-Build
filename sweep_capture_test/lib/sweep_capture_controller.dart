@@ -84,6 +84,10 @@ class SweepCaptureController extends ChangeNotifier {
   Size? _cachedPreviewSize;
   double _focusPeak = 1.0;
   double _focusValue = 0.0;
+  // Whole-frame calibration luma the torch decision was made from -- kept
+  // only so it can be written to the capture doc for diagnosis (see the
+  // zoneDebug writes in the sweep loop).
+  double _calibBrightness = 128.0;
   bool _disposed = false;
 
   SweepTestState _state = const SweepTestState();
@@ -130,6 +134,7 @@ class SweepCaptureController extends ChangeNotifier {
     // re-testing the pre-capture readiness gate.
     _emit(_state.copyWith(phase: SweepTestPhase.calibrating, message: 'Reading light + focus…'));
     final calib = await _calibrate(cam);
+    _calibBrightness = calib.brightness;
     await _flash!.calibrate(calib.brightness);
 
     // ─ Sweep zones: the WHOLE capture ────────────────────────────────────
@@ -182,6 +187,14 @@ class SweepCaptureController extends ChangeNotifier {
           } catch (_) {}
         }
         zoneDebug['torchCapable'] = torchCapable;
+        // Recorded 2026-08-12: the flash-softness investigation wanted both
+        // of these off a real capture and neither was on the doc (the EV
+        // step and the brightness the torch decision was actually made from,
+        // which AdaptiveFlashController gates at >=185 whole-frame luma).
+        // Cheap, diagnostic-only, no behaviour change.
+        zoneDebug['flashEvStep'] = flashEvStep;
+        zoneDebug['calibBrightness'] = double.parse(_calibBrightness.toStringAsFixed(1));
+        zoneDebug['flashMode'] = _flash!.modeName;
         unawaited(HapticFeedback.mediumImpact());
 
         var wasFlashLastShot = false;
@@ -519,6 +532,31 @@ class SweepCaptureController extends ChangeNotifier {
       await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
     await Future<void>.delayed(const Duration(milliseconds: _zoneFocusSettleMs));
+    // REAL BUG, found 2026-08-12 by measuring the flash frames rather than
+    // assuming: every zone's flash shot is optically SOFT (pad-crop Laplacian
+    // 3.2-31.8) while its own ambient shot, fired ~70ms earlier from the same
+    // position, is SHARP (30.0-105.2) -- up to a 16x gap on the same zone.
+    // Exposure is NOT the cause: the flash frames carry essentially no
+    // clipping (>=250 at 0.00-0.89%, and the very softest frame of all,
+    // 4a1c4d89/center at Laplacian 3.2, has 0.00% clipped and 0.00% even
+    // above 240) and no crushed shadows anywhere. Correctly exposed but
+    // detail-free is the signature of focus/motion, not blowout.
+    //
+    // Structural cause: this controller only ever sets FocusMode.auto
+    // (continuous) and never locks -- there is no FocusMode.locked anywhere
+    // in this file. So between the ambient and flash shots, the torch turns
+    // on and changes scene brightness dramatically, and continuous AF is
+    // free to start hunting right as the flash frame fires. The main app's
+    // burst has always locked focus before firing for exactly this reason
+    // (_refocus's auto -> settle -> _lockFocusOnly cycle); this file never
+    // ported that half. Locking after the settle keeps the whole ambient+
+    // flash pair on the one converged distance -- which also preserves the
+    // same-pose premise _fuse_flash_ambient depends on. The next zone's own
+    // _redirectZoneFocus call re-enables FocusMode.auto as its first step,
+    // so the lock is scoped to one zone and cannot leak forward.
+    try {
+      await cam.setFocusMode(FocusMode.locked).timeout(_zoneFocusCallTimeout);
+    } catch (_) {}
   }
 
   Map<String, dynamic>? _guideRegionForSweepZone(double progress) {
