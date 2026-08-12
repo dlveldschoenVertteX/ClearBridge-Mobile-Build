@@ -1454,6 +1454,51 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             # sharpness guard can measure the pad crop rather
                             # than the whole background-dominated still.
                             _zguide = _sb_guides.get(_zone) or _guide_region
+
+                            # Second same-pose AMBIENT frame (2026-08-12).
+                            # The client now fires two back-to-back ambient
+                            # exposures per zone, because measurement showed
+                            # the torch-lit frame contributes no usable ridge
+                            # detail (isotropic high-frequency attenuation to
+                            # 0.31-0.63 of ambient -- on-axis illumination
+                            # filling the valley shadows, not blur and not
+                            # blowout). Stacking the two ambient frames is
+                            # real noise reduction on genuinely complementary
+                            # data, using the same _stack_face_on this
+                            # pipeline already relies on for the main burst.
+                            #
+                            # Strictly optional and strictly additive: older
+                            # captures have no '<zone>_amb2' key, _stack_face_on
+                            # returns None unless >=2 frames survive its own
+                            # ECC alignment, and either way _zamb falls back to
+                            # the single ambient frame exactly as before -- so
+                            # this can only ever improve a zone's source, never
+                            # degrade or drop one.
+                            _amb2_path = _sb_paths.get(f'{_zone}_amb2')
+                            if _amb2_path and _zamb is not None:
+                                try:
+                                    _zamb2 = _decode_image(
+                                        _download_storage_file(_amb2_path))
+                                    if _zamb2 is not None:
+                                        _ga = (_zamb if _zamb.ndim == 2
+                                               else cv2.cvtColor(_zamb, cv2.COLOR_BGR2GRAY))
+                                        _ga2 = (_zamb2 if _zamb2.ndim == 2
+                                                else cv2.cvtColor(_zamb2, cv2.COLOR_BGR2GRAY))
+                                        # Sharpest frame first -- _stack_face_on
+                                        # aligns everything to cand[0] as the
+                                        # geometric reference.
+                                        _pair = [_ga, _ga2]
+                                        if (cv2.Laplacian(_ga2, cv2.CV_64F).var()
+                                                > cv2.Laplacian(_ga, cv2.CV_64F).var()):
+                                            _pair = [_ga2, _ga]
+                                        _zstack = afis_print._stack_face_on(_pair)
+                                        _zone_debug['ambStacked'] = _zstack is not None
+                                        if _zstack is not None:
+                                            _zamb = _zstack
+                                except Exception as _st_exc:   # noqa: BLE001
+                                    logger.warning('sweep zone %s ambient stack failed '
+                                                   '(non-critical): %s', _zone, _st_exc)
+                                    _zone_debug['ambStackError'] = str(_st_exc)
                             # Flash-softness guard, 2026-08-12. Real measured
                             # regression: on the first sweep captures where
                             # every zone was genuinely in focus, EVERY zone

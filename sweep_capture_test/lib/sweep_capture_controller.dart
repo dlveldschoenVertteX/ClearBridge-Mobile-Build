@@ -65,7 +65,15 @@ class SweepCaptureController extends ChangeNotifier {
   static const int _zoneMoveMs = 1400;
   static const int _zoneSettleMs = 700;
   static const int _burstFlashSettleMs = 70;
-  static const int _sweepTimeoutMs = 34000;
+  // Widened 34000->40000, 2026-08-12, alongside the second ambient shot per
+  // zone: that adds 3 more takePicture() calls (~0.5-0.9s each on this
+  // device's real numbers) to a loop whose last real captures already ran
+  // 23-25s, leaving too little headroom against the old bound. Real
+  // arithmetic, not a guess: 25s worst-case observed + 3 x 0.9s = ~27.7s,
+  // and 40s keeps roughly the same proportional margin 34s gave the
+  // 6-shot loop. This is a BOUND, not a delay -- a normal capture still
+  // finishes in ~27s and never waits on it.
+  static const int _sweepTimeoutMs = 40000;
   static const int _zoneEncodeTimeoutMs = 20000;
   static const int _zoneUploadTimeoutMs = 18000;
   static const int _zoneJpegQuality = 75;
@@ -278,7 +286,40 @@ class SweepCaptureController extends ChangeNotifier {
             zoneDebug['${zone}_amb_error'] = e.toString();
           }
 
-          // Flash shot.
+          // SECOND ambient shot, same pose, fired immediately after the first
+          // (2026-08-12). Real measurement this session: the ambient frame is
+          // the only one of the pair carrying usable ridge detail -- the
+          // torch-lit frame's high-frequency energy is isotropically
+          // attenuated to 0.31-0.63 of ambient's (anisotropy only 1.06-1.21x,
+          // ruling out motion blur; no clipping, ruling out blowout), which
+          // is the signature of the on-axis torch filling the valley
+          // micro-shadows that create ridge contrast in the first place.
+          // A second ambient exposure gives the backend a same-pose PAIR it
+          // can stack (_stack_face_on / _focus_stack_face_on, both already
+          // proven in this pipeline) for real noise reduction -- genuinely
+          // new ridge information, unlike the flash frame.
+          //
+          // Deliberately fired with NO delay and NO settle between the two:
+          // exposure/focus/torch state are all unchanged from the shot above,
+          // so back-to-back is exactly what makes them a valid same-pose
+          // stack, and it keeps the added cost to one shutter (~0.5-0.9s).
+          // Focus is locked across the whole zone (see _redirectZoneFocus),
+          // so both frames share one converged distance.
+          try {
+            final xfile = await cam.takePicture();
+            rawShots['${zone}_amb2'] = await xfile.readAsBytes();
+          } catch (e) {
+            // Non-fatal by design: the backend treats amb2 as optional and
+            // falls back to the single ambient frame exactly as before.
+            zoneDebug['${zone}_amb2_error'] = e.toString();
+          }
+
+          // Flash shot. Kept per CTO direction despite measuring as
+          // unusable on every capture so far -- the backend's own
+          // sharpness-ratio guard already rejects it per-zone when it is
+          // too soft, so retaining it costs capture time but cannot cost
+          // quality, and it keeps the pair available for the case the
+          // guard is designed for (a genuinely comparable flash frame).
           if (torchCapable) {
             try {
               await _flash!.activate();
