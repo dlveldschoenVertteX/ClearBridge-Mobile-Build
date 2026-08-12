@@ -1725,11 +1725,38 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                             # never grows into the joint.
                                             _wide_guide['cy'] = (
                                                 float(_mosaic_guide['cy']) - (_ry1 - _ry0))
+                                        # Pad refinement: the U-Net segments
+                                        # the whole finger, joint included,
+                                        # so hand generate() an explicit
+                                        # PAD mask instead -- the friction-
+                                        # ridge region only. Enforces the
+                                        # anatomical boundary far more
+                                        # precisely than a row-wise crop can,
+                                        # since it follows the real ridge
+                                        # extent in 2D rather than cutting a
+                                        # straight line. Falls through to the
+                                        # normal masking when either the
+                                        # U-Net or the refinement declines.
+                                        _pad_mask = None
+                                        try:
+                                            _fmask = afis_print._unet_mask(_mos)
+                                            if _fmask is not None:
+                                                _pad_mask = afis_print._pad_within_finger(
+                                                    _mos, _fmask)
+                                                _fusion_debug['padRefined'] = _pad_mask is not None
+                                                if _pad_mask is not None:
+                                                    _fusion_debug['padFracOfFinger'] = round(
+                                                        float((_pad_mask > 0).sum())
+                                                        / max(float((_fmask > 0).sum()), 1.0), 3)
+                                        except Exception as _pm_exc:   # noqa: BLE001
+                                            logger.warning('pad refinement failed '
+                                                           '(non-critical): %s', _pm_exc)
                                         _wimg, _wp = afis_print.generate(
                                             [_mos], [0.0], [None],
                                             guide_region=_wide_guide,
                                             freq_normalize=True,
                                             stack_cache={},
+                                            pad_mask_override=_pad_mask,
                                         )
                                         if _wimg is not None:
                                             # Distal boundary: drop the tail

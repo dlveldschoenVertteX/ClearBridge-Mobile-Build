@@ -1611,6 +1611,75 @@ _DISTAL_MIN_KEEP = 0.55      # never crop above this fraction of the height
 _DISTAL_RUN_FRAC = 0.03      # sustained run required, as a fraction of height
 
 
+# Percentile of the FINGER's own ridge-energy distribution used as the
+# pad/non-pad cut. See _pad_within_finger.
+_PAD_RIDGE_PERCENTILE = 45
+_PAD_RIDGE_WL_LO = 8      # px -- ridge band low end
+_PAD_RIDGE_WL_HI = 28     # px -- ridge band high end
+_PAD_MORPH_K = 31
+
+
+def _pad_within_finger(gray: np.ndarray,
+                       finger: np.ndarray) -> Optional[np.ndarray]:
+    """Refine a FINGER mask down to the friction-ridge PAD.
+
+    The existing U-Net (_unet_mask) segments the whole finger, joint
+    included -- it was trained for finger-vs-background and is good at it.
+    It has no notion of where the fingerprint ends, which is a real problem
+    for matching: ridges past the distal crease are not part of any
+    reference print, so including them can only add minutiae that cannot
+    match.
+
+    The pad has a physical definition the rest of the finger does not: it
+    carries friction ridges at a characteristic spatial frequency. Bandpass
+    energy in that band, gated by orientation coherence, separates the two.
+
+    CRITICAL -- the gating by `finger` is not an optimisation, it is what
+    makes this work at all. Run over the whole frame this metric segments
+    BACKGROUND: measured on real mosaics it selected 1.5-2.9% of the crop
+    with 0% overlap with the finger, latching onto wood grain and fabric,
+    which are also coherent and band-energetic. That is the same failure
+    this project already documented when cropping SD302 ("the rig's own
+    metal support rail has coherent, energetic oriented texture
+    indistinguishable from ridges"). Restricting to inside the U-Net's
+    finger removes it entirely -- the hard, learned part (finger vs
+    arbitrary background) stays with the model that was trained for it, and
+    only the easy, physical part (finger -> pad) is done here.
+
+    Threshold is a percentile of the FINGER'S OWN energy distribution, not
+    an absolute -- self-calibrating across devices, lighting and skin.
+
+    Measured on 4 real sweep mosaics: selects 44-64% of the finger, with
+    coherence inside the pad 1.5-2.1x that of the finger outside it (0.259-
+    0.454 vs 0.174-0.239) -- a real separation on every capture tried.
+
+    Returns None (caller keeps the unrefined mask) when the finger mask is
+    too small to characterise or nothing survives, so this can only ever
+    tighten a mask onto real ridge area, never invent one."""
+    if finger is None or gray is None:
+        return None
+    f = finger > 0
+    if f.sum() < 1000:
+        return None
+    g = gray.astype(np.float32)
+    band = (cv2.GaussianBlur(g, (0, 0), _PAD_RIDGE_WL_LO / 3.0)
+            - cv2.GaussianBlur(g, (0, 0), _PAD_RIDGE_WL_HI / 3.0))
+    energy = cv2.GaussianBlur(np.abs(band), (0, 0), _PAD_RIDGE_WL_HI)
+    score = energy * _block_coherence(gray)
+    thr = float(np.percentile(score[f], _PAD_RIDGE_PERCENTILE))
+    bw = ((score > thr) & f).astype(np.uint8) * 255
+    k = np.ones((_PAD_MORPH_K, _PAD_MORPH_K), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bw)
+    if n > 1:
+        big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        bw = (lab == big).astype(np.uint8) * 255
+    if (bw > 0).sum() < f.sum() * 0.15:
+        return None      # implausibly small -- distrust it, keep the finger
+    return bw
+
+
 def _distal_boundary_row(upright: np.ndarray,
                          mask: Optional[np.ndarray] = None) -> Optional[int]:
     """Row at which an UPRIGHT print stops being a fingerprint.
@@ -2147,6 +2216,7 @@ def generate(
     mirror: bool = False,
     pyfing_blend: float = 1.0,
     freq_scale_min: Optional[float] = None,
+    pad_mask_override: Optional[np.ndarray] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -2574,11 +2644,23 @@ def generate(
         # Falls back to the bare guide mask if the detector is unavailable or
         # the result looks degenerate/runaway, so this can't regress a
         # capture where the guide alone was already right.
-        pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
-        refine_tag = 'flashdiff'
-        if pad_mask is None:
-            pad_mask = _unet_mask(gray)
-            refine_tag = 'unet'
+        # An explicit PAD mask from the caller wins over both detectors.
+        # Added 2026-08-12 for the matchability mosaic: _unet_mask segments
+        # the whole FINGER (joint included) and _flash_diff_mask needs an
+        # ambient/flash pair the mosaic path does not have, so neither can
+        # express "friction-ridge pad only". _pad_within_finger can, and the
+        # caller supplies its result here. Everything downstream (hole fill,
+        # guide-dilation clip, the runaway-area accept gate) still applies
+        # unchanged, so an override is bounded exactly like a detected mask.
+        if pad_mask_override is not None and pad_mask_override.shape[:2] == gray.shape[:2]:
+            pad_mask = pad_mask_override
+            refine_tag = 'padrefined'
+        else:
+            pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
+            refine_tag = 'flashdiff'
+            if pad_mask is None:
+                pad_mask = _unet_mask(gray)
+                refine_tag = 'unet'
         if pad_mask is not None:
             # Real bug found 2026-07-23 (capture dadd4ef9): a noisy detector
             # can leave an enclosed hole/notch in an otherwise-plausible pad
