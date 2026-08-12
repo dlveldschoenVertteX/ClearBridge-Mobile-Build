@@ -1788,8 +1788,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         # not to which image type NFIQ2 was scoring.
         _afis_won = afis_nfiq >= cyl_nfiq and afis_nfiq > 0
         winning_image = best_afis_img if _afis_won else best_enhanced
-        nfiq2_score = int(round(afis_nfiq)) if _afis_won else int(round(cyl_nfiq))
-        nfiq2_source = 'winner'
+        _winning_nfiq = afis_nfiq if _afis_won else cyl_nfiq
+        # A 0 here means every real-NFIQ2 call for this capture failed
+        # (_score_ground_truth fails closed to 0.0), NOT that the print
+        # genuinely scored zero -- NFIQ2 reserves 0 for unusable input, and
+        # writing it is indistinguishable from a real catastrophic score.
+        # Report null instead, so a scoring OUTAGE can never again be
+        # mistaken for capture quality. Directly motivated by the
+        # 2026-08-12 finding that three weeks of production scores were
+        # fabricated by the sidecar's parser while looking entirely
+        # plausible in Firestore (see nfiq2_service/app.py).
+        nfiq2_score = int(round(_winning_nfiq)) if _winning_nfiq > 0 else None
+        nfiq2_source = 'winner' if nfiq2_score is not None else 'unavailable'
 
         # Additive experiment: the ResNet18 proxy above doesn't appear to
         # penalise an out-of-domain ridge period the way real NFIQ2 does (a

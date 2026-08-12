@@ -81,7 +81,33 @@ def score_nfiq2(image_array) -> int | None:
         pil_img = Image.fromarray(img, mode='L').resize(
             _NFIQ2_TARGET_SIZE, Image.LANCZOS)
         buf = io.BytesIO()
-        pil_img.save(buf, format='PNG')
+        # dpi=(500,500) is REQUIRED, not cosmetic -- this one missing argument
+        # silently invalidated every production NFIQ2 score for at least three
+        # weeks (found 2026-08-12 via Cloud Logging: 100% of sidecar scoring
+        # calls, 96/96 on 2026-08-11 alone and every logged day back to
+        # 2026-07-20, computed NO score at all).
+        #
+        # Mechanism: a PNG saved without DPI metadata reads as 72 PPI. NFIQ2
+        # only supports 500 PPI and, rather than failing, INTERACTIVELY
+        # prompts ("Assume this image was actually captured at 500 PPI?
+        # (y/[N]):"). The sidecar runs it with no stdin, so the prompt
+        # defaults to No, NFIQ2 prints "Error: User chose not to re-sample
+        # image" -- and still exits rc=0, so the sidecar treated it as a
+        # success and tried to parse a score out of that prompt text. The
+        # only digits in it come from the random tempfile name, so every
+        # "score" was a number scraped from e.g. /tmp/tmpod653349.png. Six
+        # were caught by the 0-100 range guard; the other 90 that day landed
+        # in range and were written to Firestore as if real.
+        #
+        # Declaring 500 DPI is exactly truthful -- the image is resized to
+        # _NFIQ2_TARGET_SIZE (500x500) immediately above precisely to
+        # represent a 500-PPI print, which is the convention this project's
+        # own local NFIQ2 calibration has always used. Verified locally
+        # across the full matrix (with/without -F, flag before/after -i):
+        # with DPI metadata NFIQ2 never prompts and returns the real score
+        # in every combination; without it, the no-`-F` case reproduces
+        # production's exact prompt-and-no-score behaviour.
+        pil_img.save(buf, format='PNG', dpi=(500, 500))
         png_bytes = buf.getvalue()
 
         token = _fetch_id_token(_NFIQ2_SERVICE_URL)

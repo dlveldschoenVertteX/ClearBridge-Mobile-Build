@@ -84,6 +84,37 @@ def _parse_nfiq2_score(stdout: str) -> int | None:
     returns None (the route's existing 'could not parse' 502) rather than
     ever writing a nonsense value to Firestore again."""
     stdout = stdout.strip()
+
+    # HARD REJECT any output that shows NFIQ2 did not actually score the
+    # image. Found 2026-08-12 via Cloud Logging: 100% of production scoring
+    # calls (96/96 on 2026-08-11, and every logged day back to 2026-07-20 --
+    # the full retention window) hit NFIQ2's INTERACTIVE resolution prompt
+    # ("Assume this image was actually captured at 500 PPI? (y/[N]):"),
+    # defaulted to No with no stdin attached, and printed "Error: User chose
+    # not to re-sample image" -- while still exiting rc=0, so the route
+    # treated it as success and handed this text to the parser.
+    #
+    # The parser then found a number anyway, because _parse_score's
+    # last-resort `re.search(r'-?\d+...')` scans the WHOLE string and the
+    # prompt text is full of digits that have nothing to do with quality:
+    # the random tempfile name (/tmp/tmpod653349.png -> 653349) or, when
+    # that name happens to contain none, the literal "72" in "parsed as 72
+    # PPI". Out-of-range values were caught by the guard below; anything
+    # that landed in 0-100 was written to Firestore as a real score. That
+    # is the origin of both the recurring nfiq2Score=72 and the scattered
+    # single-digit "catastrophic" scores throughout this project's history.
+    #
+    # Root cause is fixed upstream (nfiq2_client now writes dpi=(500,500)
+    # so the prompt can never fire) and by the flag-order fix at the
+    # subprocess call site; this is the last line of defence, so a scoring
+    # failure can NEVER again be silently laundered into a plausible score.
+    low = stdout.lower()
+    for marker in ('y/[n]', 're-sample', 'resample', 'error:', 'usage:'):
+        if marker in low:
+            logger.warning('NFIQ2 did not score the image (marker %r in stdout): %r',
+                            marker, stdout[:400])
+            return None
+
     score = None
     for line in stdout.splitlines():
         fields = line.split(',')
@@ -94,10 +125,22 @@ def _parse_nfiq2_score(stdout: str) -> int | None:
             except ValueError:
                 continue
     if score is None:
-        score = _parse_score(stdout)
+        # Bare-score form only ('nfiq2 -F' prints just the number). NOTE:
+        # deliberately NOT _parse_score() -- its permissive whole-string
+        # regex fallback is the exact mechanism that fabricated three weeks
+        # of scores (see above). /match still uses _parse_score, which is
+        # correct there: bozorth3 has no fixed range and its output format
+        # has no comparable free-text failure mode.
+        for line in stdout.splitlines():
+            line = line.strip()
+            try:
+                score = int(round(float(line)))
+                break
+            except ValueError:
+                continue
     if score is None or not (0 <= score <= 100):
         logger.warning('NFIQ2 score failed range validation: parsed=%r stdout=%r',
-                        score, stdout)
+                        score, stdout[:400])
         return None
     return score
 
@@ -124,9 +167,22 @@ def score():
         # nfiq2Score=898 written to Firestore because the generic permissive
         # parser below picked up the wrong field from nfiq2's non-`-F`
         # default output. See _parse_nfiq2_score's docstring.
+        # Flags BEFORE standard arguments, and stdin closed. NFIQ2's own
+        # --help is explicit: "If you would like to use one of the flags
+        # listed below, please include them before any standard arguments."
+        # This call passed `-F` AFTER `-i <path>`; the deployed build
+        # evidently did not honour it there, since production logs show the
+        # yes/no prompt firing on every single call despite `-F` being
+        # present (-F is documented as "Forces computation to occur. Tool
+        # does not prompt user with yes/no options"). stdin=DEVNULL makes
+        # any future prompt fail fast and loudly instead of hanging until
+        # the timeout. The real root-cause fix is upstream -- nfiq2_client
+        # now declares dpi=(500,500) so there is nothing to prompt about --
+        # this just stops relying on a flag position the tool says is wrong.
         proc = subprocess.run(
-            [NFIQ2_BIN, '-i', tmp_path, '-F'],
+            [NFIQ2_BIN, '-F', '-i', tmp_path],
             capture_output=True, text=True, timeout=NFIQ2_TIMEOUT_SEC,
+            stdin=subprocess.DEVNULL,
         )
         logger.info('nfiq2 rc=%s stdout=%r stderr=%r', proc.returncode, proc.stdout, proc.stderr)
 
