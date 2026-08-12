@@ -1732,6 +1732,20 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                             stack_cache={},
                                         )
                                         if _wimg is not None:
+                                            # Distal boundary: drop the tail
+                                            # where ridge structure collapses,
+                                            # i.e. past the fingerprint pad
+                                            # into joint skin. Conservative by
+                                            # construction (see
+                                            # _distal_boundary_row) and a
+                                            # no-op when no clear collapse is
+                                            # found, so it cannot amputate a
+                                            # good print.
+                                            _cut = afis_print._distal_boundary_row(_wimg)
+                                            if _cut is not None and _cut > 32:
+                                                _fusion_debug['distalCropFrac'] = round(
+                                                    1.0 - _cut / float(_wimg.shape[0]), 3)
+                                                _wimg = _wimg[:_cut]
                                             _wpath = _save_matchability_mosaic(
                                                 _wimg, user_id, capture_id)
                                             if _wpath:

@@ -1604,6 +1604,78 @@ def _superellipse_mask(shape: Tuple[int, int], region: dict) -> Optional[np.ndar
     return mask
 
 
+# Ridge-quality floor, as a fraction of the pad's own median, below which
+# the print is considered to have ended. See _distal_boundary_row.
+_DISTAL_QUALITY_DROP = 0.75
+_DISTAL_MIN_KEEP = 0.55      # never crop above this fraction of the height
+_DISTAL_RUN_FRAC = 0.03      # sustained run required, as a fraction of height
+
+
+def _distal_boundary_row(upright: np.ndarray,
+                         mask: Optional[np.ndarray] = None) -> Optional[int]:
+    """Row at which an UPRIGHT print stops being a fingerprint.
+
+    A fingerprint is the distal phalanx pad only -- tip down to the distal
+    flexion crease. Ridges below that crease are real ridges but are NOT
+    part of the print, and no reference print in an AFIS gallery contains
+    them, so including them can only add minutiae that cannot match.
+
+    Deliberately NOT a crease-line detector, because the crease is not
+    reliably there to detect: profiled on real upright sweep mosaics, the
+    row-mean intensity falls smoothly from ~179 to ~90 top-to-bottom with no
+    step, and the strongest single dark row landed at 99.9% of the height --
+    illumination falloff as the finger curves away, not a fold. Chasing a
+    discrete edge would have fitted noise.
+
+    What IS reliably present is a collapse in ridge structure: block
+    coherence measured 0.34-0.38 through the pad and 0.17-0.20 across the
+    bottom 10-15% on the same prints, i.e. roughly half. So this finds where
+    ridge quality falls below a fraction of the pad's OWN median (self-
+    calibrating -- no absolute threshold to drift across devices or
+    lighting) and stays there, which is the boundary that actually matters
+    for matching whether or not an anatomical crease is visible.
+
+    Returns the cut row, or None to leave the print untouched -- when no
+    sustained collapse is found, or when the cut would fall above
+    _DISTAL_MIN_KEEP of the height (a guard against truncating a genuinely
+    good print on a noisy profile; better to keep a little joint skin than
+    to amputate real pad)."""
+    h, w = upright.shape[:2]
+    if h < 64 or w < 64:
+        return None
+    coh = _block_coherence(upright)
+    if mask is not None and mask.shape[:2] == upright.shape[:2]:
+        m = (mask > 0).astype(np.float32)
+        num = (coh * m).sum(axis=1)
+        den = np.maximum(m.sum(axis=1), 1.0)
+        prof = num / den
+        # rows with almost no mask are meaningless -- treat as absent
+        prof[m.sum(axis=1) < w * 0.15] = np.nan
+    else:
+        band = coh[:, int(w * 0.25):int(w * 0.75)]
+        prof = band.mean(axis=1)
+    # smooth over ~1 ridge period so a single dark ridge cannot trigger it
+    k = max(3, int(h * 0.01) | 1)
+    finite = np.isfinite(prof)
+    if finite.sum() < h * 0.5:
+        return None
+    filled = np.interp(np.arange(h), np.flatnonzero(finite), prof[finite])
+    prof_s = cv2.GaussianBlur(filled.reshape(-1, 1).astype(np.float32),
+                              (1, k), 0).ravel()
+    # the pad's own reference level: the upper half, which is always print
+    ref = float(np.median(prof_s[:h // 2]))
+    if not np.isfinite(ref) or ref <= 1e-6:
+        return None
+    floor = ref * _DISTAL_QUALITY_DROP
+    run = max(4, int(h * _DISTAL_RUN_FRAC))
+    below = prof_s < floor
+    start = int(h * _DISTAL_MIN_KEEP)
+    for y in range(start, h - run):
+        if below[y:y + run].all():
+            return y
+    return None
+
+
 def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
                       tip_angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
     """
