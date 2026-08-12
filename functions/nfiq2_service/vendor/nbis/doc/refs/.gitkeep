@@ -1,0 +1,11 @@
+NBIS's own build config (rules.mak.src: EXTRA_DIR := $(MAN_DIR) $(DOC_DIR),
+DOC_DIRS := $(DOC_REFS_DIR)) makes `make config` hard-fail if doc/ and
+doc/refs/ are absent -- it only checks they EXIST, never reads them, and
+`make it` (which is all this image builds: mindtct + bozorth3) produces no
+documentation. They were emptied when this vendored copy was trimmed from
+~102MB to ~9MB, and git does not track empty directories, so they vanished
+from the repo. The 2026-07-15 image built only because that deploy ran from
+a working tree that still had them on disk; any clean clone fails at
+"Please check out the missing directory .../doc". These .gitkeep files make
+the vendored tree actually self-contained. Found 2026-08-12 when the first
+rebuild since July failed on exactly this.
