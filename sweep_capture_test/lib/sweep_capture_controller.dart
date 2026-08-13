@@ -83,13 +83,15 @@ class SweepCaptureController extends ChangeNotifier {
   // area -- the mosaic registers every side against 'center', so overlap is
   // exactly what makes a station usable rather than an orphan frame.
   //
-  // Direction note, corrected 2026-08-12: an earlier comment here asserted
-  // that moving the guide UP reaches the fingertip. That was an assumption,
-  // not a measurement. Moving the guide moves the USER's thumb to follow it,
-  // so which pad surface is revealed depends on how the thumb pivots, not on
-  // screen direction alone -- and the CTO, watching the real capture, reads
-  // it the other way. Both stations now exist and both log their framing
-  // similarity, so the next real capture settles it on evidence.
+  // DIRECTION, settled 2026-08-12 by CTO observation of a real capture, and
+  // it is the OPPOSITE of what an earlier comment here assumed. Moving the
+  // guide UP moves the USER's thumb up to follow it, which leaves the guide
+  // framing a region LOWER on the thumb -- toward the base, where the DELTA
+  // singular points sit. Moving the guide DOWN reaches the fingertip.
+  // Zones are named for the pad region they actually capture ('delta' for
+  // the guide-up station, 'tip' for guide-down), not for the direction the
+  // guide moves, since the two are inverted and conflating them is exactly
+  // the mistake that produced the earlier backwards naming.
   static const double _tipZoneDyFrac = 0.07;
 
   // Ambient luma at or above which the sweep declines the torch outright.
@@ -209,7 +211,7 @@ class SweepCaptureController extends ChangeNotifier {
       const _SweepZone('left', 0.0),
       const _SweepZone('center', 0.5),
       const _SweepZone('right', 1.0),
-      const _SweepZone('tip', 0.5, dyFrac: -_tipZoneDyFrac),
+      const _SweepZone('delta', 0.5, dyFrac: -_tipZoneDyFrac),
       // FIFTH ZONE, 2026-08-12, per CTO: a second vertical station BELOW the
       // centre, fired after 'tip', to capture ridge continuity through the
       // fingertip. 'tip' sits ABOVE the centre and this one below, so the two
@@ -225,7 +227,7 @@ class SweepCaptureController extends ChangeNotifier {
       // whichever proves redundant can be dropped on evidence. Named by
       // POSITION ('tipLow' = the lower station) rather than by anatomy, so
       // the name cannot encode a guess that turns out backwards.
-      const _SweepZone('tipLow', 0.5, dyFrac: _tipZoneDyFrac),
+      const _SweepZone('tip', 0.5, dyFrac: _tipZoneDyFrac),
     ];
     final rawShots = <String, Uint8List>{};
     final guideRegions = <String, Map<String, dynamic>>{};
@@ -330,9 +332,9 @@ class SweepCaptureController extends ChangeNotifier {
             _emit(_state.copyWith(
               distanceHint: grantedExtra
                   ? 'Move further this time'
-                  : (zone == 'tip'
-                      ? 'Slowly move up a little'
-                      : (zone == 'tipLow'
+                  : (zone == 'delta'
+                      ? 'Slowly move up — showing the lower pad'
+                      : (zone == 'tip'
                           ? 'Slowly move down — showing the fingertip'
                           : (zone == 'right'
                               ? 'Slowly move right'

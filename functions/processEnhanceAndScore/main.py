@@ -1180,6 +1180,24 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # contract as _variants_deadline: skips remaining candidates,
             # scores with whatever already won.
             _post_variant_deadline = time.monotonic() + 90.0
+            # RESERVED SLICE for the minutiae-patch block, 2026-08-12. Real
+            # failure on capture 3b716c33: minutiaeDebug came back completely
+            # EMPTY -- not even a 'skipped' reason -- meaning that loop broke
+            # on _post_variant_deadline before its first iteration, because
+            # the sweep-zone, cross-zone-mosaic and matchability-render blocks
+            # ahead of it had already consumed the whole 90s. That is the
+            # pipeline starving its best-performing candidate family:
+            # minutiae patches won 2 of the last 4 real captures outright
+            # (77 and 83, beating every zone AND the mosaic), and a fifth
+            # sweep zone only makes the crowding worse.
+            # Everything BEFORE the patches now stops at
+            # _pre_minutiae_deadline, leaving this reserve for the patches
+            # themselves, which still use the full _post_variant_deadline.
+            # Purely a reallocation of an existing budget -- the overall
+            # ceiling and the "graceful early exit, never a hang" contract
+            # are unchanged.
+            _MINUTIAE_RESERVE_SEC = 25.0
+            _pre_minutiae_deadline = _post_variant_deadline - _MINUTIAE_RESERVE_SEC
 
             # Secondary-camera candidates: independent single-frame renderings
             # from any OTHER back camera the device captured alongside the main
@@ -1205,7 +1223,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             _fl_main = (_lens_info.get('0') or {}).get('focalLengthMm')
             _secondary_cam_scores = {}
             for _cam in _cap_doc.get('secondaryCameras', []) or []:
-                if time.monotonic() > _post_variant_deadline:
+                if time.monotonic() > _pre_minutiae_deadline:
                     logger.warning('secondary camera scoring: time budget exceeded, '
                                     'skipping remaining cameras')
                     break
@@ -1467,7 +1485,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # (previously blown-out) flash shot alone.
                     _zone_grays: dict = {}   # zone -> (gray, guide) for the cross-zone fusion below
                     for _zone in _sb_zone_names:
-                        if time.monotonic() > _post_variant_deadline:
+                        if time.monotonic() > _pre_minutiae_deadline:
                             logger.warning('sweep zone scoring: time budget exceeded, '
                                             'skipping remaining zones from %s onward', _zone)
                             break
@@ -1667,12 +1685,21 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # an already-failing mosaic or match the old one, never
                     # regress it.
                     try:
-                        if time.monotonic() > _post_variant_deadline:
+                        if time.monotonic() > _pre_minutiae_deadline:
                             raise TimeoutError('time budget exceeded before cross-zone mosaic')
                         _mos, _mosaic_guide, _n_used = afis_print._front_anchored_mosaic_zones(_zone_grays)
                         if 'center' in _zone_grays:
                             _sides = [g for z, (g, _) in _zone_grays.items() if z != 'center']
                             _fusion_debug: dict = {'sidesAvailable': len(_sides)}
+                            # Which zones were offered as sides, so a
+                            # sidesUsed < sidesAvailable result (real: 2 of 3
+                            # on capture 3b716c33) says WHICH zone failed ECC
+                            # registration instead of only how many did.
+                            # Needed now that the vertical stations ('delta',
+                            # 'tip') are new and unproven relative to the
+                            # lateral ones.
+                            _fusion_debug['sideZones'] = [
+                                _z for _z in _zone_grays if _z != 'center']
                             if _sides:
                                 if _mos is not None:
                                     _fusion_debug['sidesUsed'] = _n_used
@@ -1825,7 +1852,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # OLD format (pre-2026-08-05 captures, bare '<zone>'
                     # keys, one flash-only shot per zone) -- untouched.
                     for _zone, _zpath in _sb_paths.items():
-                        if time.monotonic() > _post_variant_deadline:
+                        if time.monotonic() > _pre_minutiae_deadline:
                             logger.warning('sweep zone scoring (old format): time budget '
                                             'exceeded, skipping remaining zones from %s onward',
                                             _zone)
@@ -1941,6 +1968,37 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             'n': _gr.get('n', 2.5),
                             'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
                         },
+                        # TRUE delta-region patches, 2026-08-12 (CTO). The
+                        # 'left'/'right' patches above shift laterally but
+                        # keep the guide's own cy, so they sample the pad's
+                        # mid-height flanks -- not where deltas actually are.
+                        # A delta (the triradius where ridge flow diverges)
+                        # sits LOW and lateral: a loop has one, a whorl two,
+                        # and they are among the most matcher-relevant
+                        # structures on the print because they anchor ridge
+                        # classification. These crop low AND lateral, which
+                        # is the position the existing set never covered.
+                        #
+                        # cy offset is +0.25 ry (downward in still space =
+                        # toward the pad base) against the lateral -/+0.38 rx,
+                        # keeping each patch inside the guide while centring
+                        # it on the delta band rather than the core.
+                        'deltaLeft': {
+                            'cx': _gr['cx'] - _gr['rx'] * 0.38,
+                            'cy': _gr['cy'] + _gr['ry'] * 0.25,
+                            'rx': _gr['rx'] * 0.62,
+                            'ry': _gr['ry'] * 0.62,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'deltaRight': {
+                            'cx': _gr['cx'] + _gr['rx'] * 0.38,
+                            'cy': _gr['cy'] + _gr['ry'] * 0.25,
+                            'rx': _gr['rx'] * 0.62,
+                            'ry': _gr['ry'] * 0.62,
+                            'n': _gr.get('n', 2.5),
+                            'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
                         # Size sweep, not a position: a tighter crop than
                         # 'core' concentrates the AFIS mask on the ridge-
                         # densest region around the delta/core. Cheap to try
@@ -1956,6 +2014,9 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         },
                     }
                     for _pname, _pguide in _patch_subguides.items():
+                        # Full deadline here on purpose -- this is the block
+                        # the reserve was carved out FOR, so it must be
+                        # allowed to spend it.
                         if time.monotonic() > _post_variant_deadline:
                             logger.warning('minutiae patch scoring: time budget exceeded, '
                                             'skipping remaining patches from %s onward', _pname)
