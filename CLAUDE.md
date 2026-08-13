@@ -1,5 +1,101 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep matchability mosaic: real production defect found + fixed (pad_mask_override collapsed matchability 12x), five other mosaic-tuning ideas tested and refuted (2026-08-13)
+Follow-up to the sweep-vs-front-only decision below, working through the
+prioritized matchability-optimization list against the real SourceAFIS-vs-
+NIST-SD302-impostor gate built for that test. All tests use the same 13 real
+sweep captures (10 confirmed genuine pairs, same-user real repeat captures)
+and the same 15 real NIST SD302 impostor scans established there.
+
+**Fixed and shipped (locally, not yet pushed): the mosaic's enhancement
+config.** Production's real matchability-mosaic render used
+`enhance='pyfingHybrid', freq_normalize=True, pyfing_blend=0.7`. Real test on
+this exact artifact (3 real sweep captures): pyfingHybridFreqNorm scored
+separation **-0.13** (noise floor, same failure signature as front_only_v1's
+matchability collapse). Plain freqNorm on the SAME mosaic content, same
+fusion geometry, only this one config line different: **+8.69**, later
+confirmed at **+13.04** (beat 3/10) across the full 13-capture/10-genuine-pair
+set. `pyfing_blend`/`pyfing_hybrid` was validated on a different population
+(22 front_only_v1-era captures) and never re-checked against real sweep
+mosaic content specifically — it doesn't transfer. `main.py`'s matchability
+render now uses plain `freq_normalize=True, freq_scale_min=0.9`, no pyfing.
+Committed `30b7dc4`, **pushed**.
+
+**Five follow-up optimization ideas tested against this same real gate, all
+negative — the 0.45 whole-crop ECC accept-gate is confirmed correctly
+calibrated, not a hidden lever:**
+- **Local optical-flow residual refinement** on top of ECC registration:
+  per-side correlation improved, but real matchability WORSENED (+8.69
+  baseline -> +1.15 with flow-refine).
+- **Masked ECC** (registering only within the pad, not the whole crop):
+  frequently fails to converge; no real improvement where it does.
+- **Pad-only correlation as the accept-gate** (instead of whole-crop, at
+  0.45 and 0.30 thresholds): both worse than the shipped whole-crop gate
+  (separation 13.04 -> 4.21 or 0.56, fusion rate dropped 25/33 -> 12-18/33).
+- **Loosening the whole-crop gate** (0.45 -> 0.30 -> 0.20 -> none): monotonic
+  NEGATIVE trend on a controlled equal sample (13.04 -> 8.59 -> 7.87 ->
+  7.55). This refuted an earlier, confounded read of the pad-gate test that
+  had looked like "more fusion = better" — that apparent trend was an
+  artifact of captures dropping out of the comparison entirely as the gate
+  tightened, not a real fusion-count effect.
+- **Tightening the whole-crop gate** (0.45 -> 0.55 -> 0.65 -> 0.75): 0.55
+  showed marginally higher separation (+13.57) but on a shrunken sample
+  (11/8 vs 13/10 genuine) — discounted as a sample-size confound, not a real
+  win; 0.65 and 0.75 collapsed the sample further with no genuine pairs left
+  to compare at 0.75. **Conclusion: 0.45 is the correct operating point in
+  both directions** — diagnostically it measures the wrong thing (background
+  dominates a 2.6x-margin crop, ~91% of it), but it happens to be more
+  permissive toward genuinely complementary zone content than any
+  pad-restricted alternative, which matters given sweep's zones are
+  *designed* to show different pad regions.
+
+**Real production defect found + fixed: `pad_mask_override` was quietly
+destroying the freqNorm fix's own validated gain.** CTO directly observed
+background sometimes present in final superprints and connected it to
+matchability. Investigation found the mosaic render call
+(`main.py`, ~line 1841) was still passing `pad_mask_override=_pad_mask` — a
+U-Net-derived pad refinement mask, meant to trim the guide's mild real
+overshoot into background more precisely than the guide alone. **The U-Net
+mask is broken on mosaic crop input**: visually confirmed (contour overlay,
+`3f5b9cd6`) as a 4.3%-of-crop sliver down the thumb's LEFT EDGE, nowhere
+near the actual pad — not a subtle bug. Real matchability test isolating just
+this one variable (`none` vs `unet_gated`, same 13-capture/10-genuine set,
+same freqNorm config otherwise): separation collapsed from **+13.04 to
++1.05** (beat 3/10 -> 1/10), a ~12x loss — meaning the already-pushed
+freqNorm fix has **not actually been delivering its validated benefit in
+production**, this second, independent defect was still live underneath it
+the whole time.
+
+**Candidate fix tried and also refuted before committing to the final
+one.** Since the U-Net mask itself is broken, tried gating the same
+`_pad_within_finger` refinement by the GUIDE superellipse instead (a real,
+stable bound, unlike the broken U-Net output) — mask-stability diagnostics
+looked genuinely promising (guide-gated: 0.37-0.63x guide area, consistently
+shrinking, 1.7x spread; U-Net-gated: 0.29-3.23x guide area, mostly
+*expanding* past the guide, 11x spread). **Did not rescue matchability
+either**: separation +1.87, beat **0/10** — actually worse on the metric
+that matters most than the broken U-Net-gated version's 1/10, despite the
+mask itself being far saner. This means the failure isn't "which detector
+gates the pad refinement" — any extra content-aware restriction layered on
+top of the guide is destructive to this pipeline's real matchability, the
+same lesson as every other denoise/masking pre-pass tried against it this
+whole project (pyfing, coherenceDiff, NNS, masked ECC, pad-only correlation
+gate above). The guide's own mild real overshoot into background — genuinely
+real, and what the CTO spotted — costs far less than every attempted fix
+for it has cost so far.
+
+**Fix shipped**: removed `pad_mask_override`/the U-Net pad-refinement block
+entirely from the mosaic render call — it now renders with plain guide-only
+masking (freqNorm's already-validated +13.04 configuration, restored to
+what it should have been the whole time). Committed locally (message:
+"Remove destructive pad_mask_override from sweep matchability mosaic —
+guide-only masking restores the validated +13.04 freqNorm separation"),
+**not yet pushed** (standing process rule — awaiting explicit go-ahead,
+same as the freqNorm fix's own deploy). Not device-tested; same standing
+discipline as every other backend change this project — needs its own
+explicit deploy go-ahead before this reaches production regardless of push
+timing.
+
 ## Sweep chosen over front_only_v1 for beta (real matchability test), live-wavelength distance GATE ported to sweep (2026-08-13)
 CTO asked directly: between sweep and front_only_v1, which architecture is
 superior and which should beta ship with. This had never actually been

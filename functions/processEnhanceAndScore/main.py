@@ -1775,32 +1775,51 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                             # never grows into the joint.
                                             _wide_guide['cy'] = (
                                                 float(_mosaic_guide['cy']) - (_ry1 - _ry0))
-                                        # Pad refinement: the U-Net segments
-                                        # the whole finger, joint included,
-                                        # so hand generate() an explicit
-                                        # PAD mask instead -- the friction-
-                                        # ridge region only. Enforces the
-                                        # anatomical boundary far more
-                                        # precisely than a row-wise crop can,
-                                        # since it follows the real ridge
-                                        # extent in 2D rather than cutting a
-                                        # straight line. Falls through to the
-                                        # normal masking when either the
-                                        # U-Net or the refinement declines.
-                                        _pad_mask = None
-                                        try:
-                                            _fmask = afis_print._unet_mask(_mos)
-                                            if _fmask is not None:
-                                                _pad_mask = afis_print._pad_within_finger(
-                                                    _mos, _fmask)
-                                                _fusion_debug['padRefined'] = _pad_mask is not None
-                                                if _pad_mask is not None:
-                                                    _fusion_debug['padFracOfFinger'] = round(
-                                                        float((_pad_mask > 0).sum())
-                                                        / max(float((_fmask > 0).sum()), 1.0), 3)
-                                        except Exception as _pm_exc:   # noqa: BLE001
-                                            logger.warning('pad refinement failed '
-                                                           '(non-critical): %s', _pm_exc)
+                                        # Pad refinement REMOVED 2026-08-13,
+                                        # real negative. This used to hand
+                                        # generate() a U-Net-derived pad mask
+                                        # (_pad_within_finger gated by
+                                        # _unet_mask) on the theory that it
+                                        # would trim the guide's mild
+                                        # overshoot into background more
+                                        # precisely than the guide alone --
+                                        # exactly the contamination the CTO
+                                        # flagged after seeing background in
+                                        # some final superprints. Tested
+                                        # directly on real matchability
+                                        # (SourceAFIS vs real NIST SD302
+                                        # impostors, 13 real sweep captures,
+                                        # 10 genuine pairs): the U-Net mask
+                                        # is itself broken on mosaic crops
+                                        # (visually confirmed a 4.3% sliver
+                                        # down the thumb's LEFT EDGE, not the
+                                        # pad), and gating by it collapsed
+                                        # separation from +13.04 (no
+                                        # override) to +1.05 -- a ~12x loss,
+                                        # this WAS what production shipped.
+                                        # Swapping the gate to the guide
+                                        # superellipse instead of the U-Net
+                                        # mask (far more stable: 0.37-0.63x
+                                        # guide area vs U-Net's wild
+                                        # 0.29-3.23x) did NOT rescue it
+                                        # either -- separation +1.87, beat
+                                        # 0/10 (worse than U-Net-gated's
+                                        # 1/10). Any extra content-aware
+                                        # restriction on top of the guide is
+                                        # destructive here, same lesson as
+                                        # every other denoise/masking
+                                        # pre-pass tried against this
+                                        # pipeline this project (pyfing,
+                                        # coherenceDiff, NNS, masked ECC,
+                                        # pad-only correlation gate). The
+                                        # guide's own mild overshoot is real
+                                        # but costs far less than any fix
+                                        # for it has cost so far -- plain
+                                        # guide-only masking (freqNorm's
+                                        # already-validated +13.04) is the
+                                        # correct behaviour until a
+                                        # genuinely different mechanism is
+                                        # found, not a fallback.
                                         # Rendered with plain freqNorm, NOT
                                         # pyfingHybridFreqNorm (reverted
                                         # 2026-08-13). This artifact is judged
@@ -1844,7 +1863,6 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                             freq_normalize=True,
                                             freq_scale_min=0.9,
                                             stack_cache={},
-                                            pad_mask_override=_pad_mask,
                                         )
                                         if _wp:
                                             _fusion_debug['matchabilityEnhance'] = _wp.get('afisEnhance')
