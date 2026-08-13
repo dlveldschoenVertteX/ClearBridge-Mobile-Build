@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## SfM redemption thread closed out: real bug found+fixed+deployed, but the fix alone doesn't justify reviving SfM (documented 2026-08-13, work done 2026-08-07)
+CTO asked to revisit "the way we found to revive SfM" from memory/Notion.
+This was investigated and tested earlier in this same project (Notion:
+"Next Session Work Plan — Bozorth3 Re-Gate, SfM Redemption, Fusion Sweep",
+Track 2) but the result was never written up here — closing that gap now.
+
+**Real mechanism found, same defect class as two already-fixed NNS bugs.**
+`sfm_pipeline.reconstruct_and_unwrap()` computes a `valid` weight-mask
+(which texels of the stitched cylindrical texture have real camera
+coverage vs. gap-filled/synthesized periphery) but threw it away — never
+returned, never composited out before enhancement, for the *successful*
+multi-frame reconstruction path. The single-frame fallback path already
+did this compositing correctly; the working path never got the same
+treatment. This is the identical hard-edge-into-ridge-filter defect
+already found and fixed twice this project for NNS (pre-mask ringing,
+512-resize scale collapse) — a third occurrence nobody had checked.
+
+**Fixed, committed, and already deployed**: `eff736a` (2026-08-07) threads
+the `valid` mask through and composites it out AFTER enhancement using the
+same feathered-mask pattern already proven twice elsewhere. Predates the
+last confirmed backend deploy timestamp, so it's live in production.
+
+**Real test result on 6 real SfM/oscillating captures (2 local runs,
+scoring OLD vs NEW via real local NFIQ2): mean delta +3.0 to +3.5, mostly
+positive (4-5 of 6 improved per run) — but the ceiling after fixing it is
+only 21-44**, on captures that previously scored 1-9. Nowhere near
+front_only_v1/sweep's typical 60-86 range. The fix is real and worth
+keeping (no reason to revert a genuine bug fix), but it does **not**
+redeem SfM to competitiveness — exactly the caveat the original Notion
+plan flagged going in: fixing the gap-fill confound doesn't touch the
+independent, real reason SfM was discontinued (wide angular coverage
+dilutes ridge density in NFIQ's fixed 500×500 input). That problem is
+still fully present and still dominates the result.
+
+**One lever from the same plan was never actually verified**: whether
+cropping before enhancement causes the same NNS-style scale-collapse this
+project already found and fixed elsewhere (would need the same
+`_ridge_wavelength_robust` check used to diagnose that bug, not assumed).
+Still open if SfM is ever revisited, but closing a 20-40+ point gap from
+one more scale check would be a stretch given the dilution problem is
+untouched. **Not recommending reviving SfM/arc_sweep/oscillating_8phase
+capture modes off this result** — the gap-fill fix stands on its own
+merits (deployed, harmless, correct), but is not sufficient justification
+by itself.
+
 ## Sweep-burst field test round: adaptive-EV/gyro-gate confirmed live, first real mosaic NFIQ2 win, per-zone flat-fielding/flash-cue retest closes the PS thread (2026-08-13, round 23)
 CTO ran 3 real sweep captures back to back under deliberately different
 lighting (indoor skylight+natural sun, indoor artificial light, outdoor
