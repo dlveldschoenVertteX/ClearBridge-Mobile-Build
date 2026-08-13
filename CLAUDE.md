@@ -2471,6 +2471,49 @@ augment → forward → warp → orientation-similarity loss → backward →
 checkpoint) runs end-to-end without a shape/dtype/path error before ever
 considering a paid SageMaker run.
 
+## Sidecar service URLs — deploy-only config, NOT in the repo (2026-08-13)
+`processEnhanceAndScore` reaches its two Cloud Run sidecars purely through
+environment variables, and **neither the variables nor their values exist
+anywhere in this repository**:
+
+- **`NFIQ2_SERVICE_URL`** -> the `nfiq2-service` Cloud Run service
+  (`africa-south1`). Read by `nfiq2_client.py` and `mindtct_client.py`.
+- **`PYFING_SERVICE_URL`** -> the `pyfing-service` Cloud Run service
+  (`africa-south1`). Read by `pyfing_client.py`.
+
+**Why this matters more than it looks.** Both clients are written to fail
+SILENTLY and non-blockingly by design: if the variable is unset they log an
+info line and return `None`, and the pipeline carries on. So losing
+`NFIQ2_SERVICE_URL` does not throw — it just means every capture quietly
+stops getting a real NFIQ2 score, which is exactly the class of invisible
+regression this project already lost three weeks to once (the fabricated-
+score bug, see that section). Losing `PYFING_SERVICE_URL` silently drops
+the matchability mosaic back to the plain Gabor chain while still writing
+the artifact, so it looks like it worked.
+
+**Where they actually live**: set directly on the deployed function's
+`serviceConfig.environmentVariables`. They survived every `firebase deploy`
+observed so far, but that is deploy-tool behaviour, not a guarantee, and
+they are in no config file under version control. A local
+`functions/processEnhanceAndScore/.env` (Firebase Functions v2 reads it at
+deploy time) makes deploys from a given machine deterministic -- but
+`.gitignore`'s "# Secrets - never commit" block covers `.env` and `.env.*`,
+so that file is deliberately NOT committed and must be recreated in any new
+environment that deploys this function.
+
+**Recovering the values** (deliberately not pasted here -- this repo is
+public, and the URLs are live authenticated endpoints): read them off Cloud
+Run directly, e.g. `run_v2.ServicesClient().get_service(name=
+'projects/clearbridge-dc699/locations/africa-south1/services/<svc>').uri`
+for `nfiq2-service` / `pyfing-service`. Confirm what the function currently
+has via the Cloud Functions v2 API's
+`serviceConfig.environmentVariables`.
+
+**Also required, and separately easy to lose**: the function's runtime
+service account needs `roles/run.invoker` on each sidecar, or the calls
+return 403 and the same silent degradation follows. Granted for
+`pyfing-service` on 2026-08-13.
+
 ## Repos & branches
 - `origin` (GitHub): `dlveldschoenVertteX/ClearBridge-Mobile-Build` — **now PUBLIC** (flipped
   2026-07-15 specifically to get unlimited free GitHub Actions minutes after both GitHub's
