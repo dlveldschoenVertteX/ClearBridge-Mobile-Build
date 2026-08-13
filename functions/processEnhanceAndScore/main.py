@@ -1751,13 +1751,42 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                         except Exception as _pm_exc:   # noqa: BLE001
                                             logger.warning('pad refinement failed '
                                                            '(non-critical): %s', _pm_exc)
+                                        # Rendered with pyfingHybridFreqNorm,
+                                        # NOT freqNorm (2026-08-12). This
+                                        # artifact is judged by a MATCHER,
+                                        # never by NFIQ2, and on the matcher
+                                        # this exact config has the best
+                                        # record of any variant this project
+                                        # has measured: on a 22-capture /
+                                        # 15-genuine-pair SourceAFIS gate it
+                                        # posted the best genuine-beats-
+                                        # impostor-max rate of anything tried
+                                        # (5/15, vs 2/15 for the raw
+                                        # blend=1.0/scale_min=0.7 config),
+                                        # with the risky pair's false-match
+                                        # cut 150.58 -> 76.11. It scores
+                                        # LOWER on NFIQ2 than freqNorm (51 vs
+                                        # 56 on the first real 4-zone
+                                        # capture) -- which is precisely why
+                                        # it belongs here and not in the
+                                        # scored variant loop. Falls back to
+                                        # plain freqNorm automatically if the
+                                        # pyfing sidecar is unreachable
+                                        # (_pyfing_denoise returns None ->
+                                        # afisEnhance 'pyfingHybrid_unavailable'
+                                        # and the Gabor chain runs anyway).
                                         _wimg, _wp = afis_print.generate(
                                             [_mos], [0.0], [None],
                                             guide_region=_wide_guide,
+                                            enhance='pyfingHybrid',
                                             freq_normalize=True,
+                                            pyfing_blend=0.7,
+                                            freq_scale_min=0.9,
                                             stack_cache={},
                                             pad_mask_override=_pad_mask,
                                         )
+                                        if _wp:
+                                            _fusion_debug['matchabilityEnhance'] = _wp.get('afisEnhance')
                                         if _wimg is not None:
                                             # Distal boundary: drop the tail
                                             # where ridge structure collapses,

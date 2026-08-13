@@ -76,14 +76,20 @@ class SweepCaptureController extends ChangeNotifier {
   static const int _zoneMoveMs = 1400;
   static const int _zoneSettleMs = 700;
 
-  // Vertical offset for the 'tip' zone, as a fraction of screen height,
-  // applied to the guide's cy. Sized at roughly half the guide's own ry
-  // (defaultShape.ry = 0.137275) so the tip zone still overlaps the centre
-  // zone across most of its area -- the mosaic registers it against
-  // 'center', so overlap is exactly what makes it usable rather than a
-  // fourth orphan frame. Negative = toward the top of the screen = toward
-  // the fingertip, which is the direction the horizontal sweep can never
-  // reach.
+  // Vertical offset magnitude for the two vertical stations ('tip' above the
+  // centre, 'tipLow' below), as a fraction of screen height applied to the
+  // guide's cy. Sized at roughly half the guide's own ry (defaultShape.ry =
+  // 0.137275) so BOTH still overlap the centre zone across most of their
+  // area -- the mosaic registers every side against 'center', so overlap is
+  // exactly what makes a station usable rather than an orphan frame.
+  //
+  // Direction note, corrected 2026-08-12: an earlier comment here asserted
+  // that moving the guide UP reaches the fingertip. That was an assumption,
+  // not a measurement. Moving the guide moves the USER's thumb to follow it,
+  // so which pad surface is revealed depends on how the thumb pivots, not on
+  // screen direction alone -- and the CTO, watching the real capture, reads
+  // it the other way. Both stations now exist and both log their framing
+  // similarity, so the next real capture settles it on evidence.
   static const double _tipZoneDyFrac = 0.07;
 
   // Ambient luma at or above which the sweep declines the torch outright.
@@ -100,7 +106,15 @@ class SweepCaptureController extends ChangeNotifier {
   // and 40s keeps roughly the same proportional margin 34s gave the
   // 6-shot loop. This is a BOUND, not a delay -- a normal capture still
   // finishes in ~27s and never waits on it.
-  static const int _sweepTimeoutMs = 40000;
+  // Widened 40000->52000, 2026-08-12, for the fifth zone. Real arithmetic
+  // off the first real 4-zone capture, not a guess: that run measured
+  // durationMs 35423 against the 40s bound -- only 4.6s of headroom -- and a
+  // fifth zone adds one move animation (1400ms) + focus redirect and settle
+  // (~900ms) + three shutters (~0.5-0.9s each), i.e. roughly 5-8s. 52s keeps
+  // a similar proportional margin to what 40s gave four zones. It is a
+  // BOUND, not a delay: a clean 5-zone run should finish near 43s and never
+  // wait on it.
+  static const int _sweepTimeoutMs = 52000;
   static const int _zoneEncodeTimeoutMs = 20000;
   static const int _zoneUploadTimeoutMs = 18000;
   static const int _zoneJpegQuality = 75;
@@ -196,6 +210,22 @@ class SweepCaptureController extends ChangeNotifier {
       const _SweepZone('center', 0.5),
       const _SweepZone('right', 1.0),
       const _SweepZone('tip', 0.5, dyFrac: -_tipZoneDyFrac),
+      // FIFTH ZONE, 2026-08-12, per CTO: a second vertical station BELOW the
+      // centre, fired after 'tip', to capture ridge continuity through the
+      // fingertip. 'tip' sits ABOVE the centre and this one below, so the two
+      // bracket the centre vertically and the three together sample the pad's
+      // whole long axis instead of only its width.
+      //
+      // Which of the two actually exposes more TIP surface is an open
+      // question the next real capture settles, and is worth stating plainly
+      // rather than assuming: moving the guide moves the USER's thumb to
+      // follow it, so the mapping from guide direction to revealed pad
+      // surface depends on how the thumb pivots, not on screen direction
+      // alone. Both zones therefore record their own framing similarity, and
+      // whichever proves redundant can be dropped on evidence. Named by
+      // POSITION ('tipLow' = the lower station) rather than by anatomy, so
+      // the name cannot encode a guess that turns out backwards.
+      const _SweepZone('tipLow', 0.5, dyFrac: _tipZoneDyFrac),
     ];
     final rawShots = <String, Uint8List>{};
     final guideRegions = <String, Map<String, dynamic>>{};
@@ -301,10 +331,12 @@ class SweepCaptureController extends ChangeNotifier {
               distanceHint: grantedExtra
                   ? 'Move further this time'
                   : (zone == 'tip'
-                      ? 'Slowly move down — showing the tip'
-                      : (zone == 'right'
-                          ? 'Slowly move right'
-                          : 'Slowly move to the middle')),
+                      ? 'Slowly move up a little'
+                      : (zone == 'tipLow'
+                          ? 'Slowly move down — showing the fingertip'
+                          : (zone == 'right'
+                              ? 'Slowly move right'
+                              : 'Slowly move to the middle'))),
             ));
             final moveStart = DateTime.now();
             while (true) {
