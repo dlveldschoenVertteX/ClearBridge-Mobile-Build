@@ -1,5 +1,67 @@
 # ClearBridge Mobile — persistent context
 
+## Real device oscillating_8phase test: third independent confirmation, thread closed for good (2026-08-13)
+CTO ran one real oscillating_8phase capture (`353cb00b`) as a genuine last
+try, per their own framing, and asked for a full review/debug/optimization
+pass — the actual thing the two prior investigations (gap-fill fix,
+scale-crop check) had been building toward but never had fresh real device
+data to test against.
+
+**Real result: nfiq2Score 71 — but that number has nothing to do with the
+SfM reconstruction.** `superprintParams.afisSource` shows `frameIndex: 4,
+angleDeg: 1.2, afisStackMode: mean, afisStacked: 3` — the winner is a
+plain 3-frame mean-stack of near-face-on burst-anchored frames, the exact
+same mechanism front_only_v1/sweep already use. Visually confirmed: a
+clean, dense, well-formed whorl (`superprint_afis.png`) — a real, good
+print, but one that would have looked identical from a front_only_v1
+capture. The oscillating-specific multi-angle geometry contributed
+nothing to this number.
+
+**The actual cylindrical/SfM path scored real NFIQ2 37-39 — not the 0.0
+production recorded.** `nfiqCylindrical: 0.0` in Firestore is ambiguous by
+main.py's own documented contract (`_score_ground_truth` fails closed to
+0.0 on any sidecar error — "NOT that the print genuinely scored zero").
+Reproduced the exact pipeline locally (`main._download_oscillating_frames`
++ `sfm_pipeline.reconstruct_and_unwrap` + `enhancement_pipeline.enhance`,
+same technique as the two prior investigations): real local NFIQ2 scored
+**37 (composited) / 39 (uncomposited)** — a real, working number, meaning
+the recorded 0.0 was almost certainly a **sidecar call failure on this
+specific capture, not a genuine score**. Flagging as a separate, real
+data-integrity bug (past `nfiqCylindrical` values may understate true
+reconstruction quality in some fraction of captures) — not itself a
+reason to revive anything, and not fixed this pass since it doesn't change
+the verdict either way.
+
+**Visually confirmed the 37-39 is a fair score, not an unlucky
+sidecar.** The composited cylindrical unwrap (`enhanced_composited.png`)
+shows a blocky, discontinuous tonal smear with visible per-bin seam
+banding — no coherent ridge structure at all, next to nothing like the
+clean AFIS-path whorl that actually won. Root causes visible in the real
+diagnostics: `cylR: 198.5px` (well below the 274-540px range seen on the
+6 captures in the earlier redemption test — this capture's pad silhouette
+was detected notably smaller), mixed per-frame segmentation methods across
+the 9 angle bins (`flash_diff`/`otsu`/`center_lobe` — inconsistent
+per-frame quality feeding the stitch), and a coarse measured wavelength
+(21.5px) consistent with the already-confirmed structural finding that
+this texture's ridge scale is not a fixable resize artifact.
+
+**Final verdict, third independent real-data test in agreement**: the
+7-day-earlier batch test (6 captures, gap-fill fix, ceiling 21-44), the
+scale-collapse check (clean negative, no crop-before-enhance benefit), and
+now this fresh real device capture (37-39 cylindrical vs 71 from a
+near-face-on frame the reconstruction didn't need) all point the same
+direction. The gap between reconstruction quality and simple single-frame
+capture isn't closing — if anything this capture's margin (71 vs 37-39,
+over 30 points) is worse than the batch test's own historical range.
+**Not recommending any further SfM/oscillating optimization work.** Every
+mechanism from the Notion redemption plan has now been tested with real
+data; closing this thread for good rather than re-opening it on the next
+"one more idea." A genuinely different reconstruction strategy (true
+multi-view depth estimation instead of cylindrical single-axis unwrap)
+might fare differently, but that's a from-scratch rebuild, not an
+optimization of what exists — and three losses this size don't justify
+that investment right now.
+
 ## SfM redemption thread closed out: real bug found+fixed+deployed, but the fix alone doesn't justify reviving SfM (documented 2026-08-13, work done 2026-08-07)
 CTO asked to revisit "the way we found to revive SfM" from memory/Notion.
 This was investigated and tested earlier in this same project (Notion:
