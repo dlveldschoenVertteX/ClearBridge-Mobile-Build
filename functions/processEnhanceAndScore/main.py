@@ -1179,7 +1179,30 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # main loop used. Same "graceful early exit, never a hang"
             # contract as _variants_deadline: skips remaining candidates,
             # scores with whatever already won.
-            _post_variant_deadline = time.monotonic() + 90.0
+            # RAISED 90 -> 165, 2026-08-13, after a REGRESSION I introduced.
+            # Carving a 25s reserve out of 90s for the minutiae patches did
+            # fix their starvation (abc571cc scored all 7 patches, including
+            # the new deltaLeft/deltaRight) but it starved the cross-zone
+            # mosaic instead: 'fusion' is absent ENTIRELY from
+            # sweepBurstCandidates on both captures after that change, where
+            # 3b716c33 before it had a full fusion entry. Trading one
+            # starvation for another, and starving the mosaic specifically --
+            # the whole reason sweep exists.
+            #
+            # Real root cause is not the split, it is the total: 90s was
+            # sized when a sweep had 3 zones and no mosaic. It now carries 5
+            # zones x (flash fusion + ambient stack + generate + real NFIQ2),
+            # the cross-zone mosaic, the matchability render with pyfing and
+            # pad refinement, and 7 minutiae patches. There is ample room to
+            # widen it: the function's own ceiling is timeout_sec=300 (line
+            # 256) and the pre-variant work plus the 70s _variants_deadline
+            # leave well over half the request unused.
+            #
+            # 165s keeps a real margin under the 300s hard timeout while
+            # letting every stage run. Unchanged contract: each block still
+            # exits gracefully on its deadline and scores with whatever has
+            # already won -- never a hang.
+            _post_variant_deadline = time.monotonic() + 165.0
             # RESERVED SLICE for the minutiae-patch block, 2026-08-12. Real
             # failure on capture 3b716c33: minutiaeDebug came back completely
             # EMPTY -- not even a 'skipped' reason -- meaning that loop broke

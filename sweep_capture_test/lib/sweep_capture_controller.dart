@@ -95,10 +95,25 @@ class SweepCaptureController extends ChangeNotifier {
   static const double _tipZoneDyFrac = 0.07;
 
   // Ambient luma at or above which the sweep declines the torch outright.
-  // See the gate's own comment at the call site for the measurement behind
-  // it and why this reuses AdaptiveFlashController's night-mode boundary
-  // (80) rather than a value fitted to a single capture.
-  static const double _sweepTorchMaxAmbient = 100.0;
+  //
+  // RAISED 100 -> 160, 2026-08-13, on CTO judgement plus real data. The
+  // first value was set from a single capture and proved too aggressive:
+  // it stood the torch down at calibBrightness 127.7 and 144.6, both
+  // ordinary indoor rooms that the CTO judged dim enough for the torch to
+  // still contribute. More importantly the gate made that judgement
+  // UNTESTABLE -- no torch means no flash frame to measure, so the band
+  // between 100 and AdaptiveFlashController's own bright cut-off (185) was
+  // permanently unmeasured.
+  //
+  // 160 fires across every indoor brightness observed so far (51.5, 127.7,
+  // 136.5, 144.6) while still standing down as the scene approaches
+  // AdaptiveFlashController's 185, where the torch genuinely degrades
+  // quality. Firing costs capture TIME but not print quality: the backend's
+  // _FLASH_PAIR_MAX_SHARPNESS_RATIO guard independently rejects a flash
+  // frame that is too soft to fuse (real: it skipped 2 of 4 zones on the
+  // torch-on capture 60b4de13), so a useless flash frame is measured and
+  // discarded rather than blended in.
+  static const double _sweepTorchMaxAmbient = 160.0;
   static const int _burstFlashSettleMs = 70;
   // Widened 34000->40000, 2026-08-12, alongside the second ambient shot per
   // zone: that adds 3 more takePicture() calls (~0.5-0.9s each on this
@@ -116,7 +131,16 @@ class SweepCaptureController extends ChangeNotifier {
   // a similar proportional margin to what 40s gave four zones. It is a
   // BOUND, not a delay: a clean 5-zone run should finish near 43s and never
   // wait on it.
-  static const int _sweepTimeoutMs = 52000;
+  // RAISED 52000 -> 64000, 2026-08-13. Real failure, not a precaution: the
+  // torch-on capture 60b4de13 measured durationMs 53502 and BLEW the 52s
+  // bound, losing its fifth zone entirely (only left/center/right/delta
+  // uploaded, no 'tip'). Dim scenes are the slow case -- autofocus takes
+  // longer to converge with less light -- and raising the torch threshold
+  // above means more captures now take the torch path and pay that cost.
+  // 64s covers the 53.5s worst case observed with real headroom. Still a
+  // BOUND, not a delay: the brighter 5-zone capture the same session
+  // finished in 46.4s and never waited on it.
+  static const int _sweepTimeoutMs = 64000;
   static const int _zoneEncodeTimeoutMs = 20000;
   static const int _zoneUploadTimeoutMs = 18000;
   static const int _zoneJpegQuality = 75;
