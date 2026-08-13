@@ -1801,36 +1801,47 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                         except Exception as _pm_exc:   # noqa: BLE001
                                             logger.warning('pad refinement failed '
                                                            '(non-critical): %s', _pm_exc)
-                                        # Rendered with pyfingHybridFreqNorm,
-                                        # NOT freqNorm (2026-08-12). This
-                                        # artifact is judged by a MATCHER,
-                                        # never by NFIQ2, and on the matcher
-                                        # this exact config has the best
-                                        # record of any variant this project
-                                        # has measured: on a 22-capture /
-                                        # 15-genuine-pair SourceAFIS gate it
-                                        # posted the best genuine-beats-
-                                        # impostor-max rate of anything tried
-                                        # (5/15, vs 2/15 for the raw
-                                        # blend=1.0/scale_min=0.7 config),
-                                        # with the risky pair's false-match
-                                        # cut 150.58 -> 76.11. It scores
-                                        # LOWER on NFIQ2 than freqNorm (51 vs
-                                        # 56 on the first real 4-zone
-                                        # capture) -- which is precisely why
-                                        # it belongs here and not in the
-                                        # scored variant loop. Falls back to
-                                        # plain freqNorm automatically if the
-                                        # pyfing sidecar is unreachable
-                                        # (_pyfing_denoise returns None ->
-                                        # afisEnhance 'pyfingHybrid_unavailable'
-                                        # and the Gabor chain runs anyway).
+                                        # Rendered with plain freqNorm, NOT
+                                        # pyfingHybridFreqNorm (reverted
+                                        # 2026-08-13). This artifact is judged
+                                        # by a MATCHER, never by NFIQ2 --
+                                        # correct principle, but the
+                                        # pyfingHybridFreqNorm choice below
+                                        # was validated on a DIFFERENT
+                                        # population (22 front_only_v1-era
+                                        # captures, pre-sweep) and never
+                                        # re-checked against real sweep
+                                        # MOSAIC content specifically. Real
+                                        # SourceAFIS test on this exact
+                                        # artifact (3 real sweep captures,
+                                        # genuine vs. real NIST SD302
+                                        # impostors): pyfingHybridFreqNorm
+                                        # scored separation -0.13 (0/3 beat
+                                        # the impostor max -- noise floor,
+                                        # same failure signature already
+                                        # found for front_only_v1's own
+                                        # matchability collapse). Plain
+                                        # freqNorm on the SAME mosaic content,
+                                        # same fusion geometry, same
+                                        # anchor-dominant blend -- only this
+                                        # one config line different --
+                                        # scored +8.69 separation, a real
+                                        # reversal from negative to positive.
+                                        # The mosaic/fusion mechanism itself
+                                        # was never the problem; this one
+                                        # enhancement stage was. Old
+                                        # comment's own numbers (5/15 beat,
+                                        # 150.58->76.11 false-match cut) are
+                                        # real but describe a different
+                                        # capture population and a different
+                                        # (non-mosaic) input geometry --
+                                        # kept here as history, not as
+                                        # justification for this config
+                                        # anymore.
                                         _wimg, _wp = afis_print.generate(
                                             [_mos], [0.0], [None],
                                             guide_region=_wide_guide,
-                                            enhance='pyfingHybrid',
                                             freq_normalize=True,
-                                            pyfing_blend=0.7,
                                             freq_scale_min=0.9,
                                             stack_cache={},
                                             pad_mask_override=_pad_mask,
