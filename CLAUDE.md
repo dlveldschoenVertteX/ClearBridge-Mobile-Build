@@ -34,16 +34,40 @@ independent, real reason SfM was discontinued (wide angular coverage
 dilutes ridge density in NFIQ's fixed 500×500 input). That problem is
 still fully present and still dominates the result.
 
-**One lever from the same plan was never actually verified**: whether
-cropping before enhancement causes the same NNS-style scale-collapse this
-project already found and fixed elsewhere (would need the same
-`_ridge_wavelength_robust` check used to diagnose that bug, not assumed).
-Still open if SfM is ever revisited, but closing a 20-40+ point gap from
-one more scale check would be a stretch given the dilution problem is
-untouched. **Not recommending reviving SfM/arc_sweep/oscillating_8phase
-capture modes off this result** — the gap-fill fix stands on its own
-merits (deployed, harmless, correct), but is not sufficient justification
-by itself.
+**The remaining lever was checked too (2026-08-13, same session as this
+writeup) — clean negative, not the same bug as NNS.** Verified, not
+assumed, per the plan's own instruction: measured real ridge wavelength
+via `_ridge_wavelength_robust` (the exact diagnostic that caught the NNS
+512-resize bug) on all 6 real captures at three points — native full
+2048×2048 canvas, native canvas cropped to the `valid`-mask bounding box,
+and each of those resized to the 512×512 `enhance()` actually sees.
+
+**No collapse signature found — the opposite of the NNS case.** NNS's bug
+was a genuine collapse: ground truth 15.0px native → 29.0px after resizing
+a full ~3200px CAMERA frame where the pad occupied a small fraction of the
+canvas; cropping to the pad first fixed it (16.5px). Here, `bbox_frac`
+(pad-bearing region as a fraction of the full canvas) already ran 49.7%
+-92.0% — never a small dot in a big frame — and native full-canvas
+wavelength was ALREADY 14-28px before any resize, not a resize artifact.
+Cropping to the valid-mask bbox before the resize didn't fix anything:
+3 of 6 captures got WORSE (2927b6bd 21.5→28.0px, 7f53940f 15.0→28.0px,
+3edf5455 24.0→27.5px), 2 were unchanged, 1 moved negligibly (+1px). **Not
+implemented — a real, tested negative**, not a guess. The 14-28px native
+wavelength is a genuine property of the reconstructed cylindrical texture,
+not a fixable input-plumbing bug — direct, first-hand confirmation that
+the wide-angular-coverage dilution problem is structural, not an artifact
+stack sitting on top of a fixable bug.
+
+**Both candidate mechanisms from the Notion "SfM redemption" plan are now
+closed, one shipped-positive (modest) and one tested-negative. Not
+recommending reviving SfM/arc_sweep/oscillating_8phase capture modes** —
+the gap-fill fix stands on its own merits (deployed, harmless, correct)
+but was never sufficient alone, and the one other lever that might have
+explained the remaining gap doesn't. No code changed this pass beyond the
+already-shipped `eff736a` — this was verification only, scoped to the
+oscillating/arc SfM path, nothing touched in front_only_v1, sweep, or any
+shared `enhancement_pipeline.enhance()`/`afis_print.py` code other paths
+depend on.
 
 ## Sweep-burst field test round: adaptive-EV/gyro-gate confirmed live, first real mosaic NFIQ2 win, per-zone flat-fielding/flash-cue retest closes the PS thread (2026-08-13, round 23)
 CTO ran 3 real sweep captures back to back under deliberately different
