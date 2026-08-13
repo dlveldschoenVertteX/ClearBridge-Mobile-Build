@@ -212,6 +212,75 @@ class SweepCaptureController extends ChangeNotifier {
   static const int _steadyWaitMaxMs = 500;
   static const int _steadyPollIntervalMs = 50;
 
+  // Live ridge-wavelength distance gate, ported 2026-08-13 from
+  // front_capture_controller.dart. GAP FOUND: this file had zero live
+  // distance/scale signal at all -- distanceHint here is pure status text
+  // ("Hold still -- capturing $zone"), never derived from anything measured.
+  // Real consequence, confirmed via a same-tester SourceAFIS genuine-vs-
+  // real-NIST-impostor test (2026-08-13): front_only_v1's own real captures
+  // showed NEGATIVE separation (own finger scored worse against itself than
+  // against a stranger's), traced by eye to two of the tester's own captures
+  // sitting at visibly different physical scales despite each individually
+  // reading fine on NFIQ2 -- front_capture_controller.dart's own equivalent
+  // estimator exists but is advisory-only (a text hint the hold can complete
+  // right past), so it never actually prevented that mismatch. This is that
+  // same estimator, reused verbatim (HybridCaptureService.estimateRidgeWavelengthPx
+  // is shared package code, not duplicated), but wired as an actual bounded
+  // GATE before the sweep's first zone fires, not just a hint -- see
+  // _calibrate()'s extended-wait block below.
+  //
+  // Unlike front, this can't run on a continuously-open preview stream:
+  // this file already hit a real ANR from reopening startImageStream
+  // mid-sweep (2026-07-30, see _zoneFramingSimilarity's own comment above),
+  // so sampling happens on the SAME already-open stream _calibrate() uses
+  // for focus/brightness, never a second stream.
+  double? _liveWavelengthPx;
+  double? _liveWavelengthStillPx;
+  int _wavelengthSampleCount = 0;
+  int _wavelengthOutlierStreak = 0;
+  String? _wavelengthAxis;
+  DateTime? _lastWavelengthEstimateAt;
+  static const int _wavelengthEstimateIntervalMs = 250;
+  // Same value as front_capture_controller.dart's _liveWavelengthTooHighPx --
+  // reusing an already real-data-validated threshold (confirmed 2026-08-06
+  // there to track the backend's own afisWavelengthPx to within ~1px) rather
+  // than guessing a new one for this file's own capture flow. Sits in the
+  // SAME afisWavelengthPx units as this project's established 9-14px NFIQ2
+  // sweet spot / >=15px-catastrophic finding, with a 1px margin above that
+  // boundary.
+  static const double _liveWavelengthTooHighPx = 16.0;
+  static const int _liveWavelengthMinSamples = 3;
+  // Same base ROI as front_capture_controller.dart's own _scoreRoi -- valid
+  // to share directly because _sweepGuideShapeForProgress(0.5, dyFrac: 0.0)
+  // (the 'center' zone, where this gate runs) resolves to EXACTLY
+  // PadSilhouetteShape.defaultShape with no offset, the same base shape
+  // front's ROI was derived from and kept in sync with.
+  static const Rect _scoreRoi =
+      Rect.fromLTRB(0.518805, 0.338475, 0.741195, 0.661525);
+  // This file's own still-decode width (see _guideRegionForSweepZone's own
+  // targetWidth: 2048 call) -- NOT front's 3200. Using the wrong width here
+  // would silently scale every live estimate wrong.
+  static const int _stillDecodeTargetWidth = 2048;
+  // Guide half-width in still-normalized coordinates, set once from
+  // _stillSpaceRegionForShape right after _cachedPreviewSize is known (see
+  // _run()) -- mirrors front's own one-time _guideRx assignment from
+  // _computeGuideRegion at start().
+  double _guideRx = 0.13;
+  // Bounded extra wait if the gate fires -- capped short deliberately, same
+  // "verify, don't just delay" discipline as the gyro steadiness gate above:
+  // real margin for a genuinely-too-close user to react to the hint, never
+  // a long block on an already-correctly-positioned one (the common case,
+  // where _wavelengthTooHigh is false and this window never triggers at all).
+  static const int _wavelengthGateExtraMs = 3000;
+  static const int _wavelengthGatePollIntervalMs = 300;
+  Map<String, dynamic> _wavelengthDebug = {};
+
+  double? _wavelengthScaleToStill(CameraImage image) {
+    final roiWidthPx = _scoreRoi.width * image.width;
+    if (roiWidthPx <= 0 || _guideRx <= 0) return null;
+    return (2 * _guideRx * _stillDecodeTargetWidth) / roiWidthPx;
+  }
+
   bool _disposed = false;
 
   SweepTestState _state = const SweepTestState();
@@ -249,6 +318,15 @@ class SweepCaptureController extends ChangeNotifier {
     _sensorOrientation = _camera.selectedCamera?.sensorOrientation ?? 90;
     _cachedPreviewSize = cam.value.previewSize;
     _flash = AdaptiveFlashController(cam);
+
+    // One-time still-space guide half-width for the live wavelength gate
+    // below -- 'center' zone (progress=0.5, dyFrac=0.0) is exactly
+    // PadSilhouetteShape.defaultShape, so this is the same real geometry
+    // _guideRegionForSweepZone already computes per-zone post-capture, just
+    // derived synchronously here (screen/preview size are already known)
+    // before the gate needs it.
+    final gateRegion = _stillSpaceRegionForShape(_sweepGuideShapeForProgress(0.5));
+    if (gateRegion != null) _guideRx = gateRegion.rx;
 
     // Brief real calibration: sample live focus + brightness for a bounded
     // window (same discipline as every other capture in this project --
@@ -316,7 +394,7 @@ class SweepCaptureController extends ChangeNotifier {
     ];
     final rawShots = <String, Uint8List>{};
     final guideRegions = <String, Map<String, dynamic>>{};
-    final zoneDebug = <String, dynamic>{};
+    final zoneDebug = <String, dynamic>{'liveWavelengthDebug': _wavelengthDebug};
     final stopwatch = Stopwatch()..start();
 
     _emit(_state.copyWith(
@@ -621,7 +699,7 @@ class SweepCaptureController extends ChangeNotifier {
     double brightness = 128.0;
     var samples = 0;
     void onFrame(CameraImage image) {
-      if (_disposed || completer.isCompleted) return;
+      if (_disposed) return;
       try {
         final focus = _hybrid.offerFrame(image, thumbRoi: null);
         if (focus > _focusPeak) _focusPeak = focus;
@@ -640,6 +718,37 @@ class SweepCaptureController extends ChangeNotifier {
           if (n > 0) brightness = sum / n;
         }
       } catch (_) {}
+      // Live ridge-wavelength sample -- same throttling/EMA/outlier-
+      // rejection discipline as front_capture_controller.dart's _onFrame.
+      // Runs on every calibration frame regardless of `samples`/completer
+      // state (including during the extra gate window below), since this
+      // is the ONE stream this file keeps open, and closing/reopening it
+      // is the exact thing that caused a real ANR before.
+      final now = DateTime.now();
+      if (_lastWavelengthEstimateAt == null ||
+          now.difference(_lastWavelengthEstimateAt!).inMilliseconds >=
+              _wavelengthEstimateIntervalMs) {
+        _lastWavelengthEstimateAt = now;
+        try {
+          final est = HybridCaptureService.estimateRidgeWavelengthPx(image, roi: _scoreRoi);
+          if (est != null) {
+            final prior = _liveWavelengthPx;
+            final isOutlier = prior != null &&
+                prior > 0 &&
+                (est.medianLagPx > prior * 2.5 || est.medianLagPx < prior / 2.5);
+            if (isOutlier && _wavelengthOutlierStreak < 1) {
+              _wavelengthOutlierStreak++;
+            } else {
+              _wavelengthOutlierStreak = 0;
+              _liveWavelengthPx = HybridCaptureService.ema(prior ?? est.medianLagPx, est.medianLagPx);
+              final scale = _wavelengthScaleToStill(image);
+              _liveWavelengthStillPx = scale != null ? _liveWavelengthPx! * scale : null;
+              _wavelengthAxis = est.axis;
+              _wavelengthSampleCount++;
+            }
+          }
+        } catch (_) {}
+      }
       samples++;
       if (samples >= 15 && !completer.isCompleted) completer.complete();
     }
@@ -647,7 +756,40 @@ class SweepCaptureController extends ChangeNotifier {
     await cam.setFocusMode(FocusMode.auto);
     await _camera.startImageStream(onFrame);
     await completer.future.timeout(const Duration(milliseconds: 2500), onTimeout: () {});
+
+    // Distance/scale GATE, not just a hint: if the live estimate is already
+    // reliable (enough qualifying samples) and reads too-close, give the
+    // user a real bounded window to move back before the first zone ever
+    // fires -- on the SAME still-open stream, never a second one. Reroutes
+    // through the existing distanceHint field the sweep loop already uses
+    // for status text, so no new UI plumbing is needed.
+    var wavelengthTooHigh = _wavelengthSampleCount >= _liveWavelengthMinSamples &&
+        (_liveWavelengthStillPx ?? 0) > _liveWavelengthTooHighPx;
+    if (wavelengthTooHigh) {
+      unawaited(HapticFeedback.mediumImpact());
+      _emit(_state.copyWith(distanceHint: 'Move back slightly'));
+      final deadline = DateTime.now().add(const Duration(milliseconds: _wavelengthGateExtraMs));
+      while (wavelengthTooHigh && DateTime.now().isBefore(deadline) && !_disposed) {
+        await Future.delayed(const Duration(milliseconds: _wavelengthGatePollIntervalMs));
+        wavelengthTooHigh = _wavelengthSampleCount >= _liveWavelengthMinSamples &&
+            (_liveWavelengthStillPx ?? 0) > _liveWavelengthTooHighPx;
+      }
+    }
+
     await _camera.stopImageStream();
+    _wavelengthDebug = {
+      'liveWavelengthPx': _liveWavelengthPx,
+      'liveWavelengthStillPx': _liveWavelengthStillPx,
+      'sampleCount': _wavelengthSampleCount,
+      'axis': _wavelengthAxis,
+      'gateThresholdPx': _liveWavelengthTooHighPx,
+      // Whether the wait above actually resolved the too-close reading, or
+      // just ran out its bounded window still too-close -- real signal for
+      // whether _wavelengthGateExtraMs is long enough in practice, same
+      // "measure, don't assume" discipline as the gyro gate's own recorded
+      // per-zone readings.
+      'gateResolvedInTime': !wavelengthTooHigh,
+    };
     return (brightness: brightness, focus: _focusValue);
   }
 

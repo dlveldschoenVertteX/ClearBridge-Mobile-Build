@@ -1,5 +1,82 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep chosen over front_only_v1 for beta (real matchability test), live-wavelength distance GATE ported to sweep (2026-08-13)
+CTO asked directly: between sweep and front_only_v1, which architecture is
+superior and which should beta ship with. This had never actually been
+tested on the metric that matters — every prior comparison used NFIQ2 (both
+score 70s-80s, a wash) or capture speed/complexity (favors front_only_v1).
+Ran the real test instead: real SourceAFIS genuine-vs-impostor separation,
+using a real external impostor population.
+
+**Real, decisive result — reverses the NFIQ2-based read.** Genuine pairs =
+the CTO's own real captures across sessions (CTO confirmed they are the
+only tester, so every same-userId pair, and per capture-mode, every
+different-userId pair too, since Firebase anonymous auth mints a fresh
+userId per session — this is all one real finger). Impostor pairs = the
+CTO's own captures vs 15 real, distinct NIST SD302 subjects (right thumb,
+rolled scans, downloaded from the project's existing S3 training bucket,
+`sd302/extracted/SD302a/...`) — a genuine, unambiguous external population.
+
+| | genuine mean | impostor mean | impostor max | separation | beat impostor max |
+|---|---|---|---|---|---|
+| **sweep** (`superprintPath`, n=16) | 13.65 | 3.08 | 26.97 | **+10.57** | **18/120 (15%)** |
+| **front_only_v1** (`superprintPath`, n=10) | 1.06 | 1.48 | 14.94 | **-0.42** | **0/45 (0%)** |
+
+Front_only_v1 shows the finger matching itself *worse*, on average, than a
+real stranger's thumb — essentially zero real matchable signal, despite
+scoring fine on NFIQ2. Visually confirmed why: two of the CTO's own
+front_only_v1 captures were at visibly different physical scales (one
+tight complete whorl, one much coarser with no visible core) despite each
+individually reading well on NFIQ2 — a matcher can't correspond ridges
+across a scale mismatch. Sweep's fixed per-zone guide geometry is very
+likely winning specifically because it's more consistent session-to-
+session; front_only_v1 has nothing enforcing that.
+
+**Verdict: push sweep forward for beta, not front_only_v1** — directly
+validates this project's own prime directive (matchability over NFIQ2):
+front_only_v1 ties or beats sweep on NFIQ2 but has no real matchable
+signal on this test; sweep is the only one of the two that actually works
+as a fingerprint matcher. Caveat stated plainly: n=1 real subject, not a
+population-level guarantee — but the separation is categorical (positive
+vs. negative), not a close call.
+
+**Root cause of front_only_v1's failure — fixed, scoped to sweep only.**
+`front_capture_controller.dart` already has a real, scale-corrected live
+ridge-wavelength estimator (2026-08-06, validated to track the backend's
+own `afisWavelengthPx` to within ~1px) — but it's advisory-only, a text
+hint ("Move back slightly") the hold can complete right past. That's
+exactly why front_only_v1 still shows the scale-mismatch failure despite
+the estimator existing. `sweep_capture_controller.dart` had ZERO
+equivalent — `distanceHint` there was pure status text, never derived from
+anything measured.
+
+Fixed, scoped strictly to sweep per the CTO's explicit ask (front_only_v1
+untouched): ported `HybridCaptureService.estimateRidgeWavelengthPx` (shared
+package code, not duplicated) into `_calibrate()`, reusing front's own
+real-data-validated threshold (`_liveWavelengthTooHighPx = 16.0`) and
+EMA/outlier-rejection logic verbatim. Unlike front, this runs as an actual
+bounded GATE, not just a hint: if the estimate is reliable and reads
+too-close after the initial calibration window, the sweep shows "Move back
+slightly" and waits up to 3s more (polling every 300ms) before the first
+zone ever fires — real margin to reposition, capped short so a
+correctly-positioned user (the common case) never pays for it.
+
+Deliberately does NOT open a second camera stream — this file already hit
+a real ANR from reopening `startImageStream` mid-sweep (2026-07-30);
+sampling happens on the SAME already-open stream `_calibrate()` already
+uses for focus/brightness. Base ROI reused directly from front's own
+`_scoreRoi` constant (valid because sweep's `center` zone resolves to
+exactly `PadSilhouetteShape.defaultShape`, the same shape front's ROI was
+derived from); still-decode-width corrected to sweep's own 2048 (not
+front's 3200 — using the wrong one would silently mis-scale every
+estimate). Full diagnostics (`liveWavelengthPx`, `liveWavelengthStillPx`,
+`sampleCount`, `gateResolvedInTime`) written to
+`sweepBurstDebug.zones.liveWavelengthDebug` for the next real capture.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. Committed, not pushed (per standing
+process rule) — awaiting explicit go-ahead.
+
 ## Real device oscillating_8phase test: third independent confirmation, thread closed for good (2026-08-13)
 CTO ran one real oscillating_8phase capture (`353cb00b`) as a genuine last
 try, per their own framing, and asked for a full review/debug/optimization
