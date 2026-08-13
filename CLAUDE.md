@@ -1,5 +1,108 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep-burst field test round: adaptive-EV/gyro-gate confirmed live, first real mosaic NFIQ2 win, per-zone flat-fielding/flash-cue retest closes the PS thread (2026-08-13, round 23)
+CTO ran 3 real sweep captures back to back under deliberately different
+lighting (indoor skylight+natural sun, indoor artificial light, outdoor
+direct sun) to stress-test the adaptive-EV/gyro-gate port (`fcca7d6`,
+pushed+built this round) and re-probe the light/shadow hypothesis from the
+previous round with harsher real data than was available then.
+
+**Ported fixes confirmed working on-device, not just compiling.** All 3
+captures show `flashEvStep: -0.714` (the new adaptive curve) instead of the
+old flat `-0.6`, and every zone now carries a real `_gyroDegPerSec` reading
+(1.0-2.5°/s indoors, one 4.72°/s outlier — see below) — all comfortably
+under the 6.0°/s gate, so it never blocked capture, but it's genuinely
+measuring real device motion now, not a stub.
+
+**Real scores: 86 / 78 / 86 — no catastrophic sunlight failure this round**,
+unlike the 2026-07-18 transillumination case (NFIQ2 6-8 on that one). n=1
+per condition, not a settled result, but a real positive data point that
+the accumulated fixes (torch threshold, adaptive EV, corrected zone
+geometry, mosaic, distal crop) have made the pipeline meaningfully more
+robust to hard outdoor light than it used to be.
+
+**First real NFIQ2-selection win for the cross-zone mosaic.** Session 1
+(indoor skylight+sun): `afisSource: sweepFusion`, 4/4 sides registered,
+fusion proxy 86 = the capture's final `nfiq2Score` — the anchor-dominant
+blending fix (round 22-era work) finally won outright selection, not just a
+retained-sharpness metric. Visually confirmed clean: wide, dense,
+continuous whorl, no seam artifacts.
+
+**Outdoor sun partially broke mosaic registration.** Session 3: only 3/4
+sides registered, fusion scored 51 — the round's worst result, well below
+the single-zone `left` winner (85). Visually confirmed degraded (fragmented
+ridges on the left half). The `left` zone also carried the round's one
+elevated gyro reading (4.72°/s vs 1.0-2.5°/s everywhere else) — passed the
+6.0°/s gate but plausibly still soft enough to fail the mosaic's own
+correlation guard. A real, plausible cost of real motion, not a new bug.
+
+**New real photometric finding, not the one being searched for.** Indoor
+(both sessions), flash is consistently *softer* than ambient (Laplacian
+ratio 0.52-0.71x per zone, same direction/magnitude as everything measured
+all project). Outdoor sun *reverses* it: flash sharper than ambient in
+every zone (ratio 1.08-1.28x). Root cause isn't the torch — ambient frames
+show real highlight clipping outdoors (0.28-1.66% of pixels vs ~0% on
+flash), because the `-0.714` EV pulldown built for indoor torch-intensity
+scaling incidentally also protects the flash exposure from outdoor sun
+clipping. An emergent benefit of the port, not something it was built for.
+
+**"Hold farther back" experiment: inconclusive, CTO held back only ~5%.**
+`afisWavelengthPx` still reads exactly `20.0` (the estimator's hard clamp)
+in all 3 captures — identical to every capture before this test, no sign
+the held distance moved the needle. CTO confirmed only a ~5% pullback was
+tried and flagged wanting to go farther next round. Scores are strong
+anyway (78-86) despite sitting at the wavelength ceiling that used to be
+catastrophic on the old single-frame front-only pipeline — real evidence
+the mosaic+pyfingHybrid+distal-crop stack has made the pipeline much less
+wavelength-sensitive than the original front_only_v1-era correlation, not
+proof distance no longer matters.
+
+### Flat-fielding + flash/no-flash cue re-tested PER ZONE — clean negative, closes the thread
+Every prior PS/flat-field test this project ran on the CROSS-ZONE mosaic
+(ECC-registered to stitch side zones onto center), and both "gains" measured
+there were traced, on visual inspection, to registration-seam artifacts
+fooling the ridge-contrast proxy — not genuine signal. Re-ran both
+techniques on this round's fresh captures **strictly per zone** instead:
+a single zone's `amb`/`fl` pair is captured with the guide held at one fixed
+position (gyro-gated), so there is no registration hop and no seam possible
+— the first time either technique has been tested in a domain that
+structurally cannot produce that specific confound.
+
+Two candidates, both scored through the real production `afis_print`
+pipeline + real local NFIQ2, across all 5 zones × all 3 sessions (15 zone
+comparisons):
+- **flat-field** (divide by a heavily-blurred version of the same single
+  frame, removing large-scale illumination gradient): **0/15 wins, mean
+  delta -9.80.**
+- **flash-cue** (`fl / (amb+eps)` ratio image — the closest thing to real
+  photometric stereo available given only 2 distinct illuminants per zone,
+  never true normal-disambiguating multi-light PS): **1/15 "wins", mean
+  delta -8.93.**
+
+**The one apparent flash-cue win doesn't hold up under visual check**
+(`d6fef37f/right`, flash-cue 76 vs plain-ambient 68): the plain-ambient
+side lost because ITS OWN mask came out malformed (a jagged, notched crop —
+a segmentation instability on that specific frame), not because flash-cue
+extracted better ridge detail. The flat-field losses are genuine ridge
+fragmentation on visual check (`3f5b9cd6/delta`: clean dense whorl at 75 →
+irregular, top-corner-fragmented print at 49). **Net: 0/15 real wins for
+either technique**, and unlike the two previous rounds this is not an
+"our test was confounded" result — this is a clean, non-confounded test
+with the same clean negative. Consistent with every other denoise-pre-pass/
+illumination-correction technique tried this whole project (pyfing, NNS,
+coherenceDiff, curriculum-blur restoration) — an extra photometric
+processing stage ahead of this pipeline's own tuned Gabor+binarize chain is
+not automatically additive, and light/shadow-based correction specifically
+has now failed 4 real tests across 2 fundamentally different confound
+regimes (cross-zone-registered and per-zone-clean). **Not re-attempting
+flat-fielding or a 2-illuminant photometric cue again without a genuinely
+different mechanism** (e.g. a real 3rd non-coplanar light source, which
+this rig's fixed-position torch cannot provide) — this specific thread is
+closed, not just paused.
+
+No code shipped this round beyond the already-pushed `fcca7d6` (analysis +
+documentation only).
+
 ## Two new ML lines tried, both real negatives: mosaic registration net + curriculum-blur ridge restoration (2026-08-08, round 22)
 CTO proposed two training ideas in the same session: (1) a puzzle-piece
 registration net for stitching multi-angle captures into a mosaic, and (2) a
