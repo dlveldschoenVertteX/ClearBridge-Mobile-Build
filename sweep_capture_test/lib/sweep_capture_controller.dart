@@ -10,6 +10,7 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:mac_capture/mac_capture.dart';
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 const _uuid = Uuid();
@@ -114,6 +115,25 @@ class SweepCaptureController extends ChangeNotifier {
   // torch-on capture 60b4de13), so a useless flash frame is measured and
   // discarded rather than blended in.
   static const double _sweepTorchMaxAmbient = 160.0;
+
+  // Adaptive flash EV curve, ported verbatim (same constants) from
+  // front_capture_controller.dart's _adaptiveFlashEvStep -- see the real
+  // call site's own comment for why a flat EV step was a correctness gap,
+  // not just an untuned one. Real device history behind these two cuts:
+  // calibrated against a real overexposure case (cb684c57) then softened
+  // ~30% after two more real data points showed the original curve
+  // over-correcting toward underexposure -- inherited as-is rather than
+  // re-derived, since this app captures the same torch/sensor combination.
+  static const double _flashEvMinCut = -0.2; // intensity=1.0 (pitch dark)
+  static const double _flashEvMaxCut = -1.1; // intensity=0.3 (near bright-mode)
+  static const double _flashEvDarkRoomThreshold = 30.0; // /255
+
+  double _adaptiveFlashEvStep() {
+    if (_calibBrightness < _flashEvDarkRoomThreshold) return 0.0;
+    final intensity = (_flash?.intensity ?? 0.6).clamp(0.3, 1.0);
+    final t = (1.0 - intensity) / 0.7;
+    return _flashEvMinCut + (_flashEvMaxCut - _flashEvMinCut) * t;
+  }
   static const int _burstFlashSettleMs = 70;
   // Widened 34000->40000, 2026-08-12, alongside the second ambient shot per
   // zone: that adds 3 more takePicture() calls (~0.5-0.9s each on this
@@ -163,6 +183,35 @@ class SweepCaptureController extends ChangeNotifier {
   // only so it can be written to the capture doc for diagnosis (see the
   // zoneDebug writes in the sweep loop).
   double _calibBrightness = 128.0;
+
+  // Motion-blur gate, ported 2026-08-13 from front_capture_controller.dart.
+  // GAP FOUND: this file had ZERO motion-blur protection -- no gyroscope
+  // subscription, no steadiness gate, nothing -- despite the main app
+  // having a real, evidenced fix for exactly this failure mode ("Real
+  // captures showed motion-blur streaking in BOTH ambient and flash frames
+  // of the same burst -- camera shake at macro (thumb-pad-filling)
+  // distance, independent of focus distance or exposure"). If anything the
+  // sweep architecture is MORE exposed to this than the main burst: every
+  // zone fires immediately after a guide-move animation, i.e. right when
+  // the thumb is most likely to still be settling from motion, whereas the
+  // main burst's single hold has one long static dwell before it fires at
+  // all. `sensors_plus` needs no new pubspec entry -- it is already a
+  // transitive dependency via `mac_capture`.
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _gyroMagnitudeDegPerSec = 0.0;
+  // Same threshold as front_capture_controller.dart's _maxSteadyDegPerSec --
+  // reusing an already real-device-tuned number rather than guessing a new
+  // one for a different capture flow.
+  static const double _maxSteadyDegPerSec = 6.0;
+  // Bounded wait for steadiness before each zone's shutter, same "verify,
+  // don't just delay" pattern already used for focus (_redirectZoneFocus).
+  // Capped short deliberately: this is a bonus check layered on top of the
+  // zone's own existing settle delay, not a replacement for it, so it can
+  // only add a little real margin, never meaningfully lengthen a capture
+  // that's already steady (the common case).
+  static const int _steadyWaitMaxMs = 500;
+  static const int _steadyPollIntervalMs = 50;
+
   bool _disposed = false;
 
   SweepTestState _state = const SweepTestState();
@@ -211,6 +260,18 @@ class SweepCaptureController extends ChangeNotifier {
     final calib = await _calibrate(cam);
     _calibBrightness = calib.brightness;
     await _flash!.calibrate(calib.brightness);
+
+    _gyroSub ??= gyroscopeEventStream().listen((event) {
+      final degPerSec = math.sqrt(
+            event.x * event.x + event.y * event.y + event.z * event.z,
+          ) *
+          (180.0 / math.pi);
+      _gyroMagnitudeDegPerSec = HybridCaptureService.ema(
+        _gyroMagnitudeDegPerSec,
+        degPerSec,
+        alpha: 0.35,
+      );
+    });
 
     // ─ Sweep zones: the WHOLE capture ────────────────────────────────────
     // FOURTH ZONE ADDED 2026-08-12. The first three sweep only HORIZONTALLY
@@ -309,7 +370,25 @@ class SweepCaptureController extends ChangeNotifier {
         // moderately-lit ones where it only washes ridges out.
         final _ambientCarriesIt = _calibBrightness >= _sweepTorchMaxAmbient;
         final torchCapable = _flash!.isNeeded && !_ambientCarriesIt;
-        final flashEvStep = torchCapable ? -0.6 : 0.0; // fixed EV step -- see README
+        // GAP FOUND 2026-08-13: this used a flat -0.6 EV step regardless of
+        // scene brightness or torch intensity, while
+        // front_capture_controller.dart has a real, multi-round-tuned
+        // adaptive curve (_adaptiveFlashEvStep) -- interpolated -0.2 to
+        // -1.1 by torch intensity, and explicitly SKIPPED in a dark room
+        // (ambient < 30/255) because "the torch is already the sole light
+        // source and any negative EV step only makes an already-
+        // underexposed frame worse". The flat -0.6 had no such skip, so in
+        // a genuinely dark scene it was ACTIVELY WRONG, not just untuned --
+        // it would darken the one usable light source. Ported the same
+        // curve rather than re-deriving a new one for this app.
+        //
+        // Adaptive EV does not fix the illumination-GEOMETRY problem this
+        // session already found (isotropic high-frequency loss from the
+        // on-axis torch, confirmed unrelated to exposure -- no clipping in
+        // any measured flash frame). It fixes a separate, compounding
+        // exposure error that the flat constant could add on top of that
+        // geometry problem in specific lighting.
+        final flashEvStep = torchCapable ? _adaptiveFlashEvStep() : 0.0;
         double? minEv, maxEv;
         if (torchCapable) {
           try {
@@ -403,6 +482,22 @@ class SweepCaptureController extends ChangeNotifier {
               await Future<void>.delayed(const Duration(milliseconds: _calibrationTickMs));
             }
           }
+          if (_disposed) break;
+
+          // Motion-blur gate: bounded wait for the gyro to settle below
+          // the steadiness threshold before this zone's shutters fire. See
+          // the field docs above _gyroSub for why this was missing
+          // entirely and why it matters more here than on the main burst.
+          final steadyWaitStart = DateTime.now();
+          while (_gyroMagnitudeDegPerSec >= _maxSteadyDegPerSec &&
+              DateTime.now().difference(steadyWaitStart).inMilliseconds <
+                  _steadyWaitMaxMs) {
+            if (_disposed) break;
+            await Future<void>.delayed(
+                const Duration(milliseconds: _steadyPollIntervalMs));
+          }
+          zoneDebug['${zone}_gyroDegPerSec'] =
+              double.parse(_gyroMagnitudeDegPerSec.toStringAsFixed(2));
           if (_disposed) break;
 
           // Ambient shot.
@@ -916,6 +1011,8 @@ class SweepCaptureController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    unawaited(_gyroSub?.cancel());
+    _gyroSub = null;
     _audio.dispose();
     _camera.disposeCamera();
     super.dispose();
