@@ -1,5 +1,73 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the readiness-gate build; phone-vs-thumb movement tested (inconclusive, n=1); left zone's real root cause found + fixed (2026-08-14)
+CTO tested the countdown-removal build (`711abe9`) with a deliberate twist:
+braced the thumb against a fixed surface and moved the PHONE instead of the
+thumb through the sweep zones, per their own observation that repositioning
+the thumb feels physically uncomfortable, then asked to debug why 'left'
+keeps underperforming.
+
+**Readiness-gate build confirmed working on real hardware.** Capture
+`971c304d` (2026-08-14, new user, 48s total): every zone shows
+`readyDetected: true`, resolving in 303-364ms — all near the 300ms floor,
+nowhere close to the 1400ms bound — confirming the concurrent
+stream+`takePicture()` condition flagged as unverified is safe on this
+device, and that the fixed 2100ms countdown really was pure dead time. Gyro
+readings (1.4-2.5°/s) were in the same range as prior thumb-moved captures,
+no sign phone-movement adds meaningfully more shake at the moment of
+capture.
+
+**Phone-vs-thumb registration: genuinely inconclusive on n=1, not a win.**
+Real per-zone correlation against center on this capture: left 0.406
+(fails the 0.45 gate), right **0.822** (best right seen all session), delta
+0.686 (worse than every prior thumb-moved delta, which ran 0.85-0.94), tip
+0.797. Mixed, not a clean signal either direction — right/tip look
+slightly better, delta looks worse, on a single real capture. Told the CTO
+plainly this needs 2-3 more phone-moved captures (plus a real matchability
+comparison against existing thumb-moved captures) before concluding
+anything — comfort is a real, independent reason to prefer it regardless
+of what the numbers eventually say, but it isn't yet demonstrated to help
+or hurt matchability.
+
+**Left zone's real root cause found, distinct from the 2026-08-12 AF-timing
+fix — and NOT related to phone-vs-thumb.** Left underperformed on BOTH the
+new phone-moved capture (0.406) and every prior thumb-moved capture
+(0.169-0.620 across 4 real captures, pass rate 2/4) — same weakness in
+both builds, ruling out the countdown/readiness-gate change or the
+movement-actor question as the cause. Re-examined the code path rather
+than re-tuning AF timing again (already fixed once, 2026-08-12, and real
+data shows it's still failing): **no guide is ever shown on screen during
+calibration, and the pre-loop hold snapped the guide directly to the LEFT
+position with zero animation** — left is the only zone in the whole
+5-zone sequence the user has to find COLD, with a static target and no
+motion path to follow, while every other zone gets a continuous 1400ms
+animated tween from wherever it just successfully was. That's a real,
+structural asymmetry independent of AF convergence, and it survived the
+AF-timing fix because it was never the thing that fix addressed.
+
+**Fixed**: the guide now appears at CENTRE from the start of calibration
+(a free side benefit — the wavelength/focus sampling ROI already assumes
+centre content, so this also gives calibration itself a real target for
+the first time) and stays there through the pre-roll hold. The zone loop's
+first iteration now animates left FROM centre using the exact same tween
+every other zone already uses, instead of snapping there instantly. The
+parallel `_redirectZoneFocus(cam, 0.0)` head-start call is unchanged and
+still races AF to the left target during the hold — so by the time the
+animated move arrives, focus is very likely already converged, meaning
+this fix adds real motion guidance without giving up the existing
+AF-timing fix's benefit.
+
+**Real, deliberate cost**: zone 0 now pays the same ~1400ms move-animation
+time every other zone already pays, which it previously didn't (it went
+straight into the readiness gate). Given the ask was specifically to fix a
+real registration failure, not preserve every last millisecond of the
+countdown-removal savings, this trade was made deliberately — worth
+knowing when reviewing the next real capture's total duration.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. Committed, not pushed (per standing
+process rule) — awaiting explicit go-ahead.
+
 ## Sweep timing: countdown removed for a content-driven readiness gate; zone-geometry vertical-shift idea checked and set aside as confounded (2026-08-14)
 CTO, prepping for beta with a real 30-subject ground-truth+sweep paired
 dataset coming, asked whether sweep's capture time could be trimmed without

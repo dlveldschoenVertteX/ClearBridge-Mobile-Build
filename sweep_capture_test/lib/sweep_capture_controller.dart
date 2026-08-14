@@ -384,7 +384,24 @@ class SweepCaptureController extends ChangeNotifier {
     // simpler than clearbridge_beta's own multi-second hold-gate -- this
     // app's whole purpose is isolating the sweep architecture itself, not
     // re-testing the pre-capture readiness gate.
-    _emit(_state.copyWith(phase: SweepTestPhase.calibrating, message: 'Reading light + focus…'));
+    // Real bug found 2026-08-14: 'left' (the first zone) consistently
+    // registered worse than every other zone (real device data, both
+    // thumb-moved and phone-moved builds) despite the 2026-08-12 AF-timing
+    // fix below. Root cause isn't AF convergence -- it's that 'left' was
+    // the ONLY zone the guide never animates INTO: no guide is shown at
+    // all during calibration, so the very first thing the user ever sees
+    // is the guide already snapped cold to the left position with a
+    // static text hint, while every other zone gets a continuous 1400ms
+    // tween from wherever it just was to guide the user's hand. Showing
+    // the guide here, at centre, gives calibration a real target too (a
+    // free side benefit -- the wavelength/focus sampling ROI already
+    // assumes centre content) and gives the zone loop's own first
+    // iteration a real starting point to animate FROM instead of nothing.
+    _emit(_state.copyWith(
+      phase: SweepTestPhase.calibrating,
+      message: 'Reading light + focus…',
+      activeGuideShape: _sweepGuideShapeForProgress(0.5),
+    ));
     final calib = await _calibrate(cam);
     _calibBrightness = calib.brightness;
     await _flash!.calibrate(calib.brightness);
@@ -447,11 +464,17 @@ class SweepCaptureController extends ChangeNotifier {
     final zoneDebug = <String, dynamic>{'liveWavelengthDebug': _wavelengthDebug};
     final stopwatch = Stopwatch()..start();
 
+    // Guide stays at CENTRE through this hold (2026-08-14, see the
+    // calibration-phase comment above) -- AF is still raced to the LEFT
+    // target in parallel via the unawaited call below, so by the time the
+    // zone loop's own animated move-to-left starts, focus is very likely
+    // already converged there; the user just gets real continuous motion
+    // guidance to follow instead of a static target to jump to blind.
     _emit(_state.copyWith(
       phase: SweepTestPhase.sweeping,
-      distanceHint: 'Place your thumb at the start position',
-      sweepProgress: 0.0,
-      activeGuideShape: _sweepGuideShapeForProgress(0.0),
+      distanceHint: 'Hold at the starting position',
+      sweepProgress: 0.5,
+      activeGuideShape: _sweepGuideShapeForProgress(0.5),
     ));
     unawaited(HapticFeedback.lightImpact());
     // Real bug found 2026-08-12: real device data across 3 post-fix captures
@@ -546,14 +569,19 @@ class SweepCaptureController extends ChangeNotifier {
           final dy = zones[i].dyFrac;
           if (_disposed) break;
 
-          if (i == 0) {
-            _emit(_state.copyWith(
-              sweepProgress: target,
-              activeGuideShape: _sweepGuideShapeForProgress(target, dyFrac: dy),
-            ));
-          } else {
-            final fromProgress = zones[i - 1].progress;
-            final fromDy = zones[i - 1].dyFrac;
+          {
+            // Real fix, 2026-08-14: zone 0 ('left') used to snap here
+            // instantly with no animation, the ONLY zone that never got
+            // one -- see the calibration-phase comment above for why that
+            // was a real, previously-unaddressed cause of left's weaker
+            // real registration (not an AF-timing issue; that was already
+            // fixed 2026-08-12 and left was still underperforming after
+            // it). Now animates from wherever it last was (centre, for
+            // zone 0, since that's where the guide sits through
+            // calibration and the pre-roll hold) exactly like every other
+            // zone, using the same tween.
+            final fromProgress = i == 0 ? 0.5 : zones[i - 1].progress;
+            final fromDy = i == 0 ? 0.0 : zones[i - 1].dyFrac;
             final moveMs = _zoneMoveMs + extraMoveMs;
             final grantedExtra = extraMoveMs > 0;
             if (grantedExtra) {
@@ -569,7 +597,9 @@ class SweepCaptureController extends ChangeNotifier {
                           ? 'Slowly move down — showing the fingertip'
                           : (zone == 'right'
                               ? 'Slowly move right'
-                              : 'Slowly move to the middle'))),
+                              : (zone == 'left'
+                                  ? 'Slowly move left'
+                                  : 'Slowly move to the middle')))),
             ));
             final moveStart = DateTime.now();
             while (true) {
