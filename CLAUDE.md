@@ -1,5 +1,134 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep put on ice, focus returned to front_only_v1: fusion is real-negative on real data (mosaic AND field-domain), front's own live-wavelength check upgraded from hint to gate (2026-08-14)
+CTO decision after the mosaic/field-fusion tests below: sweep's core
+mosaic concept measures negative regardless of technique (pixel blend,
+field-domain consensus, or zone-reduced variants all lost badly to a
+single un-fused zone — see the two entries below), so sweep is shelved
+for now and effort returns to `front_only_v1`, "since it does exactly
+the same thing with less effort." Pushed back on the "exactly the same
+thing" part with the real data before proceeding: front_only_v1 is the
+one architecture in this whole project that measured **negative** real
+SourceAFIS separation (-0.42, beat 0/45) against sweep's +10.57 — and
+that gap traces to the guide PROTOCOL (session-to-session scale/pose
+consistency), not to fusion. Sweep's fusion step is confirmed bad; its
+capture protocol was never the thing that failed. CTO agreed to proceed
+on front_only_v1 anyway (product-scope decision, not a data disagreement)
+and asked for real matchability optimizations there.
+
+**Fix #1, built: front's own live-wavelength check upgraded from an
+advisory hint to a real gate.** `front_capture_controller.dart` already
+has a real, scale-corrected live ridge-wavelength estimator (2026-08-06,
+validated to track the backend's own `afisWavelengthPx` to within ~1px)
+— but `wavelengthTooHigh` only ever changed the displayed `distanceHint`
+text ("Move back slightly"); it was never included in `rawOnTarget`, the
+actual condition gating whether the hold can complete. A user could see
+the hint and have the hold finish right through it anyway. This is the
+exact, already-diagnosed reason front_only_v1 still shows real cross-
+session scale mismatch despite the estimator existing — sweep got the
+real fix for this exact gap on 2026-08-13/14 (ported as an actual bounded
+wait), but it was explicitly scoped away from front at the time per the
+CTO's own instruction then. Now that front is the focus, folded
+`wavelengthTooHigh` directly into `rawOnTarget` (`!wavelengthTooHigh`,
+same as the existing `!tooClose`) and into the refocus-reset condition —
+no new bounded-wait mechanism needed, since the hold's own continuous
+re-check loop already behaves exactly like sweep's bounded wait, just
+indefinitely, the same way it already does for `tooFar`/`tooClose` today.
+Threshold left at the existing `_liveWavelengthTooHighPx = 16.0` —
+unlike sweep's copy-pasted version of this same number (which was wrong
+for a different pipeline domain and got recalibrated to 35.0), front's
+16.0 is grounded in front's OWN real NFIQ2 correlation data (native
+wavelength >=15px -> catastrophic, 9-14px sweet spot), not a
+cross-architecture guess, so no reason to change the number itself here
+— only to make it actually load-bearing. Diagnostic field renamed
+`wavelengthHintThresholdPx` -> `wavelengthGateThresholdPx` to match.
+**Not yet device-tested** — same standing discipline as every capture-
+side change this project.
+
+**Investigation #2, running: do front's own fusion variants win NFIQ2
+selection while losing real matchability, the same pattern just found
+for sweep's mosaic?** `main.py`'s `_afis_variants` pool includes several
+pixel-averaging fusion variants (`fuseAvg`/`fuseMaxc`/`fuseSoft`,
+`deepFuse`/`deepMaxc`, `stack`/`focusStack`) guarded only by a proxy/
+NFIQ2-driven sharpness-ratio heuristic (`_FUSION_VARIANT_NAMES`) — never
+validated against real SourceAFIS matchability the way
+`pyfingHybridFreqNorm` eventually was. Given the newly-confirmed finding
+that plain pixel averaging at real registration accuracy destroys ridge
+energy (see the mosaic/field-fusion entries below), this is a directly
+motivated, previously-unchecked gap in front's own production variant
+pool. Testing all 9 reachable variants (no pyfing sidecar from this
+sandbox) against the same real NIST SD302 impostor gate, using the 10
+real front_only_v1 captures with locally cached raw bursts (3 real
+genuine pairs). Result pending.
+
+## Sweep zone reduction + field-domain fusion tested: fusion of ANY kind, on ANY zone subset, loses badly to a single un-fused zone (2026-08-14)
+Follow-up to the CTO's two direct questions: "why keep left/right if they
+contribute nothing" (proposing a tip-center-delta-only capture), and
+whether a light/shadow-consensus mechanism could work alongside the
+mosaic to bring out more ridge detail (correcting the premise first:
+photometric stereo didn't fail for lack of shadow — the torch is
+on-axis with the lens, so it fills the valley micro-shadows PS needs,
+confirmed via direct counterfactual — but a genuinely different
+mechanism, fusing ridge ORIENTATION instead of pixels, was worth a real
+test since orientation varies slowly in space and should be far more
+tolerant of the sub-ridge-period registration error that was already
+shown to destroy pixel-domain fusion).
+
+**Field-domain fusion (`fieldfuse`): real, clean negative.** Built a
+coherence-weighted multi-zone consensus ridge-orientation field (fused in
+double-angle space, sanity-checked to reproduce the plain single-zone
+field exactly when given no sides — max angular error 2.4e-7 rad), then
+ran the existing Gabor synthesis on the ANCHOR's own untouched pixels
+using that field, so anchor ridge detail is never averaged. Real
+SourceAFIS test (13 captures, 10 genuine pairs, same NIST impostor gate
+used all session), with the missing control this project had never run
+before -- a true no-fusion single-zone baseline:
+
+| arm | separation | beat impostor max |
+|---|---|---|
+| mosaic (current production pixel blend) | +13.04 | 3/10 |
+| **anchor_only (centre zone, no fusion at all)** | **+28.44** | **7/10** |
+| fieldfuse (orientation-consensus) | -0.60 | 0/10 |
+
+fieldfuse lost even to the pixel mosaic, likely because side-zone
+orientation contributed wherever ITS OWN coherence was high with no gate
+on whether the anchor's own local field was already reliable there --
+misregistered side content could overwrite good anchor signal instead of
+only filling genuine gaps. Not pursued further without a materially
+different gating mechanism. The bigger finding is `anchor_only` beating
+BOTH fusion arms by 2x+ -- no prior mosaic test in this project had ever
+included a true zero-fusion control.
+
+**Zone reduction (`zone_reduction_test.py`): independently confirms the
+same finding on a different real sample.** The 6 real 5-zone captures
+(delta/tip zones are only ~2 days old, all one finger, all 15 cross pairs
+genuine by this project's own established single-tester convention):
+
+| configuration | separation | beat impostor max | pad coverage vs. centre |
+|---|---|---|---|
+| **anchor only** | **+26.12** | **8/15** | 1.0x |
+| tip-centre-delta (CTO's proposal) | +12.55 | 3/15 | 1.74x |
+| left-centre-right | +8.82 | 2/15 | 2.28x |
+| all 5 zones fused | +4.92 | 3/15 | 2.88x |
+
+Two things settled: among fusion configs, fewer/more-overlapping zones
+lose less (tip-centre-delta > left-centre-right > all-5), consistent with
+"more averaging = more destruction" -- the CTO's own zone-reduction
+instinct was directionally right within that constraint. But no fusion
+configuration, on either real sample, comes close to no fusion at all.
+More pad coverage did not buy better matchability anywhere in this data
+-- the averaging cost dominated every time.
+
+**Conclusion, and the reason sweep was set aside (see the entry above)**:
+this isn't a technique problem (tried pixel-domain and field-domain, both
+failed) and it isn't a zone-count problem (failed at 3 zones and at 5) --
+cross-zone fusion itself appears to be the wrong lever for this
+pipeline's real matchability, regardless of form. The real, still-untested
+next step this pointed at (capture multiple zones for redundancy, SELECT
+the single best one via real NFIQ2 the same way `main.py` already selects
+every other variant, never average) was proposed but not built before the
+CTO redirected effort to front_only_v1 instead.
+
 ## Real device test of the readiness-gate build; phone-vs-thumb movement tested (inconclusive, n=1); left zone's real root cause found + fixed (2026-08-14)
 CTO tested the countdown-removal build (`711abe9`) with a deliberate twist:
 braced the thumb against a fixed surface and moved the PHONE instead of the

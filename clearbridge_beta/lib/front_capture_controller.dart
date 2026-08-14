@@ -1710,8 +1710,23 @@ class FrontCaptureController extends ChangeNotifier {
     // motion-blur streaking even when the software focus score read "on
     // target" -- a fixed hold timer alone doesn't catch handshake at macro
     // distance.
+    //
+    // wavelengthTooHigh joined this gate 2026-08-14 (was advisory-only
+    // before -- it only ever changed the displayed hint text, never
+    // actually blocked the hold from completing). That gap was the
+    // specific, already-diagnosed reason front_only_v1 still shows real
+    // cross-session scale mismatch despite this estimator existing: a user
+    // could see "Move back slightly" and still have the hold finish right
+    // through it. Sweep already ported this same estimator as an actual
+    // bounded gate (2026-08-13/14); front didn't get the equivalent fix at
+    // the time because the ask was scoped to sweep only. Now folded
+    // straight into the existing on-target condition, same as tooClose --
+    // no separate bounded-wait mechanism needed, since the hold's own
+    // continuous re-check loop already IS that wait, indefinitely, exactly
+    // like it already behaves for tooFar/tooClose today.
     final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
-    final rawOnTarget = _focusValue > 0.45 && !tooFar && !tooClose && steady;
+    final rawOnTarget =
+        _focusValue > 0.45 && !tooFar && !tooClose && !wavelengthTooHigh && steady;
 
     if (rawOnTarget) {
       // Re-acquire focus FRESH the first time this hold reaches on-target,
@@ -1751,7 +1766,7 @@ class FrontCaptureController extends ChangeNotifier {
       // stays in frame don't stale the locked focus; resetting here would
       // trigger a fresh 600ms refocus wait the moment the score recovers,
       // multiplying unnecessary waits when the user is just slightly unsteady.
-      if (tooFar || tooClose || coverage == null) {
+      if (tooFar || tooClose || wavelengthTooHigh || coverage == null) {
         _refocusedThisHold = false;
       }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
@@ -2521,12 +2536,13 @@ class FrontCaptureController extends ChangeNotifier {
       'sampleCount': _wavelengthSampleCount,
       'belowMinSamples': !wlReliable,
       'axis': _wavelengthAxis,
-      // Whether the wavelength-based distance hint ever fired during the
-      // hold (i.e. liveWavelengthStillPx exceeded _liveWavelengthTooHighPx).
-      // If true on a capture, the user moved back after seeing the hint --
-      // correlate the final afisWavelengthPx against captures where this
-      // was false to validate whether 25px is the right threshold.
-      'wavelengthHintThresholdPx': _liveWavelengthTooHighPx,
+      // Whether wavelengthTooHigh was ever true during this hold. Real GATE
+      // as of 2026-08-14 (see rawOnTarget above), not just a hint -- if
+      // true on a capture, the hold could not complete until the user
+      // moved back far enough to clear it. Correlate the final
+      // afisWavelengthPx against captures where this was false to confirm
+      // 16.0 is still the right cutover once real post-fix data exists.
+      'wavelengthGateThresholdPx': _liveWavelengthTooHighPx,
       // Absolute (non-peak-normalized) live sharpness -- see field docs
       // above _liveAbsSharpness. Not gated on a minimum sample count the
       // way liveWavelengthStillPx is (it's an EMA fed every in-range frame,
