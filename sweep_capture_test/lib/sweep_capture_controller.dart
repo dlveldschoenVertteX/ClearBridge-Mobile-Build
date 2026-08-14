@@ -69,13 +69,40 @@ class SweepCaptureController extends ChangeNotifier {
 
   // ─── Zone timing (ported from _captureSweepBurst's own constants) ────────
   static const int _calibrationHoldMs = 1500;
-  static const int _calibrationTickMs = 700;
   // Scaled back down 3100->1400 alongside the spacing fix above -- same
   // velocity-consistency reasoning as front_capture_controller.dart's own
   // _sweepZoneMoveMs (keep the guide's on-screen translation speed
   // constant even though the distance it travels shrank).
   static const int _zoneMoveMs = 1400;
-  static const int _zoneSettleMs = 700;
+  // REMOVED 2026-08-14, per CTO direction ("remove it totally and allow
+  // the camera to pick up if thumb is in mask"): the old per-zone flow
+  // was a fixed 700ms settle (zone 0) or a scripted 3-tick verbal
+  // countdown at 700ms/tick (every other zone, 2100ms total) -- pure UX
+  // pacing stacked on TOP of the real settle mechanisms
+  // (_redirectZoneFocus's own 900ms focus/exposure settle, the gyro
+  // motion-blur gate below), never itself backed by a measurement. Both
+  // paths are replaced by the single _zoneReady* gate below, which reuses
+  // _focusValue -- the SAME peak-normalized relative-sharpness signal
+  // already validated for front_capture_controller.dart's own primary
+  // hold-phase gate (0.45 relative threshold) and for this file's own
+  // _calibrate() -- applied per-zone instead of only once at the start.
+  // Resolves as soon as real content is in focus rather than always
+  // paying the old fixed cost, and never blocks past _zoneReadyMaxWaitMs.
+  //
+  // Requires the image stream to stay open for the WHOLE capture, not
+  // just calibration -- see _calibrate()'s stopImageStream() call, moved
+  // to fire once after the whole zone loop instead. That is a genuinely
+  // NEW, UNVERIFIED condition: every real device test this project has
+  // run so far only ever called takePicture() AFTER the stream was
+  // stopped; this makes takePicture() run WHILE the stream is still
+  // active. Different failure surface than the 2026-07-30 ANR (which was
+  // from REOPENING a stream mid-sweep -- this never closes and reopens,
+  // it stays open once) but still unverified -- needs real-device
+  // confirmation before trusting it, same as everything else here.
+  static const double _zoneReadyFocusThreshold = 0.45;
+  static const int _zoneReadyMinWaitMs = 300;
+  static const int _zoneReadyMaxWaitMs = 1400;
+  static const int _zoneReadyPollIntervalMs = 80;
 
   // Vertical offset magnitude for the two vertical stations ('tip' above the
   // centre, 'tipLow' below), as a fraction of screen height applied to the
@@ -571,18 +598,31 @@ class SweepCaptureController extends ChangeNotifier {
           zoneDebug['${zone}_focusRedirected'] = true;
           if (_disposed) break;
 
-          if (i == 0) {
-            unawaited(HapticFeedback.lightImpact());
-            _emit(_state.copyWith(distanceHint: 'Hold still — capturing $zone'));
-            await Future<void>.delayed(const Duration(milliseconds: _zoneSettleMs));
-          } else {
-            for (final n in const ['Hold still…', '2…', '1…']) {
-              if (_disposed) break;
-              _emit(_state.copyWith(distanceHint: n));
-              unawaited(HapticFeedback.lightImpact());
-              await Future<void>.delayed(const Duration(milliseconds: _calibrationTickMs));
+          unawaited(HapticFeedback.lightImpact());
+          _emit(_state.copyWith(distanceHint: 'Hold still — capturing $zone'));
+          // Content-driven readiness gate, replacing the old fixed
+          // settle/countdown -- see _zoneReadyFocusThreshold's own comment
+          // for the full reasoning. Fresh peak per zone so an earlier,
+          // brighter/sharper zone's peak can't suppress this zone's own
+          // relative signal and starve it toward the max-wait fallback.
+          _focusPeak = 1.0;
+          final readyStart = DateTime.now();
+          var readyDetected = false;
+          while (DateTime.now().difference(readyStart).inMilliseconds <
+              _zoneReadyMaxWaitMs) {
+            if (_disposed) break;
+            final elapsed = DateTime.now().difference(readyStart).inMilliseconds;
+            if (elapsed >= _zoneReadyMinWaitMs &&
+                _focusValue >= _zoneReadyFocusThreshold) {
+              readyDetected = true;
+              break;
             }
+            await Future<void>.delayed(
+                const Duration(milliseconds: _zoneReadyPollIntervalMs));
           }
+          zoneDebug['${zone}_readyDetected'] = readyDetected;
+          zoneDebug['${zone}_readyWaitMs'] =
+              DateTime.now().difference(readyStart).inMilliseconds;
           if (_disposed) break;
 
           // Motion-blur gate: bounded wait for the gyro to settle below
@@ -600,6 +640,14 @@ class SweepCaptureController extends ChangeNotifier {
           zoneDebug['${zone}_gyroDegPerSec'] =
               double.parse(_gyroMagnitudeDegPerSec.toStringAsFixed(2));
           if (_disposed) break;
+
+          // Visual "capturing now" cue, replacing the removed verbal
+          // countdown -- flips the guide to its green/locked highlight
+          // (see sweep_capture_screen.dart's _silhouetteState) for the
+          // real duration of this zone's shutter sequence, not a fixed
+          // cosmetic timer.
+          unawaited(HapticFeedback.mediumImpact());
+          _emit(_state.copyWith(zoneCaptureFlash: true));
 
           // Ambient shot.
           try {
@@ -670,6 +718,8 @@ class SweepCaptureController extends ChangeNotifier {
             zoneDebug['${zone}_fl_error'] = e.toString();
           }
 
+          _emit(_state.copyWith(zoneCaptureFlash: false));
+
           final region = _guideRegionForSweepZone(target, dyFrac: dy);
           if (region != null) guideRegions[zone] = region;
 
@@ -698,6 +748,14 @@ class SweepCaptureController extends ChangeNotifier {
     } catch (e) {
       zoneDebug['sweepError'] = e.toString();
     }
+    // Single stop for the stream _calibrate() opened and never closed
+    // (2026-08-14) -- see the per-zone readiness gate in the loop above.
+    // Wrapped defensively: if the stream was already stopped by an
+    // exception path above, a second stop is a harmless no-op, not a
+    // reason to lose the captured shots.
+    try {
+      await _camera.stopImageStream();
+    } catch (_) {}
     stopwatch.stop();
 
     if (rawShots.isEmpty) {
@@ -799,7 +857,10 @@ class SweepCaptureController extends ChangeNotifier {
       }
     }
 
-    await _camera.stopImageStream();
+    // stopImageStream() moved out of here 2026-08-14 -- the stream now
+    // stays open through the whole zone loop so _focusValue keeps updating
+    // live for the per-zone readiness gate (see the zone loop's own
+    // comment). Stopped exactly once, after the last zone, in _run().
     _wavelengthDebug = {
       'liveWavelengthPx': _liveWavelengthPx,
       'liveWavelengthStillPx': _liveWavelengthStillPx,
@@ -1209,6 +1270,11 @@ class SweepTestState {
   final double uploadProgress;
   final String? captureId;
   final String? error;
+  // True for the real duration of a zone's shutter sequence -- the visual
+  // "capturing now" cue that replaced the removed verbal countdown (see
+  // sweep_capture_screen.dart's _silhouetteState). Not a fixed cosmetic
+  // timer: it tracks the actual shots firing, on and off.
+  final bool zoneCaptureFlash;
 
   const SweepTestState({
     this.phase = SweepTestPhase.idle,
@@ -1219,6 +1285,7 @@ class SweepTestState {
     this.uploadProgress = 0.0,
     this.captureId,
     this.error,
+    this.zoneCaptureFlash = false,
   });
 
   SweepTestState copyWith({
@@ -1230,6 +1297,7 @@ class SweepTestState {
     double? uploadProgress,
     String? captureId,
     String? error,
+    bool? zoneCaptureFlash,
   }) =>
       SweepTestState(
         phase: phase ?? this.phase,
@@ -1240,5 +1308,6 @@ class SweepTestState {
         uploadProgress: uploadProgress ?? this.uploadProgress,
         captureId: captureId ?? this.captureId,
         error: error ?? this.error,
+        zoneCaptureFlash: zoneCaptureFlash ?? this.zoneCaptureFlash,
       );
 }

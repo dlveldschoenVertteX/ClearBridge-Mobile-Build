@@ -1,5 +1,87 @@
 # ClearBridge Mobile — persistent context
 
+## Sweep timing: countdown removed for a content-driven readiness gate; zone-geometry vertical-shift idea checked and set aside as confounded (2026-08-14)
+CTO, prepping for beta with a real 30-subject ground-truth+sweep paired
+dataset coming, asked whether sweep's capture time could be trimmed without
+sacrificing quality, then two follow-ups: remove the verbal countdown
+entirely in favor of camera-driven readiness detection plus a visual
+capture cue, and whether delta zone's strong real registration (see the
+guide-gated pad test above) means lowering all zones vertically might help.
+
+**Countdown removed, replaced with a real content-driven gate.**
+`sweep_capture_controller.dart`'s per-zone flow used to pay a fixed cost
+every zone: a 700ms settle (zone 0) or a 3-tick verbal countdown at 700ms
+each (every other zone, 2100ms total) — stacked ON TOP of the two
+mechanisms that actually do measured work (`_redirectZoneFocus`'s own
+900ms focus/exposure settle, the gyro motion-blur gate). Neither the flat
+settle nor the countdown was ever backed by a measurement. Replaced both
+with one gate reusing `_focusValue` — the same peak-normalized relative-
+sharpness signal already validated for `front_capture_controller.dart`'s
+own primary hold-phase gate (0.45 threshold) and for this file's own
+`_calibrate()` — applied per zone instead of only once at the start:
+resolves in as little as 300ms once real content is in focus, never
+blocks past 1400ms. `_focusPeak` resets per zone so an earlier, sharper
+zone can't suppress the current zone's relative signal.
+
+**This required a real architecture change, not just a constant tweak**:
+`_focusValue` only updates while the image stream is open, and the stream
+was being closed at the end of `_calibrate()` — before the zone loop even
+starts. Moved the single `stopImageStream()` call to fire once after the
+whole zone loop instead, so the same stream `_calibrate()` already opens
+stays live through every zone. **This is a genuinely new, unverified
+condition**: every real device test this project has run so far only ever
+called `takePicture()` after the stream was stopped; this makes
+`takePicture()` run while the stream is still active. Different failure
+surface than the 2026-07-30 ANR (which was from REOPENING a stream
+mid-sweep — this one never closes and reopens, it just stays open) but
+still needs real-device confirmation before trusting it, same as every
+other capture-side change this project.
+
+**Visual capture cue added in place of the countdown**, reusing
+infrastructure that already existed rather than building new UI: the
+shared `CapturePadSilhouetteOverlay` already renders gold for
+`PadSilhouetteState.capturing` and green for `.locked` — the guide now
+flips to green for the real duration of each zone's shutter sequence (not
+a fixed cosmetic timer) via a new `zoneCaptureFlash` field on
+`SweepTestState`, read by `sweep_capture_screen.dart`'s `_silhouetteState`.
+Gold reads as "sweep in progress", green as "capturing this zone right
+now".
+
+**Real budget change**: worst case per zone drops slightly (900+1400=2300ms
+max vs. the old fixed 2100ms already being paid regardless), but the real
+saving is in the common case — resolving in ~300-600ms once focus is
+already converged (likely for most zones, since the move+settle already
+ran) instead of always paying the full fixed cost. Estimated ~4-7s off the
+whole sweep in the typical case; not yet measured on a real device.
+
+**Zone-geometry vertical-shift idea: checked, real confound found, not
+implemented.** CTO's hypothesis (delta scores best in the small real
+registration sample above, so maybe all zones benefit from a similar
+vertical shift) was checked against the guide geometry directly rather
+than assumed. Computed real overlap area between each zone's guide mask
+and center's, using the actual shipped shape parameters:
+
+| zone | offset | overlap with center |
+|---|---|---|
+| left/right | cx shifted +/-0.15 (~90% of rx) | **47.5%** |
+| delta/tip | cy shifted +/-0.07 (~51% of ry) | **69.9%** |
+
+Delta/tip were deliberately built with roughly half the guide's own radius
+of displacement "so both still overlap the centre zone across most of
+their area" (the zone's own existing code comment) — left/right shift by
+nearly a full radius instead. This fully explains delta's stronger real
+registration correlation without needing a vertical-vs-horizontal
+explanation at all: delta/tip simply move less, so of course they overlap
+center more and register more easily. The n=3-4 real sample can't
+distinguish "vertical positioning is better" from "smaller displacement
+registers better" — this is the same confound class already caught once
+this session (the pad-gate "more fusion = better" reversal). **Not
+changing zone geometry on this signal** — if displacement magnitude is
+the real driver, shifting all zones vertically would only help to the
+extent it also shrinks their displacement, not because vertical is
+inherently favored, and either way the sample is too thin to act on
+without a real controlled test.
+
 ## Sweep matchability mosaic: real production defect found + fixed (pad_mask_override collapsed matchability 12x), five other mosaic-tuning ideas tested and refuted (2026-08-13)
 Follow-up to the sweep-vs-front-only decision below, working through the
 prioritized matchability-optimization list against the real SourceAFIS-vs-

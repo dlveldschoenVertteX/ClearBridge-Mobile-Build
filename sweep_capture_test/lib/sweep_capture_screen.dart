@@ -79,7 +79,7 @@ class _SweepCaptureScreenState extends State<SweepCaptureScreen> {
             if (s.activeGuideShape != null)
               Positioned.fill(
                 child: CapturePadSilhouetteOverlay(
-                  state: _silhouetteState(s.phase),
+                  state: _silhouetteState(s.phase, s.zoneCaptureFlash),
                   hint: s.distanceHint.isNotEmpty ? s.distanceHint : null,
                   shape: s.activeGuideShape!,
                   progress: s.sweepProgress,
@@ -98,8 +98,16 @@ class _SweepCaptureScreenState extends State<SweepCaptureScreen> {
     );
   }
 
-  static PadSilhouetteState _silhouetteState(SweepTestPhase p) => switch (p) {
-        SweepTestPhase.sweeping => PadSilhouetteState.capturing,
+  // zoneCaptureFlash overrides the sweeping-phase color to green/locked for
+  // the real duration of each zone's shutter sequence -- the replacement
+  // for the removed verbal countdown (2026-08-14): gold means "sweep in
+  // progress", green means "capturing this zone right now".
+  static PadSilhouetteState _silhouetteState(
+          SweepTestPhase p, bool zoneCaptureFlash) =>
+      switch (p) {
+        SweepTestPhase.sweeping => zoneCaptureFlash
+            ? PadSilhouetteState.locked
+            : PadSilhouetteState.capturing,
         SweepTestPhase.uploading || SweepTestPhase.complete =>
           PadSilhouetteState.locked,
         SweepTestPhase.error => PadSilhouetteState.warning,
