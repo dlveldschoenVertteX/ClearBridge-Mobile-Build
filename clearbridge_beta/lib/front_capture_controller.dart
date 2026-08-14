@@ -904,8 +904,43 @@ class FrontCaptureController extends ChangeNotifier {
   // NOTE this is the CameraImage/sensor-space ROI only. `setFocusPoint`/
   // `setExposurePoint` take PREVIEW-space coordinates and therefore keep the
   // original screen-space centre -- see `_focusPointScreenSpace` below.
-  static const Rect _scoreRoi =
-      Rect.fromLTRB(0.518805, 0.338475, 0.741195, 0.661525);
+  //
+  // REAL, SECOND-STAGE FIX, 2026-08-14 -- converted from a static const to
+  // a getter. The 2026-08-06 fix above corrected the ROTATION mapping
+  // (proven three independent ways, and it IS real) but never gave this
+  // value the SAME runtime BoxFit.cover crop/scale correction
+  // `_computeGuideRegion` already applies to `_guideCx`/`_guideCy`/
+  // `_guideRx`/`_guideRy` -- it stayed a hand-derived constant, frozen at
+  // whatever crop was assumed when it was written, on every device
+  // regardless of that device's real preview aspect ratio. Smoking gun:
+  // this constant's own implied center (cx=0.6300, cy=0.5000, from its
+  // LTRB bounds) is EXACTLY `_guideCx`/`_guideCy`'s hardcoded DEFAULT
+  // value below -- i.e. the value BEFORE `_computeGuideRegion` ever runs
+  // the real per-device correction -- not independent confirmation, just
+  // the same uncorrected number copied twice. Real data motivating this:
+  // 24 of the last 34 real front_only_v1 captures (71%) show
+  // `liveWavelengthDebug.sampleCount: 0` -- the live estimator never once
+  // qualifying -- persisting well past the 2026-08-06 rotation fix, which
+  // this second, previously-missed gap plausibly explains. Now derives
+  // directly from the SAME already-validated, already-runtime-corrected
+  // fields `guideRegion` itself uses, instead of maintaining a second,
+  // independently-drifting copy of the same geometry -- exactly the class
+  // of bug this file's own comments have already flagged as a real risk
+  // elsewhere (see _sweepTrackingRoi's docs on why a second hand-copied
+  // derivation can silently go stale). Cannot regress: before
+  // _computeGuideRegion ever runs, _guideCx/_guideCy/_guideRx/_guideRy
+  // sit at their own hardcoded defaults, which are themselves close to
+  // (guideCx/guideCy exactly matching) this getter's old constant value --
+  // so the fallback behaviour is no worse than what shipped before, and
+  // every real device (where _computeGuideRegion always runs before the
+  // live stream starts) gets the actual per-device-corrected region
+  // instead. **Not yet device-tested** -- same standing discipline as
+  // every other capture-side change this project; needs a real capture to
+  // confirm sampleCount actually rises.
+  Rect get _scoreRoi => Rect.fromLTRB(
+        _guideCx - _guideRx, _guideCy - _guideRy,
+        _guideCx + _guideRx, _guideCy + _guideRy,
+      );
 
   // Pre-fix screen-space rect, retained ONLY for the two AF/AE point call
   // sites, which take preview-space (not sensor-space) coordinates and were

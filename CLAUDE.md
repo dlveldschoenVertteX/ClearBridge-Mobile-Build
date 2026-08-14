@@ -1,5 +1,51 @@
 # ClearBridge Mobile — persistent context
 
+## Real root cause of the 71% wavelength-gate inertness found: `_scoreRoi` never got the runtime BoxFit.cover correction `guideRegion` already has (2026-08-14)
+Follow-up to the resolution hypothesis being refuted -- dug into the
+remaining candidate flagged at the time: whether `_scoreRoi` (the live
+ROI feeding `meanLuma`/`estimateRidgeWavelengthPx`/focus tracking) has
+the same class of bug as the already-documented, already-fixed-once
+"BoxFit.cover guideRegion bug".
+
+**Confirmed, from the code's own math, not a guess.** `_scoreRoi` IS a
+real, previously-fixed value -- the 2026-08-06 fix corrected a genuine
+rotation-axis bug, proven three independent ways at the time (arithmetic,
+real Firestore data, a visual crop comparison), and that fix is not being
+undone here. But that fix only corrected the ROTATION mapping. It never
+gave `_scoreRoi` the SEPARATE runtime BoxFit.cover crop/scale correction
+`_computeGuideRegion` already applies to `_guideCx`/`_guideCy`/
+`_guideRx`/`_guideRy` (the fields `guideRegion` itself is built from) --
+`_scoreRoi` stayed a hand-derived `static const`, frozen at whatever crop
+was assumed when it was written, never updated per real device.
+
+**Smoking gun**: `_scoreRoi`'s own hardcoded bounds imply a center of
+exactly (cx=0.6300, cy=0.5000) -- which is EXACTLY `_guideCx`/`_guideCy`'s
+hardcoded DEFAULT value (the value that exists ONLY before
+`_computeGuideRegion` ever runs its real per-device correction). Not
+independent confirmation of anything -- the same uncorrected number,
+copied into two places by hand.
+
+**Fixed**: `_scoreRoi` converted from a `static const Rect` to a getter
+deriving directly from `_guideCx`/`_guideCy`/`_guideRx`/`_guideRy` --
+the same already-validated, already-runtime-corrected fields
+`guideRegion` uses, instead of maintaining a second, independently-
+drifting copy of the same geometry. Cannot regress: before
+`_computeGuideRegion` ever runs, those fields sit at hardcoded defaults
+already close to (and, for the center, identical to) the old constant, so
+the fallback is no worse than before; on every real device (where
+`_computeGuideRegion` always runs before the live stream starts) it now
+gets the real per-device-corrected region instead.
+
+**This is the leading real explanation for the 71% `sampleCount: 0`
+finding** (see the entry below) -- a systematically-offset ROI would
+explain the estimator failing to find qualifying ridge content on most
+real captures despite its own math being proven robust down to 320px
+resolution. **Not yet device-tested** -- the two diagnostic counters
+added the same session (`inCoverageFrameCount`/`wavelengthNullAttempts`)
+will show directly on the next real capture whether this actually moves
+`sampleCount` off zero, which is the real confirmation this needs before
+trusting it.
+
 ## Real device test of the wavelength-gate build: gate confirmed inert on 71% of real captures; resolution hypothesis tested and refuted; new distance-wave UI cue built (2026-08-14)
 CTO tested the wavelength-gate build. Capture `9e7606b9` (new user,
 front_only_v1, real nfiq2Score 80, no hang/error) looked clean on the
