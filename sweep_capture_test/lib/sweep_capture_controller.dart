@@ -241,14 +241,37 @@ class SweepCaptureController extends ChangeNotifier {
   String? _wavelengthAxis;
   DateTime? _lastWavelengthEstimateAt;
   static const int _wavelengthEstimateIntervalMs = 250;
-  // Same value as front_capture_controller.dart's _liveWavelengthTooHighPx --
-  // reusing an already real-data-validated threshold (confirmed 2026-08-06
-  // there to track the backend's own afisWavelengthPx to within ~1px) rather
-  // than guessing a new one for this file's own capture flow. Sits in the
-  // SAME afisWavelengthPx units as this project's established 9-14px NFIQ2
-  // sweet spot / >=15px-catastrophic finding, with a 1px margin above that
-  // boundary.
-  static const double _liveWavelengthTooHighPx = 16.0;
+  // RECALIBRATED 2026-08-14 -- the original 16.0 (copied verbatim from
+  // front_capture_controller.dart's own threshold) was wrong for sweep and
+  // has been replaced, not just re-verified. front's 16.0 encodes the
+  // front_only_v1 NFIQ2 finding that native wavelength >=15px on a SINGLE
+  // plain frame is catastrophic -- but that finding doesn't transfer here.
+  // Real backend afisWavelengthPxRaw across 16 real sweep captures (the
+  // exact same still-decode-width/2048 domain this live estimate is scaled
+  // into, so directly comparable, no unit conversion needed) clusters at
+  // 15-30px, mean 26.7, sd 4.3 -- the OLD 16.0 threshold sits almost at the
+  // very bottom of sweep's own normal real-world range, not near the top of
+  // a good one, so as shipped it would have fired on ~15/16 real captures
+  // and spent its whole 3s window without ever resolving, adding latency
+  // while gating essentially nothing. Checked whether real matchability
+  // (SourceAFIS vs NIST impostors) supports a "closer/lower is better" gate
+  // for sweep the way it does for front: it does NOT -- across the 10 real
+  // genuine pairs in this same set, per-pair wavelength SCALE MISMATCH
+  // (not absolute wavelength) is the only thing that correlates with score
+  // (r=-0.27; well-matched pairs mean 17.9 vs mismatched 10.4), and the two
+  // single strongest real genuine matches this project has measured
+  // (41.5, 42.6) both came from captures sitting at wlRaw~=29 -- the HIGH
+  // end of the range, not the low end. Sweep's own fixed per-zone guide
+  // geometry already produces that scale consistency for free (mean/sd
+  // above), which is the real reason sweep already beats front_only_v1 on
+  // matchability (see the sweep-vs-front decision above) -- there's no
+  // real evidence a live "get farther back" push adds anything on top of
+  // it. Recalibrated as a pure safety backstop instead of an optimization
+  // target: set comfortably above the whole observed real range (mean +
+  // ~2sd, rounds to 35.0) so it only fires on a genuine, far-outside-normal
+  // outlier, never during ordinary use -- can't regress a real capture that
+  // used to pass, only catch something new and clearly pathological.
+  static const double _liveWavelengthTooHighPx = 35.0;
   static const int _liveWavelengthMinSamples = 3;
   // Same base ROI as front_capture_controller.dart's own _scoreRoi -- valid
   // to share directly because _sweepGuideShapeForProgress(0.5, dyFrac: 0.0)

@@ -169,6 +169,31 @@ estimate). Full diagnostics (`liveWavelengthPx`, `liveWavelengthStillPx`,
 `sampleCount`, `gateResolvedInTime`) written to
 `sweepBurstDebug.zones.liveWavelengthDebug` for the next real capture.
 
+**Threshold recalibrated 2026-08-14 — the original 16.0 was wrong, not just
+unverified.** It was copied verbatim from front's own value, which encodes
+front_only_v1's NFIQ2 finding (native wavelength >=15px on a single plain
+frame is catastrophic). That doesn't transfer: real backend
+`afisWavelengthPxRaw` across the 16 real sweep captures used for the
+architecture test above (same 2048-decode-width domain the live estimate is
+already scaled into, so directly comparable) clusters at 15-30px, mean 26.7,
+sd 4.3 — the old 16.0 sat almost at the very BOTTOM of sweep's own normal
+range, so as shipped it would have fired on ~15/16 real captures and spent
+its whole 3s window unresolved on nearly every capture, adding latency while
+gating essentially nothing. Checked whether real matchability actually
+supports a "closer is better" push for sweep the way it does for front — it
+does not: across the 10 real genuine pairs in this same set, per-pair scale
+MISMATCH (not absolute wavelength) is what correlates with score (r=-0.27;
+well-matched pairs mean 17.9 vs mismatched 10.4), and the two single
+strongest real genuine matches measured all session (41.5, 42.6) both came
+from captures at wlRaw~=29 — the high end, not the low end. Sweep's fixed
+per-zone guide geometry already produces that session-to-session consistency
+for free (the real reason it already beats front_only_v1 above) — no
+evidence a live "get farther back" push adds anything on top of it.
+Recalibrated `_liveWavelengthTooHighPx` 16.0 -> **35.0**: reframed from an
+optimization target to a pure safety backstop, set comfortably above the
+whole observed real range (mean + ~2sd) so it only fires on a genuine,
+far-outside-normal outlier rather than routinely on ordinary captures.
+
 **Not yet device-tested** — same standing discipline as every other
 capture-side change this project. Committed, not pushed (per standing
 process rule) — awaiting explicit go-ahead.
