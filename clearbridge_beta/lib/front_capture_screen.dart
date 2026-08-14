@@ -461,6 +461,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
                     hint: null,
                     progress: 0,
                     shape: s.activeGuideShape ?? PadSilhouetteShape.defaultShape,
+                    distanceWaveCue: s.distanceWaveCue,
                   ),
                 ),
               ),

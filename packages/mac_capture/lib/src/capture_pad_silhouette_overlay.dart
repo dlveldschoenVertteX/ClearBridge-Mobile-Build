@@ -237,6 +237,7 @@ class CapturePadSilhouetteOverlay extends StatefulWidget {
     this.hint,
     this.shape = PadSilhouetteShape.defaultShape,
     this.progress = 0.0,
+    this.distanceWaveCue,
   });
 
   final PadSilhouetteState state;
@@ -248,6 +249,13 @@ class CapturePadSilhouetteOverlay extends StatefulWidget {
   /// (CTO real-device feedback 2026-07-20: front_only_v1 had no equivalent).
   /// 0 draws nothing; the base outline is unaffected either way.
   final double progress;
+  /// 0..1 real-time distance feedback, replacing a text-only hint (CTO
+  /// direction 2026-08-14): rings stream outward from the guide's own
+  /// edge, shrinking in size/spacing/opacity as this approaches 0 (the
+  /// real target wavelength) and growing as it approaches 1 (the gate
+  /// threshold). Null means no reliable estimate yet -- draws nothing,
+  /// never a guessed cue.
+  final double? distanceWaveCue;
 
   @override
   State<CapturePadSilhouetteOverlay> createState() => _CapturePadSilhouetteOverlayState();
@@ -260,8 +268,15 @@ class CapturePadSilhouetteOverlay extends StatefulWidget {
 // overlay -- same "small, proven-safe" pattern as the header status pill's
 // own dot pulse in front_capture_screen.dart.
 class _CapturePadSilhouetteOverlayState extends State<CapturePadSilhouetteOverlay>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
   late final AnimationController _pulse;
+  // Second, independent ticker for the distance-wave rings (2026-08-14) --
+  // needs TickerProviderStateMixin (plural) instead of Single*, since
+  // _pulse already claims the one ticker Single* allows. Deliberately
+  // one-directional (repeat(), not reverse: true) so rings genuinely
+  // stream outward and reset, rather than growing then imploding back in
+  // the way a reverse ticker would read.
+  late final AnimationController _wavePhase;
 
   @override
   void initState() {
@@ -270,11 +285,16 @@ class _CapturePadSilhouetteOverlayState extends State<CapturePadSilhouetteOverla
       vsync: this,
       duration: const Duration(milliseconds: 2000),
     )..repeat(reverse: true);
+    _wavePhase = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 1600),
+    )..repeat();
   }
 
   @override
   void dispose() {
     _pulse.dispose();
+    _wavePhase.dispose();
     super.dispose();
   }
 
@@ -282,7 +302,7 @@ class _CapturePadSilhouetteOverlayState extends State<CapturePadSilhouetteOverla
   Widget build(BuildContext context) {
     return IgnorePointer(
       child: AnimatedBuilder(
-        animation: _pulse,
+        animation: Listenable.merge([_pulse, _wavePhase]),
         builder: (_, __) => CustomPaint(
           painter: _PadSilhouettePainter(
             state: widget.state,
@@ -290,6 +310,8 @@ class _CapturePadSilhouetteOverlayState extends State<CapturePadSilhouetteOverla
             shape: widget.shape,
             progress: widget.progress,
             pulse: _pulse.value,
+            distanceWaveCue: widget.distanceWaveCue,
+            wavePhase: _wavePhase.value,
           ),
           child: const SizedBox.expand(),
         ),
@@ -307,10 +329,14 @@ class _PadSilhouettePainter extends CustomPainter {
     this.hint,
     this.progress = 0.0,
     this.pulse = 0.0,
+    this.distanceWaveCue,
+    this.wavePhase = 0.0,
   });
 
   final PadSilhouetteState state;
   final PadSilhouetteShape shape;
+  final double? distanceWaveCue;
+  final double wavePhase;
   final String? hint;
   final double progress;
   /// 0..1 breathing phase from the overlay's own looping ticker.
@@ -392,6 +418,38 @@ class _PadSilhouettePainter extends CustomPainter {
         ..strokeWidth = 14 + 8 * pulse
         ..maskFilter = MaskFilter.blur(BlurStyle.normal, 14 + 6 * pulse),
     );
+
+    // Distance-wave cue (2026-08-14): concentric rings streaming outward
+    // from the pad's own edge, replacing a one-line "Move back slightly"
+    // text hint that real feedback called "not blatant enough to even be
+    // aware of". Ring travel distance, opacity, and effectively count all
+    // shrink toward zero as distanceWaveCue approaches 0 (the live
+    // wavelength estimate nearing the real NFIQ2-target period) and grow
+    // toward their max as it approaches 1 (at/beyond the gate threshold),
+    // so "the waves getting smaller" reads directly as "getting closer to
+    // the right distance". Drawn only when a reliable live estimate
+    // exists (see FrontCaptureState.distanceWaveCue's own docs) -- no
+    // signal means no rings, never a guessed animation.
+    if (distanceWaveCue != null) {
+      final cue = distanceWaveCue!.clamp(0.0, 1.0);
+      const ringCount = 3;
+      final maxTravel = 10.0 + 46.0 * cue;
+      for (var i = 0; i < ringCount; i++) {
+        final phase = (wavePhase + i / ringCount) % 1.0;
+        // Fades out as each ring travels outward, and the whole layer
+        // fades toward invisible as cue -> 0 -- no reason to keep
+        // streaming waves once the user is already on target.
+        final alpha = (1.0 - phase) * (0.08 + 0.32 * cue);
+        if (alpha <= 0.01) continue;
+        canvas.drawPath(
+          shape.toPath(size, inflate: phase * maxTravel),
+          Paint()
+            ..color = CaptureColors.cyan.withValues(alpha: alpha)
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2.5,
+        );
+      }
+    }
 
     // Capture-progress fill: a bright arc traced along the pad's own
     // boundary (not a separate circle) starting at the tip and sweeping
@@ -533,5 +591,7 @@ class _PadSilhouettePainter extends CustomPainter {
       old.hint != hint ||
       old.shape != shape ||
       old.progress != progress ||
-      old.pulse != pulse;
+      old.pulse != pulse ||
+      old.distanceWaveCue != distanceWaveCue ||
+      old.wavePhase != wavePhase;
 }

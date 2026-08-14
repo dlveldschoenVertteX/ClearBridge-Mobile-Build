@@ -1,5 +1,75 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the wavelength-gate build: gate confirmed inert on 71% of real captures; resolution hypothesis tested and refuted; new distance-wave UI cue built (2026-08-14)
+CTO tested the wavelength-gate build. Capture `9e7606b9` (new user,
+front_only_v1, real nfiq2Score 80, no hang/error) looked clean on the
+surface, but its `liveWavelengthDebug` showed `sampleCount: 0` despite
+128 general sharpness samples during the hold -- the live estimator never
+produced a single qualifying reading, so `wavelengthTooHigh` was `false`
+the whole hold by construction and the new gate never actually got a
+chance to block anything.
+
+**Checked whether this was a one-off — it isn't.** Pulled
+`liveWavelengthDebug` across the last 34 real front_only_v1 captures
+(back to early August, well before today's change): **24/34 (71%) show
+`sampleCount: 0`.** This is a longstanding, pre-existing reliability gap
+in the live estimator itself, not something today's change caused or
+revealed for the first time on this one capture — it just means the
+gate, however correctly wired into `rawOnTarget`, is near-inert in
+practice for most real users until this is fixed.
+
+**Resolution-mismatch hypothesis tested with real data, and refuted.**
+`estimateRidgeWavelengthPx` requires >=2 of 5 sampled strips to clear a
+`minStripStd=6.0` contrast bar before it returns anything; the working
+theory was that the live CameraImage preview's much lower resolution
+(vs. the ~3200px-decode still the backend measures) fails that bar even
+when the eventual still succeeds easily (this exact capture's backend
+measurement found `afisWavelengthPxRawBlocks: 419` -- plenty of reliable
+blocks). Reproduced the real strip-std qualification algorithm in Python
+against the 10 real front_only_v1 captures with locally cached raw
+bursts, at 7 simulated widths from native (~4266px) down to 320px: **100%
+of captures qualified (>=2/5 strips) at every single resolution tested,
+including 320px.** The estimator's own math is robust across resolution;
+that's not the bottleneck.
+
+**Real root cause still open — the likelier remaining candidate is
+`_scoreRoi` itself.** It's a hardcoded normalized `Rect`, never derived
+at runtime through the same BoxFit.cover-correcting transform
+`guideRegion` uses -- structurally the same class of risk as the
+already-documented real "BoxFit.cover guideRegion bug" this project hit
+once before (a hardcoded region constant that silently didn't match what
+the transform actually produced on real devices). Can't fully confirm
+this without a live raw CameraImage frame, which isn't available from
+this sandbox -- so instead of guessing at a fix blind, added two cheap,
+purely-diagnostic counters (`inCoverageFrameCount`,
+`wavelengthNullAttempts`) that will directly show on the NEXT real
+capture whether the estimator is rarely INVOKED (inCoverageRange rarely
+true) versus invoked often but rarely qualifying once it runs -- the one
+distinction the current data can't make.
+
+**New: distance-wave UI cue, replacing the text-only hint.** CTO
+feedback: the "Move back slightly" text hint isn't blatant enough to
+register mid-hold, and proposed a visual instead -- rings streaming
+outward from the guide's own edge, shrinking as the user reaches the
+right distance. Built as a genuine continuous analog of the SAME signal
+that now gates the hold (`FrontCaptureState.distanceWaveCue`, 0..1,
+anchored to the real 11.5px sweet-spot midpoint at 0 and the 16.0px gate
+threshold at 1 -- both already-established real numbers, not new ones),
+rendered in `CapturePadSilhouetteOverlay` as concentric rings traced
+along the pad's own boundary path (reusing the shape's existing
+`toPath(inflate:)`, the same technique the scrim-fade layers already
+use) via a new one-directional ticker (needed `TickerProviderStateMixin`
+instead of `Single*`, since the existing breathing-pulse ticker already
+claimed the one slot `Single*` allows). Ring travel distance, opacity,
+and visibility all shrink toward zero as the cue approaches 0 and grow
+toward their max approaching 1, so "the waves getting smaller" reads
+directly as "getting closer to right" -- and draws nothing at all when
+no reliable estimate exists yet, same discipline as everywhere else this
+signal is used. **Inherits the same inertness problem documented above**
+until the sampleCount gap is fixed -- the rings will rarely appear in
+practice on the same ~71% of real captures, for the same reason the gate
+rarely fires. Not yet device-tested.
+
 ## Sweep put on ice, focus returned to front_only_v1: fusion is real-negative on real data (mosaic AND field-domain), front's own live-wavelength check upgraded from hint to gate (2026-08-14)
 CTO decision after the mosaic/field-fusion tests below: sweep's core
 mosaic concept measures negative regardless of technique (pixel blend,

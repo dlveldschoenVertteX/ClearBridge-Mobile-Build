@@ -65,6 +65,7 @@ class FrontCaptureState {
     this.sweepPositionOk = false,
     this.sweepDwellProgress = 0.0,
     this.videoSweepActive = false,
+    this.distanceWaveCue,
   });
 
   final FrontCapturePhase phase;
@@ -137,6 +138,18 @@ class FrontCaptureState {
   // sweepActive meaning (which never applies here -- this step runs during
   // capturingExtra, not those phases).
   final bool videoSweepActive;
+  // Real-time distance feedback replacing the "Move back slightly" text
+  // hint, per CTO direction 2026-08-14 ("text is not blatant enough to
+  // even be aware of"): concentric rings stream outward from the guide's
+  // own edge, shrinking in size/spacing as the live wavelength estimate
+  // approaches the real NFIQ2 sweet spot -- a continuous visual analog of
+  // the same signal that now gates the hold (see wavelengthTooHigh in
+  // _onFrame), instead of a one-line text warning easy to miss mid-hold.
+  // 0.0 = at/inside the target wavelength (rings small/tight/fast-fading),
+  // 1.0 = at or beyond the gate threshold (rings large/slow/prominent).
+  // Null whenever no reliable live estimate exists yet (belowMinSamples)
+  // -- no signal to show is drawn as no rings, never a guessed one.
+  final double? distanceWaveCue;
 
   FrontCaptureState copyWith({
     FrontCapturePhase? phase,
@@ -159,6 +172,7 @@ class FrontCaptureState {
     bool? sweepPositionOk,
     double? sweepDwellProgress,
     bool? videoSweepActive,
+    Object? distanceWaveCue = _sentinel,
   }) =>
       FrontCaptureState(
         phase: phase ?? this.phase,
@@ -188,6 +202,9 @@ class FrontCaptureState {
         sweepPositionOk: sweepPositionOk ?? this.sweepPositionOk,
         sweepDwellProgress: sweepDwellProgress ?? this.sweepDwellProgress,
         videoSweepActive: videoSweepActive ?? this.videoSweepActive,
+        distanceWaveCue: identical(distanceWaveCue, _sentinel)
+            ? this.distanceWaveCue
+            : distanceWaveCue as double?,
       );
 }
 
@@ -1195,6 +1212,21 @@ class FrontCaptureController extends ChangeNotifier {
   double? _liveWavelengthPx;
   double? _liveWavelengthStillPx;
   int _wavelengthSampleCount = 0;
+  // Diagnostic-only counters added 2026-08-14 to answer a real, open
+  // question: real Firestore data shows _wavelengthSampleCount stays 0 on
+  // 71% of real front_only_v1 captures (24/34 checked), yet the backend's
+  // OWN post-hoc measurement on the same uploaded stills finds hundreds of
+  // reliable blocks easily -- so the ridge content is clearly there. A
+  // Python reproduction of estimateRidgeWavelengthPx's real strip-std
+  // qualification logic against 10 real captures' own frames, at every
+  // resolution from native down to 320px, passed the >=2-of-5-strips bar
+  // 100% of the time -- ruling out live-preview resolution/contrast as the
+  // cause. What's NOT yet measurable from existing data: whether the
+  // estimator is simply rarely INVOKED (inCoverageRange rarely true during
+  // the hold) versus invoked often but failing to qualify once it runs.
+  // These two counters distinguish that directly on the next real capture.
+  int _inCoverageFrameCount = 0;
+  int _wavelengthNullAttempts = 0;
   // Consecutive-outlier counter for the EMA guard below. A single rejected
   // sample is assumed to be frame noise; two in a row in the SAME direction
   // are assumed to be a genuine, sustained change (the user actually moved)
@@ -1239,6 +1271,11 @@ class FrontCaptureController extends ChangeNotifier {
   // against a transient first-frame estimate triggering "Move back" on a
   // correctly-positioned thumb.
   static const int _liveWavelengthMinSamples = 3;
+  // Lower anchor for distanceWaveCue's 0..1 ramp -- the midpoint of this
+  // project's own established 9-14px NFIQ2 sweet spot (11.5), not a new
+  // number. _liveWavelengthTooHighPx (16.0) is the upper anchor, so the
+  // cue reaches 1.0 exactly where the hold gate would start blocking.
+  static const double _liveWavelengthTargetPx = 11.5;
   Map<String, dynamic> _wavelengthDebug = {};
 
   // Guided thumb-sweep state (see the constants block above for the
@@ -1564,8 +1601,20 @@ class FrontCaptureController extends ChangeNotifier {
         : (tooClose || wavelengthTooHigh)
             ? 'Move back slightly'
             : null;
-    if (hint != _state.distanceHint) {
-      _apply((s) => s.copyWith(distanceHint: hint));
+    // distanceWaveCue: continuous 0..1 visual analog of the same signal
+    // driving `hint`/wavelengthTooHigh, for the guide's streaming-ring cue
+    // (see the field's own docs on FrontCaptureState). Only meaningful once
+    // the estimate is reliable -- null otherwise, same gate as
+    // wavelengthTooHigh itself, so the rings never imply a signal that
+    // isn't really there yet.
+    final wlReliableNow = _wavelengthSampleCount >= _liveWavelengthMinSamples;
+    final waveCue = wlReliableNow && _liveWavelengthStillPx != null
+        ? ((_liveWavelengthStillPx! - _liveWavelengthTargetPx) /
+                (_liveWavelengthTooHighPx - _liveWavelengthTargetPx))
+            .clamp(0.0, 1.0)
+        : null;
+    if (hint != _state.distanceHint || waveCue != _state.distanceWaveCue) {
+      _apply((s) => s.copyWith(distanceHint: hint, distanceWaveCue: waveCue));
     }
 
     // Live ridge-wavelength estimate (Phase 0, diagnostic-only -- see the
@@ -1575,6 +1624,7 @@ class FrontCaptureController extends ChangeNotifier {
     // pass is real work and there's no point running it on a background
     // frame. Wrapped in try/catch -- must never be able to break the hold.
     if (inCoverageRange) {
+      _inCoverageFrameCount++;
       final now = DateTime.now();
       if (_lastWavelengthEstimateAt == null ||
           now.difference(_lastWavelengthEstimateAt!).inMilliseconds >=
@@ -1583,7 +1633,9 @@ class FrontCaptureController extends ChangeNotifier {
         try {
           final est =
               HybridCaptureService.estimateRidgeWavelengthPx(image, roi: roi);
-          if (est != null) {
+          if (est == null) {
+            _wavelengthNullAttempts++;
+          } else {
             // Outlier guard, added 2026-08-06: once a prior EMA value
             // exists, reject a raw sample that's wildly different (>2.5x
             // either direction) rather than folding it straight in. Root
@@ -2543,6 +2595,16 @@ class FrontCaptureController extends ChangeNotifier {
       // afisWavelengthPx against captures where this was false to confirm
       // 16.0 is still the right cutover once real post-fix data exists.
       'wavelengthGateThresholdPx': _liveWavelengthTooHighPx,
+      // Diagnostic pair added 2026-08-14 -- see the field docs above
+      // _inCoverageFrameCount for the real open question this answers:
+      // real data shows sampleCount stays 0 on 71% of real captures, and a
+      // Python repro of the estimator's own qualification logic against
+      // real captured content ruled out live-preview resolution as the
+      // cause. This distinguishes "rarely invoked" (inCoverageFrameCount
+      // low) from "invoked often but rarely qualifies" (nullAttempts high
+      // relative to inCoverageFrameCount) on the next real capture.
+      'inCoverageFrameCount': _inCoverageFrameCount,
+      'wavelengthNullAttempts': _wavelengthNullAttempts,
       // Absolute (non-peak-normalized) live sharpness -- see field docs
       // above _liveAbsSharpness. Not gated on a minimum sample count the
       // way liveWavelengthStillPx is (it's an EMA fed every in-range frame,
