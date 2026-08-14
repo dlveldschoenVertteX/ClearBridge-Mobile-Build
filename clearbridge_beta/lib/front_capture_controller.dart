@@ -1853,7 +1853,27 @@ class FrontCaptureController extends ChangeNotifier {
       // stays in frame don't stale the locked focus; resetting here would
       // trigger a fresh 600ms refocus wait the moment the score recovers,
       // multiplying unnecessary waits when the user is just slightly unsteady.
-      if (tooFar || tooClose || wavelengthTooHigh || coverage == null) {
+      //
+      // REAL BUG, found 2026-08-14 (CTO real-device report: "live feed
+      // looked blurry"): wavelengthTooHigh was added here alongside
+      // tooFar/tooClose when the wavelength check was upgraded from a hint
+      // to a gate -- but unlike coverage (a smooth, continuously-sampled
+      // mean-luma value), wavelengthTooHigh depends on a low-sample-count,
+      // EMA'd autocorrelation estimate that's already documented as prone
+      // to noise (that's the entire reason the outlier-rejection streak
+      // logic above exists). This comment's own stated principle --
+      // transient dips shouldn't force a refocus -- argues directly
+      // against including it here: every time the noisy estimate flickers
+      // across the 16.0 threshold and back, this fired a genuine fresh
+      // unawaited(_refocus()) call the moment on-target recovered, visibly
+      // hunting on the live preview even though the actual capture (real
+      // NFIQ2 81 on the report's own test) came out fine. wavelengthTooHigh
+      // stays in rawOnTarget above (that's the real, intended fix -- the
+      // hold still can't complete while genuinely too-close) but is
+      // deliberately NOT part of this reset condition; the coverage-based
+      // signals already capture genuine distance changes reliably enough
+      // to re-trigger AF on their own.
+      if (tooFar || tooClose || coverage == null) {
         _refocusedThisHold = false;
       }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));

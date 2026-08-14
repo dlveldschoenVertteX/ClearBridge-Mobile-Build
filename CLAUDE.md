@@ -1,5 +1,44 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the `_scoreRoi` fix: "live feed looked blurry" traced to a real bug in the wavelength-gate change itself, fixed (2026-08-14)
+CTO tested the `_scoreRoi` runtime-correction build and reported the live
+camera feed looked blurry / struggled to focus. Pulled the two real
+captures from this test before touching anything: both landed fine —
+`b31f6d8e` scored real NFIQ2 **81** (a strong result), ambient-frame
+client Laplacian scores 687-740 (healthy), no errors. So the FINAL
+captured images were not degraded — ruled out via real data rather than
+assumed. `_scoreRoi`'s own consumers were also checked and cleared: the
+camera's actual autofocus target point (`_beginAutofocus`) reads from
+`_focusPointScreenSpace`, a completely separate, untouched constant --
+`_scoreRoi` only affects the app's own sharpness/coverage/wavelength
+*measurements*, never where the lens physically focuses.
+
+CTO clarified: the LIVE PREVIEW itself looked blurry/hunting, not the
+final photos. That pointed at real repeated autofocus re-triggering, and
+a real bug was found, distinct from the `_scoreRoi` fix (which stays --
+this is a separate defect in the same wavelength-gate change from
+earlier today). The hold's refocus-reset condition
+(`_refocusedThisHold = false`, which forces a fresh `_refocus()` call
+the next time on-target recovers) had `wavelengthTooHigh` added to it
+alongside `tooFar`/`tooClose` when the wavelength check became a gate --
+but unlike coverage (a smooth, continuously-sampled mean-luma value),
+`wavelengthTooHigh` depends on a low-sample-count, EMA'd autocorrelation
+estimate already known to be noisy (the whole reason the outlier-
+rejection streak logic exists). The reset condition's OWN comment states
+the design principle this violated: transient signal dips shouldn't
+force a refocus, since that "multiplies unnecessary waits" -- every time
+the noisy wavelength estimate flickered across the 16.0px threshold and
+back, this fired a real, visible AF re-acquisition cycle.
+
+**Fixed**: removed `wavelengthTooHigh` from the refocus-reset condition
+only. It stays in `rawOnTarget`'s own gate (the actual intended fix from
+earlier today — the hold still correctly can't complete while genuinely
+reading too-close); it just no longer also forces the lens to re-hunt
+every time the noisy estimate blips. The coverage-based signals
+(`tooFar`/`tooClose`) already capture genuine distance changes reliably
+enough to re-trigger AF on their own, same as before this whole
+wavelength-gate line of work started. **Not yet device-tested.**
+
 ## Real root cause of the 71% wavelength-gate inertness found: `_scoreRoi` never got the runtime BoxFit.cover correction `guideRegion` already has (2026-08-14)
 Follow-up to the resolution hypothesis being refuted -- dug into the
 remaining candidate flagged at the time: whether `_scoreRoi` (the live
