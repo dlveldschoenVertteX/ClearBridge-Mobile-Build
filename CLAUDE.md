@@ -1,5 +1,56 @@
 # ClearBridge Mobile — persistent context
 
+## Crashlytics fully wired: com.clearbridge.beta had never been registered in Firebase at all (2026-08-15)
+CTO asked to complete the Crashlytics setup properly rather than leave the
+native half undone, plus asked what else is outstanding before beta.
+
+**Real gap found, not just a missing file.** Fetched `google-services.json`
+for the app ID already in `firebase_options.dart`
+(`...:android:ad3f79916c25252848acca`, real access via the existing Admin
+SDK service-account credentials against the Firebase Management API) and
+found it registers `com.clearbridge.app` / `com.clearbridge.bridge` --
+**neither matches this app's real `applicationId`, `com.clearbridge.beta`.**
+Listed every Android app in the project directly to confirm rather than
+assume: only those same two exist. `com.clearbridge.beta` had never been
+registered at all -- `firebase_options.dart` had been borrowing the
+`com.clearbridge.app` registration's `appId` the whole time. That's fine
+for Auth/Firestore/Storage/Functions (none of them enforce package-name
+matching against `FirebaseOptions`, which is exactly why this went
+unnoticed through months of real production use) but Crashlytics's native
+Android SDK needs the app's own genuine registration to attach to, and
+the `google-services` Gradle plugin hard-fails at configuration time on
+a package-name mismatch.
+
+**Fixed at the root, not worked around**: registered a real new Android
+app for `com.clearbridge.beta` via the Management API (`POST
+.../androidApps`, real service-account credentials -- additive only,
+does not touch the two existing registrations), fetched its real
+`google-services.json`, placed it at `android/app/google-services.json`,
+and updated `firebase_options.dart`'s `appId` to the new, correctly-
+registered value (`apiKey` unchanged -- confirmed identical across all
+three apps, one shared project-level key). Applied both Gradle plugins
+(`com.google.gms.google-services`, `com.google.firebase.crashlytics`) in
+`settings.gradle.kts`/`android/app/build.gradle.kts`.
+
+**One real, flagged unknown**: `dl.google.com` and `search.maven.org` are
+both blocked by this sandbox's own egress policy (confirmed via the proxy
+status endpoint), so the two plugin versions pinned (google-services
+4.4.2, firebase-crashlytics-gradle 3.0.3) could not be verified against
+the live Maven registry -- real, well-established published versions,
+but the first thing to check if CI fails specifically on plugin
+resolution.
+
+**Real, deliberate risk taken**: changing `firebase_options.dart`'s
+`appId` touches the Dart-side `Firebase.initializeApp(options:)` call
+every SDK in this app depends on, not just Crashlytics -- unlike the new
+app registration and the JSON file (purely additive), this modifies
+something that's worked in production for months. Judged safe because
+Firestore/Storage security rules key off `request.auth.uid`, never
+`appId`, and nothing else in this codebase's own established logic
+references it either -- but it's real production-config surgery,
+**not device-tested**, and is the one part of this change most worth
+watching closely on the next real build.
+
 ## Real device test of the AF-hunting fix: one real stuck-at-pending capture (crash suspected, no logs to confirm), distance-wave rings found frozen due to a lifetime-not-per-hold sample counter, Crashlytics added (2026-08-15)
 CTO ran a real capture session: 3 of 4 captures scored cleanly (70/78/81),
 1 (`bbaebb07`) is genuinely stuck at `status: pending` -- app reportedly

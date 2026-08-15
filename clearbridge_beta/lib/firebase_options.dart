@@ -7,9 +7,21 @@ class DefaultFirebaseOptions {
     return android;
   }
 
+  // appId updated 2026-08-15: this used to point at a DIFFERENT
+  // registered Android app (com.clearbridge.app's -- ad3f7991...),
+  // borrowed because this app's own real package, com.clearbridge.beta,
+  // had never been registered in the Firebase project. That's fine for
+  // Dart-only SDKs (Auth/Firestore/Storage/Functions, which don't
+  // enforce package-name matching against FirebaseOptions), but real
+  // crash reporting needs the app's own genuine registration --
+  // registered via the Firebase Management API (real service-account
+  // credentials, an additive action that didn't touch the other two
+  // existing app registrations), now pointing at the correct app.
+  // apiKey is unchanged -- confirmed identical across all three
+  // registered apps in this project (one shared project-level key).
   static const FirebaseOptions android = FirebaseOptions(
     apiKey: 'AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU',
-    appId: '1:427514831103:android:ad3f79916c25252848acca',
+    appId: '1:427514831103:android:bc34b32903b6a9dd48acca',
     messagingSenderId: '427514831103',
     projectId: 'clearbridge-dc699',
     storageBucket: 'clearbridge-dc699.firebasestorage.app',

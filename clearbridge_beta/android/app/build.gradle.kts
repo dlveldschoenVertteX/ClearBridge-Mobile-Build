@@ -2,6 +2,13 @@ plugins {
     id("com.android.application")
     // The Flutter Gradle Plugin must be applied after the Android and Kotlin Gradle plugins.
     id("dev.flutter.flutter-gradle-plugin")
+    // Processes google-services.json (real crash reporting, 2026-08-15 --
+    // see settings.gradle.kts's own comment on this pair of plugins).
+    // Applied AFTER the Flutter plugin per Firebase's own documented
+    // ordering requirement (it needs the application block already
+    // configured).
+    id("com.google.gms.google-services")
+    id("com.google.firebase.crashlytics")
 }
 
 // AGP only auto-generates the debug keystore when a build variant uses the
