@@ -35,6 +35,17 @@ dependencies:
   cloud_firestore: ^6.1.3
   firebase_storage: ^13.1.0
   cloud_functions: ^6.0.7
+  # Real crash reporting, added 2026-08-15 -- this app had none, so a real
+  # device crash (CTO report: "crashing on upload step") could only be
+  # investigated by inference from Firestore data, never a stack trace.
+  # NOTE: the Dart-side init below is safe on its own, but Crashlytics also
+  # needs android/app/google-services.json (download from Firebase Console
+  # -> Project Settings -> the Android app) + the com.google.gms.google-
+  # services and com.google.firebase.crashlytics Gradle plugins to actually
+  # register crashes -- NOT added here, since applying either Gradle plugin
+  # without that real file present fails the build at configuration time,
+  # breaking every future CI run. See main.dart's own init comment.
+  firebase_crashlytics: ^5.0.4
   shared_preferences: ^2.3.3
 
 dev_dependencies:

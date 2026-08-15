@@ -1,5 +1,9 @@
+import 'dart:async';
+
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_crashlytics/firebase_crashlytics.dart';
+import 'package:flutter/foundation.dart' show PlatformDispatcher;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart' show SystemNavigator;
 import 'package:shared_preferences/shared_preferences.dart';
@@ -12,23 +16,55 @@ import 'package:clearbridge_beta/front_capture_screen.dart';
 import 'package:clearbridge_beta/splash_screen.dart';
 import 'package:clearbridge_beta/user_details_popia_screen.dart';
 
-void main() async {
-  WidgetsFlutterBinding.ensureInitialized();
-  // Firebase/auth failures (e.g. network-less first launch, API key
-  // restrictions) must not stop the UI from ever appearing — anything
-  // thrown here previously crashed the app before runApp() ran.
-  try {
-    await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
-    // Anonymous auth so Firestore/Storage security rules (which require
-    // request.auth.uid == userId) are satisfied without a full login flow.
-    // See user_details_popia_screen.dart for the phone-number field collected
-    // so a future production migration can link this profile without losing
-    // ClearCoin progress.
-    await FirebaseAuth.instance.signInAnonymously();
-  } catch (e, st) {
-    debugPrint('Firebase init/auth failed: $e\n$st');
-  }
-  runApp(const ClearBridgeBetaApp());
+void main() {
+  // runZonedGuarded, not a bare main() try/catch -- the crashes this was
+  // added for (CTO report: "crashing on upload step") happen well after
+  // startup, inside async capture/upload work the top-level try/catch
+  // below can't see. This is the standard Flutter+Crashlytics pattern:
+  // catches anything escaping the zone (uncaught async errors) in
+  // addition to the two handlers wired up inside runApp itself.
+  runZonedGuarded(() async {
+    WidgetsFlutterBinding.ensureInitialized();
+    // Firebase/auth failures (e.g. network-less first launch, API key
+    // restrictions) must not stop the UI from ever appearing — anything
+    // thrown here previously crashed the app before runApp() ran.
+    try {
+      await Firebase.initializeApp(options: DefaultFirebaseOptions.currentPlatform);
+      // Anonymous auth so Firestore/Storage security rules (which require
+      // request.auth.uid == userId) are satisfied without a full login flow.
+      // See user_details_popia_screen.dart for the phone-number field collected
+      // so a future production migration can link this profile without losing
+      // ClearCoin progress.
+      await FirebaseAuth.instance.signInAnonymously();
+      // Real crash reporting, added 2026-08-15 after a real device report
+      // ("crashing on upload step") that could only be diagnosed by
+      // inference from Firestore data -- no stack trace existed anywhere.
+      // NOTE: this Dart-side wiring alone is not sufficient in production
+      // -- Crashlytics also needs android/app/google-services.json (from
+      // Firebase Console) plus the google-services and firebase-
+      // crashlytics Gradle plugins applied in android/build.gradle.kts /
+      // android/app/build.gradle.kts, deliberately NOT added yet (applying
+      // either plugin without that real file fails every future build at
+      // configuration time). Until that native half lands, these calls are
+      // safe no-ops -- they only start actually reporting once it does.
+      FlutterError.onError = FirebaseCrashlytics.instance.recordFlutterFatalError;
+      PlatformDispatcher.instance.onError = (error, stack) {
+        FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+        return true;
+      };
+    } catch (e, st) {
+      debugPrint('Firebase init/auth failed: $e\n$st');
+    }
+    runApp(const ClearBridgeBetaApp());
+  }, (error, stack) {
+    debugPrint('Uncaught zone error: $error\n$stack');
+    // Guarded: Firebase may not have finished initializing yet (or may have
+    // failed entirely, per the try/catch above) when a very early error
+    // reaches this handler.
+    try {
+      FirebaseCrashlytics.instance.recordError(error, stack, fatal: true);
+    } catch (_) {}
+  });
 }
 
 final _navigatorKey = GlobalKey<NavigatorState>();

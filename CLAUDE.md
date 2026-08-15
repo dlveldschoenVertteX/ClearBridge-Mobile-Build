@@ -1,5 +1,60 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the AF-hunting fix: one real stuck-at-pending capture (crash suspected, no logs to confirm), distance-wave rings found frozen due to a lifetime-not-per-hold sample counter, Crashlytics added (2026-08-15)
+CTO ran a real capture session: 3 of 4 captures scored cleanly (70/78/81),
+1 (`bbaebb07`) is genuinely stuck at `status: pending` -- app reportedly
+crashed during upload. Also reported the new distance-wave rings never
+shrink even moving the phone all the way back (screenshot).
+
+**Crash: real, but not diagnosable from Firestore data alone.** `bbaebb07`
+has every field the app writes -- all 8 burst frames uploaded (real paths,
+healthy Laplacian 882-1168), full guide/refocus/wavelength/camera-lens
+diagnostics, a completed refocus convergence. So the upload loop and the
+Firestore write both finished; it's stuck specifically because
+`processEnhanceAndScore` never ran. That trigger call is wrapped in its
+own `try`/`catch` and is fire-and-forget (never awaited), so a network
+failure there can't crash the app or hang the UI -- ruling it out as the
+direct cause. More likely candidates: the real 8-file *concurrent* upload
+(`_uploadConcurrency = 8`, pre-existing, not touched this session) is a
+genuine memory-pressure point, or the OS killed the app for an unrelated
+reason during that window. **This app had zero crash reporting** -- no
+Crashlytics, nothing -- so this is inference from data, not a confirmed
+cause.
+
+**Real bug found: distance-wave cue frozen because its reliability gate
+uses a LIFETIME counter, not a per-hold one.** `_wavelengthSampleCount`
+is only ever incremented (`grep` confirms exactly one `= 0`, at its field
+declaration) -- across the CTO's "a few capture sessions" today, once it
+happened to accumulate to >=3 from several earlier attempts (each
+individually gathering only 0-1 samples, per the still-open `_scoreRoi`
+qualify-rate question), `wlReliable`/`distanceWaveCue` permanently
+stopped being null and started rendering off whatever `_liveWavelengthPx`
+was last cached -- which, since fresh samples are rare, barely moves,
+reading as a frozen, unresponsive cue exactly matching the screenshot.
+**Fixed**: reset the whole wavelength-estimate state
+(`_wavelengthSampleCount`, `_wavelengthOutlierStreak`, `_liveWavelengthPx`,
+`_liveWavelengthStillPx`, `_wavelengthAxis`) at the same real "thumb
+genuinely left coverage range" trigger `_refocusedThisHold` already uses,
+so reliability reflects fresh sampling on the CURRENT attempt, never
+stale accumulation from an earlier one. **Not yet device-tested.**
+
+**Crashlytics added, Dart-side only.** `firebase_crashlytics` +
+`runZonedGuarded`/`FlutterError.onError`/`PlatformDispatcher.instance.
+onError` wired into `main.dart`, matching the standard Flutter+Crashlytics
+pattern. **Deliberately incomplete**: this app has no
+`android/app/google-services.json` and no `google-services`/
+`firebase-crashlytics` Gradle plugins -- every other Firebase SDK here
+(auth/firestore/storage/functions) works purely off the Dart-side
+`FirebaseOptions` in `firebase_options.dart`, but Crashlytics genuinely
+needs the native file + both Gradle plugins to register crashes, and
+applying either plugin without that real file present fails the build at
+configuration time -- breaking every future CI run, not just this one.
+Did not fabricate or guess at the file. Real remaining step, needs the
+CTO: download `google-services.json` from Firebase Console -> Project
+Settings -> the Android app -> add it at `android/app/google-services.json`
+-> then the two Gradle plugin lines can be added safely. Until that
+lands, the Dart-side calls are safe no-ops.
+
 ## Real device test of the `_scoreRoi` fix: "live feed looked blurry" traced to a real bug in the wavelength-gate change itself, fixed (2026-08-14)
 CTO tested the `_scoreRoi` runtime-correction build and reported the live
 camera feed looked blurry / struggled to focus. Pulled the two real

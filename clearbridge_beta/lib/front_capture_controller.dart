@@ -1875,6 +1875,29 @@ class FrontCaptureController extends ChangeNotifier {
       // to re-trigger AF on their own.
       if (tooFar || tooClose || coverage == null) {
         _refocusedThisHold = false;
+        // REAL BUG, found 2026-08-15 (CTO real-device report: distance-wave
+        // rings never shrink even moving the phone all the way back).
+        // _wavelengthSampleCount is only ever incremented, never reset --
+        // it's a LIFETIME counter across every hold attempt this
+        // controller instance has ever seen, not a per-attempt one. Once
+        // it happens to accumulate to >=3 across several earlier attempts
+        // in the same session (each of which may individually gather only
+        // 0-1 samples, given the estimator's own real qualify-rate issues
+        // -- see the _scoreRoi fix above), wlReliable/distanceWaveCue
+        // permanently stop being null and start rendering off whatever
+        // _liveWavelengthPx happens to be cached -- which, since fresh
+        // samples are rare, barely moves the EMA and reads as a frozen,
+        // unresponsive cue exactly matching the report. Reset the whole
+        // wavelength-estimate state here, the same real "thumb genuinely
+        // left, this is a fresh attempt" trigger _refocusedThisHold
+        // already uses -- so reliability genuinely reflects fresh
+        // sampling on THIS attempt, not stale accumulation from an
+        // earlier one.
+        _wavelengthSampleCount = 0;
+        _wavelengthOutlierStreak = 0;
+        _liveWavelengthPx = null;
+        _liveWavelengthStillPx = null;
+        _wavelengthAxis = null;
       }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
     }
