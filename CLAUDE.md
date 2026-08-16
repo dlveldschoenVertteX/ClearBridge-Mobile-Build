@@ -1,5 +1,62 @@
 # ClearBridge Mobile — persistent context
 
+## Redundant second-burst capture built: real hypothesis test, feature-flagged off, needs real device testing (2026-08-16)
+CTO asked to build and test the "capture a second redundant hold+burst,
+keep whichever scores better, never fuse" idea floated earlier in this
+session as a fresh, unproven hypothesis (distinct from anything sweep
+already validated). Unlike the fusion-variant work above, this genuinely
+**cannot** be measured against the cached local capture library the way
+those were -- it's a question about real session-to-session physical/pose
+variability during a live capture, which a static-JPEG harness can't
+honestly simulate. Built as a real, working, OFF-by-default feature
+instead, matching this project's own established discipline for exactly
+this class of change (same pattern as `_sweepEnabled`/
+`_sweepBurstHybridEnabled`).
+
+**Client (`front_capture_controller.dart`)**: new
+`_secondBurstEnabled` flag (`false`). When on, `_fireBurst()` doesn't call
+`_finishAndUpload` after the first burst completes -- it stashes the
+captured shots (`_burst1Shots`), resets the exact same hold-gate fields
+`start()` already resets (`_refocusedThisHold`, the wavelength-estimate
+state, `_holdStart`), and returns to the `holding` phase with a "Hold
+still again — bonus capture" banner. The SAME `_onFrame`/`rawOnTarget`
+machinery that fired the first burst naturally fires `_fireBurst()` again
+for round 2 -- no parallel hold implementation, reusing 100% of the
+already-proven gate logic. Round 2 then uploads BOTH bursts: round 1 under
+the existing `front_burst_*` paths / `frames` Firestore field (byte-for-
+byte unchanged), round 2 under new `front_burst2_*` paths / a separate
+`frames2` field -- deliberately never merged into one array, so nothing
+about the existing single-burst path changes when the flag is off (the
+only state today).
+
+**Backend (`main.py`)**: new `_download_front_only_frames_burst2()`
+(reads `frames2` if present, returns `None` otherwise -- self-skipping,
+same contract as every other optional candidate source in this pipeline).
+A new candidate block runs right after the main `_afis_variants` loop:
+scores burst2's own native + freqNorm renderings via real NFIQ2
+(`_score_ground_truth`, the same ground-truth sidecar every other
+candidate uses) and keeps it ONLY if it beats round 1's own best score --
+deliberately SELECT, never fuse. Averaging pixels across two genuinely
+different real holds is exactly the risk this project's own zone-fusion
+findings already showed is harmful (`zone_reduction_test.py`: a single
+un-fused anchor zone beat every fused multi-zone configuration by 2x+) --
+this avoids that failure mode by construction, comparing two independent
+renderings rather than blending their raw frames.
+
+**Real, deliberate costs, stated plainly**: roughly doubles capture time
+(a second full hold-to-lock + 8-shot burst) and roughly doubles the
+backend's per-capture compute cost for the added candidate (2 more
+`afis_print.generate()` + NFIQ2 sidecar calls). Both costs are the direct,
+unavoidable price of testing whether real capture-to-capture redundancy
+actually helps matchability -- not incidental waste.
+
+**Not yet device-tested, and cannot be pre-validated the way the fusion
+variants were** -- this needs a real capture with the flag flipped on to
+produce even the first data point. Recommend testing this in isolation
+(flag on, nothing else changed) before drawing any conclusion, same "one
+variable at a time" discipline as every other capture-side change this
+project.
+
 ## New deepAmbBestFl fusion variant built + wired in; completed the pending "does front's fusion win NFIQ2 but lose matchability" investigation (2026-08-16)
 CTO asked (a) whether averaging the ambient burst but fusing with only the
 single best flash frame (instead of averaging the whole flash burst, like

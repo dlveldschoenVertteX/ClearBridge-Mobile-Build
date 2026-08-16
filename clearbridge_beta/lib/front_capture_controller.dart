@@ -685,6 +685,21 @@ class FrontCaptureController extends ChangeNotifier {
   // before shipping, not after.
   static const bool _sweepEnabled = false;
 
+  // Redundant second-burst capture (2026-08-16, CTO idea): fire a SECOND
+  // independent hold+burst after the first, upload both, let the backend
+  // keep whichever one's own best frame scores higher -- SELECT, never
+  // fuse or average across the two (averaging across a genuinely different
+  // real hold/pose is exactly the risk this project has already found
+  // harmful elsewhere, e.g. the zone-fusion findings in CLAUDE.md).
+  // Reuses the exact same hold-gate/_fireBurst machinery a second time
+  // rather than a parallel implementation -- see the round-tracking fields
+  // below and their use in _fireBurst/_onFrame. OFF by default: this is a
+  // genuinely new capture-flow change that roughly doubles capture time and
+  // backend compute cost, and — unlike the backend-only fusion variants —
+  // can't be validated against cached data; it needs real device testing
+  // before it proves anything.
+  static const bool _secondBurstEnabled = false;
+
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
@@ -1174,6 +1189,14 @@ class FrontCaptureController extends ChangeNotifier {
   bool _streamRunning = false;
   bool _burstInFlight = false;
 
+  // Second-burst round tracking (_secondBurstEnabled). 1 = normal/first
+  // hold; 2 = the redundant bonus hold currently in progress. _burst1Shots
+  // holds round 1's captured frames while round 2 re-runs the same
+  // hold-gate; both go into _finishAndUpload together once round 2 fires.
+  int _burstRound = 1;
+  List<_RawShot>? _burst1Shots;
+  double? _burst1Gyro;
+
   bool _refocusing = false;
   // True once a fresh auto->lock cycle has run for the CURRENT hold attempt.
   // Mirrors OscillatingCaptureController's _refocusedThisStep: focus is
@@ -1438,6 +1461,9 @@ class FrontCaptureController extends ChangeNotifier {
     _liveWavelengthPx = null;
     _liveWavelengthStillPx = null;
     _wavelengthAxis = null;
+    _burstRound = 1;
+    _burst1Shots = null;
+    _burst1Gyro = null;
     _wasInCoverageRange = false;
     _gyroMagnitudeDegPerSec = 0.0;
     _zoomLevel = 1.0;
@@ -2840,6 +2866,37 @@ class FrontCaptureController extends ChangeNotifier {
 
       HapticFeedback.heavyImpact();
       unawaited(_audio.playAngleSuccess(isFinal: true));
+
+      if (_secondBurstEnabled && preCollectedShots == null && _burstRound == 1) {
+        // Round 1 of 2: stash this burst and reset the hold gate so the
+        // SAME _onFrame/rawOnTarget machinery naturally re-triggers this
+        // function for the bonus round -- no parallel hold implementation,
+        // no change to round-1 behaviour when the flag is off (the only
+        // way this branch is ever reached).
+        _burst1Shots = rawShots;
+        _burst1Gyro = gyro;
+        _burstRound = 2;
+        _refocusedThisHold = false;
+        _holdStart = null;
+        _wavelengthSampleCount = 0;
+        _wavelengthOutlierStreak = 0;
+        _liveWavelengthPx = null;
+        _liveWavelengthStillPx = null;
+        _wavelengthAxis = null;
+        _apply(
+          (s) => s.copyWith(
+            phase: FrontCapturePhase.holding,
+            isCapturingBurst: false,
+            burstProgress: 0,
+            onTarget: false,
+            holdProgress: 0,
+            confirmationText: 'Hold still again — bonus capture',
+          ),
+          force: true,
+        );
+        return;
+      }
+
       _apply(
         (s) => s.copyWith(
           isCapturingBurst: false,
@@ -2849,11 +2906,19 @@ class FrontCaptureController extends ChangeNotifier {
       );
       await Future<void>.delayed(const Duration(milliseconds: _confirmationDisplayMs));
 
+      final secondBurstShots =
+          (_secondBurstEnabled && preCollectedShots == null && _burstRound == 2)
+              ? _burst1Shots
+              : null;
+      _burstRound = 1;
+      _burst1Shots = null;
+
       await _finishAndUpload(
         rawShots,
         gyro,
         sweepCentroids: preCollectedCentroids,
         sweepDebugData: preCollectedShots != null ? _sweepDebug : null,
+        secondBurstShots: secondBurstShots,
       );
     } catch (e) {
       _fail('Capture failed: $e');
@@ -3554,6 +3619,7 @@ class FrontCaptureController extends ChangeNotifier {
     double gyroAtCapture, {
     List<double?>? sweepCentroids,
     Map<String, dynamic>? sweepDebugData,
+    List<_RawShot>? secondBurstShots,
   }) async {
     _audio.silence();
     // NOT `uploading` yet -- the sweep burst below still needs the thumb held
@@ -3720,6 +3786,53 @@ class FrontCaptureController extends ChangeNotifier {
         });
       }
 
+      // Redundant second burst (_secondBurstEnabled), decoded/encoded the
+      // same way as the primary burst above -- separately uploaded under
+      // front_burst2_* paths and written to a SEPARATE `frames2` Firestore
+      // field, never merged with `frames`/`framesMeta`. Kept as a genuinely
+      // independent candidate (not fused/averaged with round 1) so the
+      // backend can SELECT whichever burst scores better -- see this
+      // flag's own docs above for why fusing across two real, independent
+      // holds is the wrong lever here.
+      final framesMeta2 = <Map<String, dynamic>>[];
+      if (secondBurstShots != null) {
+        final decodedShots2 = <({Uint8List bytes, bool flashOn, double? lap, DateTime ts})>[];
+        for (final r in secondBurstShots) {
+          var bytes = r.jpeg;
+          var lap = r.laplacianScore;
+          try {
+            final decoded = await decodeStillJpegToLuma(
+              r.jpeg, _sensorOrientation,
+              targetWidth: _stillDecodeTargetWidth,
+            );
+            if (decoded != null) {
+              final result = await compute(
+                _encodeBurstWithSharpnessIsolate,
+                _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height,
+                    sharpnessRoi: sharpnessRoi),
+              );
+              bytes = result.jpeg;
+              lap = result.sharpness;
+            }
+          } catch (_) {}
+          decodedShots2.add((bytes: bytes, flashOn: r.flashOn, lap: lap, ts: r.timestamp));
+        }
+        var ambIdx2 = 0, flIdx2 = 0;
+        for (final s in decodedShots2) {
+          if (s.bytes.isEmpty) continue;
+          final type = s.flashOn ? 'fl' : 'amb';
+          final idx = s.flashOn ? flIdx2++ : ambIdx2++;
+          final path = '$basePath/front_burst2_${type}_$idx.jpg';
+          uploadTasks.add((s.bytes, path));
+          framesMeta2.add({
+            'path': path,
+            'flashOn': s.flashOn,
+            if (s.lap != null) 'laplacianScore': double.parse(s.lap!.toStringAsFixed(1)),
+            'timestamp': s.ts.toIso8601String(),
+          });
+        }
+      }
+
       // Real upload begins here -- the actual Firestore write + main burst
       // upload below. Fallback transition only (see _transitionToUploading
       // docs) -- the normal path already switched the UI over right after
@@ -3760,6 +3873,7 @@ class FrontCaptureController extends ChangeNotifier {
         },
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
+        if (framesMeta2.isNotEmpty) 'frames2': framesMeta2,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
         if (noiseReductionOffSupport != null)
           'noiseReductionOffSupport': noiseReductionOffSupport,

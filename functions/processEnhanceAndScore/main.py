@@ -1173,6 +1173,54 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     best_afis_img = _img
                     afis_params = {**_p, 'afisNfiq': round(_s, 2)}
 
+            # Redundant second burst (2026-08-16, CTO idea, client-side
+            # feature-flagged off by default -- see FrontCaptureController's
+            # _secondBurstEnabled). A genuinely independent second hold+
+            # burst uploaded under 'frames2' -- scored here as its OWN
+            # candidate (native + freqNorm only, not the full variant pool,
+            # to bound the extra compute cost) and kept ONLY if it beats
+            # round 1's own best result. Deliberately SELECT, never fuse:
+            # averaging two frames from genuinely different real holds is
+            # exactly the risk this project's own zone-fusion findings
+            # already showed is harmful (see CLAUDE.md's zone_reduction_test
+            # entry -- anchor_only beat every fused configuration by 2x+).
+            # Self-skips when 'frames2' is absent (the flag's off-by-default
+            # state, i.e. every capture today).
+            if is_front_only and time.monotonic() <= _variants_deadline:
+                try:
+                    _b2 = _download_front_only_frames_burst2(capture_id, base_path)
+                except Exception as exc:
+                    _b2 = None
+                    logger.info('second burst: none/unusable (%s)', exc)
+                if _b2 is not None:
+                    _b2_frames, _b2_amb, _b2_fla = _b2
+                    for _b2_name, _b2_kw in (
+                        ('native',   dict()),
+                        ('freqNorm', dict(freq_normalize=True, freq_scale_min=0.9)),
+                    ):
+                        _b2_result = _call_with_hard_deadline(
+                            afis_print.generate,
+                            _b2_frames, [0.0], None,
+                            ambient_frames=_b2_amb, flash_frames=_b2_fla,
+                            guide_region=_guide_region,
+                            stack_cache={},
+                            timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                            **_b2_kw)
+                        if _b2_result is None:
+                            continue
+                        _b2_img, _b2_p = _b2_result
+                        if _b2_img is None:
+                            continue
+                        _b2_r = _score_ground_truth(_b2_img)
+                        _b2_s = _b2_r.get('nfiq_score', 0.0) if not _b2_r.get('error') else 0.0
+                        logger.info('second burst variant %s nfiq=%.1f (round-1 best=%.1f)',
+                                    _b2_name, _b2_s, afis_nfiq)
+                        if _b2_s > afis_nfiq:
+                            afis_nfiq = _b2_s
+                            best_afis_img = _b2_img
+                            afis_params = {**_b2_p, 'afisNfiq': round(_b2_s, 2),
+                                           'afisSecondBurstVariant': _b2_name}
+
             # Own deadline for every candidate source below (secondary camera,
             # sweep zones, cross-zone mosaic, minutiae patches) -- 2026-08-08,
             # added alongside the _score_ground_truth swap above. Before that
@@ -2788,6 +2836,59 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     logger.info('front_only: %d ambient + %d flash frames loaded',
                 len(amb_frames_list), len(fl_frames_list))
     return frames, meta_out, angles_out, ambient_frames_out, flash_frames_out
+
+
+def _download_front_only_frames_burst2(capture_id: str, base_path: str):
+    """Download the redundant SECOND burst (client's `frames2`, written only
+    when FrontCaptureController._secondBurstEnabled is on -- off by default,
+    so this returns None for every capture today). Deliberately a separate,
+    much simpler function from _download_front_only_frames rather than a
+    shared/parameterized one: burst2 is only ever scored as a single
+    candidate (native/freqNorm), never fed into stack/deepFuse/mosaic, so it
+    doesn't need that function's ambient_burst/flash_burst plumbing.
+
+    Returns (frames, ambient_frames, flash_frames) -- same per-bin-list
+    shape afis_print.generate() expects for a single face-on bin -- or None
+    if there's no usable second burst."""
+    db, _ = _get_firebase()
+    doc_dict = db.collection('captures').document(capture_id).get().to_dict() or {}
+    frames_meta = doc_dict.get('frames2') or []
+    if not frames_meta:
+        return None
+
+    def _sort_key(e):
+        return float(e.get('laplacianScore') or 0.0)
+
+    amb_entries = sorted([e for e in frames_meta if not e.get('flashOn')],
+                         key=_sort_key, reverse=True)
+    fl_entries  = sorted([e for e in frames_meta if e.get('flashOn')],
+                         key=_sort_key, reverse=True)
+
+    def _load(entry):
+        arr = _decode_image(_download_storage_file(entry['path']))
+        h, w = arr.shape[:2]
+        side = min(h, w)
+        return arr[(h - side) // 2:(h - side) // 2 + side,
+                   (w - side) // 2:(w - side) // 2 + side]
+
+    amb_arr, fl_arr = None, None
+    if amb_entries:
+        try:
+            amb_arr = _load(amb_entries[0])
+        except Exception as exc:
+            logger.warning('front_only burst2: ambient frame %s failed: %s',
+                            amb_entries[0].get('path'), exc)
+    if fl_entries:
+        try:
+            fl_arr = _load(fl_entries[0])
+        except Exception as exc:
+            logger.warning('front_only burst2: flash frame %s failed: %s',
+                            fl_entries[0].get('path'), exc)
+    if amb_arr is None and fl_arr is None:
+        return None
+
+    best_arr = amb_arr if amb_arr is not None else fl_arr
+    return [best_arr], [amb_arr], [fl_arr]
 
 
 def _download_oscillating_frames(capture_id: str, base_path: str):
