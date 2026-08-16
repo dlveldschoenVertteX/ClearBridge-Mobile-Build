@@ -61,7 +61,13 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
       _firstNameController.text.trim().length >= 2 &&
       _surnameController.text.trim().length >= 2 &&
       _age != null &&
-      _age! >= 16 &&
+      // POPIA defines a "child" as under 18; processing a minor's personal
+      // info (biometric data is "special personal information") generally
+      // needs a parent/guardian's consent, which this single-user flow has
+      // no mechanism to collect. Raised from 16 -> 18 (2026-08-16) to avoid
+      // that exposure entirely for beta rather than build a consent-by-proxy
+      // flow this app doesn't have.
+      _age! >= 18 &&
       _age! <= 120;
 
   bool get _allRequired =>
@@ -86,10 +92,10 @@ class _UserDetailsPopiaScreenState extends State<UserDetailsPopiaScreen> {
         'phone': _phoneController.text.trim(),
         'source': 'clearbridge_beta',
         'consents': {
-          'captureConsent': true,
-          'superprintConsent': true,
-          'reuseConsent': true,
-          'durationConsent': true,
+          'captureConsent': _captureConsent,
+          'superprintConsent': _superprintConsent,
+          'reuseConsent': _reuseConsent,
+          'durationConsent': _durationConsent,
           'dataTraining': _trainingOptIn,
           'consentedAt': FieldValue.serverTimestamp(),
           'version': '2.0',

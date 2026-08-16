@@ -1,5 +1,96 @@
 # ClearBridge Mobile — persistent context
 
+## Pre-beta pass: backend deploy caught up, real release keystore issued, POPIA compliance gaps found + two fixed (2026-08-16)
+CTO asked for four things: deploy whatever backend work was still pending,
+solve the release-signing-keystore gap, audit the POPIA consent flow for
+beta readiness, and refocus all remaining tweaks on front_only_v1 only.
+
+**Backend deploy.** The two commits sitting undeployed since 2026-08-13
+(`30b7dc4` reverting sweep's matchability mosaic to plain freqNorm,
+`b1f7191` removing the destructive `pad_mask_override`) were deployed via
+`firebase deploy --only functions:python-pipeline --project clearbridge-dc699`.
+Confirmed live via the real Cloud Functions v2 API: `updateTime` advanced to
+`2026-08-16T10:52:38Z`, `state: ACTIVE` — same drift-check discipline as the
+2026-07-24 14-commit deploy-gap incident.
+
+**Release keystore, real and permanent, not a placeholder.** Generated a real
+4096-bit RSA keystore (100-year validity, alias `clearbridge-release`) via
+`keytool`, non-interactively (random password via `openssl rand`, never
+echoed to the session transcript) — same parameters
+`scripts/generate_release_keystore.sh` already specified, just run
+programmatically instead of by hand. Delivered the keystore + the 4 secret
+values (`KEYSTORE_BASE64`/`KEYSTORE_PASSWORD`/`KEY_ALIAS`/`KEY_PASSWORD`) to
+the CTO directly as files, never pasted into chat. `.github/workflows/build.yml`'s
+`build-clearbridge-beta` job already reads all 4 as GitHub Actions secrets
+and decodes/signs with them — confirmed by reading the workflow, no workflow
+change needed. **The one step this session genuinely cannot do**: setting
+GitHub repo secrets requires the GitHub API's secret-encryption flow, which
+isn't among the tools available here — the CTO has to paste the 4 values in
+themselves (repo Settings → Secrets and variables → Actions). Local keystore
+working files deleted from the sandbox immediately after delivery.
+`scripts/generate_release_keystore.sh`'s own instructions were also stale
+(said "GitLab CI/CD variables" — GitLab isn't the active CI per this file's
+own "Repos & branches" section) — corrected to reference GitHub Actions repo
+secrets, matching what `build.yml` actually reads.
+
+**POPIA compliance audit — one real bug found + fixed on the spot, three
+real gaps needing a CTO call, all three now resolved.** Read
+`user_details_popia_screen.dart` plus the live Firestore ruleset (fetched
+directly via the Firebase Rules API, not assumed from a local file — this
+project has never had a local `firestore.rules`, confirmed again here).
+- **Real bug**: `_save()` wrote the `consents` map as hardcoded `true` for
+  all four required checkboxes regardless of their actual bound state.
+  Harmless in practice today (the Continue button is disabled unless
+  `_allRequired` — all four true — so the written value always matched the
+  real state anyway), but a latent landmine if any of the four ever becomes
+  optional later. Fixed: writes `_captureConsent`/`_superprintConsent`/
+  `_reuseConsent`/`_durationConsent` directly.
+- **Age gate raised 16 -> 18.** POPIA defines a "child" as under 18 and
+  generally requires a parent/guardian's ("competent person's") consent to
+  process a child's personal information — compounded here since fingerprints
+  are "special personal information" under POPIA, and this app's single-user
+  anonymous-auth flow has no mechanism to collect a guardian's consent at
+  all. CTO's explicit call: raise the floor rather than build a consent-by-
+  proxy flow. `_detailsValid` now requires `_age! >= 18`.
+- **Deletion right made real, not just promised.** The consent screen has
+  always said "I understand... I can request permanent deletion at any
+  time" — but no mechanism existed anywhere: no in-app action, no support
+  contact, and the live Firestore rules blanket-deny all client-side
+  update/delete on `captures` (`allow update, delete: if false`), so only an
+  admin with direct console/Admin-SDK access could ever have fulfilled that
+  promise, and nothing in the app or its docs told a user how to reach one.
+  Fixed with a genuinely new capability, not a doc change: a
+  `deletionRequests/{userId}` Firestore collection (rule added via the
+  Rules API — confirmed via diff against the previously-fetched live rules
+  that this was the ONLY change, nothing else in the ruleset touched — user
+  can create/refresh their own pending request, cannot set or clear its own
+  `status`, admin has full read/write, same "user creates, status is
+  server/admin-only" pattern already used for `applications`). Wired into
+  `BetaThankYouScreen` (chosen deliberately over the POPIA screen itself,
+  since that screen is a one-time first-launch gate — `popia_completed`
+  means a returning user never sees it again, so it's the ONLY screen a user
+  could ever reach this from) as a small "Request my data be deleted" link
+  below Capture Again/Exit, confirms via a dialog, writes the request, shows
+  a snackbar. Does **not** auto-delete anything — deliberately a request
+  queue for manual admin review, consistent with how every other admin-
+  gated write in this ruleset already works.
+- **Responsible-party/Information Officer disclosure**: flagged as a real
+  POPIA Section 18 gap (no company/address/Information Officer contact
+  anywhere in the consent flow) — CTO said they'd provide the real details;
+  **still open, waiting on that real information** (deliberately not
+  fabricated). Whoever picks this up next: add it to the POPIA consent
+  screen once the CTO supplies the actual company/contact details, not
+  before.
+- **Not a substitute for real legal review** — flagged explicitly to the
+  CTO as a code/product audit, not a legal opinion, given the real
+  regulatory stakes (biometric data + POPIA). The age-gate and deletion-flow
+  fixes reduce obvious exposure but don't constitute compliance sign-off.
+
+**Scope going forward, per explicit CTO instruction: front_only_v1 only.**
+No further sweep/mosaic/multi-zone work unless explicitly revived — matches
+the 2026-08-14 shelving decision already documented below. Remaining
+beta-readiness tweaks scoped to front_only_v1 specifically.
+
 ## Crashlytics fully wired: com.clearbridge.beta had never been registered in Firebase at all (2026-08-15)
 CTO asked to complete the Crashlytics setup properly rather than leave the
 native half undone, plus asked what else is outstanding before beta.

@@ -1,3 +1,5 @@
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:google_fonts/google_fonts.dart';
@@ -6,10 +8,70 @@ import 'package:clearbridge_beta/clearbridge_colors.dart';
 
 /// Final screen of the beta flow. Lets the tester either capture again or
 /// exit the app entirely.
+///
+/// Also the one persistently-reachable screen (shown after every capture)
+/// where the POPIA consent screen's "you can request permanent deletion at
+/// any time" promise is actually actionable -- that screen itself is a
+/// one-time gate the user never sees again after popia_completed is set, so
+/// this is the only place in the app a returning user could exercise that
+/// right. Writes to deletionRequests/{uid} (admin-reviewed, no auto-delete --
+/// see firestore.rules) rather than deleting anything itself.
 class BetaThankYouScreen extends StatelessWidget {
   const BetaThankYouScreen({super.key, required this.onCaptureAgain});
 
   final VoidCallback onCaptureAgain;
+
+  Future<void> _requestDeletion(BuildContext context) async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        backgroundColor: ClearBridgeColors.cardBg,
+        title: Text('Request Data Deletion',
+            style: GoogleFonts.manrope(
+                fontWeight: FontWeight.w800, color: ClearBridgeColors.silverBright)),
+        content: Text(
+          'This submits a request for ClearBridge to permanently delete your '
+          'captured fingerprint data and account details. A team member will '
+          'review and action it manually -- this is not instant.',
+          style: GoogleFonts.manrope(color: ClearBridgeColors.silver, height: 1.5),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(true),
+            child: const Text('Submit Request'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !context.mounted) return;
+
+    try {
+      await FirebaseFirestore.instance.collection('deletionRequests').doc(uid).set({
+        'userId': uid,
+        'status': 'pending',
+        'requestedAt': FieldValue.serverTimestamp(),
+        'source': 'clearbridge_beta',
+      }, SetOptions(merge: true));
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Deletion request submitted.')),
+      );
+    } catch (_) {
+      if (!context.mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Could not submit request. Please try again.'),
+          backgroundColor: ClearBridgeColors.error,
+        ),
+      );
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -86,6 +148,19 @@ class BetaThankYouScreen extends StatelessWidget {
                   icon: const Icon(Icons.logout_rounded, size: 20),
                   label: Text('Exit',
                       style: GoogleFonts.manrope(fontSize: 15, fontWeight: FontWeight.w800)),
+                ),
+              ),
+              const SizedBox(height: 16),
+              TextButton(
+                onPressed: () => _requestDeletion(context),
+                child: Text(
+                  'Request my data be deleted',
+                  style: GoogleFonts.manrope(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    color: ClearBridgeColors.silverDim,
+                    decoration: TextDecoration.underline,
+                  ),
                 ),
               ),
             ],

@@ -1,21 +1,27 @@
 #!/usr/bin/env bash
 # Run this ONCE on your local machine to generate a stable ClearBridge release
-# keystore, then paste the printed values into GitLab CI/CD variables.
+# keystore, then paste the printed values into GitHub Actions repo secrets.
+# (GitHub Actions is the active CI per CLAUDE.md -- .github/workflows/build.yml's
+# build-clearbridge-beta job already reads these four secret names and decodes
+# KEYSTORE_BASE64 into a file before the signed build; GitLab CI is not
+# actively used right now, so if you're on GitLab instead, set the same four
+# names as CI/CD Variables there.)
 #
 # Usage:
 #   bash scripts/generate_release_keystore.sh
 #
 # You will be asked to choose a password. Use something memorable and save it
 # in your password manager — you need the same password for every future build.
-# After running, add four GitLab CI/CD variables:
-#   Settings → CI/CD → Variables (protect + mask each one):
+# After running, add four GitHub Actions repo secrets:
+#   Settings → Secrets and variables → Actions → New repository secret
 #     KEYSTORE_BASE64   ← the base64 block printed below
 #     KEYSTORE_PASSWORD ← the password you chose
 #     KEY_ALIAS         ← clearbridge-release
 #     KEY_PASSWORD      ← same as KEYSTORE_PASSWORD
 #
-# Once these four variables are set, every GitLab CI build will sign with this
-# same stable cert and Android upgrades will work without uninstalling first.
+# Once these four secrets are set, every GitHub Actions build of
+# clearbridge_beta will sign with this same stable cert and Android upgrades
+# will work without uninstalling first.
 
 set -euo pipefail
 
@@ -53,18 +59,18 @@ keytool -list -v \
   -alias "$ALIAS" 2>/dev/null | grep -E "SHA256:|Owner:|Alias"
 
 echo ""
-echo "=== KEYSTORE_BASE64 (paste into GitLab CI/CD variable) ==="
+echo "=== KEYSTORE_BASE64 (paste into GitHub Actions repo secret) ==="
 echo ""
 base64 -w 0 "$KEYSTORE"
 echo ""
 echo ""
-echo "=== Done. GitLab CI/CD variables to set ==="
+echo "=== Done. GitHub Actions repo secrets to set ==="
 echo "  KEYSTORE_BASE64   = <the base64 block above>"
 echo "  KEYSTORE_PASSWORD = $PASSWORD"
 echo "  KEY_ALIAS         = $ALIAS"
 echo "  KEY_PASSWORD      = $PASSWORD"
 echo ""
 echo "IMPORTANT: Delete $KEYSTORE from this folder after saving the base64."
-echo "The keystore lives in GitLab — you don't need the local file."
-echo "GitLab → Project → Settings → CI/CD → Variables → Add variable"
-echo "  Protect: yes, Mask: yes (for passwords), Environment: All"
+echo "The keystore lives in GitHub Secrets — you don't need the local file."
+echo "GitHub repo → Settings → Secrets and variables → Actions → New repository secret"
+echo "  (each of the 4 above, as its own secret)"
