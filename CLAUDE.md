@@ -1,5 +1,36 @@
 # ClearBridge Mobile — persistent context
 
+## Real CI confirmation of the push: 3/4 jobs green, release keystore corrupted in transit, real cause found + shorter replacement issued (2026-08-16)
+Pushed the 4 held commits + confirmed the run via the real GitHub Actions API
+(not assumed). `deploy-web`, `build-capture-harness`, `build-sweep-test` all
+passed clean. `build-clearbridge-beta` failed, but not at signing setup —
+pulled the real job log rather than guess: `Decode keystore` step reported
+success (it's just `base64 -d`, which can't validate content), but the
+actual Gradle build failed at `:app:packageRelease` with
+`KeytoolException: Failed to read key from store "/tmp/release.keystore":
+Not the correct tag` -- a definitive signal the decoded bytes aren't a real
+keystore at all, not a wrong password/alias. Root cause: the
+`KEYSTORE_BASE64` secret (5,809 characters) almost certainly got corrupted
+pasting into GitHub's mobile web UI -- consistent with the two earlier
+mobile-UI failures hit setting these same secrets (a generic "Failed to add
+secret" and a "name field can't contain spaces" error from pasting the
+whole name=value block into one field).
+
+**Fixed by removing the risk factor, not by asking for a more careful
+paste.** Regenerated the keystore at RSA 2048 instead of 4096 (still
+Android's own recommended default for app signing, not a security
+downgrade) specifically to roughly halve the base64 length (5,809 -> 3,589
+chars) and reduce the odds of another mobile-paste corruption. **Verified
+the replacement round-trips correctly BEFORE sending it** (encoded to
+base64, decoded back, re-opened with `keytool -list` using the real
+password/alias, confirmed readable) -- catching any corruption in my own
+generation step, not just trusting the encode succeeded. Delivered via
+SendUserFile, never pasted into chat; local copy deleted after send. User
+needs to REPLACE (not add) all 4 existing GitHub secrets with the new
+values. `main` branch keystore never signed a real distributed build, so
+swapping it now costs nothing (no existing install would need
+uninstalling).
+
 ## Full code-review pass on front_capture_controller.dart/front_capture_screen.dart: two real (currently-dormant) bugs found + fixed (2026-08-16)
 Per the CTO's ask for a code-review pass (no new device data, just a careful
 read) before the next beta build. Dispatched a thorough review focused on
