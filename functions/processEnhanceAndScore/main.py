@@ -859,6 +859,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 ('mosaicFreq', dict(mosaic=True, freq_normalize=True, freq_scale_min=0.9)),
                 ('deepFuse',   dict(fuse='deep', freq_normalize=True, freq_scale_min=0.9)),
                 ('deepMaxc',   dict(fuse='deepMaxc', freq_normalize=True, freq_scale_min=0.9)),
+                # deepAmbBestFl (2026-08-16, CTO idea): same ambient-side
+                # averaging as deepMaxc, but the flash side uses only the
+                # single SHARPEST flash frame instead of averaging the whole
+                # flash burst -- flash is this project's own recurring
+                # source of blown-out/inconsistent exposure, so averaging it
+                # risks diluting one good frame with several bad ones. Real
+                # bozorth3 gate (22 real captures, scratchpad/ps/
+                # fusion_matchability_gate.py): beats deepMaxc on both
+                # separation (2.54 vs 2.14) and worst-case impostor score
+                # (25.0 vs 39.0, i.e. less confusable with a stranger).
+                # Max-of-variants, purely additive.
+                ('deepAmbBestFl', dict(fuse='deepAmbBestFl', freq_normalize=True, freq_scale_min=0.9)),
                 # pyfing (SNFEN, pretrained neural enhancement) as an
                 # alternative to the classical Gabor bank -- self-skips
                 # (falls back to Gabor) if the pyfing_service sidecar isn't

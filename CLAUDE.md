@@ -1,5 +1,78 @@
 # ClearBridge Mobile — persistent context
 
+## New deepAmbBestFl fusion variant built + wired in; completed the pending "does front's fusion win NFIQ2 but lose matchability" investigation (2026-08-16)
+CTO asked (a) whether averaging the ambient burst but fusing with only the
+single best flash frame (instead of averaging the whole flash burst, like
+`deepMaxc` already does) would help matchability, and (b) to run any other
+tests that could improve it -- which included finally completing the
+investigation flagged as pending in the "Sweep put on ice" entry above:
+does front's own production fusion pool win NFIQ2 selection while actually
+losing real matchability, the same pattern already confirmed for sweep's
+mosaic.
+
+**Built `deepAmbBestFl`** (`afis_print.py`): reuses `deep*`'s existing
+ambient-side `_stack_face_on` averaging unchanged, but the flash side now
+picks the single sharpest flash frame (new `_best_frame_by_sharpness`
+helper, plain Laplacian-variance argmax) instead of averaging the whole
+flash burst -- flash frames are this project's own long-documented
+recurring source of blown-out/inconsistent exposure, so averaging all of
+them risks diluting one genuinely good frame with several bad ones. Not
+`static const`-able caching concerns applied here since this reuses the
+existing request-scoped `stack_cache` dict, with its own cache key
+(`df_bestfl`) so it can't collide with `deep*`'s flat-averaged flash cache
+slot.
+
+**Real bozorth3/INCITS-378 gate, 22 real local front_only_v1 captures
+(mindtct -m1 templating, same users.json genuine/impostor grouping used
+throughout this project, `scratchpad/ps/fusion_matchability_gate.py`,
+not committed -- scratch-only):**
+
+| variant | genuine | impostor | sep | iMax | beat/15 (or /9) |
+|---|---|---|---|---|---|
+| native (single best frame, no fusion) | 4.93 | 3.84 | 1.09 | 8.0 | 1/15 |
+| **deepFuse** (flat avg combine) | 22.60 | 15.69 | **6.91** | 42.0 | **2/15** |
+| deepMaxc (coherence combine) | 13.93 | 11.79 | 2.14 | 39.0 | 0/15 |
+| **deepAmbBestFl** (new) | 13.40 | 10.86 | 2.54 | 25.0 | 0/15 |
+| stack | 4.27 | 4.61 | -0.34 | 21.0 | 0/15 |
+| focusStack | 4.60 | 4.11 | 0.49 | 10.0 | 0/15 |
+| fuseAvg (single-pair) | 6.11 | 4.37 | 1.74 | 15.0 | 0/9 |
+| fuseMaxc (single-pair) | 5.33 | 4.16 | 1.17 | 15.0 | 0/9 |
+| fuseSoft (single-pair) | 5.33 | 4.36 | 0.97 | 10.0 | 0/9 |
+
+(fuseAvg/fuseMaxc/fuseSoft ran on a smaller real sample -- 17/22 templated,
+9 genuine pairs -- some captures' best-single ambient/flash pair didn't
+register; not investigated further since the deep*-family sample is the
+one that matters more for this question, being the actual production
+default for front_only_v1's real bursts.)
+
+**Two real findings, not one.** (1) `deepAmbBestFl` is a genuine,
+measurable improvement over `deepMaxc` specifically -- its closest sibling,
+same architecture, only the flash-handling differs -- on both separation
+(2.54 vs 2.14) and worst-case impostor risk (iMax 25.0 vs 39.0, i.e.
+meaningfully less confusable with a random stranger). Wired into
+`main.py`'s `_afis_variants` as one more additive max-of-variants
+candidate on the strength of this. (2) **The pending investigation's
+answer, and a real surprise**: plain `deepFuse` (flat-average combine, the
+mode NOT preferred in production) has the single best beat-count of every
+variant tested -- better than the coherence-based `deepMaxc`/`deepSoft`
+modes production actually favors, which were chosen specifically because
+they win on NFIQ2 and visually fix flash specular smudging (see the
+`deepMaxc` real-capture writeup elsewhere in this file: "3e54236a maxc:
+real NFIQ2 57->81"). This is a real, if small-sample (9-15 real pairs,
+10 real users), signal that NFIQ2-driven variant PREFERENCE inside
+`main.py`'s max-of-variants selection may be systematically passing over a
+better-matchability candidate (`deepFuse`) in favor of a worse one
+(`deepMaxc`) purely because the worse one looks better under NFIQ2 --
+consistent with this project's own prime-directive thesis (NFIQ2 and real
+matchability pull in different directions) but not yet strong enough
+evidence (single-digit beat-count differences on this sample size) to
+justify reordering or removing anything from the existing variant pool.
+**Flagged, not acted on** -- worth a larger real sample before touching
+`deepMaxc`'s standing in production.
+
+**Not yet deployed** -- needs its own explicit go-ahead, same as every
+other backend change this project.
+
 ## Real device test of the debug-signed build: app-not-responding on upload, real root cause found + fixed (2026-08-16)
 CTO ran a real capture on the debug-signed build (the same commit with the
 AF-hunting/wave-cue/`_scoreRoi`/Crashlytics/POPIA fixes) and hit an Android

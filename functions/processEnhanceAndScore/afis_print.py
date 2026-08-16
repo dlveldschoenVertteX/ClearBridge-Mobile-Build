@@ -894,6 +894,21 @@ def flash_pair_sharpness_ratio(ambient: np.ndarray, flash: np.ndarray,
     return la / lf
 
 
+def _best_frame_by_sharpness(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Pick the single sharpest frame from `cand` by whole-frame Laplacian
+    variance -- no averaging, no registration, just a selection. Used by
+    fuse='deepAmbBestFl' for the flash side specifically, where this
+    project's own data shows averaging risks pulling in blown-out frames
+    (see that call site's own comment). Returns None if `cand` is empty."""
+    usable = [g for g in cand if g is not None]
+    if not usable:
+        return None
+    if len(usable) == 1:
+        return usable[0]
+    scores = [float(cv2.Laplacian(g, cv2.CV_64F).var()) for g in usable]
+    return usable[int(np.argmax(scores))]
+
+
 def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
                         mode: str = 'maxc') -> Optional[np.ndarray]:
     """Fuse a SAME-POSE ambient+flash pair into one enhanced grayscale.
@@ -2371,7 +2386,8 @@ def generate(
     # geometric distortion and is the single biggest superprint lever found:
     # +5–7 NFIQ on the hardest captures. Emits None (variant skipped) when no
     # fusable pair exists, so single-source renderings still stand.
-    if fuse in ('deep', 'deepMaxc', 'deepSoft', 'deepFocusAvg', 'deepFocusMaxc', 'deepFocusSoft'):
+    if fuse in ('deep', 'deepMaxc', 'deepSoft', 'deepFocusAvg', 'deepFocusMaxc', 'deepFocusSoft',
+                'deepAmbBestFl'):
         # Deep raw-burst fusion: denoise each illumination by aligning+averaging
         # ALL its preserved near-face-on burst shots, THEN fuse the two clean
         # stacks. Strengthens both fusion inputs before combining — worth
@@ -2392,6 +2408,7 @@ def generate(
         _deep_mode = {
             'deep': 'avg', 'deepMaxc': 'maxc', 'deepSoft': 'soft',
             'deepFocusAvg': 'avg', 'deepFocusMaxc': 'maxc', 'deepFocusSoft': 'soft',
+            'deepAmbBestFl': 'maxc',
         }[fuse]
         # deepFocus* variants (2026-07-24): combine two techniques already
         # separately validated but never together -- per-illumination
@@ -2402,9 +2419,25 @@ def generate(
         # specular-blown centre) that plain deep/deepMaxc/deepSoft use with
         # a flat average instead. Max-of-variants, so this can only ever
         # add a candidate.
+        # deepAmbBestFl (2026-08-16, CTO idea): flash frames are this
+        # project's own recurring source of blown-out/inconsistent exposure
+        # (torch-blowout pattern documented repeatedly elsewhere in this
+        # file) -- averaging the WHOLE flash burst, like plain deep*/
+        # deepFocus* do, risks diluting one genuinely good flash frame with
+        # several blown-out ones. This keeps deep*'s ambient-side averaging
+        # (ambient exposes consistently enough that averaging is a clean
+        # noise-reduction win) but swaps the flash side for a single BEST
+        # frame (highest pad-crop sharpness), never averaged. Unmeasured
+        # until this exact test -- see the harness in scratchpad/ps.
+        _use_best_flash = fuse == 'deepAmbBestFl'
         _use_focus_stack = fuse.startswith('deepFocus')
         _stack_fn = _focus_stack_face_on if _use_focus_stack else _stack_face_on
-        _cache_key = ('da_focus', 'df_focus') if _use_focus_stack else ('da', 'df')
+        if _use_focus_stack:
+            _cache_key = ('da_focus', 'df_focus')
+        elif _use_best_flash:
+            _cache_key = ('da', 'df_bestfl')
+        else:
+            _cache_key = ('da', 'df')
         # Paired filtering (image, gyro) so the gyro list stays index-aligned
         # to `ab`/`fb` after dropping None entries -- see _focus_stack_face_on
         # docstring for what the gyro values feed into (_stack_face_on itself
@@ -2447,6 +2480,10 @@ def generate(
                 stack_cache[_cache_key[0]] = da
         if stack_cache is not None and _cache_key[1] in stack_cache:
             df = stack_cache[_cache_key[1]]
+        elif _use_best_flash:
+            df = _best_frame_by_sharpness(fb)
+            if stack_cache is not None:
+                stack_cache[_cache_key[1]] = df
         else:
             df = _stack_fn(fb, gyros=fb_gyros) if len(fb) >= 2 else (fb[0] if fb else None)
             if stack_cache is not None:
