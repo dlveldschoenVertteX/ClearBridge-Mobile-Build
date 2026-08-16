@@ -942,12 +942,29 @@ class FrontCaptureController extends ChangeNotifier {
         _guideCx + _guideRx, _guideCy + _guideRy,
       );
 
-  // Pre-fix screen-space rect, retained ONLY for the two AF/AE point call
-  // sites, which take preview-space (not sensor-space) coordinates and were
-  // therefore always correct. Kept as its own named constant so the two
-  // spaces can never be silently conflated again.
-  static const Rect _focusPointScreenSpace =
-      Rect.fromLTRB(0.3385, 0.2588, 0.6615, 0.4812);
+  // Preview-space (not sensor-space) point for the two AF/AE point call
+  // sites -- kept as its own named quantity so the two coordinate spaces can
+  // never be silently conflated with _scoreRoi's still-space one.
+  //
+  // REAL BUG FOUND + FIXED, 2026-08-16: this used to be a hand-copied
+  // `static const Rect` (0.3385, 0.2588, 0.6615, 0.4812). Its implied centre
+  // (0.5, 0.37) still matched PadSilhouetteShape.defaultShape's cx/cy, but
+  // its implied half-width (0.1615) had already drifted from the guide's
+  // real current rx (0.134604) after a later shrink round only touched
+  // PadSilhouetteShape.defaultShape, never this copy -- the exact bug class
+  // _scoreRoi already hit once (see its own docs above). Inert today only
+  // because _beginAutofocus below has always read just the rect's centre,
+  // never its extent -- but a landmine for the day something reads the
+  // extent, or a future cx/cy retune (unlike the rx/ry-only retunes so far)
+  // drifts the centre too. Fixed the same way _scoreRoi was: derive from the
+  // real source of truth instead of a second hand-maintained copy. Not
+  // `static const`: Dart rejects `PadSilhouetteShape.defaultShape.cx` as a
+  // constant expression (confirmed by a real build failure on the same
+  // pattern for `.rx`, see _sweepGuideShapeForProgress's own note above) --
+  // a plain getter sidesteps that with no real cost, since this is only read
+  // once per autofocus trigger, never per-frame.
+  Offset get _focusPointScreenSpace =>
+      Offset(PadSilhouetteShape.defaultShape.cx, PadSilhouetteShape.defaultShape.cy);
 
   // Row-axis (maps to on-screen X, see _sweepScreenXFraction) tracking
   // window used by the guided sweep's own CENTROID tracking only. Named
@@ -1406,6 +1423,21 @@ class FrontCaptureController extends ChangeNotifier {
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
     _refocusedThisHold = false;
+    // Same reset as the per-hold "thumb genuinely left" trigger a few lines
+    // below in _onFrame (2026-08-15 fix) -- belt-and-suspenders for a
+    // session-level equivalent. Currently inert (front_capture_screen.dart
+    // always constructs a fresh controller and never calls start() twice on
+    // the same instance, and the _starting/_streamRunning guard above would
+    // additionally block same-instance re-entry while streaming), but costs
+    // nothing to keep correct, and closes off the same stale-lifetime-
+    // counter failure mode at the session boundary too, not just the hold
+    // boundary, in case that assumption ever changes (e.g. a future retake-
+    // without-rebuilding flow).
+    _wavelengthSampleCount = 0;
+    _wavelengthOutlierStreak = 0;
+    _liveWavelengthPx = null;
+    _liveWavelengthStillPx = null;
+    _wavelengthAxis = null;
     _wasInCoverageRange = false;
     _gyroMagnitudeDegPerSec = 0.0;
     _zoomLevel = 1.0;
@@ -2385,12 +2417,9 @@ class FrontCaptureController extends ChangeNotifier {
     final cam = _camera;
     if (cam == null) return;
     // Preview-space, NOT sensor-space -- setFocusPoint/setExposurePoint take
-    // coordinates relative to the camera preview, so these keep the original
-    // screen-space centre (0.5, 0.37). See _scoreRoi's own docs for why the
-    // two spaces are now separate named constants.
-    final cx = (_focusPointScreenSpace.left + _focusPointScreenSpace.right) / 2;
-    final cy = (_focusPointScreenSpace.top + _focusPointScreenSpace.bottom) / 2;
-    final pt = Offset(cx, cy);
+    // coordinates relative to the camera preview. See _focusPointScreenSpace's
+    // own docs above for why this stays a separate quantity from _scoreRoi.
+    final pt = _focusPointScreenSpace;
     try {
       await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
     } catch (_) {}

@@ -1,5 +1,78 @@
 # ClearBridge Mobile — persistent context
 
+## Full code-review pass on front_capture_controller.dart/front_capture_screen.dart: two real (currently-dormant) bugs found + fixed (2026-08-16)
+Per the CTO's ask for a code-review pass (no new device data, just a careful
+read) before the next beta build. Dispatched a thorough review focused on
+the same bug CLASS this file has hit twice already this session (hand-copied
+geometry constants silently drifting from their real source of truth) plus
+resource-leak/lifecycle/null-safety sweeps. Verified every finding against
+the actual code before trusting it (one candidate finding turned out to rest
+on a wrong assumption about Dart const-expression rules — see below).
+
+**Real bug #1, fixed: `_focusPointScreenSpace` had already drifted, just
+inertly.** This was a second hand-copied `static const Rect`
+(0.3385, 0.2588, 0.6615, 0.4812), kept deliberately separate from `_scoreRoi`
+since `setFocusPoint`/`setExposurePoint` take preview-space coordinates, not
+`_scoreRoi`'s still-space ones — a real, correct reason to keep them as two
+named quantities. But its implied half-width (0.1615) had already gone stale
+against `PadSilhouetteShape.defaultShape`'s real current `rx` (0.134604,
+after a later guide-shrink round only touched the shape's own default, never
+this copy) — the exact same bug class as the already-fixed `_scoreRoi`
+drift. Purely inert today only because `_beginAutofocus` has only ever read
+the rect's CENTRE, never its extent — the centre (0.5, 0.37) happened to
+still match. Fixed the same way `_scoreRoi` was: converted to a getter
+deriving straight from `PadSilhouetteShape.defaultShape.cx/cy`, eliminating
+the second copy entirely (returns an `Offset` now, not a `Rect`, since only
+the centre was ever meaningful). **Real Dart constraint that changed the fix
+shape**: this can't be `static const` — `PadSilhouetteShape.defaultShape.cx`
+is not a valid constant expression, confirmed by an ALREADY-DOCUMENTED real
+build failure elsewhere in this same file (`_sweepGuideShapeForProgress`'s
+own note on trying the identical pattern for `.rx`) — caught this via
+checking prior art in the file itself before shipping a fix that would have
+failed to compile, not by trusting Dart's general const-field-access rules
+in the abstract. A plain (non-const) getter sidesteps it with zero real
+cost, since this is read once per autofocus trigger, never per-frame.
+
+**Real bug #2, fixed (currently dormant, session-lifecycle version of the
+already-fixed per-hold bug): `start()` never resets the live-wavelength-
+estimate state.** The 2026-08-15 fix taught the per-hold "thumb genuinely
+left" reset trigger (inside `_onFrame`) to zero out
+`_wavelengthSampleCount`/`_liveWavelengthPx`/`_liveWavelengthStillPx`/
+`_wavelengthAxis`/`_wavelengthOutlierStreak` — but `start()` itself, which
+resets a long list of other per-session accumulator fields for a fresh
+capture attempt, never got the same treatment. Confirmed currently
+unreachable: `front_capture_screen.dart` always constructs a brand-new
+`FrontCaptureController` in `initState()` and never calls `start()` twice on
+one instance, and `start()`'s own `_starting || _streamRunning` guard would
+additionally block same-instance re-entry while streaming. Fixed anyway,
+belt-and-suspenders, directly adjacent to `_refocusedThisHold = false` in
+`start()` (the same trigger point the per-hold fix uses) — zero real cost,
+and closes the same stale-lifetime-counter failure mode at the session
+boundary too, in case a future retake-without-rebuilding flow ever changes
+the current one-controller-per-attempt lifecycle.
+
+**Everything else checked clean**: Timer/StreamSubscription/
+AnimationController disposal (the only `StreamSubscription`, `_gyroSub`, is
+cancelled on both `_fail()` and `dispose()`; all `AnimationController`s in
+the screen file are disposed in their owning `State.dispose()`; the legacy
+secondary-camera session code this project's own history documents as its
+prior source of exactly this bug class has actually been removed from this
+file entirely), `mounted` checks before post-await `setState`/context use,
+phase consistency on every early-return/error path (all route through
+`_fail()`, which always lands in `FrontCapturePhase.error`), and the
+`distanceWaveCue` computation's edge cases (no division-by-zero risk, fixed
+positive denominator; clamp/anchor directions internally consistent). Noted
+but not audited further: `_sweepEnabled`/`_sweepBurstHybridEnabled` are both
+`static const bool = false`, so the ~900 lines of sweep-positioning/
+sweep-burst code in this file are currently unreachable — not a gap in this
+review, just out of scope since it can't execute in the current build.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project; both fixes are logic-preserving on every
+real capture path exercised so far (confirmed by tracing that both were
+inert before this fix), so no behavior change is expected on the next real
+capture, just removed drift risk.
+
 ## Pre-beta pass: backend deploy caught up, real release keystore issued, POPIA compliance gaps found + two fixed (2026-08-16)
 CTO asked for four things: deploy whatever backend work was still pending,
 solve the release-signing-keystore gap, audit the POPIA consent flow for
