@@ -1,5 +1,37 @@
 # ClearBridge Mobile — persistent context
 
+## STANDING TODO: release keystore setup still not done — needs a desktop browser (2026-08-16)
+Two consecutive real attempts to set the 4 release-signing GitHub secrets from
+mobile web both failed with the identical real error
+(`KeytoolException: ... "Not the correct tag"` at `:app:packageRelease`,
+confirmed via real job logs both times, not assumed) — first with an
+RSA-4096 keystore (5,809-char base64), then again with a shorter RSA-2048
+one (3,589 chars) generated specifically to reduce mobile-paste risk. Since
+the SAME symptom recurred even after shrinking the value and switching to
+"Select All" instead of manual drag-select, the likely culprit is GitHub's
+mobile web secrets form itself mishandling a long paste into that one
+Value field, not the copy technique. CTO's call: stop fighting mobile web,
+defer this until a desktop browser is available, and revert to debug
+signing in the meantime so the app is testable again right now.
+
+**Reverted to debug signing**: CTO is deleting all 4 GitHub secrets
+(`KEYSTORE_BASE64`/`KEYSTORE_PASSWORD`/`KEY_ALIAS`/`KEY_PASSWORD`). The
+workflow (`build.yml`) already has a clean fallback for this -- the "Decode
+keystore" step's `if: env.KEYSTORE_BASE64 != ''` skips itself when the
+secret is unset, and `build.gradle.kts`'s own signing-config logic falls
+back to a freshly-generated debug keystore when `/tmp/release.keystore`
+doesn't exist -- the same path that already builds `build-capture-harness`/
+`build-sweep-test` successfully. No workflow changes needed to revert;
+purely a matter of the secrets being absent.
+
+**Next time this is picked up**: do NOT reuse any of the previously-
+generated keystore files -- both were deleted from the sandbox immediately
+after sending (standard practice this project), and their real values were
+never printed into this chat transcript either (deliberately, to avoid
+leaking secret material) — so they cannot be recovered. Generate a fresh
+keystore from scratch, and have the CTO set all 4 secrets from an actual
+desktop browser this time before trying mobile again.
+
 ## Real CI confirmation of the push: 3/4 jobs green, release keystore corrupted in transit, real cause found + shorter replacement issued (2026-08-16)
 Pushed the 4 held commits + confirmed the run via the real GitHub Actions API
 (not assumed). `deploy-web`, `build-capture-harness`, `build-sweep-test` all
