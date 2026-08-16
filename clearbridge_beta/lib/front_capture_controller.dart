@@ -3626,7 +3626,31 @@ class FrontCaptureController extends ChangeNotifier {
         _guideCx + _guideRx * 1.2,
         _guideCy + _guideRy * 1.2,
       );
-      final decodedShots = await Future.wait(rawShots.map((r) async {
+      // REAL BUG, found 2026-08-16 (CTO real-device report: app "isn't
+      // responding" / crashing during upload): this ran all 8 decode+encode
+      // passes CONCURRENTLY via Future.wait, each internally spawning its
+      // own compute() isolate -- the exact same bug class already found and
+      // fixed in _captureSweepBurst's own encode loop (see its comment
+      // above), just never ported to this, the MAIN burst path every real
+      // front_only_v1 capture goes through. That fix's own real measurement
+      // showed just 6 simultaneous compute() isolates starving each other
+      // on a mobile CPU badly enough to blow a per-zone timeout 5-6x over
+      // (18-22s vs ~3-4s expected); 8 concurrent isolates here is worse, and
+      // a strong real candidate for a main-isolate-adjacent stall severe
+      // enough to trip Android's ANR watchdog. Fixed the same way: encode
+      // sequentially, not concurrently -- each isolate gets the full CPU to
+      // itself, total wall-time is roughly unchanged (N x single-encode-time
+      // either way), but no more 8-way contention spike.
+      final decodedShots = <
+          ({
+            Uint8List bytes,
+            bool flashOn,
+            double? lap,
+            DateTime ts,
+            JpegExposureExif exif,
+            double? gyro,
+          })>[];
+      for (final r in rawShots) {
         var bytes = r.jpeg;
         // Falls back to the stale stream-frozen r.laplacianScore only if
         // decode fails -- never worse than before this fix, since that was
@@ -3647,15 +3671,15 @@ class FrontCaptureController extends ChangeNotifier {
             lap = result.sharpness;
           }
         } catch (_) {}
-        return (
+        decodedShots.add((
           bytes: bytes,
           flashOn: r.flashOn,
           lap: lap,
           ts: r.timestamp,
           exif: r.exif,
           gyro: r.gyroMagnitudeDegPerSec,
-        );
-      }));
+        ));
+      }
 
       // Build upload tasks and Firestore frames metadata from the decoded shots.
       final uploadTasks = <(Uint8List, String)>[];

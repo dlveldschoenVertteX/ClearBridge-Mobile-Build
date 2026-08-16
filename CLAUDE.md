@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test of the debug-signed build: app-not-responding on upload, real root cause found + fixed (2026-08-16)
+CTO ran a real capture on the debug-signed build (the same commit with the
+AF-hunting/wave-cue/`_scoreRoi`/Crashlytics/POPIA fixes) and hit an Android
+"ClearBridge Beta isn't responding" dialog during/around the upload step.
+
+**Pulled the real Firestore doc before guessing anything.** The capture
+(`628d7803`) actually completed successfully server-side: all 8 burst
+frames uploaded with healthy Laplacian scores (237-1857), the Firestore
+write landed, and `processingStartedAt` confirms `processEnhanceAndScore`
+was triggered and running normally (checked elapsed time against the
+project's own established 130-180s typical window before treating
+`status: enhancing` as anything other than in-progress). So the ANR wasn't
+a functional upload failure — the real question was what could block the
+UI badly enough to trip Android's ANR watchdog around that window.
+
+**Real root cause, found by reading the code, not guessing: the main
+burst's decode+encode step already had this exact bug fixed once, just in
+the wrong file.** `_captureSweepBurst`'s own encode loop carries a detailed
+comment from an earlier round: running 6 simultaneous `compute()` isolates
+on a mobile CPU made them starve each other so badly that a single
+zone's encode blew 18-22s instead of an expected 3-4s — fixed there by
+making those encodes run sequentially. `_finishAndUpload` — the MAIN burst
+path every real front_only_v1 capture goes through, unlike the
+rarely-exercised sweep path — had never gotten the same fix: its own
+decode+encode step used `Future.wait(rawShots.map(...))`, firing all
+**8** shots' `decodeStillJpegToLuma` + `compute()` calls concurrently.
+8 concurrent isolates is worse than the 6 already proven to cause severe
+contention, and a strong, well-evidenced candidate for a main-isolate-
+adjacent stall long enough to trigger the observed ANR — this is exactly
+the kind of "already found and fixed once, never ported to the sibling
+code path" bug this file's own history keeps surfacing (see `_scoreRoi`/
+`_focusPointScreenSpace`).
+
+**Fixed**: converted the `Future.wait` block to a plain sequential
+`for`-loop over `rawShots`, matching `_captureSweepBurst`'s already-proven
+pattern exactly — each isolate gets the full CPU to itself, one at a time.
+Total wall-time is roughly unchanged (still N x single-encode-time), just
+without the 8-way contention spike. Downstream code (`framesMeta`
+construction, `uploadTasks`) was already keyed off the same record shape
+(`bytes`/`flashOn`/`lap`/`ts`/`exif`/`gyro`), so this needed zero changes
+beyond the loop itself. **Not yet re-tested on a real device** — same
+standing discipline as every other capture-side change this project; the
+next real capture on this fix will be the first real confirmation the ANR
+is actually resolved, not just a plausible theory.
+
 ## STANDING TODO: release keystore setup still not done — needs a desktop browser (2026-08-16)
 Two consecutive real attempts to set the 4 release-signing GitHub secrets from
 mobile web both failed with the identical real error
