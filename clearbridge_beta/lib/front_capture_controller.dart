@@ -1908,6 +1908,26 @@ class FrontCaptureController extends ChangeNotifier {
             // wlStripsCleared telemetry fields below will show on the next
             // real capture whether 3.0 is enough or still too strict.
             minStripStd: 3.0,
+            // Raised from the shared function's stripCount=5 default,
+            // 2026-08-17 round 2. Real evidence from the first capture with
+            // the new stripsWithPeak diagnostic (see its own docs): 5/5
+            // strips clear the contrast bar on every attempt, but
+            // stripsWithPeak lands at exactly 1 on most attempts (5 of 8)
+            // and only reaches the required 2 on a couple (2 of 8, both of
+            // which succeeded) -- a genuinely borderline shortfall, not the
+            // "zero strips ever find a peak" structural-limit case this
+            // diagnostic was built to also rule out. This is a sample-
+            // DENSITY change, not a threshold guess: it doesn't touch the
+            // >=2-strips-must-agree robustness bar `estimateRidgeWavelengthPx`
+            // already enforces (lags.length < 2 -> null), it just samples
+            // more independent strip positions per attempt so the odds of
+            // hitting that same bar improve -- structurally low-risk even
+            // off a single real data point, unlike guessing a new
+            // minLagPx/maxLagRawPx value would be. Real, honest caveat:
+            // n=1 real capture with this diagnostic so far -- the next
+            // real capture's stripsWithPeak distribution is what actually
+            // confirms whether this moved the needle, not this comment.
+            stripCount: 7,
             debug: wlDebug,
           );
           _logTelemetry('wavelengthAttempt', extra: {

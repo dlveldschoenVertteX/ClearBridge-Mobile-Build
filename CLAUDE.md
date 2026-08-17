@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## First real capture with `stripsWithPeak` data: the wavelength estimator genuinely works, it's borderline-short by exactly one strip (2026-08-17, round 6)
+First real capture on the build carrying the `stripsWithPeak` diagnostic
+(`eacb0b2c`, confirmed via the field's presence in telemetry — the previous
+sunlight capture predates it). This is the real answer the diagnostic was
+built to give.
+
+**Real, decisive finding: strips ARE finding peaks — this is not the
+structural live-preview-domain dead end it could have been.** Across 8
+throttled attempts: `stripsWithPeak` read 0 (x2), 1 (x5), 2 (x2) — and the
+two attempts that hit 2 are exactly the two that succeeded
+(`success: true`, `liveWavelengthDebug.sampleCount` reached 1 by the end of
+the hold). The estimator's own >=2-strips-must-agree bar
+(`lags.length < 2 -> null` in `estimateRidgeWavelengthPx`) is being missed
+by exactly one strip on the majority of attempts — a genuinely borderline
+shortfall, not a "zero signal at all" wall. Also got the first real
+`scaleToStill` value from an actual successful live sample (2.0), confirming
+the live-preview-to-still-domain scale relationship is real and computable,
+not just theoretical.
+
+**Fixed with a sample-density change, not a threshold guess.** Raised the
+live call's `stripCount` 5 -> 7 (`front_capture_controller.dart`, shared
+function's default stays 5 for other callers, same override pattern already
+used for `minStripStd`). Deliberately NOT a guess at `minLagPx`/
+`maxLagRawPx`/lowering the 2-strip agreement bar itself — those would each
+either weaken the actual robustness check or require picking a new number
+with no real basis. Sampling more independent strip positions per attempt
+raises the odds of hitting the SAME unweakened bar without touching what
+"reliable" means. Structurally low-risk even off n=1: worst case is a
+modest extra per-attempt CPU cost (still bounded, still throttled), it
+cannot make an already-working attempt fail.
+
+**Honest caveat, stated plainly**: this is one real capture with the new
+diagnostic. The stripCount bump is justified by the shape of the evidence
+(consistently short by exactly one, never by more), not by enough real
+samples to prove 7 is the right number — the next real capture's
+`stripsWithPeak` distribution is what actually confirms this moved the
+needle, same "let the next capture answer it" discipline as the diagnostic
+itself.
+
+**Also confirmed on this second real capture**: crease-trim fired again
+(`afisCreaseTrimPx: 39159`), `refocusDebug` converged cleanly with no drift
+retry needed (real NFIQ2 66, `afisMask: guide+unet` — the content-aware
+mask engaged this time, unlike the previous sunlight capture which fell
+back to bare `guide`).
+
 ## Real sunlight device test: no repeat of the transillumination failure, crease-trim confirmed live, and a genuinely new wavelength-estimator lead (2026-08-17, round 5)
 CTO ran one real capture deliberately in sunlight to stress-test the already-
 deployed crease-trim/vignette work. Pulled the real capture (`181e8cd8`,
