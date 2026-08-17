@@ -1,5 +1,99 @@
 # ClearBridge Mobile — persistent context
 
+## Real device confirmation the wavelength/focus-zone fixes work — and two real, distinct causes of "sweeps forever" found + fixed (2026-08-17, round 8)
+CTO ran the build carrying the quadratic-detrend/stripCount=7/focus-zone-
+bracket changes: "struggled with the wavelength estimator for awhile, it
+seems I only have one shot to get correct distance or it sweeps forever...
+but I managed 1 capture where it was working as proposed." Pulled the real
+capture (`80a994ca`, real NFIQ2 74) and its full `captureTelemetry` trace
+rather than guess at what "sweeps forever" meant.
+
+**Good news first, confirmed with real numbers: both of the previous
+round's mechanism fixes are real and working.** `stripsCleared` read 7/7 on
+every single one of 69 real throttled attempts (was 5/5 before the
+stripCount bump). `stripsWithPeak` regularly reached 4-6 (not just barely
+scraping the required 2) — the quadratic detrend is genuinely finding more
+peaks per strip, not just marginally clearing the bar. **11 of 69 attempts
+(16%) succeeded** — a real, large jump from the historical near-zero
+qualify rate. The focus-zone-bracket also worked end-to-end for the first
+time ever: `focusZoneShots` has all 4 zones, and `minutiaeDebug` confirms
+the backend correctly sourced tip/base/left/right from the dedicated
+focus-zone stills (`"source": "focusZone"`) instead of the center-focused
+crop.
+
+**But the real telemetry timeline exposed two distinct, real problems, not
+one — both now fixed:**
+
+**Problem 1: the wavelengthTooHigh gate has no bounded escape.** Real
+timeline: `refocusLocked` at 12.8s, `holdComplete` at 14.3s — meaning it
+took ~14 real seconds of struggle before every gate (focus, coverage,
+wavelength, steady) was satisfied simultaneously long enough to complete
+the hold. Read `rawOnTarget`'s own code to confirm why: unlike
+`tooFar`/`tooClose` (which have an obvious physical correction via the
+on-screen guide's size, and which the reset logic already treats as a
+genuine "thumb left"), a hold blocked SOLELY by `wavelengthTooHigh` had NO
+bounded fallback at all — it just stayed blocked indefinitely until the
+user happened to land within `_liveWavelengthTooHighPx` by feel, with only
+a text hint and the wave rings to go on. This was low-risk to ship
+2026-08-14 because the estimator rarely had enough real samples to ever
+actually assert `wavelengthTooHigh=true` (the long-documented
+`sampleCount:0` problem) — now that this SAME round's quadratic-detrend/
+stripCount fixes made it genuinely reliable, this latent gap became
+reachable in practice for the first time, and this real capture is direct
+evidence of it.
+
+**Fixed**: new bounded escape hatch (`_wavelengthOnlyBlockedSince`,
+`_wavelengthOnlyBlockMaxMs = 6000`) — tracks how long the hold has been
+blocked solely by `wavelengthTooHigh` (every other gate already
+satisfied); once sustained past 6s, the hold is allowed to proceed anyway
+rather than trapping the user. Same principle sweep's own live-wavelength
+gate already uses (2026-08-13/14, bounded 3s there) — 6s chosen more
+generously here since front's hold has no separate "waiting room"
+sub-phase telegraphing the wait the way sweep's calibration step does.
+Whether this escape hatch fires is now written to `liveWavelengthDebug`
+(`wavelengthGateExpired`) so the next real capture shows if 6s is well-
+calibrated, too short, or rarely even needed now that the underlying
+estimator works better.
+
+**Problem 2, independently real and very possibly the bigger contributor
+to "sweeps forever": the focus-zone-bracket's true cost is much higher
+than documented, with zero UI feedback during it.** Real telemetry: hold
+completed at 14.3s, but the first main-burst `shotFired` didn't happen
+until 32.1s — an 18-SECOND gap. `focusZoneDebug`'s own `convergedMs`
+values (1980/1274/1382/4304ms, summing to ~8.9s across 4 zones) confirm
+why: the "250-700ms per zone" cost documented when this feature shipped
+only ever described the intended POLL bound inside `_retargetAndConverge`
+— it never accounted for the real camera API round-trip latency
+(`setFocusMode`/`setFocusPoint`/`setExposurePoint`, each individually
+allowed up to 3s via `_zoneFocusCallTimeout`), which this real data shows
+dominates the actual cost. Add 4 real shutter presses on top of that and
+the true per-capture cost of this feature is ~15-18s, not the "meaningfully
+lengthening capture time" the original ship note undersold it as. Worse:
+`_fireBurst()` sets `phase: capturing, burstProgress: 0` at entry and
+never updates either during the focus-zone-bracket loop (which runs BEFORE
+the main burst) — so for that whole 15-18s window the UI showed a frozen
+progress state with no confirmation text at all, reading exactly like a
+hang regardless of what the wavelength gate was doing.
+
+**Fixed**: `_captureFocusZoneShots()` now sets `confirmationText:
+'Capturing extra detail…'` before starting the zone loop — same "silent
+gap reads as a freeze" fix already proven once elsewhere in this file
+(2026-07-23, the burst-end decode/encode lag), applied to a new location.
+Deliberately did NOT touch `burstProgress` during this phase (would need
+to interact with the main burst's own progress calc afterward in a way
+that risks looking like it jumps backward) — the text banner alone is the
+low-risk fix for "looks stuck."
+
+**Honest, undecided real product question, not resolved this round**: is
+an 18-second real cost (on top of whatever time the hold itself takes)
+worth the focus-zone-bracket's real per-zone matchability gain that
+motivated building it? Not re-litigated here — the CTO explicitly
+authorized turning it on for its first real test, and it worked correctly.
+Worth an explicit product call once more real captures confirm whether the
+`minutiaeDebug` proxy-score gains from `source: focusZone` translate to
+real bozorth3 matchability gains (the actual thing this whole feature was
+built to chase), weighed against 15-18s of added real capture time.
+
 ## Wavelength estimator: quadratic detrend (real debug fix, not another parameter nudge); focus-zone bracket extended to left/right and turned ON (2026-08-17, round 7)
 CTO reviewed the `eacb0b2c` superprint (sent for review) and gave two direct
 instructions: build the focus-zone-bracket extension to left/right and turn

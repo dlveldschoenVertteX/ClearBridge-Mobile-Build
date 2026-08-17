@@ -1410,6 +1410,41 @@ class FrontCaptureController extends ChangeNotifier {
   // once that's been sustained, not on the first noisy frame.
   DateTime? _wavelengthOutOfRangeSince;
   static const int _wavelengthResetDebounceMs = 500;
+  // Bounded escape hatch for the wavelengthTooHigh GATE, added 2026-08-17
+  // round 4 (real CTO report: "I only have one shot to get correct
+  // distance or it sweeps forever"). Real cause, confirmed in code: unlike
+  // tooFar/tooClose (which the reset condition below already treats as a
+  // genuine "thumb left" and which have an obvious physical correction via
+  // the on-screen guide's own size), a hold blocked SOLELY by
+  // wavelengthTooHigh has no bounded fallback at all -- rawOnTarget just
+  // stays false indefinitely until the user happens to land within
+  // _liveWavelengthTooHighPx by feel, with only a text hint + the wave
+  // rings to go on. This was low-risk to ship before now because the
+  // estimator rarely had enough real samples to ever assert
+  // wavelengthTooHigh=true in the first place (the long-documented
+  // sampleCount:0 problem) -- now that the quadratic-detrend/stripCount=7
+  // fixes (same round) have made it genuinely reliable, this latent gap is
+  // newly reachable in practice, confirmed on a real capture the same
+  // round (69 throttled attempts, 11 real successes, ~14s before the hold
+  // finally completed). Tracks how long the hold has been blocked SOLELY
+  // by wavelengthTooHigh (every other gate already satisfied); once
+  // sustained past the bound, the capture is allowed to proceed anyway --
+  // same "give it a bounded chance, then don't trap the user" principle
+  // already proven for sweep's own live-wavelength gate (2026-08-13/14,
+  // 3s bound there). Deliberately more generous here (front's hold has no
+  // separate "waiting room" sub-phase telegraphing the wait the way
+  // sweep's calibration step does), and errs toward "let the real fix
+  // (quadratic detrend/stripCount) do its job" rather than the gate simply
+  // giving up too early.
+  DateTime? _wavelengthOnlyBlockedSince;
+  static const int _wavelengthOnlyBlockMaxMs = 6000;
+  // Sticky per-hold flag: true once the escape hatch above has ever let a
+  // frame through that the gate itself would still have blocked. Written
+  // to liveWavelengthDebug so the next real capture shows directly whether
+  // this ever fires, and how it correlates with the eventual
+  // afisWavelengthPx -- same visibility-before-more-tuning discipline as
+  // every other change in this thread.
+  bool _wavelengthGateExpiredThisHold = false;
   // "Move back slightly" fires when liveWavelengthStillPx exceeds this
   // threshold, even if the coverage/brightness proxy says "in range". Root
   // cause: brightness is an imperfect distance proxy -- the thumb can be in
@@ -1615,6 +1650,8 @@ class FrontCaptureController extends ChangeNotifier {
     _liveWavelengthStillPx = null;
     _wavelengthAxis = null;
     _wavelengthOutOfRangeSince = null;
+    _wavelengthOnlyBlockedSince = null;
+    _wavelengthGateExpiredThisHold = false;
     _burstRound = 1;
     _burst1Shots = null;
     _burst1Gyro = null;
@@ -2096,11 +2133,25 @@ class FrontCaptureController extends ChangeNotifier {
     // the time because the ask was scoped to sweep only. Now folded
     // straight into the existing on-target condition, same as tooClose --
     // no separate bounded-wait mechanism needed, since the hold's own
-    // continuous re-check loop already IS that wait, indefinitely, exactly
-    // like it already behaves for tooFar/tooClose today.
+    // continuous re-check loop already IS that wait -- but see
+    // _wavelengthOnlyBlockedSince's own docs above: that wait is bounded,
+    // not truly indefinite, unlike tooFar/tooClose (which stay unbounded
+    // deliberately, since they have an obvious physical correction).
     final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
+    final otherwiseOnTarget = _focusValue > 0.45 && !tooFar && !tooClose && steady;
+    if (otherwiseOnTarget && wavelengthTooHigh) {
+      _wavelengthOnlyBlockedSince ??= DateTime.now();
+    } else {
+      _wavelengthOnlyBlockedSince = null;
+    }
+    final wavelengthBlockExpired = _wavelengthOnlyBlockedSince != null &&
+        DateTime.now().difference(_wavelengthOnlyBlockedSince!).inMilliseconds >=
+            _wavelengthOnlyBlockMaxMs;
+    if (wavelengthTooHigh && wavelengthBlockExpired) {
+      _wavelengthGateExpiredThisHold = true;
+    }
     final rawOnTarget =
-        _focusValue > 0.45 && !tooFar && !tooClose && !wavelengthTooHigh && steady;
+        otherwiseOnTarget && (!wavelengthTooHigh || wavelengthBlockExpired);
 
     if (rawOnTarget) {
       // Re-acquire focus FRESH the first time this hold reaches on-target,
@@ -2797,6 +2848,19 @@ class FrontCaptureController extends ChangeNotifier {
     if (cam == null) return const [];
     final shots = <_RawShot>[];
     final focusZoneDebug = <String, dynamic>{};
+    // Real per-zone cost, confirmed on the first real device test
+    // (2026-08-17): summed convergedMs alone ran ~8.9s across 4 zones
+    // (1274-4304ms each -- real camera AF/AE-retarget round trips, not
+    // just the intended 250-700ms poll bound this comment originally
+    // estimated), plus 4 real shutter presses on top -- the whole bracket
+    // cost ~15-18s before the main burst's own first shot fired on that
+    // capture. Without a visible banner here, the UI showed no
+    // confirmationText and a frozen burstProgress the entire time, reading
+    // as a hang -- directly implicated in a real CTO report ("sweeps
+    // forever") on that exact capture. Same "silent gap reads as a freeze"
+    // fix already applied once elsewhere in this file (2026-07-23, the
+    // burst-end decode/encode lag) -- same discipline, new location.
+    _apply((s) => s.copyWith(confirmationText: 'Capturing extra detail…'), force: true);
     for (final zone in _focusZoneBracketZones) {
       final sw = Stopwatch()..start();
       final sharpness = await _retargetAndConverge(_focusPointForZone(zone));
@@ -3120,6 +3184,15 @@ class FrontCaptureController extends ChangeNotifier {
       // afisWavelengthPx against captures where this was false to confirm
       // 16.0 is still the right cutover once real post-fix data exists.
       'wavelengthGateThresholdPx': _liveWavelengthTooHighPx,
+      // True if the bounded escape hatch (see _wavelengthOnlyBlockedSince's
+      // own docs, 2026-08-17 round 4) ever let the hold proceed while
+      // wavelengthTooHigh was still true, rather than the gate clearing
+      // normally. Real signal for whether _wavelengthOnlyBlockMaxMs=6000
+      // is well-calibrated: if this is rarely true, the gate is mostly
+      // resolving on its own within the bound; if it's frequently true,
+      // either the bound is too short or the underlying estimator still
+      // needs work.
+      'wavelengthGateExpired': _wavelengthGateExpiredThisHold,
       // Diagnostic pair added 2026-08-14 -- see the field docs above
       // _inCoverageFrameCount for the real open question this answers:
       // real data shows sampleCount stays 0 on 71% of real captures, and a
@@ -3293,6 +3366,8 @@ class FrontCaptureController extends ChangeNotifier {
         _liveWavelengthStillPx = null;
         _wavelengthAxis = null;
         _wavelengthOutOfRangeSince = null;
+        _wavelengthOnlyBlockedSince = null;
+        _wavelengthGateExpiredThisHold = false;
         _apply(
           (s) => s.copyWith(
             phase: FrontCapturePhase.holding,
