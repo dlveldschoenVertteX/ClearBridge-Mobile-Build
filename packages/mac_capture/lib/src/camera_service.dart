@@ -39,10 +39,46 @@ class CameraService {
   /// ignores them). Codec (H.264 vs H.265/HEVC) and true constant-bitrate
   /// enforcement are NOT controllable through this plugin -- the platform
   /// picks the codec; [videoBitrate] is a target, not a hard guarantee.
+  // Real bug found 2026-08-17 (CTO real-device report, first-ever app
+  // launch: "Camera error: CameraException(CameraPermissionsRequestOngoing,
+  // Another request is ongoing and multiple requests cannot be handled at
+  // once.)"). This class already tracked `_pendingInitialization` as a
+  // field, but `initializeCamera()` never actually CHECKED it on entry --
+  // a second concurrent call (same instance) would just overwrite the
+  // field and start its own independent `CameraController(...).initialize()`
+  // call, racing the first one's own internal Android runtime permission
+  // request. That race can only ever matter on the very first launch
+  // (permission not yet granted -- once granted, initialize() never needs
+  // to prompt again), which is exactly what was reported. This lock makes
+  // a second concurrent call on the SAME CameraService instance await the
+  // first one's result instead of starting its own, closing that race
+  // regardless of which caller fires the second time.
+  Future<void>? _initializeCameraCall;
+
   Future<void> initializeCamera({
     CameraLensDirection lensDirection = CameraLensDirection.back,
     ResolutionPreset resolution = ResolutionPreset.max,
     CameraDescription? cameraDescription,
+    int? fps,
+    int? videoBitrate,
+  }) {
+    final existing = _initializeCameraCall;
+    if (existing != null) return existing;
+    final call = _initializeCameraUnguarded(
+      lensDirection: lensDirection,
+      resolution: resolution,
+      cameraDescription: cameraDescription,
+      fps: fps,
+      videoBitrate: videoBitrate,
+    );
+    _initializeCameraCall = call;
+    return call.whenComplete(() => _initializeCameraCall = null);
+  }
+
+  Future<void> _initializeCameraUnguarded({
+    required CameraLensDirection lensDirection,
+    required ResolutionPreset resolution,
+    required CameraDescription? cameraDescription,
     int? fps,
     int? videoBitrate,
   }) async {

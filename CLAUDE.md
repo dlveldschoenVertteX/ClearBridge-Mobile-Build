@@ -1,5 +1,73 @@
 # ClearBridge Mobile — persistent context
 
+## Three real bugs found from a real device-test round: wavelength-reset over-firing, focus-drift-onto-background, first-launch camera permission race (2026-08-17)
+CTO ran 2 real capture sessions plus hit a real error on the very first app
+open, reporting three things: focus locked onto the background and came out
+soft in session 1; the wavelength estimator still never locks no matter
+where the thumb is placed; and a `CameraException(CameraPermissionsRequestOngoing,
+...)` error on first launch, before either capture.
+
+**Wavelength estimator: real root cause found via the telemetry system
+built specifically for this.** Pulled the real `wavelengthAttempt` events
+for both sessions -- and the per-attempt fix from earlier today IS working
+(one real hold had 9 CONSECUTIVE successful attempts; 30/156 succeeded
+overall on the second capture) -- but the session's final `sampleCount`
+still landed at 0 both times. Root cause: the per-hold reset
+(`front_capture_controller.dart`, the "thumb genuinely left" trigger) fired
+on the very FIRST single frame where coverage blipped past tooFar/tooClose
+-- ordinary hand tremor during a multi-second hold does this routinely --
+wiping the accumulated sample count before it ever reached
+`_liveWavelengthMinSamples`, over and over, even though individual
+attempts were succeeding fine. **Fixed**: debounced the reset with a
+`_wavelengthOutOfRangeSince` timestamp -- only treated as a genuine "thumb
+left" once out-of-range has been sustained for 500ms, not a single noisy
+frame. `_refocusedThisHold`'s own reset is deliberately NOT debounced the
+same way (already real-device-tuned for AF-hunting risk, 2026-08-14 --
+not this fix's job to touch).
+
+**Focus locking onto the background: real, self-relative fix, not a fixed
+threshold.** Real Firestore data across 18 recent captures confirmed the
+reported capture's `refocusDebug.finalSharpness` (29.85) was the lowest of
+the set by a real margin, and its own `nfiq2Score` (52) was also the
+lowest -- but the same data also showed a genuinely GOOD capture
+(nfiq2=81) with a similarly low finalSharpness (35.5), ruling out a fixed
+absolute floor (this live, uncalibrated Laplacian signal varies too much
+with distance/lighting for one global number to be trustworthy across
+different captures). `_refocus()`'s convergence check only ever asked "has
+the reading stopped changing" -- a lens settled on the background behind
+the thumb converges (stops changing) just as confidently as one settled on
+the thumb itself. **Fixed, self-relative instead**: track the PEAK
+sharpness seen during the poll; if the value it converges to is well below
+that peak (< 60%), that's evidence the lens swept past a genuinely better
+focus point before drifting onto something worse, and it gets exactly ONE
+extra `_beginAutofocus()` retry (bounded -- can't loop indefinitely, the
+second attempt's result is always accepted regardless). New diagnostics
+(`maxSharpnessObserved`, `driftRetried`) on `refocusDebug` and the
+`refocusLocked` telemetry event so the next real capture shows whether
+this actually fires and helps.
+
+**First-launch camera permission crash: real re-entrancy bug in
+`CameraService`, fixed at the shared choke point.** `CameraService`
+already tracked a `_pendingInitialization` field but never actually
+checked it on entry to `initializeCamera()` -- a second concurrent call on
+the same instance would silently overwrite the field and start its own
+independent `CameraController(...).initialize()`, racing the first call's
+own Android runtime permission request (`CameraPermissionsRequestOngoing`
+is exactly what that race throws). Can only ever matter on the very first
+launch, before permission is granted -- once granted, `initialize()` never
+needs to prompt again, matching "only happened the first time I opened the
+app." Root-caused which SPECIFIC second call was responsible was not
+achievable from static code review alone (no device logs with a full stack
+trace available) -- fixed at the correct choke point regardless: a second
+concurrent `initializeCamera()` call on the same `CameraService` instance
+now awaits the first call's own in-flight result instead of starting an
+independent one, closing the race no matter which caller fires second.
+
+**Not yet re-tested on a real device** -- same standing discipline as
+every other capture-side change this project; all three fixes are
+diagnosed from real data (Firestore + the new telemetry system) but need
+the next real capture round to confirm.
+
 ## Crease trim recalibrated against direct CTO ground truth; circular scanner-style vignette added (2026-08-17, round 3)
 CTO sent back a real generated print (the one from the previous entry) with
 the residual crease band hand-marked yellow: "remove the yellow highlighted

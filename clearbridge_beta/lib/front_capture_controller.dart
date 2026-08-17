@@ -1226,6 +1226,33 @@ class FrontCaptureController extends ChangeNotifier {
   // same caveat _liveAbsSharpness's own field docs already state).
   static const double _refocusStableRatio = 0.12;
   static const int _refocusStableStreakRequired = 2;
+  // Real bug found 2026-08-17 (CTO real-device report: "the focus locks
+  // onto the background" -- confirmed via real Firestore data: the
+  // reported capture's refocusDebug.finalSharpness was 29.85, the lowest
+  // of 18 recent real front_only_v1 captures checked by a real margin, and
+  // its own real nfiq2Score, 52, was also the lowest of that set). The
+  // convergence check above only asks "has the reading stopped changing",
+  // never "is this a genuinely sharp reading at all" -- a lens that
+  // settles on the background behind the thumb converges (stops changing)
+  // just as confidently as one that settles on the thumb itself.
+  //
+  // Deliberately NOT a fixed absolute floor: real data across those same
+  // 18 captures also showed a genuinely fine capture (nfiq2 81) with a
+  // similarly low finalSharpness (35.5) to the bad one -- this live,
+  // uncalibrated Laplacian-based signal varies too much with distance/
+  // lighting for one global number to be trustworthy (the exact reason
+  // _refocusStableRatio above was never given an absolute counterpart
+  // either). Instead, self-relative: track the PEAK sharpness seen during
+  // the same poll, and treat convergence as suspect if the value it
+  // settled on is well below that peak -- evidence the lens swept past a
+  // genuinely better focus point (the thumb) before drifting onto
+  // something worse (the background), rather than just being a uniformly
+  // soft scene throughout. Triggers at most ONE extra _beginAutofocus()
+  // retry -- bounded, so this can never loop indefinitely or add more than
+  // one extra ~_refocusMaxMs to a hold; the second attempt's result is
+  // always accepted regardless, same "never block capture entirely"
+  // discipline as everywhere else in this controller.
+  static const double _refocusDriftAcceptRatio = 0.6;
   // Diagnostic snapshot of the most recent _refocus() call -- see field
   // docs above. Written to the capture doc alongside _flashEvDebug/
   // _wavelengthDebug so real convergence behaviour (or its absence) is
@@ -1311,6 +1338,19 @@ class FrontCaptureController extends ChangeNotifier {
   String? _wavelengthAxis;
   DateTime? _lastWavelengthEstimateAt;
   static const int _wavelengthEstimateIntervalMs = 250;
+  // Debounce timestamp for the wavelength-state reset below -- see the real
+  // bug found 2026-08-17 (CTO real-device report: "wavelength never locks
+  // no matter how far I place the thumb"). Real telemetry from that report
+  // showed individual attempts succeeding often (up to 9 in a row on one
+  // real capture), but the SESSION-level sampleCount still landed at 0 --
+  // the reset below was firing on a single transient tooFar/tooClose frame
+  // (real, ordinary hand tremor during a multi-second hold), wiping the
+  // accumulated count before it ever reached _liveWavelengthMinSamples.
+  // Null means "currently in range" (or not yet measured); non-null is the
+  // moment the thumb FIRST appeared out of range, so the reset only fires
+  // once that's been sustained, not on the first noisy frame.
+  DateTime? _wavelengthOutOfRangeSince;
+  static const int _wavelengthResetDebounceMs = 500;
   // "Move back slightly" fires when liveWavelengthStillPx exceeds this
   // threshold, even if the coverage/brightness proxy says "in range". Root
   // cause: brightness is an imperfect distance proxy -- the thumb can be in
@@ -1515,6 +1555,7 @@ class FrontCaptureController extends ChangeNotifier {
     _liveWavelengthPx = null;
     _liveWavelengthStillPx = null;
     _wavelengthAxis = null;
+    _wavelengthOutOfRangeSince = null;
     _burstRound = 1;
     _burst1Shots = null;
     _burst1Gyro = null;
@@ -2061,11 +2102,36 @@ class FrontCaptureController extends ChangeNotifier {
         // already uses -- so reliability genuinely reflects fresh
         // sampling on THIS attempt, not stale accumulation from an
         // earlier one.
-        _wavelengthSampleCount = 0;
-        _wavelengthOutlierStreak = 0;
-        _liveWavelengthPx = null;
-        _liveWavelengthStillPx = null;
-        _wavelengthAxis = null;
+        //
+        // REAL BUG #2, found 2026-08-17 (CTO real-device report: "the
+        // wavelength estimator... never locks no matter how far I place
+        // the thumb"). Real telemetry from that exact report
+        // (wavelengthAttempt events in captureTelemetry) showed individual
+        // attempts succeeding often -- one real hold had 9 CONSECUTIVE
+        // successes -- yet the session's final sampleCount still landed at
+        // 0. Root cause: this reset fired on the very first single noisy
+        // frame where coverage blipped past tooFar/tooClose, which ordinary
+        // hand tremor does routinely during a multi-second hold -- wiping
+        // the accumulated count before it ever reached
+        // _liveWavelengthMinSamples, over and over. Debounced: only treat
+        // this as a genuine "thumb left" once out-of-range has been
+        // sustained for _wavelengthResetDebounceMs, same "don't trust a
+        // single sample" principle already applied to the outlier-rejection
+        // guard just below. _refocusedThisHold above is deliberately NOT
+        // debounced the same way -- that reset was already real-device-
+        // tuned for AF-hunting risk (2026-08-14) and touching its timing
+        // isn't this fix's job.
+        _wavelengthOutOfRangeSince ??= DateTime.now();
+        if (DateTime.now().difference(_wavelengthOutOfRangeSince!).inMilliseconds >=
+            _wavelengthResetDebounceMs) {
+          _wavelengthSampleCount = 0;
+          _wavelengthOutlierStreak = 0;
+          _liveWavelengthPx = null;
+          _liveWavelengthStillPx = null;
+          _wavelengthAxis = null;
+        }
+      } else {
+        _wavelengthOutOfRangeSince = null;
       }
       _apply((s) => s.copyWith(onTarget: false, holdProgress: 0, isSteady: steady));
     }
@@ -2637,44 +2703,69 @@ class FrontCaptureController extends ChangeNotifier {
     _refocusing = true;
     final sw = Stopwatch()..start();
     double? lastSample;
+    var maxSample = 0.0;
     var stableStreak = 0;
     var converged = false;
     var pollIterations = 0;
     var sampleCount = 0;
     var maxIterGapMs = 0;
-    var lastIterMs = 0;
+    var driftRetried = false;
     try {
       await _beginAutofocus();
       final beginAutofocusMs = sw.elapsedMilliseconds;
-      final pollSw = Stopwatch()..start();
-      while (pollSw.elapsedMilliseconds < _refocusMaxMs) {
-        await Future<void>.delayed(
-            const Duration(milliseconds: _refocusPollIntervalMs));
-        if (_disposed) break;
-        pollIterations++;
-        final nowMs = pollSw.elapsedMilliseconds;
-        final gap = nowMs - lastIterMs;
-        if (gap > maxIterGapMs) maxIterGapMs = gap;
-        lastIterMs = nowMs;
-        final sample = _liveAbsSharpness;
-        if (sample != null && sample > 0) {
-          sampleCount++;
-          if (lastSample != null && lastSample! > 0) {
-            final change = (sample - lastSample!).abs() / lastSample!;
-            stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+      for (var attempt = 1; attempt <= 2; attempt++) {
+        lastSample = null;
+        stableStreak = 0;
+        converged = false;
+        var lastIterMs = 0;
+        final pollSw = Stopwatch()..start();
+        while (pollSw.elapsedMilliseconds < _refocusMaxMs) {
+          await Future<void>.delayed(
+              const Duration(milliseconds: _refocusPollIntervalMs));
+          if (_disposed) break;
+          pollIterations++;
+          final nowMs = pollSw.elapsedMilliseconds;
+          final gap = nowMs - lastIterMs;
+          if (gap > maxIterGapMs) maxIterGapMs = gap;
+          lastIterMs = nowMs;
+          final sample = _liveAbsSharpness;
+          if (sample != null && sample > 0) {
+            sampleCount++;
+            if (sample > maxSample) maxSample = sample;
+            if (lastSample != null && lastSample! > 0) {
+              final change = (sample - lastSample!).abs() / lastSample!;
+              stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+            }
+            lastSample = sample;
           }
-          lastSample = sample;
+          if (pollSw.elapsedMilliseconds >= _refocusMinMs &&
+              stableStreak >= _refocusStableStreakRequired) {
+            converged = true;
+            break;
+          }
         }
-        if (pollSw.elapsedMilliseconds >= _refocusMinMs &&
-            stableStreak >= _refocusStableStreakRequired) {
-          converged = true;
-          break;
+        // Drift check -- see _refocusDriftAcceptRatio's own docs above.
+        // Only retry once (attempt == 1) and only if there's a genuinely
+        // higher peak to distrust the final value against.
+        final driftedLow = converged &&
+            attempt == 1 &&
+            maxSample > 0 &&
+            lastSample != null &&
+            lastSample! < maxSample * _refocusDriftAcceptRatio &&
+            !_disposed;
+        if (driftedLow) {
+          driftRetried = true;
+          await _beginAutofocus();
+          continue;
         }
+        break;
       }
       await _lockFocusOnly();
       _logTelemetry('refocusLocked', extra: {
         'converged': converged,
         'finalSharpnessAtLock': lastSample,
+        'maxSharpnessObserved': maxSample,
+        'driftRetried': driftRetried,
         'waitedMs': sw.elapsedMilliseconds,
       });
       _refocusDebug = {
@@ -2685,6 +2776,8 @@ class FrontCaptureController extends ChangeNotifier {
         'maxIterGapMs': maxIterGapMs,
         'converged': converged,
         'finalSharpness': lastSample,
+        'maxSharpnessObserved': maxSample,
+        'driftRetried': driftRetried,
       };
     } catch (e) {
       debugPrint('[front] refocus failed (non-fatal): $e');
@@ -3008,6 +3101,7 @@ class FrontCaptureController extends ChangeNotifier {
         _liveWavelengthPx = null;
         _liveWavelengthStillPx = null;
         _wavelengthAxis = null;
+        _wavelengthOutOfRangeSince = null;
         _apply(
           (s) => s.copyWith(
             phase: FrontCapturePhase.holding,
