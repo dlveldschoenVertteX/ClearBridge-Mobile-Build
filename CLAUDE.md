@@ -1,5 +1,65 @@
 # ClearBridge Mobile — persistent context
 
+## Per-zone, per-architecture real matchability comparison: sweep's dedicated zone shots beat front's sub-crops on core/right, tied on left (2026-08-17)
+CTO sent a real print with green (strong, well-defined core/whorl) vs.
+yellow (distorted above/below) hand-annotated, and asked which capture
+architecture produces the best ridge quality per anatomical segment —
+explicitly correcting the approach up front: use real matchability
+(bozorth3), not NFIQ2, since NFIQ2 only estimates "looks print-like",
+not whether it's coherent with the real underlying finger.
+
+**Built a real, purely diagnostic comparison — no fusion, per this
+project's own hard-won lesson that combining zones destroys matchability
+(see the "zone reduction + field-domain fusion" and "matchability mosaic"
+entries).** Found 9 real users in Firestore with >=2 real captures that
+each carry real `sweepBurstDebug` zone data (22 captures, 17 genuine
+pairs total). For each capture: rendered FRONT-architecture zones (core/
+tip/base/left/right) as sub-crops of the capture's own single main-burst
+frame, using the exact same sub-guide formulas `main.py`'s minutiae-patch
+candidates already use; rendered SWEEP-architecture zones from each
+zone's own dedicated captured still + dedicated guide region (no
+sub-cropping — a real, separate shot per zone). Scored every genuine
+(same-user, cross-capture) pair, same-zone-same-architecture, via real
+`mindtct -m1` + `bozorth3` — never NFIQ2.
+
+**Real result (17 genuine pairs, `scratchpad/zone_arch_compare`):**
+
+| zone | front mean (n) | sweep mean (n) |
+|---|---|---|
+| core | 16.76 (17) | **23.53** (17) |
+| tip | 17.82 (17) | 21.00 (3 -- thin) |
+| base | 17.94 (17) | 20.50 (4 -- thin) |
+| left | 19.47 (17) | 19.82 (17) — tied |
+| right | 19.00 (17) | **25.53** (17) |
+
+Sweep's dedicated zone shots beat front's own sub-crops on core (+40%
+relative) and right (+34%), tied on left, and showed the same direction
+on tip/base but those two only had 2 of 9 users with real 5-zone data
+(n=3-4, not trustworthy on their own). Medians moved the same direction
+as means throughout, so this isn't an outlier-driven artifact.
+
+**Real, honest interpretation, not just "sweep wins": the likely mechanism
+is a fresh shot beats a crop, not sweep's multi-position protocol
+specifically.** Visually confirmed (sent to CTO) on one real pair: sweep's
+`right` zone is a genuinely different capture geometry (its own framing/
+angle), not just the same content cropped tighter, and shows visibly
+cleaner ridge continuity than front's simple rectangular sub-crop of the
+same fixed frame. This is the plausible real driver — a dedicated,
+independently-focused/exposed capture of a specific region beats a
+sub-crop of one general-purpose frame — which is a genuinely different,
+more actionable finding than "switch to sweep": it points at *per-zone
+re-focus/re-shoot within a single architecture* as the real lever, not
+sweep's discontinued multi-position capture flow specifically (matches
+the CTO's own scope decision to keep front_only_v1 as the sole active
+architecture).
+
+**Not acted on yet — diagnostic only**, per the explicit ask. Real next
+step this points at, not built: test whether front_only_v1's own already-
+built redundant-second-burst mechanism (currently feature-flagged off),
+or a new per-zone refocus pass within a single front_only_v1 capture,
+recovers some of this real gap without reintroducing the fusion/mosaic
+failure mode already closed out.
+
 ## Three real bugs found from a real device-test round: wavelength-reset over-firing, focus-drift-onto-background, first-launch camera permission race (2026-08-17)
 CTO ran 2 real capture sessions plus hit a real error on the very first app
 open, reporting three things: focus locked onto the background and came out
