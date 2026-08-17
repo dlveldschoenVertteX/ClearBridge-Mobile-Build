@@ -601,6 +601,7 @@ class HybridCaptureService {
         }
       }
       if (peakLags.isEmpty) continue;
+      debug?.stripsWithPeak += 1;
 
       double refinedLag;
       if (peakLags.length == 1) {
@@ -812,6 +813,25 @@ class RidgeWavelengthAttemptDebug {
   /// the single most useful number for deciding whether minStripStd itself
   /// is set too high for live-preview content.
   double maxStripStd = 0.0;
+
+  /// How many of the strips that cleared [stripsClearedStd] then ALSO found
+  /// a real autocorrelation local maximum (i.e. contributed to `lags` and
+  /// would count toward the >=2 needed for a non-null result). Added
+  /// 2026-08-17 round 2: real telemetry from the first working round of
+  /// this debug sink showed 5/5 strips clearing the contrast bar on every
+  /// single attempt across multiple real captures (indoor AND sunlight)
+  /// while `estimateRidgeWavelengthPx` still returned null every time --
+  /// proving the contrast bar (minStripStd) was never the real bottleneck,
+  /// but leaving genuinely ambiguous whether strips are finding ZERO
+  /// autocorrelation peaks (no periodic signal survives in the live-preview
+  /// domain at all -- a structural ISP/resolution limit no amount of
+  /// threshold tuning fixes) or finding exactly ONE (a borderline case
+  /// where minLagPx/maxLagRawPx tuning could plausibly help). This field
+  /// is the direct answer: equals `lags.length` at the point
+  /// [estimateRidgeWavelengthPx] returns, so `stripsWithPeak < 2` on the
+  /// next real capture pinpoints exactly which of those two cases is
+  /// actually happening, instead of guessing.
+  int stripsWithPeak = 0;
 
   /// 'rows' or 'cols' -- the axis picked before any strip was sampled.
   String? axis;

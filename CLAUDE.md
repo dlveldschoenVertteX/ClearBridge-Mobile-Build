@@ -1,5 +1,64 @@
 # ClearBridge Mobile — persistent context
 
+## Real sunlight device test: no repeat of the transillumination failure, crease-trim confirmed live, and a genuinely new wavelength-estimator lead (2026-08-17, round 5)
+CTO ran one real capture deliberately in sunlight to stress-test the already-
+deployed crease-trim/vignette work. Pulled the real capture (`181e8cd8`,
+single-capture session) directly rather than assume anything from "it was
+done in sunlight" alone.
+
+**Good news: no repeat of the earlier sunlight failure.** Real NFIQ2 **70**.
+Frames show ISO 50-53, shutter 1/821-1/1642 (genuinely bright scene, HAL
+compensating hard) but none of the near-zero-contrast red-transillumination
+signature from the earlier catastrophic sunlight capture (NFIQ2 6-8). Also
+the first real device confirmation the deployed crease-trim fired on a real
+capture: `superprintParams.afisCreaseTrimPx: 17190`.
+
+**Caveat stated plainly**: this capture predates the wavelength-reset-
+debounce / focus-drift-retry / permission-race fixes pushed+deployed earlier
+this same round — those need a fresh APK build+install before they can be
+judged from real data. `refocusDebug` on this capture looked healthy on its
+own terms (converged, no drift retry needed), but that doesn't confirm or
+refute the drift-retry logic specifically since it never had cause to fire.
+
+**Real, newly-precise finding on the wavelength estimator, from the
+telemetry system built specifically for this.** All 8 live attempts on this
+capture show **5/5 strips clearing the contrast bar** (`stripsCleared: 5`,
+`maxStripStd` 34-47 vs. the live `minStripStd=3.0` floor) yet every attempt
+still failed (`success: false`). Checked two older non-sunlight captures
+(`5363a49b`, `4ae6d13c`) and found the identical signature — so this is very
+likely the GENERAL bottleneck behind the long-standing sampleCount:0
+problem, not something sunlight-specific. Read `estimateRidgeWavelengthPx`'s
+own code to find exactly where: it needs >=2 strips to each find a real
+autocorrelation local maximum (`peakLags` non-empty) before it will return a
+result (`lags.length < 2 -> null`) — a strip can clear the CONTRAST bar and
+still contribute nothing if its autocorrelation never produces a clean local
+max within the search window. The existing diagnostics (`stripsAttempted`/
+`stripsClearedStd`/`maxStripStd`) couldn't distinguish "0 strips found any
+peak at all" (a structural live-preview-domain limit no threshold tuning
+would fix) from "exactly 1 strip found a peak, needed 2" (a genuinely
+threshold-adjacent case) — both looked identical from outside.
+
+**Fixed the visibility gap, not the number** — per this project's own
+standing discipline, did not guess at `minLagPx`/`maxLagRawPx` values
+without evidence to justify a specific new number (checked whether the true
+live-preview ridge period was suspiciously close to `minLagPx=2` via
+`_wavelengthScaleToStill`'s own scale math, but couldn't derive a confident
+raw-px estimate without a real device's actual live preview resolution to
+hand). New `RidgeWavelengthAttemptDebug.stripsWithPeak`
+(`frame_capture_service.dart`) — incremented exactly when a strip's
+autocorrelation search succeeds, so it equals `lags.length` at the point the
+function returns. Wired into the `wavelengthAttempt` telemetry event
+(`front_capture_controller.dart`) as `stripsWithPeak`. The next real capture
+will show, for the first time, whether strips are finding zero peaks (points
+at a live-preview resolution/ISP-denoising ceiling — no code fix available)
+or one (points at `minLagPx`/`maxLagRawPx` being the real lever) — turning
+the next round into a real, evidence-based fix instead of another guess.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project; this is a pure diagnostic addition with
+zero behavior change, so it's safe to ship regardless, but the actual
+answer it's built to reveal needs a real capture on the built APK.
+
 ## Per-zone focus-bracket capture built: the real lever the zone comparison pointed at, front_only_v1-only, feature-flagged off (2026-08-17, round 4)
 Direct follow-up to the per-zone matchability comparison below. CTO asked how
 the "per-zone refocus/re-shoot" lever I proposed as the actionable takeaway

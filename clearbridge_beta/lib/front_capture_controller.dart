@@ -1914,6 +1914,12 @@ class FrontCaptureController extends ChangeNotifier {
             'success': est != null,
             'stripsAttempted': wlDebug.stripsAttempted,
             'stripsCleared': wlDebug.stripsClearedStd,
+            // 2026-08-17 round 2: distinguishes "strips have no periodic
+            // signal at all" from "found peaks but fewer than the 2 needed"
+            // -- see RidgeWavelengthAttemptDebug.stripsWithPeak's own docs
+            // for why this was the missing piece after real telemetry
+            // showed stripsCleared==5 on every attempt while still failing.
+            'stripsWithPeak': wlDebug.stripsWithPeak,
             'maxStripStd': double.parse(wlDebug.maxStripStd.toStringAsFixed(2)),
             if (wlDebug.axis != null) 'wlAxis': wlDebug.axis!,
           });
