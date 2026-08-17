@@ -2053,6 +2053,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # outright (39eb41dd at 77, d1f3153a at 83), beating
                         # every sweep zone AND the cross-zone mosaic on both,
                         # with no tuning since the family was first added.
+                        # UPDATE 2026-08-17: "won" here is now purely
+                        # diagnostic -- see the promotion-disable comment at
+                        # this loop's own scoring block below. These wins are
+                        # exactly the real production risk that fix addresses.
                         # The three above only ever sample the HORIZONTAL
                         # axis (cx shifts, cy fixed), so the pad's tip and
                         # base were never given their own crop even though
@@ -2156,14 +2160,31 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                                        if not _pres.get('error') else 0.0)
                                 _pdebug['proxyScore'] = round(_ps, 2)
                                 logger.info('AFIS minutiae patch %s nfiq=%.1f', _pname, _ps)
-                                _pdebug['wonSelection'] = bool(_ps > afis_nfiq)
-                                if _ps > afis_nfiq:
-                                    afis_nfiq = _ps
-                                    best_afis_img = _pimg
-                                    afis_params = {**_pp, 'afisNfiq': round(_ps, 2),
-                                                   'afisSource': f'minutiae_{_pname}'}
+                                # Diagnostic-only, NOT promoted to best_afis_img/
+                                # afis_params -- fixed 2026-08-17. Every patch here
+                                # is a sub-crop of the real guide (0.55-0.70x radius,
+                                # deltaLeft/deltaRight also off-centre), never the
+                                # full pad. This block used to let a patch win the
+                                # FINAL production superprint outright whenever its
+                                # own real NFIQ2 beat the full-guide candidates'
+                                # (confirmed live in production: capture 01662ffb
+                                # shipped `afisSource: minutiae_deltaLeft`, a ~38%-
+                                # area off-centre crop, as the actual superprint).
+                                # NFIQ2 measures local block quality, not print
+                                # completeness -- a tight, evenly-focused sub-crop
+                                # can score BETTER than the full pad while covering
+                                # meaningfully less real ridge/minutiae area, which
+                                # is real production risk for an AFIS match against
+                                # a full-pad enrolled reference, not just a quality-
+                                # metric quirk. The original intent here (see this
+                                # block's own 2026-08-03 history) was to observe
+                                # whether a patch ever wins on real NFIQ2 -- keep
+                                # that measurement (minutiaeDebug), stop acting on
+                                # it as if a partial-pad crop were a valid
+                                # replacement for the full print.
+                                _pdebug['wouldWinSelection'] = bool(_ps > afis_nfiq)
                             else:
-                                _pdebug['wonSelection'] = False
+                                _pdebug['wouldWinSelection'] = False
                         except Exception as _pe:   # noqa: BLE001
                             logger.warning('minutiae patch %s scoring failed: %s', _pname, _pe)
                             _pdebug['error'] = str(_pe)

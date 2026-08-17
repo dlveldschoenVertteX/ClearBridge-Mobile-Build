@@ -52,7 +52,7 @@ export 'src/adaptive_flash_controller.dart' show AdaptiveFlashController;
 export 'src/device_orientation_service.dart'
     show DeviceOrientationService, RelativeOrientation;
 export 'src/frame_capture_service.dart'
-    show TaggedFrame, HybridCaptureService;
+    show TaggedFrame, HybridCaptureService, RidgeWavelengthAttemptDebug;
 export 'src/capture_axis_controller.dart'
     show CaptureAxisController, AxisEvaluationResult;
 export 'src/spatial_anchor_service.dart' show SpatialAnchorService, ScreenAnchor;

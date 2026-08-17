@@ -1,5 +1,88 @@
 # ClearBridge Mobile — persistent context
 
+## Real production bug found + fixed: minutiae patches could win as the FINAL superprint (partial-pad crops, not diagnostic-only as originally intended); live wavelength estimator retuned off real telemetry (2026-08-17)
+CTO reviewed the first real telemetry capture (`01662ffb`, nfiq2Score 86) and
+flagged two things: the live wavelength estimator/UX wave cue is "definitely
+not working," and asked to see the real superprint for that capture directly,
+saying "I'm not sure AFIS would allow a partial print" once told its
+`afisSource` was `minutiae_deltaLeft`.
+
+**Real production bug, confirmed and fixed.** Pulled `01662ffb`'s real
+`minutiaeDebug` — `deltaLeft` (a 0.62x-radius crop of the guide, ALSO shifted
+off-centre: `cx - 0.38*rx`, `cy + 0.25*ry`, so ~38% of the full pad's area,
+not concentric with it) had won outright and become the actual production
+`superprintPath`/`nfiq2Score`. Checked every one of the 8 minutiae-patch
+sub-guides in `main.py`: none of them is the full pad — they range 0.55x
+(coreTight) to 0.70x (core/left/right/tip/base) radius, with deltaLeft/
+deltaRight also off-centre. Re-derived both the real full-guide candidate and
+the real winning deltaLeft crop from `01662ffb`'s own raw burst
+(`afis_print.generate()`, same real code) and ran real `mindtct -m1` on both
+to sanity-check: full-guide native 100 minutiae, freqNorm 275, the deltaLeft
+crop 132 — minutiae COUNT alone doesn't settle this (this project's own prime
+directive already established mindtct/Gabor-synthesized minutiae counts are
+foolable, not a trustworthy stand-in for real bozorth3 matchability), but the
+structural finding stands regardless of count: a smaller, off-centre crop
+representing less of the physical pad was silently allowed to REPLACE the
+full print in production, contradicting this feature's own originally-stated
+intent (2026-08-03 history: "written to Firestore as `minutiaeDebug` for
+per-capture validation of whether any patch ever wins selection" — i.e. meant
+to be *observed*, not acted on). The 2026-08-12 comment in `main.py` even
+already documents this happening twice before (`minutiae_left` won two real
+captures, 77 and 83) without ever being flagged as a policy question until
+now. Root cause: NFIQ2 measures local block quality, not print completeness
+— a tight, evenly-focused sub-crop can score BETTER than the full pad while
+covering meaningfully less real ridge/minutiae area, the same NFIQ2-vs-real-
+matchability divergence this project's whole prime directive is about, just
+never previously checked for THIS candidate family specifically.
+
+**Fixed** (`main.py`): minutiae patches still compute and log their real
+NFIQ2 score (`minutiaeDebug`, field renamed `wonSelection` ->
+`wouldWinSelection` to make the new semantics explicit) but can no longer
+promote themselves to `best_afis_img`/`afis_params`/the real `superprintPath`
+— restores the original diagnostic-only intent. Real, deliberate cost: any
+capture that was relying on a minutiae patch to rescue a weak full-guide
+result (this session's own two prior real wins) will now score whatever the
+full-guide candidates alone produce instead — likely lower NFIQ2 on some
+captures, but a full-pad print instead of an undisclosed partial one, which
+is the trade the CTO's own question was actually asking for. **Committed,
+NOT deployed** — needs its own explicit deploy go-ahead like every other
+backend change.
+
+**Live wavelength estimator: real root cause narrowed from the new
+telemetry, not fully solved, retuned.** `01662ffb`'s telemetry showed 129
+in-coverage frames, 21 real throttled attempts, only 1 success
+(`sampleCount: 1`) — consistent with the long-standing historical
+`sampleCount:0` pattern (71% of captures, 2026-08-14). Traced two real,
+additive contributors: (1) refocus lock alone took 3.68s of the ~7.5s
+pre-burst window, so most of the 21 throttled attempts were spent on frames
+still actively AF-hunting (genuinely blurred) rather than the ~1.5s of
+actually-in-focus hold time — now gated on `!_refocusing` so attempts
+concentrate on the post-lock window instead; (2) the `minStripStd=6.0`
+per-strip contrast bar was validated (2026-08-14) against cached, full-
+quality STILL JPEGs, never against the live YUV preview stream this actually
+runs on, which is lower-resolution and plausibly more ISP-denoised — relaxed
+to `3.0` for the live call specifically (shared function's default
+unchanged, so nothing else that calls it is affected). Also lowered
+`_liveWavelengthMinSamples` 3 -> 2: even a fully-fixed per-attempt success
+rate still has to clear 3 independent samples inside a typically-short
+post-lock hold window (~6 possible throttled attempts at 250ms in 1.5s) —
+2 is still a real check (the existing outlier-rejection guard already
+protects against trusting a single bad sample), just a more realistic bar
+for how much post-lock time a hold actually provides.
+
+**New diagnostics added, not just a guess-and-hope fix.** `estimateRidgeWavelengthPx`
+gained an optional `RidgeWavelengthAttemptDebug` sink (`stripsAttempted`,
+`stripsClearedStd`, `maxStripStd`, `axis`) filled in on EVERY attempt,
+success or failure — closes the exact gap that made this untraceable before
+(every past failure looked identical from the outside). Logged to the new
+`captureTelemetry` stream as a `wavelengthAttempt` event per throttled
+attempt. The next real capture's telemetry will show, for the first time,
+the actual observed per-strip contrast distribution — confirming whether
+3.0 is enough, needs to go lower, or whether the real bottleneck is
+something else entirely (e.g. `axis` picking the wrong strip orientation
+near a whorl core). **Not yet device-tested** — same standing discipline as
+every other capture-side change this project.
+
 ## Real device retest confirms ANR fix; ClearCoin root-caused to identity churn, not a code bug; full-pipeline diagnostic telemetry added (2026-08-17)
 CTO ran two more real captures on the sequential-encode-fix build. Both
 completed cleanly (`a262d2b3` nfiq2=78, `e33d618e` nfiq2=82) — **first real

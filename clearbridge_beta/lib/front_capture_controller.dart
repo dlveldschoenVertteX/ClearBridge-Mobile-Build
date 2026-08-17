@@ -1345,7 +1345,18 @@ class FrontCaptureController extends ChangeNotifier {
   // Minimum wavelength EMA samples before the hint can fire, to guard
   // against a transient first-frame estimate triggering "Move back" on a
   // correctly-positioned thumb.
-  static const int _liveWavelengthMinSamples = 3;
+  //
+  // Lowered 3 -> 2, 2026-08-17. Real telemetry (capture 01662ffb) showed
+  // this is a big part of why the gate/wave-cue almost never activates even
+  // when estimates DO come through: refocus lock left only ~1.5s of hold
+  // before the burst fired, and at the 250ms sample throttle that's ~6
+  // possible attempts -- requiring 3 INDEPENDENT clean samples in that
+  // window (on top of the per-attempt success rate fix below) is a taller
+  // bar than a typical short hold can clear. The outlier-rejection guard
+  // (isOutlier check below) already protects against trusting a single bad
+  // sample, so 2 agreeing samples is still a real check, not a reversion to
+  // the pre-2026-08-06 single-sample instability bug.
+  static const int _liveWavelengthMinSamples = 2;
   // Lower anchor for distanceWaveCue's 0..1 ramp -- the midpoint of this
   // project's own established 9-14px NFIQ2 sweet spot (11.5), not a new
   // number. _liveWavelengthTooHighPx (16.0) is the upper anchor, so the
@@ -1774,16 +1785,50 @@ class FrontCaptureController extends ChangeNotifier {
     // _calibDurationMs) and gated on inCoverageRange, since the autocorrelation
     // pass is real work and there's no point running it on a background
     // frame. Wrapped in try/catch -- must never be able to break the hold.
+    //
+    // Also gated on !_refocusing, added 2026-08-17. Real telemetry (capture
+    // 01662ffb) showed 129 in-coverage frames but only 1 of 21 real attempts
+    // succeeded -- and refocus lock alone took 3.68s of that same window, so
+    // most of those 21 attempts were almost certainly spent on frames still
+    // actively hunting for focus (genuinely blurred, not just "in coverage
+    // range"). Concentrating the throttled attempts on the post-lock window
+    // instead spends them where they're actually likely to succeed.
     if (inCoverageRange) {
       _inCoverageFrameCount++;
       final now = DateTime.now();
-      if (_lastWavelengthEstimateAt == null ||
-          now.difference(_lastWavelengthEstimateAt!).inMilliseconds >=
-              _wavelengthEstimateIntervalMs) {
+      if (!_refocusing &&
+          (_lastWavelengthEstimateAt == null ||
+              now.difference(_lastWavelengthEstimateAt!).inMilliseconds >=
+                  _wavelengthEstimateIntervalMs)) {
         _lastWavelengthEstimateAt = now;
         try {
-          final est =
-              HybridCaptureService.estimateRidgeWavelengthPx(image, roi: roi);
+          final wlDebug = RidgeWavelengthAttemptDebug();
+          final est = HybridCaptureService.estimateRidgeWavelengthPx(
+            image,
+            roi: roi,
+            // Relaxed from the shared function's 6.0 default, 2026-08-17.
+            // Real evidence: the same real captures this project already
+            // validated the estimator's underlying math against (2026-08-14,
+            // 100% qualification at every simulated resolution down to
+            // 320px) used cached, well-lit, full-quality STILL JPEGs -- not
+            // the live YUV preview stream this actually runs against, which
+            // is lower quality and likely more aggressively denoised by the
+            // camera ISP to hold frame rate. A stricter bar tuned against
+            // still-quality content is a plausible real reason live attempts
+            // qualify so rarely. Deliberately a moderate, reasoned relaxation
+            // rather than a blind guess -- the new wlMaxStripStd/
+            // wlStripsCleared telemetry fields below will show on the next
+            // real capture whether 3.0 is enough or still too strict.
+            minStripStd: 3.0,
+            debug: wlDebug,
+          );
+          _logTelemetry('wavelengthAttempt', extra: {
+            'success': est != null,
+            'stripsAttempted': wlDebug.stripsAttempted,
+            'stripsCleared': wlDebug.stripsClearedStd,
+            'maxStripStd': double.parse(wlDebug.maxStripStd.toStringAsFixed(2)),
+            if (wlDebug.axis != null) 'wlAxis': wlDebug.axis!,
+          });
           if (est == null) {
             _wavelengthNullAttempts++;
           } else {

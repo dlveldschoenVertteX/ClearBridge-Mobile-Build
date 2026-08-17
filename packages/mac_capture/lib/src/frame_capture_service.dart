@@ -446,6 +446,7 @@ class HybridCaptureService {
     // ~12-14px ridge period.
     int maxLagRawPx = 40,
     int maxSignalSamples = 300,
+    RidgeWavelengthAttemptDebug? debug,
   }) {
     if (image.planes.isEmpty) return null;
     final plane = image.planes[0];
@@ -487,6 +488,7 @@ class HybridCaptureService {
     // that varies along X. Otherwise strips are vertical column-bands
     // averaged across to a signal that varies along Y.
     final ridgesVertical = sumAbsColGrad >= sumAbsRowGrad;
+    debug?.axis = ridgesVertical ? 'rows' : 'cols';
 
     final projectedLen = ridgesVertical ? roiW : roiH;
     // Bound the O(L^2) autocorrelation cost regardless of live-preview
@@ -536,7 +538,11 @@ class HybridCaptureService {
         variance += (v - mean) * (v - mean);
       }
       variance /= sig.length;
-      if (math.sqrt(variance) < minStripStd) continue;
+      final stripStd = math.sqrt(variance);
+      debug?.stripsAttempted += 1;
+      if (stripStd > (debug?.maxStripStd ?? 0.0)) debug?.maxStripStd = stripStd;
+      if (stripStd < minStripStd) continue;
+      debug?.stripsClearedStd += 1;
 
       // Mean-center then linear-detrend to suppress torch-gradient trends that
       // would otherwise produce spurious autocorrelation peaks at long lags.
@@ -782,6 +788,33 @@ class HybridCaptureService {
     if (c != null && !c.isCompleted) c.complete();
     _earlyExitCompleter = null;
   }
+}
+
+/// Optional diagnostic sink for [HybridCaptureService.estimateRidgeWavelengthPx],
+/// filled in unconditionally (success OR failure) when passed. Added
+/// 2026-08-17: real telemetry showed live attempts return null ~95% of the
+/// time with zero detail on why -- every failure looked identical from the
+/// outside (too little texture? wrong axis? ROI too small?), which is
+/// exactly why the long-standing sampleCount:0 problem was never root-
+/// caused from real device data before now. The caller logs this alongside
+/// each attempt so the NEXT real capture's telemetry shows the actual
+/// observed per-strip contrast distribution instead of just a bare null.
+class RidgeWavelengthAttemptDebug {
+  /// How many of the [stripCount] strips were actually sampled (can be
+  /// fewer than requested if a band clamps to zero height/width).
+  int stripsAttempted = 0;
+
+  /// How many strips cleared the [minStripStd] contrast bar (regardless of
+  /// whether a peak was then found in them).
+  int stripsClearedStd = 0;
+
+  /// Highest per-strip std observed, even if it didn't clear the bar --
+  /// the single most useful number for deciding whether minStripStd itself
+  /// is set too high for live-preview content.
+  double maxStripStd = 0.0;
+
+  /// 'rows' or 'cols' -- the axis picked before any strip was sampled.
+  String? axis;
 }
 
 /// Result of [HybridCaptureService.estimateRidgeWavelengthPx].
