@@ -1238,6 +1238,93 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 except Exception as exc:
                     logger.info('focus-zone stills: none/unusable (%s)', exc)
 
+            # Focus-zone splice candidate (2026-08-17): incorporates the
+            # per-zone focus-bracket stills into the actual DELIVERED print
+            # for the first time -- previously they only ever fed the
+            # diagnostic minutiae-patch scores below, never the real output
+            # (direct CTO ask: "how do we incorporate the focusZone data
+            # into the final superprint"). See afis_print._focus_zone_splice
+            # 's own docstring for the mechanism (hard replace + narrow
+            # feathered seam, per zone, NOT the cross-zone pixel-fusion
+            # already measured destructive elsewhere in this project -- no
+            # cross-position registration is needed here since the camera
+            # never moved, only the AF/AE target did).
+            #
+            # Genuinely new, UNVALIDATED against real bozorth3 -- same
+            # precautionary-margin discipline as pyfingHybridFreqNorm/
+            # nnsHybrid (both also gated on beating native by a real margin
+            # before their own real matchability numbers existed): requires
+            # beating native by _FOCUS_ZONE_SPLICE_MARGIN before it can win
+            # production selection, so real captures accumulate an honest
+            # signal without risking a partial-detail-favoring candidate
+            # quietly displacing a more matchable full-print one. Sub-guide
+            # regions duplicated here (not imported) from the SAME 0.35-
+            # offset/0.70-radius formulas the minutiae-patch block below
+            # already uses -- same "each side keeps its own copy" pattern
+            # already accepted elsewhere in this pipeline (documented drift
+            # risk, not new).
+            _FOCUS_ZONE_SPLICE_MARGIN = 5.0
+            if (is_front_only and _focus_zone_frames and _guide_region
+                    and time.monotonic() <= _variants_deadline):
+                try:
+                    _gr = _guide_region
+                    _fz_subguides = {
+                        'tip': {
+                            'cx': _gr['cx'], 'cy': _gr['cy'] - _gr['ry'] * 0.35,
+                            'rx': _gr['rx'], 'ry': _gr['ry'] * 0.70,
+                            'n': _gr.get('n', 2.5), 'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'base': {
+                            'cx': _gr['cx'], 'cy': _gr['cy'] + _gr['ry'] * 0.35,
+                            'rx': _gr['rx'], 'ry': _gr['ry'] * 0.70,
+                            'n': _gr.get('n', 2.5), 'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'left': {
+                            'cx': _gr['cx'] - _gr['rx'] * 0.35, 'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.70, 'ry': _gr['ry'],
+                            'n': _gr.get('n', 2.5), 'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                        'right': {
+                            'cx': _gr['cx'] + _gr['rx'] * 0.35, 'cy': _gr['cy'],
+                            'rx': _gr['rx'] * 0.70, 'ry': _gr['ry'],
+                            'n': _gr.get('n', 2.5), 'tipAngleDeg': _gr.get('tipAngleDeg', 0.0),
+                        },
+                    }
+                    _fz_arg = {
+                        _zone: {'frame': _arr, 'region': _fz_subguides[_zone]}
+                        for _zone, _arr in _focus_zone_frames.items()
+                        if _zone in _fz_subguides
+                    }
+                    if _fz_arg:
+                        _fz_result = _call_with_hard_deadline(
+                            afis_print.generate,
+                            frames, angles_for_sfm, _laps,
+                            ambient_frames=ambient_frames, flash_frames=flash_frames,
+                            guide_region=_guide_region,
+                            stack_cache=_stack_cache,
+                            timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                            enhance='focusZoneSplice',
+                            focus_zone_frames=_fz_arg,
+                        )
+                        if _fz_result is not None:
+                            _fz_img, _fz_p = _fz_result
+                            if _fz_img is not None:
+                                _fz_r = _score_ground_truth(_fz_img)
+                                _fz_s = (_fz_r.get('nfiq_score', 0.0)
+                                         if not _fz_r.get('error') else 0.0)
+                                logger.info(
+                                    'focusZoneSplice nfiq=%.1f (native=%.1f, needs >= %.1f)',
+                                    _fz_s, _native_nfiq or 0.0,
+                                    (_native_nfiq or 0.0) + _FOCUS_ZONE_SPLICE_MARGIN)
+                                if (_native_nfiq is not None
+                                        and _fz_s >= _native_nfiq + _FOCUS_ZONE_SPLICE_MARGIN
+                                        and _fz_s > afis_nfiq):
+                                    afis_nfiq = _fz_s
+                                    best_afis_img = _fz_img
+                                    afis_params = {**_fz_p, 'afisNfiq': round(_fz_s, 2)}
+                except Exception as exc:   # noqa: BLE001 -- never block the pipeline
+                    logger.warning('focusZoneSplice candidate failed (non-critical): %s', exc)
+
             # Own deadline for every candidate source below (secondary camera,
             # sweep zones, cross-zone mosaic, minutiae patches) -- 2026-08-08,
             # added alongside the _score_ground_truth swap above. Before that

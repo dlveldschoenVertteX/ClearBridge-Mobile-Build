@@ -1,5 +1,62 @@
 # ClearBridge Mobile — persistent context
 
+## Focus-zone data now actually incorporated into the delivered superprint — new focusZoneSplice candidate, diagnostic-first (2026-08-17, round 10)
+Direct follow-up to the CTO's question "how do we incorporate the
+focusZone data into the final superprint since it catches details that
+specifically are eroded in the final superprint." Answered first, then
+built what was described: NOT cross-zone pixel fusion (already measured
+destructive multiple times this project — matchability mosaic, field-
+domain fusion, `zone_reduction_test`: a single un-fused zone beat every
+fused configuration by 2x+ real bozorth3 separation every time) — a
+**hard region-replace with a narrow feathered seam**, justified by a real
+structural difference from what already failed: the focus-zone-bracket
+shots share the exact same framing as the main frame (only the AF/AE
+target moved, the camera never did), so there is no cross-position
+registration step and no interpolation-error risk, unlike sweep's own
+zones which needed real ECC alignment between genuinely different poses.
+
+**Built (`afis_print.py`)**: `_focus_zone_splice(g8, mask, focus_zones)` —
+for each zone with a dedicated still, rasterizes that zone's own sub-guide
+region (`_superellipse_mask`, same coordinate convention as
+`guide_region`), intersects with the pad's own mask, feathers the
+boundary via the same distance-transform technique the module already
+uses for the pad/background edge (`_FOCUS_ZONE_FEATHER_PX = 18.0`,
+narrower than `_FADE_INSET_PX=25` since this seam sits inside real pad
+content on both sides, not at a background boundary), and hard-replaces
+that sub-region's pixels — never an average/blend of the whole region.
+Runs BEFORE `_normalize`/`_orientation_field`/`_gabor_enhance`, so ridge
+orientation is computed once over the whole composite and stays locally
+coherent across each seam, instead of gluing together already-binarized
+crops (closer to the mosaic's own failure mode). New `enhance=
+'focusZoneSplice'` dispatch branch and `focus_zone_frames` parameter on
+`generate()`.
+
+**Wired in (`main.py`)** as a new standalone candidate block, run once
+after the main variant loop (same point `_focus_zone_frames` is already
+downloaded) — not part of the static `_afis_variants` tuple, since it
+needs the per-request downloaded zone stills + sub-guide regions that
+aren't available until after that tuple is built. Sub-guide formulas
+(0.35 offset / 0.70 radius) duplicated from the minutiae-patch block's
+own — same accepted "each side keeps its own copy" pattern already used
+elsewhere in this pipeline.
+
+**Real, deliberate guard, matching precedent**: genuinely new and
+UNVALIDATED against real bozorth3, so it requires beating `native` by
+`_FOCUS_ZONE_SPLICE_MARGIN = 5.0` NFIQ2 before it can win production
+selection — same precautionary-margin discipline already applied to
+`pyfingHybridFreqNorm`/`nnsHybrid` before either had its own real
+matchability numbers. Purely additive: can only ever replace
+`best_afis_img` with something that scored higher AND cleared the margin,
+never regress a capture that doesn't trigger it.
+
+**Not yet deployed, not yet device-tested.** The real next step once
+enough real captures with focus-zone data + this candidate exist: a
+proper bozorth3 (not NFIQ2 proxy) genuine-vs-impostor gate on
+`focusZoneSplice` specifically, the same standard every other candidate
+in this pipeline has ultimately been held to — that's what should decide
+whether the margin comes down, goes up, or this gets shelved like the
+cross-zone fusion techniques before it.
+
 ## Distance hint moved to a bold, pulsing top-of-screen banner; real device review of a ridge-continuity print, and its limits (2026-08-17, round 9)
 CTO real-device feedback: "the wavelength signal text needs to be displayed
 on top of the screen in bold and it needs to pulse, can't see it at the

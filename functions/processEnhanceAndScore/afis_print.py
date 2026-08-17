@@ -2393,6 +2393,94 @@ def _ridge_restore_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndar
     return composited
 
 
+# Narrower than the pad/background mask-edge fade (_FADE_INSET_PX=25) --
+# this seam sits INSIDE already-real pad content on both sides (the main
+# frame and the zone frame), not at a pad/background boundary, so a
+# narrower ramp is enough to avoid a visible seam without unnecessarily
+# discarding the zone frame's own better-focused detail near its own edges.
+_FOCUS_ZONE_FEATHER_PX = 18.0
+
+
+def _focus_zone_splice(g8: np.ndarray, mask: np.ndarray,
+                        focus_zones: Optional[dict]) -> np.ndarray:
+    """
+    2026-08-17: incorporates the per-zone focus-bracket stills (real per-
+    zone matchability comparison, CLAUDE.md -- sweep's own dedicated zone
+    shots beat front's sub-crops of one general frame on core/right) into
+    the actual delivered print, not just the diagnostic minutiae-patch
+    scores. Splices each zone's OWN dedicated-focus still into g8, hard-
+    replacing that zone's own sub-region with only a narrow feathered seam
+    -- deliberately NOT the cross-zone pixel-averaging/mosaic fusion this
+    project has already measured destructive multiple times (matchability
+    mosaic, field-domain fusion, zone_reduction_test -- a single un-fused
+    zone beat every fused configuration by 2x+ real bozorth3 separation in
+    every one of those tests).
+
+    Two real, structural differences from that already-failed technique are
+    the reason this is worth trying as a genuinely different mechanism, not
+    a repeat of the same mistake:
+      1. No cross-position registration is needed. Sweep's mosaic/fusion
+         failures traced to real ECC registration error between frames
+         captured at DIFFERENT camera positions/poses/exposures. The
+         focus-zone-bracket shots share the exact same framing as the main
+         frame -- only the AF/AE target moved, the camera never did -- so
+         `guide_region`'s own sub-guide coordinates already apply exactly,
+         with zero alignment step and zero interpolation-error risk.
+      2. This is a hard replace within a spatially bounded sub-region with
+         only a narrow feather at the seam, not a full-region average/
+         blend of two sources. Structurally closer to how this module
+         already feathers the pad mask's own edge (`_FADE_INSET_PX`) than
+         to a cross-zone pixel blend.
+
+    Still a real, UNPROVEN hypothesis, not a confirmed result -- wired in
+    as one more diagnostic-first `enhance` mode (see 'focusZoneSplice'
+    below), gated by the same real-bozorth3-before-production-selection
+    discipline as every other candidate in this pipeline.
+
+    `focus_zones` maps zone name -> {'frame': raw still array, 'region':
+    sub-guide region dict in the SAME guide_region-relative coordinate
+    convention `_superellipse_mask` already expects}. Returns g8 UNCHANGED
+    (never None) when there is nothing usable to splice -- this can only
+    ever add detail inside an already-real sub-region, never remove or
+    degrade the main frame's own content, since every pixel outside a
+    spliced zone is left untouched.
+    """
+    if not focus_zones:
+        return g8
+    h, w = g8.shape[:2]
+    composite = g8.astype(np.float32).copy()
+    any_spliced = False
+    for zone, entry in focus_zones.items():
+        zframe = entry.get('frame') if isinstance(entry, dict) else None
+        region = entry.get('region') if isinstance(entry, dict) else None
+        if zframe is None or region is None:
+            continue
+        if zframe.shape[:2] != g8.shape[:2]:
+            # Real safety net, not expected in practice -- the client's own
+            # decode pipeline uses the identical _stillDecodeTargetWidth +
+            # center-square crop for the zone shots as the main burst,
+            # specifically so these stay pixel-aligned. Skip rather than
+            # risk splicing a mis-scaled zone into the composite.
+            continue
+        zgray = zframe if zframe.ndim == 2 else cv2.cvtColor(zframe, cv2.COLOR_BGR2GRAY)
+        zg8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(zgray.astype(np.uint8))
+        zone_mask = _superellipse_mask((h, w), region)
+        if zone_mask is None:
+            continue
+        # Never splice outside the pad's own already-established mask.
+        zone_mask = cv2.bitwise_and(zone_mask, mask)
+        if (zone_mask > 0).sum() < 200:
+            continue
+        dist = cv2.distanceTransform((zone_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        alpha = np.clip(dist / _FOCUS_ZONE_FEATHER_PX, 0.0, 1.0).astype(np.float32)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
+        composite = composite * (1.0 - alpha) + zg8.astype(np.float32) * alpha
+        any_spliced = True
+    if not any_spliced:
+        return g8
+    return np.clip(composite, 0, 255).astype(np.uint8)
+
+
 def generate(
     frames: List[np.ndarray],
     angles_deg: List[float],
@@ -2420,6 +2508,7 @@ def generate(
     pad_mask_override: Optional[np.ndarray] = None,
     crease_trim: bool = True,
     circular_vignette: bool = True,
+    focus_zone_frames: Optional[dict] = None,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -2481,6 +2570,27 @@ def generate(
                      signal at their current first-guess thresholds; they need
                      the paired dataset to tune before they can win, so they
                      stay unwired for now. gaborPyfingField not yet measured.
+                       'focusZoneSplice'  -- splices each per-zone focus-
+                                             bracket still (see
+                                             focus_zone_frames below) into
+                                             its own sub-region of the main
+                                             frame, hard-replace + narrow
+                                             feathered seam, NOT the cross-
+                                             zone pixel-fusion already
+                                             measured destructive elsewhere
+                                             in this project -- see
+                                             _focus_zone_splice's own
+                                             docstring for why this is a
+                                             genuinely different mechanism.
+                                             Real, unproven hypothesis --
+                                             diagnostic-first like every
+                                             other fidelity scaffold above.
+    focus_zone_frames : optional {zone_name: {'frame': np.ndarray, 'region':
+                     dict}} -- only consumed by enhance='focusZoneSplice'.
+                     `region` must be in the same guide_region-relative
+                     coordinate convention _superellipse_mask expects (i.e.
+                     the same sub-guide dicts main.py's minutiae-patch loop
+                     already builds). Absent/empty is a no-op self-skip.
     freq_scale_min : per-call override of _FREQ_SCALE_MIN (module default
                      0.7 when None), same per-call-override pattern as
                      gabor_sigma_ratio/gabor_gamma -- deliberately NOT a
@@ -3113,6 +3223,21 @@ def generate(
             params['afisEnhance'] = 'ridgeRestoreHybrid'
         else:
             params['afisEnhance'] = 'ridgeRestoreHybrid_unavailable'
+    elif enhance == 'focusZoneSplice':
+        # See _focus_zone_splice's own docstring for the full mechanism and
+        # why it's structurally different from the already-refuted cross-
+        # zone fusion techniques. Splices happen BEFORE _normalize/
+        # _orientation_field/_gabor_enhance run, so ridge orientation is
+        # computed once over the WHOLE composite -- stays locally coherent
+        # across each seam, unlike stitching together already-binarized
+        # crops (closer to the matchability mosaic's own failure mode).
+        spliced = _focus_zone_splice(g8, mask, focus_zone_frames)
+        norm = _normalize(spliced)
+        orient = _orientation_field(norm)
+        enh = _gabor_enhance(norm, orient, wl)
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+        params['afisEnhance'] = ('focusZoneSplice' if focus_zone_frames
+                                  else 'focusZoneSplice_unavailable')
     elif enhance == 'fomfe':
         # Global 2D-Fourier orientation-field model instead of a denoise
         # pre-pass -- see _fomfe_orientation_field's own docstring. No
