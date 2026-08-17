@@ -1412,6 +1412,49 @@ class FrontCaptureController extends ChangeNotifier {
   double? _liveAbsSharpness;
   int _sharpnessSampleCount = 0;
 
+  // Full-pipeline diagnostic trajectory (2026-08-17, CTO ask: "add a
+  // diagnostic function for everything on capture pipeline so we can start
+  // debugging from a point of knowledge rather than guessing"). Directly
+  // targets a real, previously-invisible gap found from real device data:
+  // refocusDebug.finalSharpness (measured once, at the moment focus locks)
+  // doesn't line up with the eventual captured still frames' laplacianScore
+  // -- with nothing recorded in between, there was no way to tell whether
+  // sharpness degrades during the 1.5s hold window, during the 8-shot
+  // burst itself, or whether the two numbers just aren't directly
+  // comparable (different measurement pipelines -- live preview vs. full
+  // JPEG). A throttled continuous sample plus explicit checkpoints at each
+  // real transition (lock, hold-complete, each shot fired) answers that
+  // with real data instead of another guess.
+  //
+  // Written to `captureTelemetry/{captureId}` -- an existing Firestore
+  // collection/security-rule pair already in this project (used by the
+  // discontinued oscillating flow, never wired up for front_only_v1 before
+  // now) deliberately kept SEPARATE from the `captures` doc so a slow or
+  // failed telemetry write can never block or corrupt the real capture
+  // write. One batched write at the end of the capture, not one write per
+  // sample -- this is diagnostic data, not part of the scoring pipeline.
+  final List<Map<String, dynamic>> _telemetry = [];
+  DateTime? _telemetrySessionStart;
+  DateTime? _telemetryLastSampleAt;
+  static const int _telemetrySampleIntervalMs = 150;
+
+  void _logTelemetry(String event, {double? coverage, Map<String, dynamic>? extra}) {
+    final t0 = _telemetrySessionStart;
+    if (t0 == null) return;
+    _telemetry.add({
+      'tMs': DateTime.now().difference(t0).inMilliseconds,
+      'event': event,
+      'phase': _state.phase.name,
+      'focusValue': double.parse(_focusValue.toStringAsFixed(3)),
+      if (_liveAbsSharpness != null)
+        'liveAbsSharpness': double.parse(_liveAbsSharpness!.toStringAsFixed(2)),
+      if (coverage != null) 'coverage': double.parse(coverage.toStringAsFixed(3)),
+      'gyroDegPerSec': double.parse(_gyroMagnitudeDegPerSec.toStringAsFixed(2)),
+      'refocusing': _refocusing,
+      if (extra != null) ...extra,
+    });
+  }
+
   DateTime? _holdStart;
   DateTime? _lastEmitAt;
 
@@ -1464,6 +1507,9 @@ class FrontCaptureController extends ChangeNotifier {
     _burstRound = 1;
     _burst1Shots = null;
     _burst1Gyro = null;
+    _telemetry.clear();
+    _telemetrySessionStart = DateTime.now();
+    _telemetryLastSampleAt = null;
     _wasInCoverageRange = false;
     _gyroMagnitudeDegPerSec = 0.0;
     _zoomLevel = 1.0;
@@ -1667,6 +1713,18 @@ class FrontCaptureController extends ChangeNotifier {
     try {
       coverage = HybridCaptureService.meanLuma(image, roi: roi) / 255.0;
     } catch (_) {}
+    // Continuous telemetry sample, throttled -- see _logTelemetry's own
+    // docs above. Captured this early (before any of the gates/hints below
+    // can early-return) so the trajectory has no blind spots regardless of
+    // what phase/branch the rest of this frame takes.
+    final _now = DateTime.now();
+    if (_telemetrySessionStart != null &&
+        (_telemetryLastSampleAt == null ||
+            _now.difference(_telemetryLastSampleAt!).inMilliseconds >=
+                _telemetrySampleIntervalMs)) {
+      _telemetryLastSampleAt = _now;
+      _logTelemetry('sample', coverage: coverage);
+    }
     final tooFar = coverage != null && coverage < _coverageMin;
     final tooClose = coverage != null && coverage > _coverageMax;
     // Hoisted here (was previously computed further down, just before the
@@ -1897,6 +1955,13 @@ class FrontCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
       if (heldMs >= _holdDurationMs) {
         _holdStart = null;
+        // Real checkpoint: sharpness/coverage right as the hold completes,
+        // directly comparable against 'refocusLocked' above (same
+        // liveAbsSharpness signal, same units) to see whether anything
+        // degrades during the _holdDurationMs window between lock and
+        // shutter -- the real gap this whole diagnostic pass was built to
+        // close.
+        _logTelemetry('holdComplete', coverage: coverage, extra: {'heldMs': heldMs});
         // Sweep behind a disabled flag (see _sweepEnabled's own docs) --
         // routes back to the proven static burst path _fireBurst() by
         // default, which is _fireBurst's original pre-sweep behaviour when
@@ -2562,6 +2627,11 @@ class FrontCaptureController extends ChangeNotifier {
         }
       }
       await _lockFocusOnly();
+      _logTelemetry('refocusLocked', extra: {
+        'converged': converged,
+        'finalSharpnessAtLock': lastSample,
+        'waitedMs': sw.elapsedMilliseconds,
+      });
       _refocusDebug = {
         'waitedMs': sw.elapsedMilliseconds,
         'beginAutofocusMs': beginAutofocusMs,
@@ -2819,6 +2889,16 @@ class FrontCaptureController extends ChangeNotifier {
           wasFlashLastShot = wantFlash;
           try {
             final xfile = await cam.takePicture();
+            // Timing-only marker (2026-08-17 diagnostic pass) -- the image
+            // stream is already stopped by this point (_stopStream() above,
+            // required so takePicture() doesn't fight the stream for the
+            // sensor), so focusValue/liveAbsSharpness in this event are
+            // necessarily the FROZEN last live reading from before the
+            // stream stopped, not a fresh per-shot measurement -- there is
+            // no live signal available during the actual burst. Real value
+            // here is the wall-clock spacing between shots, directly
+            // comparable against each shot's own eventual laplacianScore.
+            _logTelemetry('shotFired', extra: {'shotIndex': i, 'flashOn': wantFlash});
             final jpeg = await xfile.readAsBytes();
             // Locked-shutter-speed investigation, Stage 1 (2026-08-02): the
             // `camera` plugin has no public API for manual SENSOR_EXPOSURE_
@@ -3912,6 +3992,28 @@ class FrontCaptureController extends ChangeNotifier {
           debugPrint('[front] processEnhanceAndScore trigger failed (non-blocking): $e');
         }
       }();
+
+      // Full-pipeline telemetry trajectory, fire-and-forget -- see
+      // _logTelemetry's own docs above for what this covers and why.
+      // Written to captureTelemetry (a doc ID different from `id` would be
+      // needed if this could ever collide, but capture IDs are UUIDs, so
+      // reusing `id` here just gives a 1:1 lookup from a capture to its
+      // trajectory). A write failure here can never affect the real
+      // capture -- already fully committed above by this point.
+      if (_telemetry.isNotEmpty) {
+        () async {
+          try {
+            await FirebaseFirestore.instance.collection('captureTelemetry').doc(id).set({
+              'captureId': id,
+              'userId': userId,
+              'createdAt': FieldValue.serverTimestamp(),
+              'samples': _telemetry,
+            });
+          } catch (e) {
+            debugPrint('[front] captureTelemetry write failed (non-blocking): $e');
+          }
+        }();
+      }
 
       _apply(
         (s) => s.copyWith(

@@ -1,5 +1,66 @@
 # ClearBridge Mobile — persistent context
 
+## Real device retest confirms ANR fix; ClearCoin root-caused to identity churn, not a code bug; full-pipeline diagnostic telemetry added (2026-08-17)
+CTO ran two more real captures on the sequential-encode-fix build. Both
+completed cleanly (`a262d2b3` nfiq2=78, `e33d618e` nfiq2=82) — **first real
+confirmation the ANR fix from the previous round is holding**, no repeat of
+the "isn't responding" dialog.
+
+**ClearCoin "+10 shows every time" — investigated with real data, root
+cause is NOT the code.** `clearcoin_screen.dart` already does exactly what
+was asked: reads a live, per-user Firestore `clearCoinBalance` field, shows
+"+10 earned" only while under 50, switches to showing just the total once
+at/above it. Confirmed this is genuinely live and correct: the CTO's real
+account balance read **20** after their 2 real captures this session
+(exactly 2x10). The real reason the cap has never visibly kicked in:
+queried all real captures project-wide and found **99 distinct userIds
+across only 238 total captures** (~2.4 captures per identity) — Firebase
+anonymous auth persists across app restarts but not across a reinstall,
+and every current test build is still signed with a freshly-regenerated
+debug keystore (the still-open release-keystore item), which forces an
+uninstall between builds and wipes that identity. The CTO has likely never
+gotten 5 real captures on one persistent identity before the next test
+build reset it. **Not a code change** — this should resolve itself once
+the permanent release keystore lands and updates happen in-place instead
+of via reinstall.
+
+**Full-pipeline diagnostic telemetry added**, per explicit CTO ask ("add a
+diagnostic function for everything on capture pipeline so we can start
+debugging and optimizing from a point of knowledge rather than guessing").
+Directly targets a real, previously-invisible gap found in this same
+review: `refocusDebug.finalSharpness` (measured once, at the moment focus
+locks) didn't line up with the eventual captured stills' `laplacianScore`
+on either of the two real captures reviewed (`e33d618e`: 176 at lock vs.
+~87 on the actual best still) — with nothing recorded in between, there
+was no way to tell whether sharpness genuinely degrades during the hold
+window, during the burst itself, or whether the two numbers just aren't
+directly comparable (different measurement pipelines -- live preview vs.
+full JPEG).
+
+Built as a throttled (150ms), non-blocking trajectory logger
+(`_logTelemetry`) sampling `focusValue`/`liveAbsSharpness`/`coverage`/gyro
+continuously through the whole session, plus explicit checkpoints at every
+real transition: `refocusLocked` (right after focus lock, matching
+`refocusDebug`'s own moment), `holdComplete` (right as the hold timer
+finishes, immediately before the image stream stops for the burst — the
+real checkpoint closing the gap above, directly comparable against
+`refocusLocked` since both are live-domain), and `shotFired` per burst
+shot (timing-only — the image stream is already stopped by then for
+`takePicture()`, so there is genuinely no live focus signal available
+during the actual burst; documented plainly rather than faking a per-shot
+reading). Written once, fire-and-forget, to `captureTelemetry/{captureId}`
+-- an existing Firestore collection/security-rule pair already in this
+project (built for the discontinued oscillating flow, never wired up for
+front_only_v1 before now) deliberately separate from the `captures` doc so
+a slow/failed telemetry write can never affect the real capture. No new
+Firestore rules needed — the existing `captureTelemetry` rule (`create` if
+`userId == auth.uid`) already covers this write exactly.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. CTO plans several more real test
+captures next; this telemetry is what turns those into real answers about
+focus-drift instead of another single-data-point guess.
+
 ## Redundant second-burst capture built: real hypothesis test, feature-flagged off, needs real device testing (2026-08-16)
 CTO asked to build and test the "capture a second redundant hold+burst,
 keep whichever scores better, never fuse" idea floated earlier in this
