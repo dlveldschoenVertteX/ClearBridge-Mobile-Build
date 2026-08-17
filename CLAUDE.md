@@ -1,5 +1,75 @@
 # ClearBridge Mobile — persistent context
 
+## Per-zone focus-bracket capture built: the real lever the zone comparison pointed at, front_only_v1-only, feature-flagged off (2026-08-17, round 4)
+Direct follow-up to the per-zone matchability comparison below. CTO asked how
+the "per-zone refocus/re-shoot" lever I proposed as the actionable takeaway
+would actually work for front_only_v1, then said "Yes build B, but keep A in
+memory, I would actually like a hybrid of the 2 options... let's start with
+B" — B being "focus-bracket the shot: fire one extra dedicated still per
+weak zone, retarget AF to that zone specifically, then let the BACKEND select
+per-region instead of trusting one center-focused frame for everything", vs.
+A ("just nudge the existing single AF point off-center toward the weak
+zones"). **What actually got built is honestly already the hybrid, not pure
+B** — worth stating plainly since I never answered the "what would a hybrid
+look like" question directly before building: this codebase has no manual
+lens-distance control exposed (`setFocusPoint`/`setFocusMode` only, confirmed
+via `camera_service.dart` — Camera2Interop manual `LENS_FOCUS_DISTANCE` was
+never built, per the standing `docs/LOCKED_SHUTTER_SPEED_SCOPE.md` finding
+that only manual EXPOSURE has ever been probed), so "bracket focus distance"
+is only achievable in practice by retargeting the AF POINT (mechanism A) and
+letting the platform's own AF algorithm re-converge at whatever distance that
+region needs — then treating each resulting frame as its own independently-
+selectable per-region candidate (philosophy B, never fused/averaged across
+positions, per this project's own hard-won zone-fusion-destroys-matchability
+finding). One mechanism, both ideas' benefits: A's buildability + B's
+backend-selection safety.
+
+**Client (`front_capture_controller.dart`)**: new `_focusZoneBracketEnabled`
+flag (`false`), `_focusZoneBracketZones = ['tip', 'base']` — chosen because
+those are exactly the two zones `main.py`'s minutiae-patch block already
+crops as sub-guides of the single center-focused main frame but has never
+had its own dedicated focus for (core/left/right already get reasonable
+coverage from the center focus point; tip/base sit at the guide's own
+vertical extremes, farthest from center). When on, `_fireBurst()` calls the
+new `_captureFocusZoneShots()` right before `_stopStream()` (round 1 only —
+can't double up with the also-off `_secondBurstEnabled`), which for each
+zone: retargets `setFocusPoint`/`setExposurePoint` to that zone's own
+position within `PadSilhouetteShape.defaultShape` (`_focusPointForZone`),
+polls the same self-relative peak/streak convergence signal `_refocus()`
+already uses (`_retargetAndConverge`, bounded 250-700ms), fires a real
+`takePicture()` tagged with a new `_RawShot.focusZone` field, then restores
+AF to the guide's own centre before the main alternating ambient/flash burst
+proceeds exactly as before. `_finishAndUpload()` splits these tagged shots
+out of the main burst BEFORE the existing ambient/flash decode loop (so they
+can never get miscounted into `front_burst_${type}_$idx` numbering), uploads
+each under its own `front_focuszone_$zone.jpg` path, and writes a separate
+`focusZoneShots`/`focusZoneDebug` Firestore field — same additive, own-field
+pattern `_secondBurstEnabled`'s `frames2` already established. Also checks
+`secondBurstShots` for the same tag (covers the combination where both flags
+are on, even though neither is by default).
+
+**Backend (`main.py`)**: new `_download_front_only_focus_zone_frames()`
+(self-skips to `{}` when `focusZoneShots` is absent, i.e. every capture
+today), downloaded once per request alongside the existing burst2 download.
+The minutiae-patch loop's `tip`/`base` candidates now check
+`_focus_zone_frames.get(_pname)` first: if a dedicated zone still exists,
+that sub-guide crops from the ZONE-FOCUSED frame instead of the single
+center-focused main frame every other patch still uses (guide coordinates
+stay valid unchanged — the camera never moved/zoomed, only the AF target
+did). Purely additive to an already-diagnostic-only block (minutiae patches
+were fixed 2026-08-17 earlier this session to never win the real superprint
+outright — see below) — this can only change what the tip/base diagnostic
+candidates' OWN score is, never let a partial-pad patch back into
+production selection.
+
+**Not yet device-tested, both flags stay off** — same standing discipline
+as every other capture-side change this project. The real next check once a
+device test lands: does `focusZoneDebug`'s `convergedMs`/`sharpness` per
+zone show the AF point actually re-converging distinctly for tip vs. base
+(not just re-locking on the same spot), and does `minutiaeDebug.tip/base`'s
+`proxyScore` improve with `source: 'focusZone'` vs. the historical
+center-focused-crop baseline on the same real captures.
+
 ## Per-zone, per-architecture real matchability comparison: sweep's dedicated zone shots beat front's sub-crops on core/right, tied on left (2026-08-17)
 CTO sent a real print with green (strong, well-defined core/whorl) vs.
 yellow (distorted above/below) hand-annotated, and asked which capture

@@ -334,6 +334,11 @@ class _RawShot {
   // in _stack_face_on/_focus_stack_face_on) currently have no per-frame
   // motion signal at all -- they only ever see the pixels themselves.
   final double? gyroMagnitudeDegPerSec;
+  // Non-null only for the dedicated per-zone-refocused shots added
+  // 2026-08-17 (see _captureFocusZoneShots) -- 'tip' or 'base'. Null for
+  // every shot in the main center-focused burst, so existing consumers of
+  // rawShots that don't check this field are completely unaffected.
+  final String? focusZone;
   const _RawShot({
     required this.jpeg,
     required this.flashOn,
@@ -341,6 +346,7 @@ class _RawShot {
     required this.timestamp,
     this.exif = const JpegExposureExif(),
     this.gyroMagnitudeDegPerSec,
+    this.focusZone,
   });
 }
 
@@ -699,6 +705,44 @@ class FrontCaptureController extends ChangeNotifier {
   // can't be validated against cached data; it needs real device testing
   // before it proves anything.
   static const bool _secondBurstEnabled = false;
+
+  // Per-zone refocus bracket (2026-08-17, CTO-directed): real per-zone
+  // matchability data (scratchpad/zone_arch_compare) showed front_only_v1's
+  // own tip/base minutiae patches -- both simple sub-crops of the ONE
+  // center-focused main-burst frame -- lag sweep's dedicated, independently-
+  // focused per-zone shots on real bozorth3 matching, while front's own
+  // 'left' zone (which the same data shows scoring fine as a plain sub-crop)
+  // did not. The likely mechanism isn't sweep's multi-position protocol
+  // itself -- it's that a dedicated, freshly-focused shot of a region beats
+  // a crop of one general frame, most where the guide's own vertical extent
+  // means AF's single center lock is furthest from correct (tip/base, not
+  // left/right, which sit at the same vertical distance as centre).
+  //
+  // This retargets AF to the guide's own tip/base sub-guide centres (same
+  // 0.35*ry offset main.py's minutiae patches already use) and grabs one
+  // extra verified-converged ambient still at each, entirely BEFORE
+  // _stopStream() runs and the main center-focused burst fires -- so it
+  // can only ever ADD two extra shots to a hold, never change the existing
+  // main burst's own already-proven behaviour. Framing never moves (no
+  // guide reposition, no user movement), so these stay naturally registered
+  // with the main burst -- none of sweep's real cross-position registration/
+  // seam risk applies here, since nothing gets fused; the backend uses each
+  // shot as an independent, better-focused SOURCE for its own already-
+  // diagnostic-only minutiae patch, same "can only add a candidate" pattern
+  // as everywhere else in this pipeline.
+  //
+  // OFF by default -- genuinely new capture-flow timing this project's own
+  // discipline says needs real device validation before it proves anything,
+  // same as _secondBurstEnabled/_sweepEnabled above.
+  static const bool _focusZoneBracketEnabled = false;
+  static const List<String> _focusZoneBracketZones = ['tip', 'base'];
+  // Bounded verify-convergence wait per extra zone shot -- shorter than
+  // _refocus()'s own _refocusMinMs/_refocusMaxMs (600-1200ms): the lens is
+  // already converged at the CENTRE point from the hold's own _refocus()
+  // moments earlier, so retargeting to a nearby point on the same real
+  // subject is a much smaller adjustment than the initial cold acquire.
+  static const int _focusZoneMinMs = 250;
+  static const int _focusZoneMaxMs = 700;
 
   static const int _holdDurationMs = 1500;
   static const int _calibDurationMs = 500;
@@ -1258,6 +1302,9 @@ class FrontCaptureController extends ChangeNotifier {
   // _wavelengthDebug so real convergence behaviour (or its absence) is
   // visible on every capture going forward, not just this investigation.
   Map<String, dynamic> _refocusDebug = {};
+  // Per-zone diagnostic from _captureFocusZoneShots (see
+  // _focusZoneBracketEnabled's own docs) -- {zone: {convergedMs, sharpness}}.
+  Map<String, dynamic> _focusZoneDebug = {};
   // Tracks whether the thumb was in coverage range on the previous frame so
   // we can detect the entry transition and immediately point AF at the thumb.
   bool _wasInCoverageRange = false;
@@ -2641,6 +2688,101 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
   }
 
+  /// Screen-space AF target for a zone-bracket shot -- same 0.35*ry offset
+  /// from the guide's own centre that main.py's tip/base minutiae sub-guides
+  /// already use, so the physical region this shot focuses on matches the
+  /// region the backend will actually crop it to.
+  Offset _focusPointForZone(String zone) {
+    final shape = PadSilhouetteShape.defaultShape;
+    switch (zone) {
+      case 'tip':
+        return Offset(shape.cx, shape.cy - shape.ry * 0.35);
+      case 'base':
+        return Offset(shape.cx, shape.cy + shape.ry * 0.35);
+      default:
+        return _focusPointScreenSpace;
+    }
+  }
+
+  /// Retargets AF/AE to [pt], waits (bounded, [minMs]..[maxMs]) for the live
+  /// [_liveAbsSharpness] signal to genuinely stabilise (same relative-
+  /// stability check `_refocus()` itself uses), then locks. Returns the
+  /// final sharpness sample for the caller's own diagnostics. Requires the
+  /// image stream to still be running (reads `_liveAbsSharpness`, which
+  /// `_onFrame` only updates while streaming) -- callers MUST run this
+  /// before `_stopStream()`.
+  Future<double?> _retargetAndConverge(Offset pt,
+      {int minMs = _focusZoneMinMs, int maxMs = _focusZoneMaxMs}) async {
+    final cam = _camera;
+    if (cam == null) return null;
+    try {
+      await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
+      await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
+      await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
+    } catch (_) {}
+    double? lastSample = _liveAbsSharpness;
+    var stableStreak = 0;
+    final pollSw = Stopwatch()..start();
+    while (pollSw.elapsedMilliseconds < maxMs) {
+      await Future<void>.delayed(const Duration(milliseconds: _refocusPollIntervalMs));
+      if (_disposed) break;
+      final sample = _liveAbsSharpness;
+      if (sample != null && sample > 0) {
+        if (lastSample != null && lastSample! > 0) {
+          final change = (sample - lastSample!).abs() / lastSample!;
+          stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+        }
+        lastSample = sample;
+      }
+      if (pollSw.elapsedMilliseconds >= minMs &&
+          stableStreak >= _refocusStableStreakRequired) {
+        break;
+      }
+    }
+    try {
+      await cam.setFocusMode(FocusMode.locked).timeout(_zoneFocusCallTimeout);
+    } catch (_) {}
+    return lastSample;
+  }
+
+  /// Per-zone refocus bracket (see `_focusZoneBracketEnabled`'s own docs
+  /// above): grabs one dedicated, independently-focused ambient still per
+  /// zone in `_focusZoneBracketZones`, then restores focus to the guide's
+  /// own centre so the caller can continue straight into the existing
+  /// centre-focused burst flow unaffected. MUST run before `_stopStream()`.
+  Future<List<_RawShot>> _captureFocusZoneShots() async {
+    final cam = _camera;
+    if (cam == null) return const [];
+    final shots = <_RawShot>[];
+    final focusZoneDebug = <String, dynamic>{};
+    for (final zone in _focusZoneBracketZones) {
+      final sw = Stopwatch()..start();
+      final sharpness = await _retargetAndConverge(_focusPointForZone(zone));
+      focusZoneDebug[zone] = {'convergedMs': sw.elapsedMilliseconds, 'sharpness': sharpness};
+      try {
+        final xfile = await cam.takePicture();
+        final jpeg = await xfile.readAsBytes();
+        final exif = parseJpegExposureExif(jpeg);
+        shots.add(_RawShot(
+          jpeg: jpeg,
+          flashOn: false,
+          laplacianScore: sharpness,
+          timestamp: DateTime.now(),
+          exif: exif,
+          gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+          focusZone: zone,
+        ));
+      } catch (e) {
+        debugPrint('[front] focus-zone shot ($zone) failed (non-fatal): $e');
+      }
+    }
+    _focusZoneDebug = focusZoneDebug;
+    // Restore focus to the guide's own centre -- the caller's existing
+    // centre-focused burst flow assumes this is where the lens already is.
+    await _retargetAndConverge(_focusPointScreenSpace);
+    return shots;
+  }
+
   /// Re-acquire then re-lock focus at the pad's actual current distance,
   /// instead of trusting whatever the lens converged to before the thumb was
   /// in frame. Waits at least `_refocusMinMs` (the original proven floor)
@@ -2975,6 +3117,13 @@ class FrontCaptureController extends ChangeNotifier {
       if (preCollectedShots != null) {
         rawShots.addAll(preCollectedShots);
       } else {
+        // Per-zone refocus bracket -- MUST run before _stopStream() (needs
+        // the live _liveAbsSharpness signal to verify convergence). Round-1
+        // only, so this can never double up with the also-flagged-off
+        // redundant-second-burst feature if both are ever enabled together.
+        if (_focusZoneBracketEnabled && _burstRound == 1) {
+          rawShots.addAll(await _captureFocusZoneShots());
+        }
         await _stopStream();
 
         // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
@@ -3935,7 +4084,16 @@ class FrontCaptureController extends ChangeNotifier {
             JpegExposureExif exif,
             double? gyro,
           })>[];
-      for (final r in rawShots) {
+      // Per-zone focus-bracket stills (_focusZoneBracketEnabled) are tagged
+      // via _RawShot.focusZone and must never be folded into the main
+      // burst's ambient/flash numbering below -- pulled out up front so the
+      // main decode loop only ever sees genuine main-burst shots, same as
+      // before this feature existed.
+      final focusZoneRawShots =
+          rawShots.where((r) => r.focusZone != null).toList(growable: false);
+      final mainRawShots =
+          rawShots.where((r) => r.focusZone == null).toList(growable: false);
+      for (final r in mainRawShots) {
         var bytes = r.jpeg;
         // Falls back to the stale stream-frozen r.laplacianScore only if
         // decode fails -- never worse than before this fix, since that was
@@ -4005,6 +4163,61 @@ class FrontCaptureController extends ChangeNotifier {
         });
       }
 
+      // Per-zone focus-bracket stills (_focusZoneBracketEnabled): each is a
+      // single dedicated-refocus still for one anatomical zone (tip/base),
+      // decoded/encoded the same way as the main burst above but uploaded
+      // under its own distinct path and written to a SEPARATE
+      // `focusZoneShots` Firestore field -- never folded into the main
+      // `frames`/`framesMeta` numbering, same "additive, own field" pattern
+      // as `_secondBurstEnabled`'s frames2 below. Also checks
+      // secondBurstShots for the same tag, since a focus-zone bracket run
+      // in round 1 alongside _secondBurstEnabled would have its tagged
+      // shots stashed into that list rather than passed here directly (see
+      // _fireBurst's _burst1Shots handling) -- covers that combination
+      // even though neither flag is enabled by default today.
+      final focusZoneMeta = <Map<String, dynamic>>[];
+      Future<void> _collectFocusZoneShots(List<_RawShot> shots) async {
+        for (final r in shots) {
+          final zone = r.focusZone;
+          if (zone == null) continue;
+          var bytes = r.jpeg;
+          var lap = r.laplacianScore;
+          try {
+            final decoded = await decodeStillJpegToLuma(
+              r.jpeg, _sensorOrientation,
+              targetWidth: _stillDecodeTargetWidth,
+            );
+            if (decoded != null) {
+              final result = await compute(
+                _encodeBurstWithSharpnessIsolate,
+                _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height,
+                    sharpnessRoi: sharpnessRoi),
+              );
+              bytes = result.jpeg;
+              lap = result.sharpness;
+            }
+          } catch (_) {}
+          if (bytes.isEmpty) continue;
+          final path = '$basePath/front_focuszone_$zone.jpg';
+          uploadTasks.add((bytes, path));
+          focusZoneMeta.add({
+            'zone': zone,
+            'path': path,
+            if (lap != null) 'laplacianScore': double.parse(lap.toStringAsFixed(1)),
+            'timestamp': r.timestamp.toIso8601String(),
+          });
+        }
+      }
+
+      if (focusZoneRawShots.isNotEmpty) {
+        await _collectFocusZoneShots(focusZoneRawShots);
+      }
+      if (secondBurstShots != null) {
+        await _collectFocusZoneShots(
+          secondBurstShots.where((r) => r.focusZone != null).toList(growable: false),
+        );
+      }
+
       // Redundant second burst (_secondBurstEnabled), decoded/encoded the
       // same way as the primary burst above -- separately uploaded under
       // front_burst2_* paths and written to a SEPARATE `frames2` Firestore
@@ -4016,7 +4229,7 @@ class FrontCaptureController extends ChangeNotifier {
       final framesMeta2 = <Map<String, dynamic>>[];
       if (secondBurstShots != null) {
         final decodedShots2 = <({Uint8List bytes, bool flashOn, double? lap, DateTime ts})>[];
-        for (final r in secondBurstShots) {
+        for (final r in secondBurstShots.where((r) => r.focusZone == null)) {
           var bytes = r.jpeg;
           var lap = r.laplacianScore;
           try {
@@ -4093,6 +4306,8 @@ class FrontCaptureController extends ChangeNotifier {
         'gyroMagnitudeDegPerSec': double.parse(gyroAtCapture.toStringAsFixed(2)),
         'frames': framesMeta,
         if (framesMeta2.isNotEmpty) 'frames2': framesMeta2,
+        if (focusZoneMeta.isNotEmpty) 'focusZoneShots': focusZoneMeta,
+        if (focusZoneMeta.isNotEmpty) 'focusZoneDebug': _focusZoneDebug,
         if (rawSensorSupport != null) 'rawSensorSupport': rawSensorSupport,
         if (noiseReductionOffSupport != null)
           'noiseReductionOffSupport': noiseReductionOffSupport,

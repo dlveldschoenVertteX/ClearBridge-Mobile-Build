@@ -1221,6 +1221,23 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             afis_params = {**_b2_p, 'afisNfiq': round(_b2_s, 2),
                                            'afisSecondBurstVariant': _b2_name}
 
+            # Per-zone focus-bracket stills (2026-08-17, client-side feature-
+            # flagged off by default -- see FrontCaptureController's
+            # _focusZoneBracketEnabled). Downloaded once here (self-skips to
+            # {} when the client didn't capture any, i.e. every capture
+            # today) and consumed below by the minutiae-patch block's own
+            # 'tip'/'base' candidates in place of a sub-crop of the single
+            # center-focused main frame.
+            _focus_zone_frames = {}
+            if is_front_only:
+                try:
+                    _focus_zone_frames = _download_front_only_focus_zone_frames(capture_id)
+                    if _focus_zone_frames:
+                        logger.info('focus-zone stills available: %s',
+                                    sorted(_focus_zone_frames.keys()))
+                except Exception as exc:
+                    logger.info('focus-zone stills: none/unusable (%s)', exc)
+
             # Own deadline for every candidate source below (secondary camera,
             # sweep zones, cross-zone mosaic, minutiae patches) -- 2026-08-08,
             # added alongside the _score_ground_truth swap above. Before that
@@ -2145,19 +2162,49 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             'guide': {k: round(v, 4) for k, v in _pguide.items()
                                       if isinstance(v, (int, float))}
                         }
+                        # 2026-08-17: if the client captured a dedicated
+                        # focus-bracket still for THIS zone (AF point
+                        # retargeted to tip/base and locked before that
+                        # shutter, instead of the guide's own centre --
+                        # see _download_front_only_focus_zone_frames), crop
+                        # this same sub-guide out of THAT frame instead of
+                        # the single center-focused main frame every other
+                        # patch uses. Directly motivated by the real
+                        # per-zone matchability comparison (CLAUDE.md,
+                        # 2026-08-17): sweep's own dedicated zone shots beat
+                        # front's sub-crops of one general frame on
+                        # core/right, and this is the same lever applied to
+                        # front_only_v1 itself rather than reviving sweep.
+                        # Purely additive to this already-diagnostic-only
+                        # block (see the 'wouldWinSelection'-not-promoted
+                        # fix above) -- can only ever change what this
+                        # candidate's OWN score is, never let it win the
+                        # real superprint.
+                        _zone_arr = _focus_zone_frames.get(_pname)
                         try:
-                            _pimg, _pp = afis_print.generate(
-                                frames, angles_for_sfm, _laps,
-                                ambient_frames=ambient_frames,
-                                flash_frames=flash_frames,
-                                ambient_burst=ambient_burst,
-                                flash_burst=flash_burst,
-                                ambient_burst_gyros=ambient_burst_gyros,
-                                flash_burst_gyros=flash_burst_gyros,
-                                guide_region=_pguide,
-                                freq_normalize=True,
-                                stack_cache=_stack_cache,
-                            )
+                            if _zone_arr is not None:
+                                _pdebug['source'] = 'focusZone'
+                                _pimg, _pp = afis_print.generate(
+                                    [_zone_arr], [0.0], None,
+                                    ambient_frames=[_zone_arr],
+                                    flash_frames=[None],
+                                    guide_region=_pguide,
+                                    freq_normalize=True,
+                                    stack_cache=_stack_cache,
+                                )
+                            else:
+                                _pimg, _pp = afis_print.generate(
+                                    frames, angles_for_sfm, _laps,
+                                    ambient_frames=ambient_frames,
+                                    flash_frames=flash_frames,
+                                    ambient_burst=ambient_burst,
+                                    flash_burst=flash_burst,
+                                    ambient_burst_gyros=ambient_burst_gyros,
+                                    flash_burst_gyros=flash_burst_gyros,
+                                    guide_region=_pguide,
+                                    freq_normalize=True,
+                                    stack_cache=_stack_cache,
+                                )
                             if _pimg is not None:
                                 _pres = _score_ground_truth(_pimg)
                                 _ps = (_pres.get('nfiq_score', 0.0)
@@ -2914,6 +2961,49 @@ def _download_front_only_frames_burst2(capture_id: str, base_path: str):
 
     best_arr = amb_arr if amb_arr is not None else fl_arr
     return [best_arr], [amb_arr], [fl_arr]
+
+
+def _download_front_only_focus_zone_frames(capture_id: str):
+    """Download the per-zone focus-bracket stills (client's `focusZoneShots`,
+    written only when FrontCaptureController._focusZoneBracketEnabled is on --
+    off by default, so this returns {} for every capture today).
+
+    Each entry is a single dedicated still captured with the AF point
+    retargeted to a specific anatomical zone (currently 'tip'/'base')
+    instead of the guide's own centre, then locked before the shutter fired
+    -- see the 2026-08-17 CLAUDE.md "real per-zone matchability comparison"
+    entry for why tip/base specifically: those are the two zones
+    front_only_v1's minutiae-patch block already crops as sub-guides of the
+    single center-focused main frame, but never gets its own dedicated
+    focus for, unlike sweep's own dedicated zone shots which that same
+    comparison found meaningfully stronger on core/right.
+
+    Returns {zone: array} for whichever zones have a usable downloaded
+    still -- self-skipping per zone, never raises."""
+    db, _ = _get_firebase()
+    doc_dict = db.collection('captures').document(capture_id).get().to_dict() or {}
+    shots_meta = doc_dict.get('focusZoneShots') or []
+    if not shots_meta:
+        return {}
+
+    def _load(entry):
+        arr = _decode_image(_download_storage_file(entry['path']))
+        h, w = arr.shape[:2]
+        side = min(h, w)
+        return arr[(h - side) // 2:(h - side) // 2 + side,
+                   (w - side) // 2:(w - side) // 2 + side]
+
+    out = {}
+    for e in shots_meta:
+        zone = e.get('zone')
+        if not zone or not e.get('path'):
+            continue
+        try:
+            out[zone] = _load(e)
+        except Exception as exc:
+            logger.warning('front_only focus-zone: %s frame %s failed: %s',
+                            zone, e.get('path'), exc)
+    return out
 
 
 def _download_oscillating_frames(capture_id: str, base_path: str):
