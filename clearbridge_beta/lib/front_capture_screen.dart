@@ -44,6 +44,8 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
   late final Animation<double> _popScale;
   late final AnimationController _blinkCtrl;
   late final Animation<double> _blinkOpacity;
+  late final AnimationController _distancePulseCtrl;
+  late final Animation<double> _distancePulseOpacity;
   bool _ready = false;
   bool _navigated = false;
   String? _initError;
@@ -100,6 +102,21 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     );
     _blinkOpacity = Tween(begin: 1.0, end: 0.25).animate(
       CurvedAnimation(parent: _blinkCtrl, curve: Curves.easeInOut),
+    );
+    // Pulsing distance-hint banner, top of screen (CTO request 2026-08-17:
+    // the wavelength/distance signal lives in the bottom warning row today,
+    // which real device testing already showed is easy to miss while
+    // looking at the guide near the top -- same root complaint the
+    // brightness pill above was built to fix, just never applied to this
+    // signal). Own controller (not reusing _blinkCtrl) since brightness and
+    // distance can in principle both be true at once and need independent
+    // pulse phases.
+    _distancePulseCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 700),
+    );
+    _distancePulseOpacity = Tween(begin: 1.0, end: 0.35).animate(
+      CurvedAnimation(parent: _distancePulseCtrl, curve: Curves.easeInOut),
     );
     _init();
   }
@@ -216,6 +233,7 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     _scanAnim.dispose();
     _popCtrl.dispose();
     _blinkCtrl.dispose();
+    _distancePulseCtrl.dispose();
     super.dispose();
   }
 
@@ -394,16 +412,15 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
     final brightLeft = ringLeft - meterGap - meterW;
     final focusLeft = ringLeft + ringD + meterGap;
 
-    // Warning / hint row — distance or lighting.
+    // Warning / hint row — lighting only now (distance moved to a top-of-
+    // screen pulsing banner, see showDistancePulse below: CTO real-device
+    // feedback 2026-08-17, "the wavelength signal text... can't see it at
+    // the bottom" -- same root complaint the brightness pill was already
+    // built to fix for lighting, 2026-08-06, just never applied to this
+    // signal until now).
     String? warningText;
     Color warningColor = CaptureColors.warning;
-    if (showGuide &&
-        s.distanceHint != null &&
-        s.phase != FrontCapturePhase.capturingExtra) {
-      warningText = s.distanceHint == 'Move closer'
-          ? '↑ Move phone CLOSER to your thumb'
-          : '↓ Move phone BACK a little';
-    } else if (showGuide && s.distanceHint == null && lowQuality) {
+    if (showGuide && s.distanceHint == null && lowQuality) {
       // MAC3D capture-UX-polish mockup: focus takes priority over brightness
       // when both are low (same order the mockup's own warningText uses).
       // Copy adapted from the mockup's "Move slider or refocus" -- this app
@@ -415,7 +432,22 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
       warningColor = CaptureColors.warning;
     }
 
-    // Run the blink only while the warning is actually on screen -- an
+    // Top-of-screen pulsing distance banner -- direct, bold, impossible to
+    // miss text driven by the exact same distanceHint signal that used to
+    // render as a small row at the bottom. 'Move closer' is the only
+    // coverage-driven "too far" case; every other non-null distanceHint
+    // value (both the coverage-driven "too close" and the wavelength-gate-
+    // driven "too close" cases -- see FrontCaptureController.rawOnTarget --
+    // already share the single 'Move back slightly' string) means the
+    // thumb needs to move BACK, so this two-way split covers every real
+    // value the controller ever sets.
+    final showDistancePulse = showGuide &&
+        s.distanceHint != null &&
+        s.phase != FrontCapturePhase.capturingExtra;
+    final distanceBannerText =
+        s.distanceHint == 'Move closer' ? 'Bring Print Closer' : 'Push Print Backward';
+
+    // Run the blinks only while their warning is actually on screen -- an
     // always-repeating controller would keep the widget tree animating (and
     // burning frames) for the entire session. Scheduled post-frame because
     // build() must not mutate animation state synchronously.
@@ -427,6 +459,17 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
         } else if (!showBrightnessBlink && _blinkCtrl.isAnimating) {
           _blinkCtrl.stop();
           _blinkCtrl.value = 0.0;
+        }
+      });
+    }
+    if (showDistancePulse != _distancePulseCtrl.isAnimating) {
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        if (showDistancePulse && !_distancePulseCtrl.isAnimating) {
+          _distancePulseCtrl.repeat(reverse: true);
+        } else if (!showDistancePulse && _distancePulseCtrl.isAnimating) {
+          _distancePulseCtrl.stop();
+          _distancePulseCtrl.value = 0.0;
         }
       });
     }
@@ -705,6 +748,26 @@ class _FrontCaptureScreenState extends State<FrontCaptureScreen>
             right: 0,
             child: _buildHeader(s),
           ),
+
+          // Top-of-screen pulsing distance banner (CTO real-device feedback
+          // 2026-08-17: "the wavelength signal text needs to be displayed
+          // on top of the screen in bold and it needs to pulse, can't see
+          // it at the bottom"). Sited below the header row rather than
+          // inside it so it never competes with the back button/status
+          // pill for tap space, and above the guide ring so it's the first
+          // thing in the user's eyeline while they're adjusting distance.
+          if (showDistancePulse)
+            Positioned(
+              left: 16,
+              right: 16,
+              top: topPad + 54,
+              child: IgnorePointer(
+                child: FadeTransition(
+                  opacity: _distancePulseOpacity,
+                  child: _DistanceBanner(text: distanceBannerText),
+                ),
+              ),
+            ),
 
           // Headline + idle caption, anchored just below the ring.
           // Suppressed when the confirmationText banner is active so the two
@@ -1237,6 +1300,43 @@ class _MeterPainter extends CustomPainter {
   @override
   bool shouldRepaint(_MeterPainter old) =>
       old.value != value || old.color != color;
+}
+
+/// Bold, pulsing top-of-screen distance directive (CTO real-device feedback
+/// 2026-08-17 -- see the build()-level comment above showDistancePulse for
+/// the full context). Deliberately larger/bolder than _BrightnessWarningPill
+/// (direct imperative text, not a small chip) since this is the signal a
+/// real user reported being unable to see at all in its previous location.
+class _DistanceBanner extends StatelessWidget {
+  final String text;
+  const _DistanceBanner({required this.text});
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 12),
+        decoration: BoxDecoration(
+          color: CaptureColors.void_.withValues(alpha: 0.80),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: CaptureColors.gold, width: 2),
+          boxShadow: [
+            BoxShadow(color: CaptureColors.gold.withValues(alpha: 0.45), blurRadius: 16),
+          ],
+        ),
+        child: Text(
+          text.toUpperCase(),
+          textAlign: TextAlign.center,
+          style: const TextStyle(
+            color: CaptureColors.gold,
+            fontSize: 20,
+            fontWeight: FontWeight.w900,
+            letterSpacing: 0.6,
+          ),
+        ),
+      ),
+    );
+  }
 }
 
 // ── Capture progress ring ─────────────────────────────────────────────────────

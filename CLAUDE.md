@@ -1,5 +1,66 @@
 # ClearBridge Mobile — persistent context
 
+## Distance hint moved to a bold, pulsing top-of-screen banner; real device review of a ridge-continuity print, and its limits (2026-08-17, round 9)
+CTO real-device feedback: "the wavelength signal text needs to be displayed
+on top of the screen in bold and it needs to pulse, can't see it at the
+bottom. just direct text 'Bring Print Closer'... 'Push Print Backward'" —
+plus asked to see the latest superprint to judge whether the round-7/8
+ridge-continuity work (quadratic detrend, focus-zone bracket) actually
+improved it.
+
+**UI fix, direct implementation of the ask.** The `distanceHint`-driven text
+("Move phone CLOSER"/"Move phone BACK") used to render as a small row at
+the very bottom of the screen, alongside the CTA button — same class of
+"easy to miss while looking at the guide" problem the brightness warning
+pill was already built to fix on 2026-08-06, just never applied to this
+signal. Split it out of the bottom `_WarningRow` (which now only ever shows
+the lighting/focus low-quality case) into a new top-of-screen
+`_DistanceBanner`: bold (`FontWeight.w900`, 20px, uppercase), gold-bordered
+pill, positioned just below the header row so it's the first thing in the
+user's eyeline. Pulses via its own dedicated `AnimationController`
+(`_distancePulseCtrl`, 700ms opacity tween 1.0->0.35, same pattern already
+proven for the brightness pill's `_blinkCtrl` but kept independent since
+brightness and distance warnings can in principle both be true
+simultaneously and need independent pulse phases). Copy is exactly the
+CTO's own wording: `distanceHint == 'Move closer' ? 'Bring Print Closer' :
+'Push Print Backward'` — the only two non-null values `rawOnTarget` ever
+produces (coverage-driven "too far" vs. either coverage- or
+wavelength-gate-driven "too close", which already share one string).
+Committed, not device-tested.
+
+**Superprint review: honest read, with the real limiting caveat stated
+plainly rather than oversold either way.** Pulled the latest real capture
+(`286f1f0a`, NFIQ2 63) and sent the superprint for direct visual review.
+It reads coarser/more fragmented than some earlier prints this session —
+but this is very likely a **direct, expected consequence of physical
+distance, not a ridge-continuity regression**: this is the exact capture
+the round-8 wavelength escape hatch rescued, raw wavelength **26px**, well
+above the established 9-14px sweet spot. Cross-checked against `80a994ca`
+(also raw wavelength 28px, different finger, NFIQ2 74) which visually
+reads notably cleaner despite an almost identical raw wavelength number —
+underscoring that a single cross-subject visual comparison like this isn't
+a controlled test; different real fingers look different regardless of
+pipeline quality, the same "don't over-index on one comparison" discipline
+this project applies everywhere else.
+
+**The more important, structural finding: no capture so far COULD show the
+focus-zone fix's real effect, by design.** `minutiaeDebug` confirms the
+dedicated tip/base/left/right stills are captured and scored correctly
+(`source: focusZone`) — but per the existing 2026-08-17-earlier-round
+policy, minutiae patches (focus-zone-sourced or not) stay strictly
+diagnostic-only and can never win production selection over the full-print
+candidate, specifically to prevent a partial-pad crop from silently
+replacing the real print (the exact real bug fixed earlier this session).
+So every superprint delivered today, including this one, is still built
+the same way it always was — the plain single best full frame — regardless
+of whether the focus-zone bracket ran. The mechanism works; it just isn't
+connected to the real output yet. **Real next step, not yet built**: a
+proper bozorth3 (not NFIQ2 proxy) matchability test on the focus-zone data
+now that it exists in real Firestore docs, to decide whether/how it should
+ever be allowed to influence the delivered print — the same "verify with
+real matchability before touching production selection" discipline as
+every other candidate-selection decision in this pipeline.
+
 ## Real device confirmation the wavelength/focus-zone fixes work — and two real, distinct causes of "sweeps forever" found + fixed (2026-08-17, round 8)
 CTO ran the build carrying the quadratic-detrend/stripCount=7/focus-zone-
 bracket changes: "struggled with the wavelength estimator for awhile, it
