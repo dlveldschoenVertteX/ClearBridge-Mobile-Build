@@ -1405,12 +1405,15 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _rx_ratio = (_fl_sec / _sw_sec) / (_fl_main / _sw_main)
                         _ry_ratio = (_fl_sec / _sh_sec) / (_fl_main / _sh_main)
                         # Camera "3" (largest sensor, most similar angle to
-                        # main) uses cy=0.37 -- matching the main guide's own
-                        # top-half-of-pad default (PadSilhouetteShape.cy).
+                        # main) matches the main guide's own cy
+                        # (PadSilhouetteShape.cy -- 0.3311 as of the 2026-08-17
+                        # crease-exclusion cut; keep this in sync if that shape
+                        # ever moves again, same hand-copied-constant risk
+                        # already documented elsewhere in this project).
                         # Camera "2" (wide, very different FOV) keeps cy=0.5
                         # (centred) since its framing offset is unknown without
                         # dedicated calibration data.
-                        _sec_cy = (0.37 if _cam.get('name') == '3' else 0.5)
+                        _sec_cy = (0.3311 if _cam.get('name') == '3' else 0.5)
                         _sec_guide = {
                             'cx': 0.5,
                             'cy': _sec_cy,

@@ -1,5 +1,61 @@
 # ClearBridge Mobile — persistent context
 
+## Guide shape cut to exclude the DIP flexion crease, per a real annotated CTO photo (2026-08-17)
+CTO sent a real photo of their own thumb, hand-marked green (true pad/ridge
+area) vs. yellow (the joint flexion-crease band below it, visibly different
+ridge character) and said the yellow area must never appear in the
+superprint — plus floated, as a separate thought, that once the guide only
+captures real ridge area, there may be room to move the working distance
+closer for more detail on the fixed-size AFIS/NFIQ2 canvas.
+
+**Fixed** (`capture_pad_silhouette_overlay.dart`, `PadSilhouetteShape.defaultShape`):
+the crease boundary in the photo sits at roughly 64% of the way down the old
+guide's own vertical span — i.e. the bottom ~35% of every capture to date
+was crease, not pad. Cut asymmetrically (top edge held at its old position,
+only the bottom edge moves up) since the CTO's photo only flagged the
+BOTTOM boundary as wrong: `cy` 0.37 -> 0.3311, `ry` 0.111195 -> 0.0723,
+`rx` untouched (width wasn't flagged). Since `guideRegion` is written
+verbatim from this shape and used directly as the backend's AFIS crop mask,
+this one client-side change is sufficient to affect everything downstream
+(on-screen guide, `_scoreRoi`, `_focusPointScreenSpace`, the real backend
+mask) — same "single source of truth" design this file already documents.
+Also fixed a real, now-stale hand-copied constant this change would
+otherwise have silently drifted from (`main.py`'s secondary-camera-3 guide
+synthesis hardcoded `cy=0.37` "matching the main guide's own" -- updated to
+0.3311, same drift-risk class already documented elsewhere in this project
+for `_scoreRoi`/`_focusPointScreenSpace`).
+
+**Real, flagged residual risk, not yet resolved**: `_MASK_COVER_DILATE=1.3`
+(`afis_print.py`) still lets the backend's content-aware flash-diff/U-Net
+mask reach up to 1.3x beyond whatever `guideRegion` this shape produces --
+a real risk given the crease has its own periodic, ridge-like texture that
+could fool that same content-aware detector into treating it as pad. This
+cut was sized so the new dilated bound (0.425) sits comfortably above the
+OLD guide's own un-dilated bottom edge (0.481), which should leave real
+margin, but if the crease still shows up in a real superprint after this
+ships, `_MASK_COVER_DILATE` — not another guide-size cut — is the next real
+lever to check, per its own already-existing real-data-calibration history
+(round 11: 1.6 measurably hurt a well-placed capture; not re-tuning it blind
+here).
+
+**The "move closer once the canvas is pad-only" idea — real, plausible,
+deliberately NOT acted on yet.** Correct mechanism as stated: a fixed-size
+AFIS/NFIQ2 canvas wastes resolution on non-ridge content, and removing the
+crease should let a closer capture spend that recovered canvas budget on
+real ridge detail instead of overflowing into skin that was always going to
+be masked out. But this project's own standing discipline is one variable
+at a time — the crease cut itself needs a real device test first (does the
+new guide actually look right against a real live thumb, does the crease
+actually disappear from real superprints) before compounding it with a
+second, independent distance change on top. Flagged as the natural next
+real experiment once this cut is confirmed, not built now.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. My own vertical-boundary estimate came
+from visually reading the CTO's photo, not an exact pixel measurement —
+worth a direct on-screen sanity check against a real thumb before trusting
+the exact numbers.
+
 ## Real production bug found + fixed: minutiae patches could win as the FINAL superprint (partial-pad crops, not diagnostic-only as originally intended); live wavelength estimator retuned off real telemetry (2026-08-17)
 CTO reviewed the first real telemetry capture (`01662ffb`, nfiq2Score 86) and
 flagged two things: the live wavelength estimator/UX wave cue is "definitely
