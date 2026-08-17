@@ -158,47 +158,19 @@ class PadSilhouetteShape {
   // measurably hurts a well-placed capture; 1.3 is real-data-calibrated, not
   // a guess) -- the lever here is still the guide's own base size, same as
   // every prior round.
-  // Vertical extent cut, 2026-08-17 (CTO real-photo annotation): a photo of
-  // the CTO's own thumb, hand-marked green (true pad/ridge area, tip down to
-  // just above the DIP flexion crease) vs. yellow (the crease band itself --
-  // visibly different ridge character, must never appear in the superprint)
-  // showed the crease boundary sits at roughly 64% of the way down the
-  // guide's own previous vertical span, i.e. the bottom ~35% of the old
-  // guide was crease, not pad. Cut from the BOTTOM only, not symmetrically:
-  // top edge (cy-ry) left at its old position (0.2588, matching the green
-  // area's own top boundary near the tip -- the CTO didn't flag the tip
-  // framing as wrong), only the bottom edge (cy+ry) moves up. Since
-  // boundingRect is symmetric around cy, this required moving BOTH cy (up,
-  // 0.37 -> 0.3311) and ry (down, 0.111195 -> 0.0723) together, not a plain
-  // scaled() call (which would have shrunk the top edge too, undoing the
-  // "tip framing was already right" half of the finding).
-  //
-  // This is a real, substantial cut (~35%, bigger than any prior single
-  // round) -- deliberately not moderated to match this file's usual ~15%
-  // steps, because unlike every prior wavelength-driven shrink (an indirect
-  // signal, tuned in small steps to avoid overfitting one data point), this
-  // one is grounded in the CTO's own direct, unambiguous annotation of
-  // where the crease actually starts on their own real thumb.
-  //
-  // Real, flagged residual risk: `_MASK_COVER_DILATE = 1.3` (afis_print.py)
-  // still lets the backend's content-aware mask reach up to 1.3x beyond
-  // whatever guide_region this shape produces, if flash-diff/U-Net
-  // misreads crease texture as pad content (a real risk -- the crease has
-  // its own periodic ridge-like texture). This cut was sized so the NEW
-  // dilated bound (cy+ry*1.3 = 0.425) sits well above the OLD guide's own
-  // un-dilated bottom edge (0.481), which should leave real margin -- but
-  // if the crease still shows up in a real superprint after this ships,
-  // _MASK_COVER_DILATE (not this shape) is the next real lever to check,
-  // not another guide-size guess.
-  //
-  // Not yet device-tested -- same standing discipline as every other
-  // capture-side change this project. rx left untouched: the CTO's photo
-  // flagged vertical (length) framing only, not width.
+  // REVERTED 2026-08-17. A same-day round briefly cut cy/ry here (0.37/
+  // 0.111195 -> 0.3311/0.0723) to try to exclude the DIP flexion crease
+  // from the capture, based on a real CTO-annotated thumb photo. CTO
+  // explicitly reverted this on the next device test: liked this on-screen
+  // shape as it was, and directed that pad/crease isolation should be a
+  // BACKEND config problem (content-aware masking on the unchanged capture),
+  // not a client-side guide-geometry change. See CLAUDE.md 2026-08-17 for
+  // the backend-side approach that replaced this.
   static const PadSilhouetteShape defaultShape = PadSilhouetteShape(
     cx: 0.5,
-    cy: 0.3311,
+    cy: 0.37,
     rx: 0.134604,
-    ry: 0.0723,
+    ry: 0.111195,
     taper: 0.20,
   );
 

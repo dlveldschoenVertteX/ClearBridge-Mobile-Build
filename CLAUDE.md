@@ -1,6 +1,31 @@
 # ClearBridge Mobile — persistent context
 
-## Guide shape cut to exclude the DIP flexion crease, per a real annotated CTO photo (2026-08-17)
+## Guide-shape crease cut REVERTED — CTO wants pad/crease isolation solved as a backend config problem, not client geometry (2026-08-17)
+CTO tested the crease-cut build (previous entry below) and gave direct
+feedback: liked the on-screen guide shape as it was before that change, and
+explicitly directed that fingerprint-pad isolation should be solved as a
+**backend configuration** problem, not by changing the client-side capture
+geometry. `PadSilhouetteShape.defaultShape` reverted to its pre-cut values
+(`cy: 0.37, ry: 0.111195`), and the companion `main.py` secondary-camera-3
+`_sec_cy` copy reverted to `0.37` alongside it, so the two stay in sync.
+
+**Why a backend fix is a genuinely different, harder problem than the
+existing content-aware masking already solves.** `afis_print.py`'s existing
+`_flash_diff_mask`/U-Net refinement (guide+flashdiff / guide+unet) separates
+finger SKIN from non-finger BACKGROUND (desk, wall) using near-camera torch
+falloff -- but the flexion crease is still finger skin, illuminated the same
+way as the true pad, so that mechanism has no signal to tell pad and crease
+apart. A real pad/crease isolation fix needs a different cue: the crease's
+own texture is characteristically straighter/more parallel and lower-
+curvature than the pad's whorled ridge flow (visible directly in the CTO's
+own annotated photo). This project already has the building block for
+exactly that measurement (`_ridge_confidence`, orientation coherence gated
+by in-band ridge energy, and the Poincare-index core/curvature search used
+elsewhere for reticle placement) -- next real step is applying that as an
+additional mask-refinement stage inside the guide bound, not a guide-size
+change. Not yet built -- flagged for the next session/round.
+
+## Guide shape cut to exclude the DIP flexion crease, per a real annotated CTO photo (2026-08-17) — SUPERSEDED, see entry above
 CTO sent a real photo of their own thumb, hand-marked green (true pad/ridge
 area) vs. yellow (the joint flexion-crease band below it, visibly different
 ridge character) and said the yellow area must never appear in the
