@@ -1,5 +1,67 @@
 # ClearBridge Mobile — persistent context
 
+## Wavelength estimator: quadratic detrend (real debug fix, not another parameter nudge); focus-zone bracket extended to left/right and turned ON (2026-08-17, round 7)
+CTO reviewed the `eacb0b2c` superprint (sent for review) and gave two direct
+instructions: build the focus-zone-bracket extension to left/right and turn
+it on (per the earlier recommendation), and — separately, more pointedly —
+"debug 2. because the wavelength estimator is not working as it should",
+pushing back on treating the `stripCount` bump alone as sufficient.
+
+**Focus-zone bracket: extended + enabled.** `_focusZoneBracketZones` now
+`['tip', 'base', 'left', 'right']`, `_focusZoneBracketEnabled = true`.
+`_focusPointForZone` gained `left`/`right` cases (`cx -/+ rx*0.35`, same
+0.35 offset convention already used for tip/base and already matching
+`main.py`'s own minutiae sub-guide formulas). Corrected an assumption in
+the original (still-present) comment block above the flag: it argued
+left/right don't need dedicated focus since they "sit at the same vertical
+distance as centre" — but the real bozorth3 per-zone comparison this whole
+feature is built from actually found 'right' as one of the two STRONGEST
+real gains from a dedicated zone shot (core +40%, right +34%), not a zone
+that could skip it. Backend needed zero changes — `main.py`'s minutiae-
+patch loop already checks `_focus_zone_frames.get(_pname)` generically for
+every patch name, so `left`/`right` zone stills are picked up automatically.
+**Real, deliberate cost, stated plainly**: this now fires 4 extra dedicated
+stills (up from 2) before the main burst — each a retarget+converge
+(250-700ms) + a real shutter press — meaningfully lengthening capture time.
+Turned on before its own first device test, on explicit CTO instruction —
+a deliberate exception to this project's usual "ship off, validate one
+device round before enabling" sequencing, not a change to that discipline
+generally.
+
+**Wavelength estimator: real debug pass, found a genuine mechanism gap, not
+just another number to guess.** Re-read `estimateRidgeWavelengthPx` end to
+end looking for an actual bug rather than another threshold tweak. Real
+candidate found in the detrending step: the code mean-centers each strip's
+signal then removes only a LINEAR trend before autocorrelating, explicitly
+to "suppress torch-gradient trends" (the function's own comment) — but the
+torch is a near-point source, so its brightness falloff across a strip is
+genuinely closer to quadratic (radial, centred wherever the torch's own
+falloff peaks) than linear. A linear fit only removes the strip's AVERAGE
+slope and leaves the residual curvature in place — worst for strips that
+sit off to one side of the ROI, which is consistent with the real telemetry
+pattern already found (`stripsWithPeak` landing at 1 of the 2 needed on
+strips that had already cleared the contrast bar, meaning real periodic
+content was present but the peak search still came up short).
+
+**Fixed, not just re-diagnosed**: upgraded to a proper quadratic (least-
+squares, 3x3 normal-equations solve via Cramer's rule) detrend. Strictly
+generalises the existing linear detrend (a linear trend is just the
+degenerate c=0 case), so it can only detrend at least as well as before on
+strips that were already fine — it cannot regress a strip that already
+found its peak. **Verified the closed-form solve numerically before
+trusting it in a live-camera code path**: reproduced the exact same Cramer's-
+rule arithmetic in Python against 5 random synthetic quadratic+noise
+signals and compared to `numpy.polyfit` — matched to within floating-point
+precision (~1e-12) on every trial, not just eyeballed.
+
+**Honest framing, same as the stripCount change**: this is a real,
+physically-motivated mechanism fix, not a guessed magic number — but it's
+still unconfirmed against real device data. The next real capture's
+`stripsWithPeak` distribution (now on top of the also-real stripCount=7
+change from the previous round) is what actually shows whether this closes
+the gap, same "let the next capture answer it" discipline as every other
+change in this thread.
+
 ## First real capture with `stripsWithPeak` data: the wavelength estimator genuinely works, it's borderline-short by exactly one strip (2026-08-17, round 6)
 First real capture on the build carrying the `stripsWithPeak` diagnostic
 (`eacb0b2c`, confirmed via the field's presence in telemetry — the previous

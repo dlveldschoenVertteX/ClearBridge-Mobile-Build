@@ -731,11 +731,23 @@ class FrontCaptureController extends ChangeNotifier {
   // diagnostic-only minutiae patch, same "can only add a candidate" pattern
   // as everywhere else in this pipeline.
   //
-  // OFF by default -- genuinely new capture-flow timing this project's own
-  // discipline says needs real device validation before it proves anything,
-  // same as _secondBurstEnabled/_sweepEnabled above.
-  static const bool _focusZoneBracketEnabled = false;
-  static const List<String> _focusZoneBracketZones = ['tip', 'base'];
+  // ENABLED 2026-08-17 round 3, with 'left'/'right' added to the zone list
+  // -- direct follow-up to a real superprint review (capture eacb0b2c) that
+  // visually confirmed the exact core-strong/periphery-fragmented pattern
+  // the zone comparison predicted, with left/right specifically weak on
+  // THAT print. Corrects the assumption in the comment block above (that
+  // left/right "sit at the same vertical distance as centre" and don't
+  // need their own focus): the real bozorth3 per-zone comparison this
+  // whole feature is built from actually found 'right' as one of the TWO
+  // strongest real gains from a dedicated zone shot (core +40%, right
+  // +34%), not a zone that could skip it -- 'left' was tied, not clearly
+  // unnecessary either. First real on-device test of this whole mechanism;
+  // per this project's own discipline every other capture-side change here
+  // shipped OFF first specifically for a device-tested initial run before
+  // being turned on -- this is a deliberate exception, on explicit CTO
+  // instruction, not a change in that discipline generally.
+  static const bool _focusZoneBracketEnabled = true;
+  static const List<String> _focusZoneBracketZones = ['tip', 'base', 'left', 'right'];
   // Bounded verify-convergence wait per extra zone shot -- shorter than
   // _refocus()'s own _refocusMinMs/_refocusMaxMs (600-1200ms): the lens is
   // already converged at the CENTRE point from the hold's own _refocus()
@@ -2714,10 +2726,10 @@ class FrontCaptureController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  /// Screen-space AF target for a zone-bracket shot -- same 0.35*ry offset
-  /// from the guide's own centre that main.py's tip/base minutiae sub-guides
-  /// already use, so the physical region this shot focuses on matches the
-  /// region the backend will actually crop it to.
+  /// Screen-space AF target for a zone-bracket shot -- same 0.35*rx/ry
+  /// offset from the guide's own centre that main.py's minutiae sub-guides
+  /// already use for each named zone, so the physical region this shot
+  /// focuses on matches the region the backend will actually crop it to.
   Offset _focusPointForZone(String zone) {
     final shape = PadSilhouetteShape.defaultShape;
     switch (zone) {
@@ -2725,6 +2737,10 @@ class FrontCaptureController extends ChangeNotifier {
         return Offset(shape.cx, shape.cy - shape.ry * 0.35);
       case 'base':
         return Offset(shape.cx, shape.cy + shape.ry * 0.35);
+      case 'left':
+        return Offset(shape.cx - shape.rx * 0.35, shape.cy);
+      case 'right':
+        return Offset(shape.cx + shape.rx * 0.35, shape.cy);
       default:
         return _focusPointScreenSpace;
     }

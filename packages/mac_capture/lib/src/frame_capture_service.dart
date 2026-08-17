@@ -544,18 +544,79 @@ class HybridCaptureService {
       if (stripStd < minStripStd) continue;
       debug?.stripsClearedStd += 1;
 
-      // Mean-center then linear-detrend to suppress torch-gradient trends that
-      // would otherwise produce spurious autocorrelation peaks at long lags.
-      // Linear detrend: fit a line through the mean-centered signal and subtract
-      // it. This is O(sigLen) and keeps the ridge-period component intact while
-      // removing the slow brightness ramp from uneven torch illumination across
-      // the pad.
+      // Mean-center then quadratic-detrend to suppress torch-gradient trends
+      // that would otherwise produce spurious autocorrelation peaks at long
+      // lags, or blur/suppress the true ridge-period peak entirely.
+      //
+      // Upgraded from a purely linear detrend, 2026-08-17 round 3 (real
+      // debugging pass, not a parameter guess): the torch is a near-point
+      // source, so its brightness falloff across a strip is genuinely
+      // closer to quadratic (radial, centred wherever the torch's own
+      // falloff peaks) than linear -- a linear fit only ever removes the
+      // AVERAGE slope across the strip and leaves the residual curvature
+      // in place, worst for strips that sit off to one side of the ROI
+      // (exactly where real telemetry showed the estimator falling short:
+      // stripsWithPeak landing at 1 of 2 needed on strips that had already
+      // cleared the contrast bar, i.e. real periodic content was present
+      // but the autocorrelation search still failed to find a clean local
+      // maximum for it). Quadratic strictly generalises linear (a linear
+      // trend is just the degenerate c=0 case), so this can only detrend
+      // at least as well as before on genuinely linear cases -- it cannot
+      // regress a strip that already worked.
+      //
+      // Closed-form least-squares fit of y = a + b*x + c*x^2 via the 3x3
+      // normal-equations system, solved with Cramer's rule -- O(sigLen),
+      // cheap enough for a per-strip, per-throttled-attempt computation.
       final centered = List<double>.generate(sig.length, (i) => sig[i] - mean);
-      final slope = centered.isNotEmpty
-          ? (centered.last - centered.first) / math.max(1, centered.length - 1)
-          : 0.0;
-      for (var i = 0; i < centered.length; i++) {
-        centered[i] -= slope * i;
+      final n = centered.length;
+      if (n >= 3) {
+        var s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+        var t0 = 0.0, t1 = 0.0, t2 = 0.0;
+        for (var i = 0; i < n; i++) {
+          final x = i.toDouble();
+          final x2 = x * x;
+          s1 += x;
+          s2 += x2;
+          s3 += x2 * x;
+          s4 += x2 * x2;
+          final y = centered[i];
+          t0 += y;
+          t1 += x * y;
+          t2 += x2 * y;
+        }
+        final s0 = n.toDouble();
+        final det = s0 * (s2 * s4 - s3 * s3) -
+            s1 * (s1 * s4 - s3 * s2) +
+            s2 * (s1 * s3 - s2 * s2);
+        if (det.abs() > 1e-9) {
+          final detA = t0 * (s2 * s4 - s3 * s3) -
+              s1 * (t1 * s4 - s3 * t2) +
+              s2 * (t1 * s3 - s2 * t2);
+          final detB = s0 * (t1 * s4 - s3 * t2) -
+              t0 * (s1 * s4 - s3 * s2) +
+              s2 * (s1 * t2 - t1 * s2);
+          final detC = s0 * (s2 * t2 - t1 * s3) -
+              s1 * (s1 * t2 - t1 * s2) +
+              t0 * (s1 * s3 - s2 * s2);
+          final a = detA / det, b = detB / det, c = detC / det;
+          for (var i = 0; i < n; i++) {
+            final x = i.toDouble();
+            centered[i] -= a + b * x + c * x * x;
+          }
+        } else {
+          // Degenerate normal-equations matrix (shouldn't happen for n>=3
+          // with distinct integer x's, but fall back to linear-only rather
+          // than leaving raw content undetrended).
+          final slope = (centered.last - centered.first) / math.max(1, n - 1);
+          for (var i = 0; i < n; i++) {
+            centered[i] -= slope * i;
+          }
+        }
+      } else if (n >= 2) {
+        final slope = (centered.last - centered.first) / math.max(1, n - 1);
+        for (var i = 0; i < n; i++) {
+          centered[i] -= slope * i;
+        }
       }
       // Only compute the autocorrelation up to the max-lag ceiling. Beyond
       // ~40 raw px there is no plausible ridge period worth measuring; computing
