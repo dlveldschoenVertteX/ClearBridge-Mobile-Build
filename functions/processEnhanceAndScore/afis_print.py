@@ -1314,28 +1314,49 @@ def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     return combined[1:-1, 1:-1]
 
 
-_CREASE_MIN_CIRCVAR = 0.30   # row is "crease-like" below this circular
-# variance of ridge orientation across x. Real basis, not a guess: measured
-# on 2 real front_only_v1 captures (01662ffb, 474b4d6a) via
-# scratchpad/ps/deltacheck -- true pad/whorl rows scored 0.4-0.9, the base
-# ~10-15% of the guide (where the CTO's own annotated photo showed the DIP
-# flexion crease sits) dropped to 0.01-0.25. 0.30 sits between the two
-# populations with real margin on both real samples.
-_CREASE_MIN_RUN_FRAC = 0.08  # a low-variance run must persist this long
+_CREASE_MIN_CIRCVAR = 0.40   # row is "crease-like" below this circular
+# variance of ridge orientation across x, measured on a SMOOTHED profile
+# (see _CREASE_SMOOTH_PX). Retuned 2026-08-17 round 2, real CTO feedback on
+# a real generated print: the first cut (raw per-row, threshold 0.30) left
+# a real residual crease band visible -- a real capture's row-wise circular
+# variance profile (scratchpad/ps/deltacheck) showed the true tail crease
+# (frac 0.82-1.0 of the mask's span) is separated from the genuine core
+# peak (frac ~0.50-0.55) by only a shallow, narrow dip (frac ~0.60-0.68,
+# smoothed value ~0.37) then a SECOND, narrower high-variance bump (frac
+# 0.73-0.80) that the original threshold treated as real ridge structure
+# and left untouched -- but which the CTO's own annotation marked as still
+# being crease. 0.40 on the smoothed profile crosses that middle dip
+# instead, trimming from just past the real core onward and folding the
+# second bump into the cut. Real, deliberate trade-off, stated plainly:
+# this is more aggressive and costs more real area than the first cut --
+# accepted because leaving visible crease in the print is the worse
+# failure mode per direct CTO instruction.
+_CREASE_SMOOTH_PX = 21  # box-smoothing window (rows) applied to the raw
+# per-row circular-variance profile before thresholding -- absorbs narrow
+# spurious bumps/dips (a few rows wide) without needing a much higher/lower
+# threshold to compensate, same motivation as _ORIENT_SMOOTH existing at
+# all for the orientation field itself.
+_CREASE_MIN_RUN_FRAC = 0.05  # a low-variance run must persist this long
 # (as a fraction of the mask's own vertical span) before it's trusted as a
 # real crease boundary, not one noisy row -- same "don't trust a single
 # sample" discipline as the live wavelength estimator's own multi-strip
-# averaging.
-_CREASE_MAX_TRIM_FRAC = 0.40  # hard cap: never trim more than this fraction
+# averaging. Lowered alongside the smoothing change above (8% -> 5%): the
+# smoothed profile itself already absorbs short-run noise, so requiring a
+# long RAW run on top of that made the scan needlessly conservative.
+_CREASE_MAX_TRIM_FRAC = 0.55  # hard cap: never trim more than this fraction
 # of the mask's vertical span this way, regardless of what the scan finds --
 # a real safety bound against a false-positive run eating a legitimately
-# low-curvature (e.g. arch-pattern) pad.
+# low-curvature (e.g. arch-pattern) pad. Raised alongside the more
+# aggressive threshold above (0.40 -> 0.55) so the cap doesn't silently
+# override the real, validated boundary found on the CTO's own test capture
+# (~0.61 of that print's span).
 
 
 def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
                        min_circvar: float = _CREASE_MIN_CIRCVAR,
                        min_run_frac: float = _CREASE_MIN_RUN_FRAC,
-                       max_trim_frac: float = _CREASE_MAX_TRIM_FRAC
+                       max_trim_frac: float = _CREASE_MAX_TRIM_FRAC,
+                       smooth_px: int = _CREASE_SMOOTH_PX
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """Trims print area toward the BASE half only (never the tip -- matches
     the CTO's own annotated photo, which flagged only the bottom boundary as
@@ -1372,10 +1393,13 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     grayscale would.
 
     Real, deliberate choice: scans from the CENTRE outward (not from the
-    base edge inward) and requires a sustained run before accepting a trim
-    boundary -- a single noisy row right at the mask's own soft/feathered
-    edge (inherently less reliable for orientation estimation) shouldn't be
-    enough to trigger a trim on its own.
+    base edge inward) and requires a sustained run (on a SMOOTHED profile,
+    see `smooth_px`) before accepting a trim boundary -- a single noisy row
+    right at the mask's own soft/feathered edge (inherently less reliable
+    for orientation estimation) shouldn't be enough to trigger a trim on
+    its own, and a narrow spurious bump of apparent curvature shouldn't be
+    able to hide real crease just past it either (see the module-level
+    constants' own history for the real capture that found this gap).
 
     Can only ever REMOVE area from the base half (whitened in binimg,
     cleared in mask), never add or touch the tip half -- cannot regress a
@@ -1392,21 +1416,30 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
         return binimg, mask
     orient = _orientation_field(binimg.astype(np.float32))
     mid_y = y0 + span // 2
+
+    raw = np.full(y1 - y0 + 1, np.nan, dtype=np.float32)
+    for y in range(y0, y1 + 1):
+        row = mask[y] > 0
+        if row.sum() < 5:
+            continue
+        th = orient[y, row]
+        c = float(np.mean(np.cos(2 * th)))
+        s = float(np.mean(np.sin(2 * th)))
+        raw[y - y0] = 1.0 - float(np.hypot(c, s))
+    valid = (~np.isnan(raw)).astype(np.float32)
+    filled = np.nan_to_num(raw, nan=0.0)
+    kernel = np.ones(max(1, smooth_px), dtype=np.float32)
+    num = np.convolve(filled, kernel, mode='same')
+    den = np.convolve(valid, kernel, mode='same')
+    smoothed = np.divide(num, den, out=np.ones_like(num), where=den > 0)
+
     min_run = max(3, int(min_run_frac * span))
     run = 0
     trim_at: Optional[int] = None
-    for y in range(mid_y, y1 + 1):
-        row = mask[y] > 0
-        if row.sum() < 5:
-            run += 1
-        else:
-            th = orient[y, row]
-            c = float(np.mean(np.cos(2 * th)))
-            s = float(np.mean(np.sin(2 * th)))
-            circvar = 1.0 - float(np.hypot(c, s))
-            run = (run + 1) if circvar < min_circvar else 0
+    for i in range(mid_y - y0, len(smoothed)):
+        run = (run + 1) if smoothed[i] < min_circvar else 0
         if run >= min_run:
-            trim_at = y - min_run + 1
+            trim_at = y0 + i - min_run + 1
             break
     if trim_at is None:
         return binimg, mask
@@ -1419,6 +1452,52 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     binimg[trim_at:, :] = 255
     mask[trim_at:, :] = 0
     return binimg, mask
+
+
+_VIGNETTE_FEATHER_FRAC = 0.14  # width of the fade ring, as a fraction of
+# the fitted ellipse's own radius -- e.g. 0.14 means the last 14% of the
+# radius (working outward) ramps 1.0 -> 0.0 rather than cutting hard at the
+# boundary. Matches the general softness of the existing distance-transform
+# feather elsewhere in this pipeline, just applied to a geometric shape
+# instead of the organic mask boundary.
+
+
+def _circular_vignette(binimg: np.ndarray, mask: np.ndarray,
+                        feather_frac: float = _VIGNETTE_FEATHER_FRAC
+                        ) -> np.ndarray:
+    """Replaces the print's organic, mask-shaped edge fade with a smooth
+    ELLIPTICAL vignette, mimicking the clean round/oval capture window of a
+    real optical/capacitive fingerprint scanner (CTO request, 2026-08-17:
+    "have the feathing be circular so it mimics real fingerprint scanner
+    prints"). The existing per-pixel distance-transform feather (see
+    `_FADE_INSET_PX`/`_FEATHER_SIGMA` above) still runs first and is left
+    untouched -- it does real work fading Gabor content out cleanly at the
+    true segmented boundary. This runs as a LATER, purely geometric pass on
+    top: fits an ellipse to the mask's own centroid + extent, then fades
+    `binimg` to white with a smooth radial falloff from 1.0 (well inside)
+    to 0.0 (at/beyond the ellipse boundary).
+
+    Can only ever fade MORE of the image toward white, never reveal
+    anything the earlier organic feather or the crease trim had already
+    removed -- multiplies into the same white background those steps
+    already produce, so this is strictly additive/bounded like every other
+    mask refinement in this pipeline.
+    """
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return binimg
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    cy, cx = (y0 + y1) / 2.0, (x0 + x1) / 2.0
+    a = (x1 - x0) / 2.0
+    b = (y1 - y0) / 2.0
+    if a < 4 or b < 4:
+        return binimg
+    h, w = binimg.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    r = np.sqrt(((xx - cx) / a) ** 2 + ((yy - cy) / b) ** 2)
+    alpha = np.clip((1.0 - r) / max(feather_frac, 1e-6), 0.0, 1.0)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=max(a, b) * feather_frac * 0.25)
+    return (binimg.astype(np.float32) * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
 
 
 def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
@@ -2340,6 +2419,7 @@ def generate(
     freq_scale_min: Optional[float] = None,
     pad_mask_override: Optional[np.ndarray] = None,
     crease_trim: bool = True,
+    circular_vignette: bool = True,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -3141,6 +3221,14 @@ def generate(
         trimmed_px = pre_cov - int((mask > 0).sum())
         if trimmed_px > 0:
             params['afisCreaseTrimPx'] = trimmed_px
+
+    # Circular/elliptical vignette (2026-08-17, CTO request: "have the
+    # feathing be circular so it mimics real fingerprint scanner prints").
+    # Purely cosmetic edge treatment, applied on top of the crease-trimmed
+    # mask -- see _circular_vignette's own docstring.
+    if circular_vignette:
+        binimg = _circular_vignette(binimg, mask)
+        params['afisVignette'] = 'elliptical'
 
     # Mirror-correction SCAFFOLD (2026-08-03, CTO-reported): this capture
     # flow requires the user to twist their thumb behind the phone to

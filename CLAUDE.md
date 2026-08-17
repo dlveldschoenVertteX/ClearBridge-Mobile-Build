@@ -1,5 +1,50 @@
 # ClearBridge Mobile — persistent context
 
+## Crease trim recalibrated against direct CTO ground truth; circular scanner-style vignette added (2026-08-17, round 3)
+CTO sent back a real generated print (the one from the previous entry) with
+the residual crease band hand-marked yellow: "remove the yellow highlighted
+section as well, it is clearly crease" -- plus a second, separate ask: "have
+the feathing be circular so it mimics real fingerprint scanner prints."
+
+**Crease trim recalibrated using the CTO's own annotation as ground
+truth, not another guess.** Measured the real row-wise circular-variance
+profile of the exact flagged print (`scratchpad/ps/deltacheck`): the true
+tail crease (frac 0.82-1.0 of the mask's span) turned out to be separated
+from the genuine core peak (frac ~0.50-0.55) by only a shallow dip then a
+SECOND, narrower high-variance bump (frac 0.73-0.80) -- the original
+threshold (0.30, raw per-row) read that second bump as real ridge
+structure and left it untouched, which is exactly the residual band the
+CTO marked. Fixed two ways together: (1) smoothed the per-row circular-
+variance profile (21px box window) before thresholding, so a narrow bump
+can't hide real crease just past it; (2) raised the threshold 0.30 -> 0.40
+on that smoothed profile, which crosses the dip BEFORE the second bump
+instead of after it -- confirmed via a full offline sweep
+(threshold x smoothing-window x run-length) against the real cached
+binarized print, not picked blind. Real, deliberate trade-off, stated
+plainly in the code: more aggressive, costs more real area, accepted
+because a visible crease is the worse failure mode per direct instruction.
+
+**Circular/elliptical vignette added** (`_circular_vignette`, new
+`circular_vignette: bool = True` param on `generate()`): fits an ellipse
+to the (crease-trimmed) mask's own centroid + extent, then fades the print
+to white with a smooth radial falloff, on top of the existing organic
+mask-shaped feather rather than replacing it. Direct, real side benefit:
+this also fixed the "known cosmetic gap" flagged in the previous round
+(the crease-trim boundary was a hard cut, unlike the print's other,
+naturally-feathered edges) -- the vignette smooths over it for free.
+
+**Re-validated on the same 2 real cached captures, real numbers improved,
+not just held steady**: real NFIQ2 `01662ffb` 70 (original) -> 66 (round-2
+trim) -> **77** (this round); `474b4d6a` 77 -> 75 -> **79**. Both now score
+*above* their original untrimmed baseline, not just "acceptably lower" --
+removing the genuinely messy crease content plus softening the edges via
+the vignette reads as cleaner, more consistent ridge structure to NFIQ2,
+not just a smaller print. Visually confirmed (sent to CTO) the residual
+band from the annotated screenshot is gone on the same real capture.
+
+**Not yet deployed** — needs its own explicit deploy go-ahead like every
+other backend change, same as the round-2 crease-trim commit it amends.
+
 ## Backend-side crease exclusion built: real ridge-curvature mask trim, found and fixed a real axis bug along the way (2026-08-17)
 Direct follow-up to the CTO's "pad isolation needs to be a backend
 configuration" direction (previous entry). Built `_trim_base_crease()`
