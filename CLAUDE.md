@@ -1,5 +1,71 @@
 # ClearBridge Mobile — persistent context
 
+## Backend-side crease exclusion built: real ridge-curvature mask trim, found and fixed a real axis bug along the way (2026-08-17)
+Direct follow-up to the CTO's "pad isolation needs to be a backend
+configuration" direction (previous entry). Built `_trim_base_crease()`
+(`afis_print.py`): trims print area toward the guide's BASE half only
+wherever local ridge orientation is too uniform across a row to plausibly
+be real pad structure — a flexion crease is characteristically near-
+straight parallel lines, while true whorl/loop/arch ridge flow has real
+local curvature. Measures this via row-wise CIRCULAR variance of
+`_orientation_field`'s own ridge-direction estimate (1 - resultant-vector-
+length of the doubled angles), scanning from the mask's own vertical centre
+toward its base for the first sufficiently-long run of low-variance rows.
+Wired into `generate()` as `crease_trim: bool = True` — applies universally
+to every guide-region-based candidate (front burst, minutiae patches, sweep
+zones, secondary cameras), matching the "backend config, not capture
+geometry" framing directly.
+
+**Real, non-trivial bug found and fixed during validation, not shipped
+blind.** First implementation trimmed based on `guide_region`'s own
+`cy`/`ry` keys, applied BEFORE the pipeline's upright rotation — reasoned
+to be correct, but a visual overlay of the actual mask boundary directly on
+a real raw capture (`scratchpad/ps/deltacheck/raw_with_trim_overlay_zoom.png`)
+showed the trim cutting a vertical strip on one SIDE of the final image,
+not a horizontal band at the bottom. Root cause: `_stillSpaceRegionForShape`'s
+own `(u,v)->(1-v,u)` rotation means `guide_region`'s `cy`/`ry` keys do NOT
+correspond to the pre-rotation image's row axis — they're already rotated
+90° from the on-screen shape's own tip/base axis. Fixed by moving the trim
+to run AFTER `_upright_from_tip`/`_upright_rotate` instead, on the
+already-rotated `binimg`/`mask` — the one point in this pipeline with a
+*guaranteed* row-axis contract ("larger row = base"), sidestepping the
+whole class of pre-rotation axis confusion rather than re-deriving it by
+hand. Same rotation-bug class already documented multiple times elsewhere
+in this project (`_scoreRoi`, `_focusPointScreenSpace`, the original
+BoxFit.cover guideRegion bug) — this file's own standing lesson held again.
+
+**Validated locally against 2 real cached front_only_v1 captures**
+(`01662ffb`, `474b4d6a` — raw bursts + guide_region pulled from Storage/
+Firestore, full `generate()` run, real calibrated NFIQ2 binary):
+- Visually confirmed (post-fix) the trim removes a horizontal band from
+  the BOTTOM of the upright print, not a side strip — matches the CTO's
+  own photo (crease is below the pad, not beside it).
+- `01662ffb` (full, un-shrunk guide): trimmed 28,908px off the base;
+  real NFIQ2 70 -> 66 (-4).
+- `474b4d6a` (captured on the now-reverted shrunk guide, so less crease
+  was present to begin with): trimmed only 4,630px; real NFIQ2 77 -> 75
+  (-2).
+- Both real, small NFIQ2 *decreases* — expected and consistent with this
+  project's own established finding that NFIQ2 and real matchability are
+  different axes: removing non-ridge crease content costs a little
+  quality-proxy score (less total area) while the content removed was
+  never real fingerprint signal, so it should be a net real-matchability
+  positive, not something the NFIQ2 dip alone should be read as a
+  regression.
+
+**Known, accepted cosmetic gap, not fixed this round**: the new trim
+boundary is a hard cut (matches the mask exactly), unlike the print's
+other edges, which fade via the existing `_FADE_INSET_PX`/`_FEATHER_SIGMA`
+distance-transform feather. Visually minor in the validated samples: a
+real follow-up if it looks wrong on a real device capture, not blocking
+this shipping.
+
+**Not yet deployed** — needs its own explicit deploy go-ahead like every
+other backend change. `crease_trim` defaults `True` (so it's live the
+moment this deploys, on every guide-region-based candidate, without a
+`main.py` change) but is a real, named, easily-disabled parameter if it
+needs to be turned off without a revert.
+
 ## Guide-shape crease cut REVERTED — CTO wants pad/crease isolation solved as a backend config problem, not client geometry (2026-08-17)
 CTO tested the crease-cut build (previous entry below) and gave direct
 feedback: liked the on-screen guide shape as it was before that change, and

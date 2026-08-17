@@ -1314,6 +1314,113 @@ def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
     return combined[1:-1, 1:-1]
 
 
+_CREASE_MIN_CIRCVAR = 0.30   # row is "crease-like" below this circular
+# variance of ridge orientation across x. Real basis, not a guess: measured
+# on 2 real front_only_v1 captures (01662ffb, 474b4d6a) via
+# scratchpad/ps/deltacheck -- true pad/whorl rows scored 0.4-0.9, the base
+# ~10-15% of the guide (where the CTO's own annotated photo showed the DIP
+# flexion crease sits) dropped to 0.01-0.25. 0.30 sits between the two
+# populations with real margin on both real samples.
+_CREASE_MIN_RUN_FRAC = 0.08  # a low-variance run must persist this long
+# (as a fraction of the mask's own vertical span) before it's trusted as a
+# real crease boundary, not one noisy row -- same "don't trust a single
+# sample" discipline as the live wavelength estimator's own multi-strip
+# averaging.
+_CREASE_MAX_TRIM_FRAC = 0.40  # hard cap: never trim more than this fraction
+# of the mask's vertical span this way, regardless of what the scan finds --
+# a real safety bound against a false-positive run eating a legitimately
+# low-curvature (e.g. arch-pattern) pad.
+
+
+def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
+                       min_circvar: float = _CREASE_MIN_CIRCVAR,
+                       min_run_frac: float = _CREASE_MIN_RUN_FRAC,
+                       max_trim_frac: float = _CREASE_MAX_TRIM_FRAC
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Trims print area toward the BASE half only (never the tip -- matches
+    the CTO's own annotated photo, which flagged only the bottom boundary as
+    wrong) wherever local ridge orientation is too uniform across a row to
+    plausibly be real pad structure. A flexion crease is characteristically
+    near-straight, near-parallel lines; true pad ridge flow (whorl/loop/
+    arch, especially near a core) has real local curvature -- ridge
+    direction genuinely varies across x. Measures that via the row-wise
+    CIRCULAR variance of `_orientation_field`'s own ridge-direction estimate
+    (1 - resultant-vector-length of the doubled angles, so it's insensitive
+    to the pi-periodicity of ridge direction), scanning from the mask's own
+    vertical centre toward its base edge for the first sufficiently-long run
+    of low-variance rows.
+
+    MUST be called AFTER `_upright_from_tip`/`_upright_rotate` (i.e. on the
+    already-rotated `binimg`/`mask`, not the pre-rotation working image) --
+    that is the one point in this pipeline where "larger row index" is
+    unambiguously "toward the base", by construction. Found the hard way,
+    2026-08-17: guide_region's own `cy`/`ry` keys (still-space, pre-
+    rotation) do NOT correspond to the pre-rotation image's row axis --
+    they're already rotated 90 deg from the on-screen shape's own tip/base
+    axis (a real consequence of `_stillSpaceRegionForShape`'s
+    `(u,v)->(1-v,u)` transform, confirmed by direct visual overlay: the
+    guide's own cy+-ry span traced along the pre-rotation image's COLUMN
+    axis, not its row axis, in a real downloaded capture). Operating post-
+    rotation instead sidesteps that whole class of axis confusion, same
+    lesson as every other rotation bug already documented in this project --
+    trust the one point in the pipeline with a guaranteed, deterministic
+    orientation contract, not an intermediate space's own field names.
+
+    Runs `_orientation_field` directly on the binarized ridge image --
+    already clean, high-contrast black/white content, which gives a
+    stronger edge signal for this purpose than the noisier pre-binarization
+    grayscale would.
+
+    Real, deliberate choice: scans from the CENTRE outward (not from the
+    base edge inward) and requires a sustained run before accepting a trim
+    boundary -- a single noisy row right at the mask's own soft/feathered
+    edge (inherently less reliable for orientation estimation) shouldn't be
+    enough to trigger a trim on its own.
+
+    Can only ever REMOVE area from the base half (whitened in binimg,
+    cleared in mask), never add or touch the tip half -- cannot regress a
+    capture that had no real crease overlap, same "additive/bounded, can't
+    make things worse" discipline as every other mask refinement in this
+    pipeline. Returns both inputs unchanged if no qualifying run is found.
+    """
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return binimg, mask
+    y0, y1 = int(ys.min()), int(ys.max())
+    span = y1 - y0
+    if span < 40:
+        return binimg, mask
+    orient = _orientation_field(binimg.astype(np.float32))
+    mid_y = y0 + span // 2
+    min_run = max(3, int(min_run_frac * span))
+    run = 0
+    trim_at: Optional[int] = None
+    for y in range(mid_y, y1 + 1):
+        row = mask[y] > 0
+        if row.sum() < 5:
+            run += 1
+        else:
+            th = orient[y, row]
+            c = float(np.mean(np.cos(2 * th)))
+            s = float(np.mean(np.sin(2 * th)))
+            circvar = 1.0 - float(np.hypot(c, s))
+            run = (run + 1) if circvar < min_circvar else 0
+        if run >= min_run:
+            trim_at = y - min_run + 1
+            break
+    if trim_at is None:
+        return binimg, mask
+    min_trim_at = y1 - int(max_trim_frac * span)
+    trim_at = max(trim_at, min_trim_at)
+    if trim_at >= y1:
+        return binimg, mask
+    binimg = binimg.copy()
+    mask = mask.copy()
+    binimg[trim_at:, :] = 255
+    mask[trim_at:, :] = 0
+    return binimg, mask
+
+
 def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
                       flash_burst: Optional[List[np.ndarray]],
                       shape: Tuple[int, int]) -> Optional[np.ndarray]:
@@ -2232,6 +2339,7 @@ def generate(
     pyfing_blend: float = 1.0,
     freq_scale_min: Optional[float] = None,
     pad_mask_override: Optional[np.ndarray] = None,
+    crease_trim: bool = True,
 ) -> Tuple[Optional[np.ndarray], dict]:
     """
     Build the AFIS-style binary print from the best face-on frame.
@@ -3018,6 +3126,21 @@ def generate(
     else:
         binimg, mask = _upright_rotate(binimg, mask)
     params['afisRotated'] = True
+
+    # Base-crease trim (2026-08-17, CTO-directed: "pad isolation needs to be
+    # a backend configuration"). The guide/flash-diff/U-Net masking above
+    # all separate finger SKIN from non-finger BACKGROUND -- the DIP flexion
+    # crease is still finger skin, so none of them have any signal to
+    # exclude it. This trims by ridge CURVATURE instead, and MUST run here,
+    # after upright rotation -- see _trim_base_crease's own docstring for
+    # why an earlier attempt at this (pre-rotation, keyed off guide_region's
+    # own cy/ry) trimmed the wrong axis entirely.
+    if crease_trim:
+        pre_cov = int((mask > 0).sum())
+        binimg, mask = _trim_base_crease(binimg, mask)
+        trimmed_px = pre_cov - int((mask > 0).sum())
+        if trimmed_px > 0:
+            params['afisCreaseTrimPx'] = trimmed_px
 
     # Mirror-correction SCAFFOLD (2026-08-03, CTO-reported): this capture
     # flow requires the user to twist their thumb behind the phone to
