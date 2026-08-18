@@ -1,5 +1,37 @@
 # ClearBridge Mobile — persistent context
 
+## Distance-wave cue recalibrated off 3 real reliable reads: it was clamping "too close" to a flat plateau, hiding real progress (2026-08-18, round 11)
+CTO reported the wavelength gate "takes long to lock even when I follow
+instructions" on a real device screenshot showing the new top-of-screen
+banner correctly reading "PUSH PRINT BACKWARD" — asked to review, then
+took a second capture session specifically so this could be calibrated off
+real data rather than guessed.
+
+**Real root cause, confirmed across 3 real captures the same session**:
+`liveWavelengthStillPx` posted RELIABLE final reads of **15.18, 47.92, and
+54.80px** — real users (well, the one real tester) routinely sitting FAR
+beyond the gate threshold (16.0px) for extended periods, not just grazing
+it. The wave-cue's own formula clamped `(liveWavelengthStillPx - 11.5) /
+(16.0 - 11.5)` to `[0,1]` — meaning 20px and 54.8px rendered IDENTICALLY
+(rings maximally "too close" either way). A user genuinely moving in the
+right direction while still outside range got zero visual confirmation of
+progress until crossing the last few px before the threshold — a direct,
+concrete explanation for "feels stuck" even while doing the right thing.
+
+**Fixed by decoupling the cue's visual ceiling from the real gate
+threshold** — `_liveWavelengthTooHighPx` (16.0, the value that actually
+blocks the hold) is untouched. New `_liveWavelengthCueCeilingPx = 50.0`,
+used only as the wave-cue's own scaling denominator, calibrated against
+the real observed max (54.8) so the worst real case still reads as ~maxed
+while the whole real 16-50px range in between now gets actual
+differentiation instead of a flat plateau.
+
+**Honest caveat, same as every other real-data-driven number in this
+project**: n=3 real reliable samples (the estimator only started producing
+reliable reads reliably enough to calibrate against after this same
+round's quadratic-detrend/stripCount=7 fixes) — revisit 50.0 once more
+real reliable reads accumulate. Not yet device-tested.
+
 ## Focus-zone data now actually incorporated into the delivered superprint — new focusZoneSplice candidate, diagnostic-first (2026-08-17, round 10)
 Direct follow-up to the CTO's question "how do we incorporate the
 focusZone data into the final superprint since it catches details that

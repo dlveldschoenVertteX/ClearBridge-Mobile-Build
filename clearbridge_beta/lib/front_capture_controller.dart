@@ -1496,6 +1496,24 @@ class FrontCaptureController extends ChangeNotifier {
   // number. _liveWavelengthTooHighPx (16.0) is the upper anchor, so the
   // cue reaches 1.0 exactly where the hold gate would start blocking.
   static const double _liveWavelengthTargetPx = 11.5;
+  // Separate upper anchor for the CUE's visual scaling only -- deliberately
+  // NOT the same as _liveWavelengthTooHighPx (16.0, the real gate threshold,
+  // untouched by this). Real calibration data, 2026-08-18: with the
+  // quadratic-detrend/stripCount=7 estimator fixes finally making
+  // liveWavelengthStillPx reliable often enough to matter, 3 real captures
+  // this session posted RELIABLE final reads of 15.18, 47.92, and 54.80px
+  // -- i.e. real users routinely sit far beyond the old ceiling (16.0) for
+  // extended periods, not just marginally over it. The old cue formula
+  // clamped ANY value above 16.0 to 1.0, so 20px and 54.8px rendered
+  // IDENTICALLY (rings maximally "too close" either way) -- real, direct
+  // explanation for a reported "feels stuck, no sense of progress" struggle
+  // even while moving the right direction. 50.0 sits just under the real
+  // observed max (54.8) so the worst real case still reads as ~maxed, while
+  // the whole real 16-50px range in between now gets actual differentiation
+  // instead of a flat plateau. Honest caveat: n=3 real reliable samples,
+  // same as every other real-data-driven number in this project -- revisit
+  // once more real reliable reads exist.
+  static const double _liveWavelengthCueCeilingPx = 50.0;
   Map<String, dynamic> _wavelengthDebug = {};
 
   // Guided thumb-sweep state (see the constants block above for the
@@ -1907,9 +1925,15 @@ class FrontCaptureController extends ChangeNotifier {
     // wavelengthTooHigh itself, so the rings never imply a signal that
     // isn't really there yet.
     final wlReliableNow = _wavelengthSampleCount >= _liveWavelengthMinSamples;
+    // Ceiling is _liveWavelengthCueCeilingPx (real-data-calibrated, see its
+    // own docs), deliberately NOT _liveWavelengthTooHighPx (the real gate
+    // threshold, untouched) -- the old code reused the gate threshold as
+    // the cue's own ceiling too, which meant every value above it rendered
+    // identically ("maximally too close") regardless of how far over it
+    // actually was.
     final waveCue = wlReliableNow && _liveWavelengthStillPx != null
         ? ((_liveWavelengthStillPx! - _liveWavelengthTargetPx) /
-                (_liveWavelengthTooHighPx - _liveWavelengthTargetPx))
+                (_liveWavelengthCueCeilingPx - _liveWavelengthTargetPx))
             .clamp(0.0, 1.0)
         : null;
     if (hint != _state.distanceHint || waveCue != _state.distanceWaveCue) {
