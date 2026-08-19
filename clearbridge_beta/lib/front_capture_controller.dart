@@ -1853,20 +1853,57 @@ class FrontCaptureController extends ChangeNotifier {
   /// (measured directly on the still decoded to _stillDecodeTargetWidth,
   /// no further resize before _ridge_wavelength runs).
   ///
-  /// `_guideRx` is the guide's half-width already in still-normalized,
-  /// crop-and-rotation-corrected coordinates (_computeGuideRegion above);
-  /// `_scoreRoi` is the same ROI already feeding meanLuma/the wavelength
-  /// estimator, in raw-CameraImage-normalized coordinates. These are two
-  /// INDEPENDENTLY derived approximations of "the same" guide region
-  /// (_scoreRoi's own comment says it's only "kept 1:1" with the guide
-  /// shape, not identical to the crop-corrected _guideRx) -- fine for a
-  /// coarse scale factor, but exactly why liveWavelengthStillPx must be
-  /// checked against real backend afisWavelengthPx data (not trusted
-  /// because it looks reasonable) before this ever drives distanceHint.
+  /// REAL BUG FOUND + FIXED, 2026-08-19: this used to derive a genuine
+  /// still-vs-preview correction from the ratio between `_scoreRoi.width`
+  /// and `_guideRx`, back when those were two INDEPENDENTLY derived
+  /// approximations of "the same" guide region (per this comment's own
+  /// prior wording). That independence is exactly what the 2026-08-14
+  /// `_scoreRoi` fix removed: `_scoreRoi` is now a getter defined AS
+  /// `Rect.fromLTRB(_guideCx-_guideRx, ..., _guideCx+_guideRx, ...)` (see
+  /// its own docs above), so `_scoreRoi.width` is `2*_guideRx` by
+  /// construction. That makes `_guideRx` cancel out of this function's
+  /// old formula algebraically -- `roiWidthPx = _scoreRoi.width *
+  /// image.width = 2*_guideRx*image.width`, so
+  /// `(2*_guideRx*_stillDecodeTargetWidth)/roiWidthPx` collapsed to a bare
+  /// `_stillDecodeTargetWidth/image.width` resolution ratio, with zero
+  /// real geometric correction left in it -- silently, since nobody
+  /// touched THIS function when `_scoreRoi` was refactored.
+  ///
+  /// Confirmed via 6 real front_only_v1 captures pairing
+  /// `liveWavelengthStillPx` against the backend's own real
+  /// `afisWavelengthPxRaw` (2026-08-17 through 2026-08-19): the collapsed
+  /// resolution-ratio scale inflates the live estimate 1.25x-2.2x above
+  /// the real backend measurement on 5 of 6 captures (774f2252 2.14x,
+  /// e50047c7 2.17x, 4508786f 1.71x, 1c019820 1.96x, f0968af4 1.25x -- one
+  /// older outlier, 286f1f0a at 0.58x, predates this session's other
+  /// fixes and doesn't fit the pattern). The RAW, un-scaled
+  /// `liveWavelengthPx` tracks the real backend value far better on those
+  /// same 5 captures (ratios 1.07, 1.09, 0.86, 0.98, 0.90 -- mean 0.98,
+  /// essentially 1:1) -- consistent with the real 2026-08-06 calibration
+  /// noted above `_liveWavelengthTooHighPx` (corrected live 21.2 vs.
+  /// backend 20.0/22.0, "tracks... to within ~1px"), which this same
+  /// silent collapse broke sometime after 2026-08-14 without changing
+  /// that constant. A very plausible real contributor to "wavelength
+  /// estimator not intuitive"/"takes a while to lock" persisting even
+  /// after the round-12 staleness fix: an inflated
+  /// `liveWavelengthStillPx` reads as falsely too-close, triggering
+  /// unnecessary `wavelengthTooHigh` gate blocks and a wave-cue that
+  /// never visibly settles.
+  ///
+  /// Fixed by dropping the now-vestigial resolution-ratio math and
+  /// returning a flat 1.0 -- per the real data above, the raw
+  /// preview-domain estimate is already a good proxy for the backend's
+  /// still-domain measurement post the 2026-08-14 `_scoreRoi` refactor,
+  /// so no further scaling is warranted. Honest caveat: this is an
+  /// empirical correction grounded in 5 consistent real data points, not
+  /// a from-first-principles re-derivation of the true preview-vs-still
+  /// relationship -- if a future `_stillDecodeTargetWidth` or preview-
+  /// resolution change shows real drift again, re-validate against fresh
+  /// `afisWavelengthPxRaw` pairs the same way; don't assume 1.0 holds
+  /// forever without checking.
   double? _wavelengthScaleToStill(CameraImage image) {
-    final roiWidthPx = _scoreRoi.width * image.width;
-    if (roiWidthPx <= 0 || _guideRx <= 0) return null;
-    return (2 * _guideRx * _stillDecodeTargetWidth) / roiWidthPx;
+    if (image.width <= 0 || _guideRx <= 0) return null;
+    return 1.0;
   }
 
   void _onFrame(CameraImage image) {

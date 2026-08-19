@@ -1,5 +1,75 @@
 # ClearBridge Mobile — persistent context
 
+## Round-12's own fixes confirmed working on real data — and that check surfaced a bigger, real bug: a 2026-08-14 refactor silently broke the live wavelength estimator's still-domain calibration (2026-08-19, round 13)
+Round-12's two fixes (stale `liveWavelengthDebug` snapshot, widened focus-zone
+restore-to-centre bound) shipped without a device test. First real capture on
+that build (`774f2252`, NFIQ2 63) confirms both are working exactly as
+designed: the diagnostic snapshot's `liveAbsSharpness` (27.017) now EXACTLY
+matches `focusZoneDebug.restoreCenter.sharpness` (27.017) — direct proof the
+re-snapshot fires after the bracket, not before it — and the gap between the
+last focus-zone shot and the first main-burst frame shrank from the previous
+capture's 21s down to ~2s. This capture's own overall softness (main-burst
+Laplacian 11.2-21.4) traces to something else, not a repeat of the round-12
+bug: `refocusDebug.maxSharpnessObserved` was already only 28.88 at the very
+first hold-lock, before the zone bracket ever ran — this specific attempt had
+a poor initial AF lock, a different failure mode than the one round-12 fixed.
+
+**Pulling on that same real capture surfaced a second, more consequential
+real bug, unrelated to round-12's own fixes.** Cross-checking the freshly-
+accurate post-bracket snapshot against the backend's own real measurement of
+the actually-captured frame (`afisWavelengthPxRaw`) found `liveWavelengthStillPx:
+60.02` vs. the real backend value **28.0** — a 2.14x inflation, even with the
+staleness bug now fixed. Checked whether this was a one-off: pulled every
+real front_only_v1 capture with both fields present (6 total, 2026-08-17
+through 2026-08-19). 5 of 6 show the same pattern, `liveWavelengthStillPx`
+inflated 1.25x-2.2x over the real backend value (774f2252 2.14x, `e50047c7`
+2.17x, `4508786f` 1.71x, `1c019820` 1.96x, `f0968af4` 1.25x — one older
+capture, `286f1f0a`, predates this session's other fixes and doesn't fit).
+**The raw, UN-scaled `liveWavelengthPx` tracks the real backend value far
+better on those same 5 captures** (ratios 1.07, 1.09, 0.86, 0.98, 0.90 — mean
+0.98, essentially 1:1) — the scaling step itself, not the underlying
+estimate, is what's wrong.
+
+**Real, mechanistic root cause, not a guess**: `_wavelengthScaleToStill()`
+used to derive a genuine still-vs-preview correction from the ratio between
+`_scoreRoi.width` and `_guideRx`, back when those were two INDEPENDENTLY
+derived approximations of the guide region (the function's own prior comment
+said so explicitly). But the 2026-08-14 fix ("`_scoreRoi` never got the
+runtime BoxFit.cover correction") redefined `_scoreRoi` as a getter equal to
+`2*_guideRx` by construction — which makes `_guideRx` cancel out of this
+OTHER function's formula algebraically: `roiWidthPx = _scoreRoi.width *
+image.width = 2*_guideRx*image.width`, so
+`(2*_guideRx*_stillDecodeTargetWidth)/roiWidthPx` collapses to a bare
+`_stillDecodeTargetWidth/image.width` resolution ratio with zero real
+geometric correction left in it — silently, since nobody touched THIS
+function when `_scoreRoi` was refactored. This lines up exactly with a real,
+already-documented calibration from 2026-08-06 (above `_liveWavelengthTooHighPx`):
+back then, the corrected live estimate tracked the real backend value to
+within ~1px (21.2 live vs. 20.0/22.0 backend) — a genuinely validated ~1:1
+relationship that this silent collapse broke sometime after 2026-08-14
+without anyone changing that threshold or re-checking the calibration.
+**Very likely a real, direct contributor to "wavelength estimator not
+intuitive"/"takes a while to lock" persisting even after the round-12
+staleness fix**: an inflated `liveWavelengthStillPx` reads as falsely
+too-close, triggering unnecessary `wavelengthTooHigh` gate blocks and a
+wave-cue that never visibly settles, regardless of where the thumb actually
+is.
+
+**Fixed**: `_wavelengthScaleToStill()` now returns a flat `1.0` instead of
+the collapsed resolution-ratio math — per the real data above, the raw
+preview-domain estimate is already a good proxy for the backend's
+still-domain measurement post the 2026-08-14 refactor, so no further scaling
+is warranted. **Honest caveat, stated plainly**: this is an empirical
+correction grounded in 5 consistent real data points, not a from-first-
+principles re-derivation of the true preview-vs-still relationship — if a
+future `_stillDecodeTargetWidth` or preview-resolution change shows real
+drift again, re-validate against fresh `afisWavelengthPxRaw` pairs the same
+way rather than assuming 1.0 holds forever. `scaleToStill`/`liveWavelengthPx`
+stay in `liveWavelengthDebug` specifically so the next real captures keep
+this checkable. Not yet device-tested — needs a fresh real capture to
+confirm `liveWavelengthStillPx` now tracks `afisWavelengthPxRaw` to within
+~1-2px again, the same bar the 2026-08-06 calibration originally set.
+
 ## Two real bugs found from a real device-test round: wavelength-diagnostic staleness explains "backward said, forward worked"; focus-zone bracket's own restore-to-center was the softness culprit (2026-08-18, round 12)
 CTO reported two issues on the build carrying the recalibrated wave-cue:
 "Wavelength estimator is still not intuitive... text said go backwards but
