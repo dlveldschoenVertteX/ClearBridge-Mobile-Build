@@ -1,5 +1,69 @@
 # ClearBridge Mobile — persistent context
 
+## Two real bugs found from a real device-test round: wavelength-diagnostic staleness explains "backward said, forward worked"; focus-zone bracket's own restore-to-center was the softness culprit (2026-08-18, round 12)
+CTO reported two issues on the build carrying the recalibrated wave-cue:
+"Wavelength estimator is still not intuitive... text said go backwards but
+when I brought thumb forward it only locked" and "Focus still has an
+issue, the captures were soft." Pulled the real capture (`e50047c7`) and
+its full `captureTelemetry` trace for both rather than guess.
+
+**Wavelength "backward said, forward worked": real root cause is a stale
+diagnostic snapshot, not a wrong direction or a broken estimator.** Real
+timeline: `holdComplete` at 18.3s, but the first real `shotFired` didn't
+happen until 39.4s — a 21-second gap (the focus-zone-bracket's own real
+cost, see round 8's finding, now confirmed even larger). Critically, the
+wavelength estimator kept sampling the WHOLE time during that gap — 110 of
+123 real attempts succeeded — but `liveWavelengthDebug` is snapshotted at
+`_fireBurst()` ENTRY (hold-complete time), before the bracket runs, so the
+value written to Firestore reflects an 21-second-STALE moment, not the
+state when the real scored frames actually get captured. This capture's
+own numbers prove it: the stale snapshot read `liveWavelengthStillPx:
+32.57` (still over the 16.0 gate) with `wavelengthGateExpired: true`, yet
+the REAL backend measurement of the actually-captured frame
+(`afisWavelengthPxRaw`) came back a healthy **15.0** — i.e. the true
+distance was fine by the time the shutter fired, the diagnostic just never
+saw it. The most likely real explanation for the CTO's own experience:
+the hold finally completing was the 6-second escape hatch's timer expiring
+(not a genuine gate-clear), which can land right after ANY movement --
+creating a false "that's what fixed it" impression regardless of which
+direction was actually corrective.
+
+**Fixed the observability gap**: `snapshotWavelengthDebug()` (extracted
+from the existing snapshot code, unchanged) is now called a SECOND time
+right after the focus-zone-bracket completes, overwriting the stale
+hold-complete-time snapshot with the state that's actually current when
+the real burst fires. Diagnostic-only — doesn't change any gate/hold
+behavior, just stops misleading the next review of a real capture's data.
+
+**Focus softness: real, distinct bug found in the SAME 21-second window.**
+This capture's real Laplacian scores (main burst 36.5-111.1,
+`refocusDebug.finalSharpness` 44.2) were measurably below this session's
+other captures (90-220+ range) — a real, quantitative match for "the
+captures were soft," not just a subjective read. Root cause: after the
+focus-zone-bracket retargets AF to 4 different zone points, the final
+"restore focus to centre" call — the ACTUAL focus state the real scored
+ambient/flash frames get captured at, since it's the last thing that runs
+before `_stopStream()` and the main burst — used the SAME short
+`_focusZoneMinMs`/`_focusZoneMaxMs` (250-700ms) bound as each individual
+zone shot. That bound's own justification ("the lens is already converged
+at centre from the hold's own `_refocus()` moments earlier, so retargeting
+nearby is a small delta") doesn't hold for the RESTORE call: by then the
+lens has moved to 4 different zone targets over 10+ real seconds, so
+returning to centre is a real, larger readjustment. It was also never
+verified or logged at all.
+
+**Fixed**: widened the restore-to-centre call to the same bound the
+original hold-lock's own `_refocus()` uses (`_refocusMinMs`/
+`_refocusMaxMs`, 600-1200ms) — the one convergence in the whole bracket
+that actually matters for the delivered print, so it deserves at least the
+same rigor as the first lock, not the shortest bound in the sequence.
+Logged into `focusZoneDebug['restoreCenter']` (previously unobserved) so
+the next real capture's data confirms whether this recovers real sharpness.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project; both fixes are diagnosed from real data
+but need the next real capture to confirm.
+
 ## Distance-wave cue recalibrated off 3 real reliable reads: it was clamping "too close" to a flat plateau, hiding real progress (2026-08-18, round 11)
 CTO reported the wavelength gate "takes long to lock even when I follow
 instructions" on a real device screenshot showing the new top-of-screen

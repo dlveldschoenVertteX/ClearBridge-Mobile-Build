@@ -2906,10 +2906,37 @@ class FrontCaptureController extends ChangeNotifier {
         debugPrint('[front] focus-zone shot ($zone) failed (non-fatal): $e');
       }
     }
-    _focusZoneDebug = focusZoneDebug;
     // Restore focus to the guide's own centre -- the caller's existing
-    // centre-focused burst flow assumes this is where the lens already is.
-    await _retargetAndConverge(_focusPointScreenSpace);
+    // centre-focused burst flow assumes this is where the lens already is,
+    // and this is the ACTUAL focus state the real scored ambient/flash
+    // burst frames get captured at (this call is the last thing that runs
+    // before _stopStream()/the main burst). Real bug found 2026-08-18 (CTO
+    // report: "captures were soft", corroborated by real Laplacian scores
+    // well below this session's other captures): this used the SAME short
+    // _focusZoneMinMs/_focusZoneMaxMs (250-700ms) bound as each individual
+    // zone shot, whose own justification -- "the lens is already converged
+    // at the centre point from the hold's own _refocus() moments earlier,
+    // so retargeting to a nearby point is a smaller adjustment" -- does NOT
+    // hold here: by this point the lens has moved to 4 different zone
+    // targets over ~10+ real seconds, so returning to centre is a real,
+    // larger readjustment, not a small delta. Widened to the SAME bound the
+    // original hold-lock's own _refocus() uses (600-1200ms) -- this is the
+    // one convergence in the whole bracket that actually matters for the
+    // delivered print, so it deserves at least the same rigor as the first
+    // lock, not the shortest bound in the sequence. Logged into
+    // focusZoneDebug (was previously not observed at all) so the next real
+    // capture's data confirms whether this actually recovers sharper focus.
+    final restoreSw = Stopwatch()..start();
+    final restoreSharpness = await _retargetAndConverge(
+      _focusPointScreenSpace,
+      minMs: _refocusMinMs,
+      maxMs: _refocusMaxMs,
+    );
+    focusZoneDebug['restoreCenter'] = {
+      'convergedMs': restoreSw.elapsedMilliseconds,
+      'sharpness': restoreSharpness,
+    };
+    _focusZoneDebug = focusZoneDebug;
     return shots;
   }
 
@@ -3191,51 +3218,68 @@ class FrontCaptureController extends ChangeNotifier {
     // captures logged this field off a single noisy frame. Below the
     // threshold, report null + the real sample count instead of a
     // misleadingly precise-looking number.
-    final wlReliable = _wavelengthSampleCount >= _liveWavelengthMinSamples;
-    _wavelengthDebug = {
-      'liveWavelengthPx': wlReliable ? _liveWavelengthPx : null,
-      'liveWavelengthStillPx': wlReliable ? _liveWavelengthStillPx : null,
-      'scaleToStill': _liveWavelengthPx != null && _liveWavelengthPx! > 0
-          ? (_liveWavelengthStillPx ?? 0) / _liveWavelengthPx!
-          : null,
-      'sampleCount': _wavelengthSampleCount,
-      'belowMinSamples': !wlReliable,
-      'axis': _wavelengthAxis,
-      // Whether wavelengthTooHigh was ever true during this hold. Real GATE
-      // as of 2026-08-14 (see rawOnTarget above), not just a hint -- if
-      // true on a capture, the hold could not complete until the user
-      // moved back far enough to clear it. Correlate the final
-      // afisWavelengthPx against captures where this was false to confirm
-      // 16.0 is still the right cutover once real post-fix data exists.
-      'wavelengthGateThresholdPx': _liveWavelengthTooHighPx,
-      // True if the bounded escape hatch (see _wavelengthOnlyBlockedSince's
-      // own docs, 2026-08-17 round 4) ever let the hold proceed while
-      // wavelengthTooHigh was still true, rather than the gate clearing
-      // normally. Real signal for whether _wavelengthOnlyBlockMaxMs=6000
-      // is well-calibrated: if this is rarely true, the gate is mostly
-      // resolving on its own within the bound; if it's frequently true,
-      // either the bound is too short or the underlying estimator still
-      // needs work.
-      'wavelengthGateExpired': _wavelengthGateExpiredThisHold,
-      // Diagnostic pair added 2026-08-14 -- see the field docs above
-      // _inCoverageFrameCount for the real open question this answers:
-      // real data shows sampleCount stays 0 on 71% of real captures, and a
-      // Python repro of the estimator's own qualification logic against
-      // real captured content ruled out live-preview resolution as the
-      // cause. This distinguishes "rarely invoked" (inCoverageFrameCount
-      // low) from "invoked often but rarely qualifies" (nullAttempts high
-      // relative to inCoverageFrameCount) on the next real capture.
-      'inCoverageFrameCount': _inCoverageFrameCount,
-      'wavelengthNullAttempts': _wavelengthNullAttempts,
-      // Absolute (non-peak-normalized) live sharpness -- see field docs
-      // above _liveAbsSharpness. Not gated on a minimum sample count the
-      // way liveWavelengthStillPx is (it's an EMA fed every in-range frame,
-      // not a low-frequency 250ms-interval sample, so it converges much
-      // faster) -- written whenever any samples exist, real sample count
-      // included so a genuinely short hold is still identifiable.
-      'liveAbsSharpness': _liveAbsSharpness,
-      'sharpnessSampleCount': _sharpnessSampleCount,
-    };
+    //
+    // Wrapped in a closure and called TWICE, 2026-08-18: real telemetry
+    // showed the focus-zone-bracket (when enabled) adds a real ~21s gap
+    // between this point and the main burst's actual first shot, during
+    // which the wavelength estimator keeps sampling/updating in the
+    // background (confirmed: 110/123 real attempts succeeded in that exact
+    // window on one real capture) -- but the ORIGINAL single call here
+    // snapshotted state from BEFORE that whole window, so the field could
+    // read as stuck/wrong ("too close") right up to hold-complete while
+    // the real captured frames -- taken ~21s later -- ended up measuring a
+    // perfectly fine wavelength. Calling this again right after the
+    // bracket (see below) overwrites with the state that's actually
+    // current when the real scored frames get captured.
+    void snapshotWavelengthDebug() {
+      final wlReliable = _wavelengthSampleCount >= _liveWavelengthMinSamples;
+      _wavelengthDebug = {
+        'liveWavelengthPx': wlReliable ? _liveWavelengthPx : null,
+        'liveWavelengthStillPx': wlReliable ? _liveWavelengthStillPx : null,
+        'scaleToStill': _liveWavelengthPx != null && _liveWavelengthPx! > 0
+            ? (_liveWavelengthStillPx ?? 0) / _liveWavelengthPx!
+            : null,
+        'sampleCount': _wavelengthSampleCount,
+        'belowMinSamples': !wlReliable,
+        'axis': _wavelengthAxis,
+        // Whether wavelengthTooHigh was ever true during this hold. Real GATE
+        // as of 2026-08-14 (see rawOnTarget above), not just a hint -- if
+        // true on a capture, the hold could not complete until the user
+        // moved back far enough to clear it. Correlate the final
+        // afisWavelengthPx against captures where this was false to confirm
+        // 16.0 is still the right cutover once real post-fix data exists.
+        'wavelengthGateThresholdPx': _liveWavelengthTooHighPx,
+        // True if the bounded escape hatch (see _wavelengthOnlyBlockedSince's
+        // own docs, 2026-08-17 round 4) ever let the hold proceed while
+        // wavelengthTooHigh was still true, rather than the gate clearing
+        // normally. Real signal for whether _wavelengthOnlyBlockMaxMs=6000
+        // is well-calibrated: if this is rarely true, the gate is mostly
+        // resolving on its own within the bound; if it's frequently true,
+        // either the bound is too short or the underlying estimator still
+        // needs work.
+        'wavelengthGateExpired': _wavelengthGateExpiredThisHold,
+        // Diagnostic pair added 2026-08-14 -- see the field docs above
+        // _inCoverageFrameCount for the real open question this answers:
+        // real data shows sampleCount stays 0 on 71% of real captures, and a
+        // Python repro of the estimator's own qualification logic against
+        // real captured content ruled out live-preview resolution as the
+        // cause. This distinguishes "rarely invoked" (inCoverageFrameCount
+        // low) from "invoked often but rarely qualifies" (nullAttempts high
+        // relative to inCoverageFrameCount) on the next real capture.
+        'inCoverageFrameCount': _inCoverageFrameCount,
+        'wavelengthNullAttempts': _wavelengthNullAttempts,
+        // Absolute (non-peak-normalized) live sharpness -- see field docs
+        // above _liveAbsSharpness. Not gated on a minimum sample count the
+        // way liveWavelengthStillPx is (it's an EMA fed every in-range frame,
+        // not a low-frequency 250ms-interval sample, so it converges much
+        // faster) -- written whenever any samples exist, real sample count
+        // included so a genuinely short hold is still identifiable.
+        'liveAbsSharpness': _liveAbsSharpness,
+        'sharpnessSampleCount': _sharpnessSampleCount,
+      };
+    }
+
+    snapshotWavelengthDebug();
 
     double? minEv, maxEv;
     if (preCollectedShots != null) {
@@ -3262,6 +3306,10 @@ class FrontCaptureController extends ChangeNotifier {
         // redundant-second-burst feature if both are ever enabled together.
         if (_focusZoneBracketEnabled && _burstRound == 1) {
           rawShots.addAll(await _captureFocusZoneShots());
+          // Re-snapshot now that the real ~21s bracket has run -- see
+          // snapshotWavelengthDebug's own docs above for why the earlier
+          // call alone left this stale for exactly this path.
+          snapshotWavelengthDebug();
         }
         await _stopStream();
 
