@@ -1,5 +1,58 @@
 # ClearBridge Mobile — persistent context
 
+## Lens-probe diagnostic built to answer "is my phone's stock Macro mode a real lens we could use?" (2026-08-19, round 15)
+CTO sent screenshots of their stock camera app: "Macro" appears as its own
+mode tile under "More" (alongside Pro/Portrait/Bokeh/Mono), not a toggle
+inside regular Photo mode — real evidence favoring "genuinely separate
+hardware lens" over "software crop heuristic". Cross-referenced against
+real `cameraLensInfo` data this project already collected: camera "2" has
+the shortest focal length (2.37mm vs. main's 4.15mm) and by far the
+smallest sensor (3.92×2.94mm vs. main's 5.98×4.49mm) of the four cameras —
+the classic signature of a budget quad-camera phone's dedicated macro
+sensor. Camera "2" has been used as a secondary/bonus capture camera all
+project, just never explicitly recognized as "the macro lens" specifically
+— front_only_v1's primary capture has always used camera "0" (main).
+
+**Built a standalone, `capture_harness`-only diagnostic** (per this
+project's own standing "no one-off diagnostic tooling in the production
+clearbridge_beta app" precedent, commit `4a832c0`) to settle this on a
+real device, two independent ways:
+1. **`getCameraExtensionSupport`** (new native method,
+   `capture_harness/android/.../MainActivity.kt`): queries Android's formal
+   Camera2 Extensions API (`CameraExtensionCharacteristics`, API 31+) per
+   camera id for `EXTENSION_MACRO` support — if this device implements
+   Macro as a vendor extension layered on a base camera (mostly a flagship
+   feature), this settles the question directly with zero visual
+   comparison needed. Real expectation stated plainly in the code: unlikely
+   on this rugged/budget device, but free to check and definitive if
+   positive. Gated on `Build.VERSION.SDK_INT`, wrapped per-id in try/catch
+   — can only ever report false/empty on an unsupported device, never
+   crash.
+2. **`LensProbeScreen`** (`capture_harness/lib/lens_probe_screen.dart`, new
+   "Lens Probe (diagnostic)" entry on the harness's mode-chooser screen):
+   cycles through every back camera id in turn (reusing `CameraService`,
+   the same hardened open/dispose API `front_capture_controller.dart`'s
+   secondary-camera capture already relies on), fires one still from each,
+   labels it with the real `getCameraLensInfo` characteristics (focal
+   length/sensor size/flash — copied verbatim from clearbridge_beta's own
+   `MainActivity.kt`), and shows a review grid of all captured stills so
+   the CTO can directly compare each against a reference photo taken with
+   the stock app's own Macro mode — whichever matches field-of-view/
+   close-focus behaviour is the real answer.
+
+**Real bug found and fixed before shipping**: the first draft derived
+"all cameras done" purely from `_captured.length >= _backCameras.length`
+— skipping (not capturing) the LAST camera in the list would then never
+satisfy that condition, permanently stranding the screen on a disposed
+camera controller with no button to proceed (the capture-step view's own
+loading branch has no escape once `_service.isInitialized` is false and
+nothing reopens it). Fixed with an explicit `_finished` flag set on
+stepping past the last camera via EITHER path (capture or skip), not
+derived from the capture count.
+
+Not yet run on a real device — needs the next harness APK build + a real
+walkthrough to actually answer the question this was built for.
+
 ## Real root cause of a reported ridge-continuity complaint, found via Cloud Logging, not guessed: one stuck fuse-pair call starves the whole variant loop, letting the weakest candidate win by default (2026-08-19, round 14)
 CTO pushed back directly on my own read of a fresh capture (`1cc301a8`,
 NFIQ2 59): I'd called the print's density/detail a sign of quality; CTO

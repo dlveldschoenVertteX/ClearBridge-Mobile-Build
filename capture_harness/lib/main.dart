@@ -9,6 +9,7 @@ import 'firebase_options.dart';
 import 'front_burst_screen.dart';
 import 'harness_splash_screen.dart';
 import 'last_capture_review_screen.dart';
+import 'lens_probe_screen.dart';
 import 'oscillating_capture_review_screen.dart';
 import 'oscillating_capture_screen.dart';
 
@@ -115,6 +116,24 @@ class _ModeChooserScreen extends StatelessWidget {
                 onPressed: () => _navigatorKey.currentState?.pushReplacement(
                   MaterialPageRoute(
                       builder: (_) => const _HarnessOscillatingRoute()),
+                ),
+              ),
+              const SizedBox(height: 16),
+              // Diagnostic-only: cycles through every back camera id, firing
+              // one still from each so it can be visually compared against
+              // a photo taken with the stock camera app's Macro mode --
+              // answers "which camera id (if any) is the real macro lens".
+              // See lens_probe_screen.dart's own docs for the full context.
+              CaptureButton(
+                label: 'Lens Probe (diagnostic)',
+                leadingIcon: Icons.center_focus_strong,
+                variant: CaptureButtonVariant.ghost,
+                onPressed: () => _navigatorKey.currentState?.push(
+                  MaterialPageRoute(
+                    builder: (_) => LensProbeScreen(
+                      onClose: () => _navigatorKey.currentState?.pop(),
+                    ),
+                  ),
                 ),
               ),
             ],
