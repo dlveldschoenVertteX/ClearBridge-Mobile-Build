@@ -1,5 +1,29 @@
 # ClearBridge Mobile — persistent context
 
+## Follow-on to the scale fix, same round: the wave-cue ceiling was calibrated on the same inflated data, recalibrated off the (bug-immune) real backend numbers instead (2026-08-19, round 13 cont.)
+Direct consequence of the `_wavelengthScaleToStill` fix immediately below,
+caught before pushing rather than after: `_liveWavelengthCueCeilingPx`
+(50.0) was calibrated 2026-08-18 from 3 real `liveWavelengthStillPx`
+reads — but that's exactly the live-domain field the scale bug was
+inflating 1.25x-2.2x, and 2026-08-18 postdates the 2026-08-14 refactor that
+caused it. So 50.0 was very likely calibrated against already-inflated
+numbers. Left in place after the scale fix, it would badly
+under-differentiate the real, corrected 16-28px range users actually see —
+a milder recurrence of the exact "flat plateau" problem this constant was
+built to solve in round 11.
+
+Re-derived from the real backend `afisWavelengthPxRaw` measurements instead
+(server-side, immune to the live-domain bug): the same 6 recent captures
+pulled for the scale fix read 28.0, 15.0, 28.0, 28.0, 26.0, 28.0 (max 28.0).
+Applied the same "ceiling sits just under the real observed max" convention
+the original 50.0 used (50/54.8 ≈ 0.91x) to this new max: 28.0×0.91 ≈ 25.5,
+rounded to **26.0**. Honest caveat, same as round 11's own: n=6, and
+backend-domain data is a proxy for what the corrected live domain *should*
+now read, not itself a direct live-domain sample — revisit once several
+fresh real captures on the scale-fixed build post genuinely reliable
+`liveWavelengthStillPx` reads to calibrate against directly. Not yet
+device-tested.
+
 ## Round-12's own fixes confirmed working on real data — and that check surfaced a bigger, real bug: a 2026-08-14 refactor silently broke the live wavelength estimator's still-domain calibration (2026-08-19, round 13)
 Round-12's two fixes (stale `liveWavelengthDebug` snapshot, widened focus-zone
 restore-to-centre bound) shipped without a device test. First real capture on

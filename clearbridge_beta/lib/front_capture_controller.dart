@@ -1498,22 +1498,32 @@ class FrontCaptureController extends ChangeNotifier {
   static const double _liveWavelengthTargetPx = 11.5;
   // Separate upper anchor for the CUE's visual scaling only -- deliberately
   // NOT the same as _liveWavelengthTooHighPx (16.0, the real gate threshold,
-  // untouched by this). Real calibration data, 2026-08-18: with the
-  // quadratic-detrend/stripCount=7 estimator fixes finally making
-  // liveWavelengthStillPx reliable often enough to matter, 3 real captures
-  // this session posted RELIABLE final reads of 15.18, 47.92, and 54.80px
-  // -- i.e. real users routinely sit far beyond the old ceiling (16.0) for
-  // extended periods, not just marginally over it. The old cue formula
-  // clamped ANY value above 16.0 to 1.0, so 20px and 54.8px rendered
-  // IDENTICALLY (rings maximally "too close" either way) -- real, direct
-  // explanation for a reported "feels stuck, no sense of progress" struggle
-  // even while moving the right direction. 50.0 sits just under the real
-  // observed max (54.8) so the worst real case still reads as ~maxed, while
-  // the whole real 16-50px range in between now gets actual differentiation
-  // instead of a flat plateau. Honest caveat: n=3 real reliable samples,
-  // same as every other real-data-driven number in this project -- revisit
-  // once more real reliable reads exist.
-  static const double _liveWavelengthCueCeilingPx = 50.0;
+  // untouched by this).
+  //
+  // RECALIBRATED 2026-08-19: the original 50.0 (2026-08-18) was derived from
+  // 3 real `liveWavelengthStillPx` reads (15.18, 47.92, 54.80) -- but those
+  // were sampled AFTER the 2026-08-14 `_scoreRoi` refactor silently broke
+  // `_wavelengthScaleToStill`'s calibration (see that function's own docs),
+  // inflating every live-domain reading 1.25x-2.2x above the real backend
+  // value. So 50.0 was very likely calibrated against already-inflated
+  // numbers -- now that the scale bug is fixed (flat 1.0, no more
+  // resolution-ratio inflation), 50.0 is stale: it would badly
+  // under-differentiate the real, corrected 16-28px range users actually
+  // see, reintroducing a milder version of the exact "flat plateau" problem
+  // this constant was built to fix in the first place.
+  //
+  // Re-derived from the REAL BACKEND `afisWavelengthPxRaw` measurements
+  // instead (immune to the live-domain scale bug, since it's measured
+  // directly on the captured still server-side) -- 6 recent real
+  // front_only_v1 captures: 28.0, 15.0, 28.0, 28.0, 26.0, 28.0 (max 28.0).
+  // Applying the same "ceiling sits just under the real observed max"
+  // convention the original 50.0 used (50/54.8 ~= 0.91x) to this new real
+  // max: 28.0*0.91 ~= 25.5, rounded to 26.0. Honest caveat, same as before:
+  // n=6, backend-domain (a proxy for what the corrected live domain SHOULD
+  // now read, not itself a live-domain sample) -- revisit once several
+  // fresh real captures on the scale-fixed build post genuinely reliable
+  // liveWavelengthStillPx reads to calibrate against directly.
+  static const double _liveWavelengthCueCeilingPx = 26.0;
   Map<String, dynamic> _wavelengthDebug = {};
 
   // Guided thumb-sweep state (see the constants block above for the
