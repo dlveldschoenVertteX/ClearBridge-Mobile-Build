@@ -1,5 +1,80 @@
 # ClearBridge Mobile — persistent context
 
+## Real root cause of a reported ridge-continuity complaint, found via Cloud Logging, not guessed: one stuck fuse-pair call starves the whole variant loop, letting the weakest candidate win by default (2026-08-19, round 14)
+CTO pushed back directly on my own read of a fresh capture (`1cc301a8`,
+NFIQ2 59): I'd called the print's density/detail a sign of quality; CTO
+correctly identified it as fragmented ridge continuity instead, pointing at
+a real prior high-scorer (`1c019820`, NFIQ2 79) as the comparison for what
+genuine continuity looks like. Visual re-check confirmed the CTO's read,
+not mine — `1c019820`'s ridge strokes run long and continuous around a
+clear whorl; `1cc301a8`'s are short, choppy, and frequently break rather
+than flow.
+
+**Found the real mechanism, not a guess.** `1cc301a8`'s
+`superprintParams` was missing the `afisFreqScale` field entirely — the
+tell that its winning candidate was the plain `native` variant
+(`_afis_variants = (('native', dict()), ...)`, the only entry that never
+passes `freq_normalize`). Checked this across 25 real recent captures:
+**23 of 25 won via a `freq_normalize=True` variant; only 2 won via bare
+`native`**, and neither of those 2 is among the session's higher scorers.
+One of the 23 freqNorm-winners (`628d7803`, NFIQ2 78) has nearly the exact
+same wavelength profile as `1cc301a8` (wl=15.0/wlRaw=11.0 vs 15.0/11.0) —
+almost a controlled pair, and it scored 19 points higher with the resample
+applied. Strong, real evidence `native` losing out to a freqNorm-family
+variant is the anomaly, not the norm.
+
+**Pulled the actual Cloud Run logs for this request (not inferred) to see
+why `native` won anyway:**
+```
+17:04:59  AFIS variant native nfiq=59.0
+17:05:12  AFIS variant freqNorm nfiq=59.0
+17:05:12  freqNorm suppressed by freqNorm false-match guard (needed >= native(59.0)+3.0, got 59.0)
+17:05:30  AFIS variant stack nfiq=59.0
+17:05:47  AFIS variant focusStack nfiq=59.0
+17:06:27  _call_with_hard_deadline: generate did not complete within 40.0s
+17:06:27  AFIS variant loop: time budget exceeded, skipping remaining variants from fuseMaxc onward
+```
+A single flash-pair candidate inside `fuseMaxc` ran the FULL 40-second
+per-pair hard-cap (`_FUSE_PAIR_HARD_TIMEOUT_SEC`) before
+`_call_with_hard_deadline` gave up on it — and that alone blew past the
+loop's overall 70s `_variants_deadline`, skipping every variant after it:
+`deepFuse`, `deepMaxc`, `mosaicFreq`, `pyfingHybridFreqNorm`,
+`deepAmbBestFl`, and more — several of which are this project's own
+historically strongest real scorers. `native` didn't win this capture on
+merit; it won because it was the only thing that finished before the
+clock ran out. `freqNorm` DID run and tied `native` exactly (59.0 both)
+but was correctly withheld by its own real, already-justified false-match
+margin (needs +3.0 over native, a deliberate 2026-08-07 guard, not
+touched here) — so even the one cheaper freqNorm-family candidate that
+did get a chance couldn't win on a tie.
+
+**This is a recurrence of an already-diagnosed failure class, just not
+fully closed the first time.** The 40s per-pair cap was added 2026-08-08
+specifically to stop one earlier, worse version of this same bug (a
+single stuck pair blocking ~144s, threatening the request's own harder
+300s Cloud Run ceiling and leaving captures stuck at `status: enhancing`
+forever). That fix protects the REQUEST from hanging, but never protected
+the other VARIANTS in the same request from being starved — 40s is more
+than half of the entire 70s variant-loop budget, so even a single
+capped-out pair can crowd out most of the tuple after it.
+
+**Fixed**: `_FUSE_PAIR_HARD_TIMEOUT_SEC` lowered 40.0 → 20.0. Per this
+constant's own already-documented real evidence ("every real per-pair
+time this session's own logs have shown for a WORKING alignment" is
+"single-digit to low-double-digit seconds"), 20s is still a comfortable
+2-4x margin above the normal case — it only changes how fast a pair
+that's ALREADY struggling gets abandoned, freeing real budget for the
+stronger, later candidates in the tuple. Purely a timing change, no
+scoring/selection logic touched — can only let MORE variants compete
+within the same 70s budget, never fewer.
+
+**Committed, NOT deployed** — this is a `functions/` change and needs its
+own explicit deploy go-ahead like every other backend change this
+project. Not yet re-confirmed against a real capture that hits the same
+stuck-pair condition; the next one that does is what shows whether 20s
+actually recovers the lost variants or whether the loop still runs out
+before reaching the historically-strongest candidates.
+
 ## Follow-on to the scale fix, same round: the wave-cue ceiling was calibrated on the same inflated data, recalibrated off the (bug-immune) real backend numbers instead (2026-08-19, round 13 cont.)
 Direct consequence of the `_wavelengthScaleToStill` fix immediately below,
 caught before pushing rather than after: `_liveWavelengthCueCeilingPx`

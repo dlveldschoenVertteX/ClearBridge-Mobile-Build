@@ -1073,13 +1073,41 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # deepFuse/deepMaxc outage was 15+ minutes for one variant on a
             # poorly-correlated burst; this project's real logs show that
             # exact failure mode recurring through a different code path
-            # (a single fuseAvg flash-bracket pair blocking ~144s). 40s is
-            # generous against every real per-pair time this session's own
-            # logs have shown for a WORKING alignment (single-digit to
-            # low-double-digit seconds), while still bounding the true
-            # pathological case far below the request's own harder 300s
-            # Cloud Run ceiling.
-            _FUSE_PAIR_HARD_TIMEOUT_SEC = 40.0
+            # (a single fuseAvg flash-bracket pair blocking ~144s). 40s was
+            # chosen as generous against every real per-pair time this
+            # session's own logs had shown for a WORKING alignment
+            # (single-digit to low-double-digit seconds), while still
+            # bounding the true pathological case far below the request's
+            # own harder 300s Cloud Run ceiling.
+            #
+            # LOWERED 40.0 -> 20.0, 2026-08-19: that cap alone doesn't
+            # protect the REST of the 70s `_variants_deadline` budget it
+            # sits inside -- confirmed via real Cloud Logging on capture
+            # `1cc301a8`: native/freqNorm/stack/focusStack all completed by
+            # 17:05:47, then a single fuseMaxc flash-pair ran the full
+            # 40.0s before `_call_with_hard_deadline` gave up on it
+            # (17:06:27), which by itself blew past `_variants_deadline` --
+            # "AFIS variant loop: time budget exceeded, skipping remaining
+            # variants from fuseMaxc onward" fired immediately after,
+            # meaning deepFuse/deepMaxc/mosaicFreq/pyfingHybridFreqNorm and
+            # every other later (often stronger -- see this file's own
+            # deepMaxc/mosaicFreq real-data writeups) candidate never got a
+            # chance to compete. `native` "won" this capture purely because
+            # it was the only thing that finished before time ran out, not
+            # because it scored best -- directly consistent with a real,
+            # user-reported ridge-continuity complaint on this exact
+            # capture (native skips the freq_normalize resample every
+            # freqNorm-family variant applies). A single stuck pair costing
+            # more than half the ENTIRE variant loop's budget is the real
+            # defect this lowers: per this comment's own cited real
+            # evidence, a WORKING alignment finishes in single-to-low-
+            # double-digit seconds, so 20.0s is still a comfortable 2-4x
+            # margin above that normal case -- it only changes how fast a
+            # already-struggling pair gets abandoned, freeing real budget
+            # for the variants after it. Not yet deployed/re-tested; the
+            # next real capture that hits this same stuck-pair condition is
+            # what confirms whether 20.0 recovers the lost variants.
+            _FUSE_PAIR_HARD_TIMEOUT_SEC = 20.0
 
             for _vname, _vkw in _afis_variants:
                 if time.monotonic() > _variants_deadline:
