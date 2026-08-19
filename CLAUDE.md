@@ -1,5 +1,60 @@
 # ClearBridge Mobile — persistent context
 
+## Real root cause of the guide+flashdiff matchability deficit, found + fixed + visually confirmed: the lobe search was seeded at the wrong point (2026-08-19, round 16)
+Direct follow-up to the mask-vs-matchability sweep (round 15's own predecessor
+finding): `guide+flashdiff`-masked captures scored ~1/3 the real matchability
+of `guide+unet`-masked ones despite near-identical NFIQ2 (76.1 vs 79.3),
+pointing at a real defect in flash-diff's own mask boundary rather than a
+capture-quality difference. Investigated directly rather than guess.
+
+**Reproduced a real `guide+flashdiff` capture's exact mask locally**
+(`14674391`, score 0.00 in the sweep) — downloaded its raw ambient/flash
+burst pair, ran the real `sfm_pipeline._segment_via_flash_diff` used in
+production, and overlaid the resulting contour on the raw frame. **The mask
+was centered on a knuckle/flexion-crease region, not the fingertip pad at
+all** — visually unambiguous (multiple horizontal crease grooves inside the
+boundary, no whorl pattern anywhere near it).
+
+**Real, precise root cause, confirmed by direct calculation before touching
+any code**: `_isolate_thumb_lobe`'s seed point is hardcoded to the frame's
+bare geometric centre (`w_img/2, h_img/2`) — correct only if the guided pad
+sits at cx=0.5. front_only_v1's real `guide_region` is cx=0.63 (confirmed
+via `_superellipse_mask`'s own docstring: its region is already in the same
+coordinate space `generate()`'s raw frame uses, no rotation adjustment
+needed here) — a real, non-trivial **555px offset** on a 4266px-wide raw
+frame (13% of width). The mis-centred lobe search in the reproduced capture
+landed at (2149.5, 1437.5) — almost exactly on the WRONG assumed centre
+(2133, 1600), nowhere near the true guide centre (2687.6, 1600) — direct,
+numeric confirmation this is the actual mechanism, not a coincidence.
+
+Same bug CLASS already diagnosed and fixed once before in this exact
+codebase, just in a different code path: the 2026-08-14 `_scoreRoi` fix's
+own real evidence item 3 states "cropping a real capture by the OLD
+[uncorrected] rect yields knuckle skin plus background with essentially no
+pad ridges at all" — the identical failure signature, now found in
+`_flash_diff_mask`'s call into `_isolate_thumb_lobe`, which never got that
+fix applied to it.
+
+**Fixed**: `_segment_via_flash_diff` (`sfm_pipeline.py`) gained optional
+`seed_cx`/`seed_cy` params (pixel space), defaulting to the old frame-centre
+behaviour when omitted — every other caller (arc_sweep/oscillating) is
+byte-for-byte unaffected. `afis_print._flash_diff_mask` now threads its
+already-in-scope `guide_region` through, computing the real seed as
+`guide_region['cx']*w, guide_region['cy']*h` instead of assuming centre.
+
+**Re-ran the exact same real capture through the fixed code and visually
+confirmed the mask now correctly wraps the actual fingertip pad**,
+whorl/ridge pattern included, no crease content — a completely different
+(correct) region from the pre-fix contour. Real, decisive, non-speculative
+before/after comparison — not inferred from a plausible-sounding theory.
+
+**Committed, NOT deployed** — needs its own explicit deploy go-ahead like
+every other backend change. Real next step once deployed: re-run this same
+session's mask-vs-matchability sweep (63 real captures against the ground-
+truth ink scan) to confirm `guide+flashdiff`'s real mean score closes the
+gap toward (or past) `guide+unet`'s 3.87, not just that one capture's mask
+looks visually correct now.
+
 ## Lens-probe diagnostic built to answer "is my phone's stock Macro mode a real lens we could use?" (2026-08-19, round 15)
 CTO sent screenshots of their stock camera app: "Macro" appears as its own
 mode tile under "More" (alongside Pro/Portrait/Bokeh/Mono), not a toggle

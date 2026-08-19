@@ -788,6 +788,8 @@ def _segment_via_flash_diff(
     ambient_gray: np.ndarray,
     flash_gray:   np.ndarray,
     ksize:        int,
+    seed_cx:      Optional[float] = None,
+    seed_cy:      Optional[float] = None,
 ) -> Optional[Tuple[np.ndarray, float, float]]:
     """
     Segment via flash-minus-ambient differencing: the LED torch is inches from
@@ -812,6 +814,20 @@ def _segment_via_flash_diff(
     tiers but with a lower minimum-area floor — see min_area_frac below) —
     callers should fall through to the Otsu/adaptive/ellipse-prior cascade
     in that case.
+
+    `seed_cx`/`seed_cy` (pixel coordinates, optional): where to seed the
+    thumb-lobe search below -- defaults to the frame's own geometric centre
+    when omitted (every caller before 2026-08-19). REAL BUG this parameter
+    fixes: front_only_v1's caller (afis_print._flash_diff_mask) never had a
+    way to say "the guided pad isn't at the frame centre" -- its real
+    guide_region sits at cx=0.63, a genuine ~13%-of-width offset -- so the
+    lobe search below was seeding on the wrong spot and could lock onto
+    whatever OTHER near-camera blob happened to be closest to the frame's
+    bare centre instead (confirmed on a real capture: it grabbed a knuckle/
+    flexion-crease region, not the fingertip pad). Callers with a real
+    known guide/ROI centre should now pass it; every other caller is
+    unaffected (still defaults to frame-centre, byte-for-byte the same
+    behaviour as before this parameter existed).
     """
     if ambient_gray.shape != flash_gray.shape:
         return None
@@ -847,7 +863,9 @@ def _segment_via_flash_diff(
     # The lobe cut keeps just the guided, centred thumb pad.
     h_img, w_img = ambient_gray.shape[:2]
     expected_r   = 0.14 * min(h_img, w_img)
-    lobe = _isolate_thumb_lobe(opened, w_img / 2.0, h_img / 2.0, expected_r)
+    lobe_cx = seed_cx if seed_cx is not None else w_img / 2.0
+    lobe_cy = seed_cy if seed_cy is not None else h_img / 2.0
+    lobe = _isolate_thumb_lobe(opened, lobe_cx, lobe_cy, expected_r)
     if lobe is not None:
         mask, tx, ty = lobe
         k2_size = max(3, (ksize // 2) | 1)

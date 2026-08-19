@@ -1502,7 +1502,8 @@ def _circular_vignette(binimg: np.ndarray, mask: np.ndarray,
 
 def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
                       flash_burst: Optional[List[np.ndarray]],
-                      shape: Tuple[int, int]) -> Optional[np.ndarray]:
+                      shape: Tuple[int, int],
+                      guide_region: Optional[dict] = None) -> Optional[np.ndarray]:
     """Content-aware thumb mask via flash-minus-ambient differencing (see
     sfm_pipeline._segment_via_flash_diff) — picks the first ambient/flash
     pair whose shape matches the frame being processed. Used to refine the
@@ -1513,11 +1514,49 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
     content. This is the same tier that already proved itself against real
     captures for the (currently unguided-only) segmentation fallback —
     reused here rather than re-derived. Best-effort: returns None on any
-    failure, same contract as _unet_mask."""
+    failure, same contract as _unet_mask.
+
+    REAL BUG FOUND + FIXED, 2026-08-19: `_segment_via_flash_diff` internally
+    seeds its thumb-lobe search at the frame's bare geometric centre
+    (`_isolate_thumb_lobe(opened, w/2, h/2, ...)`) — correct ONLY when the
+    guided pad happens to sit at cx=0.5. front_only_v1's real guide_region
+    is cx=0.63 (confirmed against `_superellipse_mask`'s own docstring: its
+    region is "the SAME normalized coordinate space as the frame generate()
+    receives", i.e. no rotation adjustment needed here, unlike the client-
+    side screen/still-space split) — a real ~13%-of-width offset (555px on
+    a 4266px-wide raw frame). Confirmed visually on a real capture
+    (`14674391`, a `guide+flashdiff`-masked capture that scored badly on
+    real SourceAFIS matchability, see this session's mask-vs-matchability
+    sweep): the flash-diff mask landed almost exactly on the WRONG
+    (frame-centre) seed point, not the true guide centre, and turned out to
+    be a knuckle/flexion-crease region, not the fingertip pad — a real,
+    visually-unambiguous case of the exact "wrong-centre grabs knuckle
+    skin" failure this project has already diagnosed once for a sibling
+    bug (`_scoreRoi`, capture-side, 2026-08-14 fix notes: "cropping a real
+    capture by the OLD [uncorrected] rect yields knuckle skin plus
+    background with essentially no pad ridges at all"). This is the same
+    bug class recurring in a different code path that never got the fix.
+
+    Fixed by threading `guide_region` through and seeding the lobe search
+    at the guide's own real centre (pixel space) instead of the bare frame
+    centre, falling back to frame-centre only when no guide_region is
+    available (matches every other caller of `_segment_via_flash_diff`
+    outside this guided front_only_v1 path, e.g. arc_sweep/oscillating,
+    which is unaffected by this change). Not yet re-measured against the
+    real SourceAFIS-vs-ground-truth sweep -- the next run of that sweep
+    after this deploys is what confirms whether `guide+flashdiff` closes
+    the real matchability gap against `guide+unet` this found."""
     try:
         import sfm_pipeline
         ab = [g for g in (ambient_burst or []) if g is not None]
         fb = [g for g in (flash_burst or []) if g is not None]
+        seed_cx = seed_cy = None
+        if guide_region:
+            try:
+                seed_cx = float(guide_region['cx']) * shape[1]
+                seed_cy = float(guide_region['cy']) * shape[0]
+            except (KeyError, TypeError, ValueError):
+                seed_cx = seed_cy = None
         for a, f in zip(ab, fb):
             a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
             f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
@@ -1533,7 +1572,8 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
                 logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
                             f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
                 continue
-            result = sfm_pipeline._segment_via_flash_diff(a_gray, f_gray, ksize=7)
+            result = sfm_pipeline._segment_via_flash_diff(
+                a_gray, f_gray, ksize=7, seed_cx=seed_cx, seed_cy=seed_cy)
             if result is not None:
                 mask, _tx, _ty = result
                 return mask
@@ -2991,7 +3031,7 @@ def generate(
             pad_mask = pad_mask_override
             refine_tag = 'padrefined'
         else:
-            pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2])
+            pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2], guide_region)
             refine_tag = 'flashdiff'
             if pad_mask is None:
                 pad_mask = _unet_mask(gray)
