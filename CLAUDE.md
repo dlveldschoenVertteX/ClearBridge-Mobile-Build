@@ -1,5 +1,33 @@
 # ClearBridge Mobile — persistent context
 
+## Distance-gate reversed on explicit CTO product call: real matchability wants closer, not farther (2026-08-19, round 17)
+Direct follow-up to the mask-vs-matchability sweep: the real winners all sit
+at wlRaw 28-30, squarely inside what `_liveWavelengthTooHighPx=16.0` was
+built to block. CTO's explicit call, stated plainly: "we need ridge
+continuity more than we need NFIQ at this point." Raised
+`_liveWavelengthTooHighPx` 16.0 → **35.0** — grounded in the same 63-capture
+sweep's real backend `afisWavelengthPxRaw` stats (n=44: mean 23.8, sd 6.4,
+max 30.0, mean+2sd=36.6), and lands independently on the exact same number
+sweep's own analogous threshold was already recalibrated to on 2026-08-14
+for the identical reason ("reframed from an optimization target to a pure
+safety backstop"). No longer an optimization target — a backstop against a
+genuinely pathological outlier only.
+
+**Real, unresolved follow-on flagged, not silently changed**: the
+`_DistanceBanner`/`distanceHint` copy ("Push Print Backward") and the
+wave-cue's own anchor points (`_liveWavelengthTargetPx=11.5`,
+`_liveWavelengthCueCeilingPx=26.0`) are ALL still built around the old
+NFIQ2-driven "closer is bad" framing — now directly inconsistent with this
+gate change (the cue would read "maxed out, too close" at wl 26 while the
+gate no longer blocks until 35, and the banner would still tell a user
+moving into the real-matchability-favorable 28-30 range to back away).
+Deliberately NOT touched this round — changing what the app tells the user
+to physically DO is a bigger UX decision than the backstop threshold itself,
+flagged for explicit direction before acting.
+
+Not yet device-tested. Client-only change (no backend), needs only a push
+to reach a real build.
+
 ## Real root cause of the guide+flashdiff matchability deficit, found + fixed + visually confirmed: the lobe search was seeded at the wrong point (2026-08-19, round 16)
 Direct follow-up to the mask-vs-matchability sweep (round 15's own predecessor
 finding): `guide+flashdiff`-masked captures scored ~1/3 the real matchability

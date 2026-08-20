@@ -1470,12 +1470,32 @@ class FrontCaptureController extends ChangeNotifier {
   // tracks the backend's own authoritative value to within ~1px, which is
   // what it was always supposed to do.
   //
-  // 16.0 therefore sits in the SAME units as afisWavelengthPx and is chosen
-  // against this project's own established real-data finding: 9-14px is the
-  // NFIQ2 sweet spot and >=15px correlates with catastrophic real scores.
-  // 16.0 keeps a 1px margin above that boundary to avoid firing on captures
-  // sitting right at the edge.
-  static const double _liveWavelengthTooHighPx = 16.0;
+  // 16.0 sat in the SAME units as afisWavelengthPx and was chosen against
+  // this project's own established real-data finding: 9-14px is the NFIQ2
+  // sweet spot and >=15px correlates with catastrophic real NFIQ2 scores.
+  //
+  // RAISED 16.0 -> 35.0, 2026-08-19 (explicit CTO product call: "we need
+  // ridge continuity more than we need NFIQ at this point"). Real
+  // SourceAFIS-vs-ground-truth-ink-scan matchability sweep this same round
+  // (63 real captures, scratchpad/ps/run_sweep.py) found the opposite
+  // correlation from the NFIQ2 one this threshold was built around: the
+  // best real matches all sit at wlRaw 28-30 (the sweep's winner: real
+  // SourceAFIS score 16.76 at wlRaw=29; the two next-best: 14.55/29,
+  // 14.49/28) -- squarely in the range this gate used to block. This isn't
+  // a contradiction so much as confirmation NFIQ2 and real matchability
+  // optimize for different things (this project's own long-standing
+  // prime-directive thesis) -- 16.0 was tuned for the wrong axis. Real
+  // full-population stats grounding the new ceiling (same 63-capture
+  // sweep, real backend afisWavelengthPxRaw, n=44): mean 23.8, sd 6.4, max
+  // observed 30.0 -- mean+2sd=36.6. 35.0 mirrors sweep's own already-
+  // established analogous recalibration (2026-08-14, same reasoning:
+  // "reframed from an optimization target to a pure safety backstop, set
+  // comfortably above the whole observed real range") landing on the same
+  // number independently. Now purely a safety backstop against a
+  // genuinely pathological outlier, not an optimization target -- do not
+  // re-tighten this toward the old NFIQ2 sweet spot without a new
+  // matchability-driven reason.
+  static const double _liveWavelengthTooHighPx = 35.0;
   // Minimum wavelength EMA samples before the hint can fire, to guard
   // against a transient first-frame estimate triggering "Move back" on a
   // correctly-positioned thumb.
