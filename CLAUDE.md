@@ -1,5 +1,84 @@
 # ClearBridge Mobile — persistent context
 
+## Flash-diff mask seed fix, real follow-up test: does NOT close the matchability gap toward guide+unet — a visually-correct fix that didn't move the real score (2026-08-20, round 20)
+Direct follow-up to round 16's flash-diff mask fix (`339a1e2`, committed,
+NOT deployed): that round found and fixed a real bug (`_isolate_thumb_lobe`
+seeded at the bare frame centre instead of the true `guide_region` centre,
+a 555px real offset) and visually confirmed the fix correctly re-centres
+the mask on ONE real capture (`14674391`). That entry's own final line
+flagged the real next step, not yet done: "re-run this same session's
+mask-vs-matchability sweep (63 real captures) to confirm `guide+flashdiff`'s
+real mean score closes the gap toward (or past) `guide+unet`'s 3.87, not
+just that one capture's mask looks visually correct now." Ran that test
+this round, on the CURRENT (fixed) code, against all 19 real captures
+whose PRODUCTION mask had resolved to `guide+flashdiff` (the original
+`mask_correlation.json` sweep — same real SourceAFIS-vs-ink-scan harness
+used throughout this session).
+
+**Real result: it does not close the gap.** Mean score barely moved:
+**1.351 (old, buggy seed) -> 1.362 (new, fixed seed)** — nowhere near
+`guide+unet`'s established 3.872 mean. Win rate 9/19 (47%), a coin flip.
+
+**Broke this down further, and the more precise picture is less
+flattering than the flat mean alone suggests.** Of the 19 captures, the
+fixed code still resolves 12 to `guide+flashdiff` (the fix changed the
+seed, not whether flash-diff's own accept-gate takes the result), 6 now
+fall back to `guide+unet` (the seed fix apparently makes the flash-diff
+candidate fail its own area/coverage accept-gate more often than before),
+and 1 falls back to bare `guide`.
+
+- **Among the 12 that stayed `guide+flashdiff`**: mean delta is
+  **NEGATIVE, -0.88** (sum -10.6/12) — on the captures where the seed fix
+  is actually doing what it was built to do (a correctly-centred
+  flash-diff mask, same mechanism, just fixed geometry), real matchability
+  trended slightly WORSE, not better, on this sample.
+- **Among the 6 that fell back to `guide+unet`**: mean delta is
+  **positive, +1.94** — but this is dominated by one outlier
+  (`3f8fd075`, +9.04) that also carries this project's own
+  already-documented `nfiq2Score: 586` data-integrity bug (a known sidecar
+  parsing defect unrelated to masking) — a single anomalous capture, not a
+  reliable signal. Excluding it, the remaining 5 average +0.52 — a mild,
+  not decisive, lean positive, and this "win" isn't really the seed fix
+  working — it's the seed fix incidentally making flash-diff fail its
+  accept-gate more often, letting the ALREADY-established stronger
+  `guide+unet` mask take over instead.
+- **The exact capture visually confirmed in round 16 (`14674391`)** scored
+  **0.0 in BOTH the old and new run** — the mask is visibly, unambiguously
+  better-centred now (round 16's own overlay proved this), but the real
+  SourceAFIS-vs-ink-scan score didn't move at all on this specific
+  capture. A direct, humbling confirmation that a visually-correct mask
+  fix does not automatically show up in this particular metric.
+
+**Honest interpretation, not spin either direction.** This isn't strong
+evidence the fix is WRONG — it's still a real, independently-verified bug
+fix (the mask objectively covers the correct anatomical region now,
+confirmed by direct pixel-space calculation and visual overlay in round
+16, unrelated to whatever this score says). But it IS strong evidence
+against the specific hope that fixing this one seeding bug would, on its
+own, meaningfully close `guide+flashdiff`'s matchability gap toward
+`guide+unet`. The same standing noise-floor caveat this project has
+already established for the single-ink-scan SourceAFIS gate applies here
+too (absolute scores 0-10 on a matcher whose practical match threshold is
+~40) — a modest real improvement could in principle be hiding under this
+gate's own known insensitivity. But there is no evidence of one in this
+data, and the flashdiff-retained subset trending negative argues against
+assuming one exists.
+
+**Not recommending further optimization effort on `_flash_diff_mask`
+specifically on the strength of this round's result** — the seed bug was
+real and worth fixing regardless (it was producing masks centred on
+knuckle/crease content some of the time, a correctness bug independent of
+this score), but this data doesn't support treating the flash-diff path
+as a promising lever for closing the real matchability gap toward
+`guide+unet`. `guide+unet` remains the stronger mask by a wide, consistent
+margin (3.872 vs. 1.362) — worth considering whether `guide+unet` should
+be preferred more aggressively over `guide+flashdiff` in the mask-
+selection order, though that's a real product/pipeline decision, not
+actioned here without explicit direction. Fix stays committed (`339a1e2`,
+still not deployed) since it's still the objectively correct mask-geometry
+behavior; this round's finding is about its downstream matchability
+effect, not about whether to keep the fix.
+
 ## Learned scale-normalizer: mixed MAC3D+SD302 checkpoint validated against the real SourceAFIS gate — no clear win, real mechanistic reason found (2026-08-20, round 19)
 Direct follow-up to the CTO's "move to NIST SD302" instruction: retrained the
 mixed-corpus checkpoint (113 real MAC3D superprints + 300 sampled NIST SD302
