@@ -1,5 +1,105 @@
 # ClearBridge Mobile — persistent context
 
+## Macro-camera (camera "2") capture: two real, independent, compounding bugs found + fixed -- a framing/calibration bug much bigger than the reported softness, plus the softness itself (2026-08-20, round 31)
+CTO report on the same `5d3fb521` capture from round 30: "The macro lens did
+not fully lock focus on the print it was soft, you need to tweak the
+focus" -- plus asked to see the macro capture's own superprint run through
+the enhancement pipeline. Pulled the real raw macro frame from Storage and
+reproduced `main.py`'s exact secondary-camera-2 candidate locally rather
+than guess at what "soft" meant.
+
+**Visual review immediately surfaced a bigger, real, previously-unknown
+problem than softness alone: the crop `main.py` scores is not even
+centred on the fingertip.** `_sec_guide`'s own code comment already
+flagged this as a known gap ("Camera '2' ... keeps cy=0.5 (centred) since
+its framing offset is unknown without dedicated calibration data") --
+this capture is the first real data that gap ever had. Cropping the raw
+3264x2448 frame at the assumed cy=0.5 centre lands mostly on WRIST/
+forearm skin and background quilt fabric -- visually confirmed, sent for
+review. The real thumb pad sits at roughly **cy=0.34** in this frame (tip
+near y=0.245, first flexion crease near y=0.44), a full ~0.16 offset from
+the assumed centre -- about half the guide's own radius. Most likely
+mechanism, consistent with this project's own established camera-
+parallax finding elsewhere: the on-screen guide shown during the macro
+shot (`_captureMacroShot`, client) is drawn from the MAIN camera's own
+`PadSilhouetteShape`, never corrected for camera "2"'s different physical
+lens position or field of view -- so the user is aiming at a guide
+calibrated for a different camera's viewpoint entirely.
+
+**Confirms this project's own prime-directive finding about NFIQ2 in a
+new, concrete way**: the mis-framed crop (mostly wrist/background) still
+produced a plausible-LOOKING Gabor-synthesized ridge pattern -- the
+enhancement pipeline's own orientation-field + Gabor bank will impose
+ridge-like structure on any input with enough local contrast, whether or
+not real fingerprint ridges are present. Production's real NFIQ2 sidecar
+score for this exact candidate was 47.0 -- a real, non-trivial number
+scored on content that wasn't even mostly a fingerprint. Visually
+confirmed side by side (both sent to CTO): the OLD (cy=0.5) render shows
+generic parallel-ish striping; the NEW (cy=0.34) render shows a
+coherent, flowing whorl-like pattern with a visible core/delta
+convergence -- structurally far more consistent with genuine fingerprint
+topology, even though both are Gabor-synthesized.
+
+**Fixed** (`main.py`): `_sec_cy` for camera "2" changed from the
+frame-centred `0.5` to **`0.34`**, matching this real measurement.
+Flagged explicitly as provisional pending more real captures (n=1),
+same discipline as every other threshold in this pipeline -- but a real,
+evidenced correction, not a guess, and can only move the crop TOWARD
+where the pad was actually observed to sit. `rx`/`ry` (the crop radius)
+left untouched this round -- one variable at a time.
+
+**Softness itself is also real and separate, confirmed by direct visual
+inspection of the raw (uncropped) fingertip region**: even within the
+now-correctly-centred crop, the ridge texture is only faintly visible
+against the surrounding quilt fabric's own crisp thread detail in the
+same frame -- a genuine AF miss, not just a framing artifact, matching
+the CTO's own report. Root-caused via code read, not guessed: 
+`_captureMacroShot` reused `_retargetAndConverge` with the PRIMARY
+camera's own convergence bound (`_refocusMinMs`/`_refocusMaxMs`,
+600-1200ms) -- the same bound already proven correct for camera "0"'s
+own centre-lock, but never re-validated for camera "2" specifically. Two
+real, independent reasons this specific shot plausibly needs more time:
+(1) camera "2" has a long, documented history in this project of being
+the slowest/least reliable camera to focus (the original round-4
+secondary-camera focus-lock fix was built for exactly this, but that
+mechanism was later removed with the old `_captureSecondaryBurst` path
+and never replaced when the newer macro shot was built); (2) this is the
+closest-range, most-magnified shot in the whole flow (guide grown 20%
+specifically to pull the thumb closer), and shallower depth of field at
+closer range needs a more precise AF lock. The existing drift-retry logic
+in `_retargetAndConverge` (round 26) only catches "converged to something
+WORSE than a peak already seen" -- it does NOT catch "never reached a
+real peak within the time budget at all", which is the more likely
+mechanism behind a report of general softness rather than a specific
+background-bleed artifact.
+
+**Fixed** (`front_capture_controller.dart`): new dedicated
+`_macroFocusMinMs`/`_macroFocusMaxMs` = 1200/2400ms (2x the primary
+bound, a deliberate reasoned multiple grounded in both factors above, not
+a blind guess), used only by the macro shot -- every other
+`_retargetAndConverge` caller (focus-zone bracket, its own centre-restore)
+keeps the original, already-validated 600/1200ms untouched. Outer
+`_macroCaptureTimeoutMs` widened 45s -> 60s to preserve real margin now
+that the AF window can legitimately take longer, especially if the
+drift-retry also fires (worst case ~2x2.4s poll + native round-trip
+overhead + upload). New `macroDebug` Firestore field (`_retargetAndConverge`
+gained an optional `debugOut` sink, `sharpness`/`maxSample`/`driftRetried`,
+plus `convergedMs` from a dedicated stopwatch) -- previously this shot
+recorded ZERO convergence diagnostics at all, so a direct real-device
+report of softness couldn't be checked against anything; the next real
+capture will show whether the wider window actually lets AF find and
+report a genuine peak.
+
+**Not yet deployed/device-tested** -- both fixes are committed locally,
+not pushed, per standing process. The client fix and backend fix are
+independent and both real: the framing fix alone should already recover
+most of the visual coherence shown above regardless of focus timing; the
+focus-timing fix is what should show up as a higher `maxSample` value in
+`macroDebug` on the next real capture. Real next step: a fresh real macro
+capture on both fixes together, to confirm the corrected crop AND a
+sharper AF lock compound into a genuinely usable macro candidate rather
+than just a better-composed soft one.
+
 ## AFIS variant pool reordered by MEASURED win rate across all 116 real captures (2026-08-20, round 29)
 Direct follow-up to round 28's own closing recommendation, on explicit CTO
 approval ("yes reorder the variant pool by win rate"). Not a guess at what

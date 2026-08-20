@@ -605,12 +605,49 @@ class FrontCaptureController extends ChangeNotifier {
   // has a long, real history in this project of being the slowest camera
   // to open/upload (multiple prior rounds: "camera '2' still timed out at
   // the exact same step", "camera '2' has by far the slowest upload").
-  // 45s budgeted: real CameraService.initializeCamera() retry structure
-  // alone can take up to ~32s worst case (12s attempt + 20s retry), plus
-  // real margin for one focus-converge + shutter + at least one real
-  // upload attempt. Self-skipping on expiry -- can only ever cost this one
-  // candidate, never the main capture already safely uploaded elsewhere.
-  static const int _macroCaptureTimeoutMs = 45000;
+  // 60s budgeted (widened from 45s 2026-08-20 round 31 -- see
+  // _macroFocusMinMs/_macroFocusMaxMs below for why): real
+  // CameraService.initializeCamera() retry structure alone can take up to
+  // ~32s worst case (12s attempt + 20s retry), plus real margin for the
+  // now-widened focus-converge window (up to ~2x2.4s poll + native
+  // round-trip overhead if a drift retry fires) + shutter + at least one
+  // real upload attempt (_uploadWithRetry's own 20s cap). Self-skipping on
+  // expiry -- can only ever cost this one candidate, never the main
+  // capture already safely uploaded elsewhere.
+  static const int _macroCaptureTimeoutMs = 60000;
+  // Real, deliberate deviation from _refocusMinMs/_refocusMaxMs (600/1200ms
+  // -- the primary hold-lock's own already-validated bound), added
+  // 2026-08-20 round 31 after a direct real-device report ("did not fully
+  // lock focus... it was soft"). Two independent, already-documented real
+  // reasons this specific shot plausibly needs MORE convergence time than
+  // the primary lock, not the same amount: (1) camera "2" has a long, real
+  // history in this project of being the slowest/least reliable camera to
+  // focus (round 4's original secondary-camera focus-lock fix was built
+  // "specifically because this device's secondary cameras are documented
+  // to focus slowly/unreliably" -- that dedicated mechanism was later
+  // removed with the old _captureSecondaryBurst path, and this newer macro
+  // shot never got an equivalent of its own, reusing the PRIMARY camera's
+  // bound instead); (2) this is the closest-range, most-magnified shot in
+  // the whole capture flow (guide grown 20% specifically to pull the thumb
+  // physically closer), and shallower depth of field at closer range needs
+  // a more precise AF lock, plausibly more iterations/time to settle than
+  // the primary camera's own working distance requires. The existing
+  // drift-retry logic in _retargetAndConverge (round 26) only catches
+  // "converged to something WORSE than a peak already seen" -- it does
+  // NOT catch "never reached a real peak within the time budget at all",
+  // which is the more likely mechanism behind a report of general softness
+  // rather than a specific background-bleed artifact. A wider poll window
+  // directly addresses that gap by giving AF more real time to actually
+  // find and report its true peak, not just retry after overshooting one.
+  // 2x the primary bound is a deliberate, reasoned multiple (not a blind
+  // guess) grounded in both real factors above; can only ever let focus
+  // converge MORE fully before locking, never regress an already-good
+  // lock, and stays comfortably inside the widened 60s outer timeout even
+  // if a drift retry doubles it again. `macroDebug` (see _captureMacroShot)
+  // now records real sharpness/maxSample/driftRetried data so the next
+  // real capture confirms whether this actually closes the gap.
+  static const int _macroFocusMinMs = 1200;
+  static const int _macroFocusMaxMs = 2400;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -1387,6 +1424,13 @@ class FrontCaptureController extends ChangeNotifier {
   // Per-zone diagnostic from _captureFocusZoneShots (see
   // _focusZoneBracketEnabled's own docs) -- {zone: {convergedMs, sharpness}}.
   Map<String, dynamic> _focusZoneDebug = {};
+  // Real convergence diagnostics for the camera-2 macro shot, added
+  // 2026-08-20 (round 31) -- previously this shot recorded no data at
+  // all beyond the resulting image, so a direct real-device report of
+  // softness ('did not fully lock focus') could not be checked against
+  // anything. Filled by _captureMacroShot via _retargetAndConverge's
+  // debugOut sink; empty when the macro shot never ran/self-skipped.
+  Map<String, dynamic> _macroDebug = {};
   // Tracks whether the thumb was in coverage range on the previous frame so
   // we can detect the entry transition and immediately point AF at the thumb.
   bool _wasInCoverageRange = false;
@@ -3019,11 +3063,13 @@ class FrontCaptureController extends ChangeNotifier {
   /// just applied here too since every zone-bracket and macro-camera shot
   /// goes through this same convergence path, not just the primary hold.
   Future<double?> _retargetAndConverge(Offset pt,
-      {int minMs = _focusZoneMinMs, int maxMs = _focusZoneMaxMs}) async {
+      {int minMs = _focusZoneMinMs, int maxMs = _focusZoneMaxMs,
+      Map<String, dynamic>? debugOut}) async {
     final cam = _camera;
     if (cam == null) return null;
     double? lastSample;
     var maxSample = 0.0;
+    var driftRetried = false;
     for (var attempt = 1; attempt <= 2; attempt++) {
       try {
         await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
@@ -3056,10 +3102,22 @@ class FrontCaptureController extends ChangeNotifier {
           lastSample! < maxSample * _refocusDriftAcceptRatio &&
           !_disposed;
       if (!driftedLow) break;
+      driftRetried = true;
     }
     try {
       await cam.setFocusMode(FocusMode.locked).timeout(_zoneFocusCallTimeout);
     } catch (_) {}
+    // Optional diagnostic sink -- added 2026-08-20 (round 31) so callers
+    // that need more than the final settled sample (e.g. _captureMacroShot,
+    // to confirm on the next real capture whether a wider poll window
+    // actually recovers focus) can see the real peak sample and whether the
+    // drift-retry fired, without changing this function's return type or
+    // any existing caller's behavior.
+    if (debugOut != null) {
+      debugOut['sharpness'] = lastSample;
+      debugOut['maxSample'] = maxSample;
+      debugOut['driftRetried'] = driftRetried;
+    }
     return lastSample;
   }
 
@@ -4794,6 +4852,7 @@ class FrontCaptureController extends ChangeNotifier {
           'shotsCaptured': rawShots.length,
         },
         if (macroCamera != null) 'secondaryCameras': [macroCamera],
+        if (macroCamera != null) 'macroDebug': _macroDebug,
       }, SetOptions(merge: true));
 
       var completed = 0;
@@ -4977,14 +5036,19 @@ class FrontCaptureController extends ChangeNotifier {
           } catch (_) {}
         }
         await macroCam.startImageStream(macroFrameListener);
+        final focusDebug = <String, dynamic>{};
+        final focusSw = Stopwatch()..start();
         try {
           await _retargetAndConverge(const Offset(0.5, 0.5),
-              minMs: _refocusMinMs, maxMs: _refocusMaxMs);
+              minMs: _macroFocusMinMs, maxMs: _macroFocusMaxMs,
+              debugOut: focusDebug);
         } finally {
           try {
             await macroCam.stopImageStream();
           } catch (_) {}
         }
+        focusDebug['convergedMs'] = focusSw.elapsedMilliseconds;
+        _macroDebug = focusDebug;
 
         final xfile = await macroCam.takePicture();
         final jpeg = await xfile.readAsBytes();

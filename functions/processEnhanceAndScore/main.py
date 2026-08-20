@@ -1752,10 +1752,34 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # briefly moved this to 0.3311 was reverted the same
                         # day -- see CLAUDE.md, pad isolation is now a
                         # backend-config problem instead).
-                        # Camera "2" (wide, very different FOV) keeps cy=0.5
-                        # (centred) since its framing offset is unknown without
-                        # dedicated calibration data.
-                        _sec_cy = (0.37 if _cam.get('name') == '3' else 0.5)
+                        # Camera "2" was cy=0.5 (frame-centred) since its real
+                        # framing offset was unknown without dedicated
+                        # calibration data -- this is now that data. Direct
+                        # visual review of a real macro capture (2026-08-20,
+                        # round 31, capture 5d3fb521) shows the thumb pad
+                        # actually sitting at roughly cy=0.34 in this camera's
+                        # raw frame (tip near y=0.245, first flexion crease
+                        # near y=0.44), not centred -- a 0.5-centred crop for
+                        # THIS capture landed mostly on wrist/forearm skin and
+                        # background quilt fabric, with the pad only partly
+                        # inside the crop's upper edge. This is very likely a
+                        # real, structural mismatch, not a one-off: the
+                        # on-screen guide shown during this shot
+                        # (`_captureMacroShot`, capture-side) is drawn from
+                        # the MAIN camera's own `PadSilhouetteShape`, which is
+                        # never corrected for camera "2"'s different physical
+                        # lens position (parallax) or narrower/differently-
+                        # centred field of view -- the same camera-parallax
+                        # class of gap already noted elsewhere in this
+                        # project's history for secondary-camera framing.
+                        # Flagged as provisional pending more real captures,
+                        # same discipline as every other threshold in this
+                        # pipeline (n=1) -- but a real, evidenced correction,
+                        # not a guess, and can only move the crop TOWARD
+                        # where the pad was actually observed to sit.
+                        _sec_cy = (0.37 if _cam.get('name') == '3'
+                                   else 0.34 if _cam.get('name') == '2'
+                                   else 0.5)
                         _sec_guide = {
                             'cx': 0.5,
                             'cy': _sec_cy,
