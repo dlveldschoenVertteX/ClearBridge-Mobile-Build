@@ -1,5 +1,42 @@
 # ClearBridge Mobile — persistent context
 
+## Real device report: camera-2 macro focus locking onto background -- same bug class already fixed once, ported to the shared convergence helper (2026-08-20, round 26)
+CTO reported "a real blur issue... it's picking up the background" on the
+camera-2 macro capture, with a screenshot showing the live guide/preview
+rendering correctly (confirming rounds 24-25's fixes) but background
+detail visibly bleeding into what should be a thumb-focused close-up.
+
+**Real, well-precedented root cause, found by re-reading this project's
+own history rather than guessing.** `_retargetAndConverge` -- the shared
+helper both the focus-zone-bracket AND the new macro capture use to lock
+focus -- only ever asks "has the live sharpness reading stopped
+changing", never "is this actually a sharp reading". This is the exact
+same gap already found and fixed once before, in `_refocus()`
+(2026-08-17, real CTO report: "focus locks onto the background",
+root-caused via real Firestore data at the time): a lens that settles on
+the background behind the thumb converges (stops changing) just as
+confidently as one that settles on the thumb itself. `_refocus()` got a
+real fix for this (track the PEAK sharpness seen during the poll, retry
+once if the value it settles on is well below that peak) -- but
+`_retargetAndConverge` (built later, for the focus-zone-bracket) never
+got the same treatment, and the new macro capture inherited the gap by
+reusing it.
+
+**Fixed**: ported `_refocus()`'s own already-validated peak-tracking +
+one-retry drift check into `_retargetAndConverge`, using the same
+`_refocusDriftAcceptRatio` constant -- identical logic, not a new
+threshold. Bounded to exactly one extra retry (can't loop indefinitely),
+and can only ever improve an already-suspect convergence result, never
+regress a genuinely good one. Since `_retargetAndConverge` is shared,
+this also applies to the main-camera focus-zone-bracket's own tip/base/
+left/right shots, not just the macro capture -- the same real risk was
+already present there too, just not yet reported.
+
+**Not yet device-tested** -- same standing discipline as every other
+capture-side change this project. The next real macro capture is what
+confirms whether this actually recovers thumb-focused detail instead of
+background bleed.
+
 ## Camera-2 macro capture: round-24 fixes confirmed working on a real device (2026-08-20, round 25)
 Direct follow-up to round 24's two fixes (rebuild-after-swap, 45s outer
 timeout). Real device retest, `8ed1c600`: both fixes confirmed working
