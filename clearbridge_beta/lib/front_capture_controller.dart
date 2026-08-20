@@ -3076,6 +3076,24 @@ class FrontCaptureController extends ChangeNotifier {
     var sampleCount = 0;
     var maxIterGapMs = 0;
     var driftRetried = false;
+    // Diagnostic-only, added 2026-08-20 per a real audit finding: the loop's
+    // own lock/break condition below requires `elapsedMilliseconds >=
+    // _refocusMinMs` before it will ever exit, which means it can NEVER
+    // report converging faster than the 600ms floor even if the underlying
+    // stability signal (stableStreak) was satisfied much earlier -- 10/10
+    // recent real captures land at exactly 4 poll iterations (600ms) with
+    // converged:true, which is consistent with either "AF genuinely needs
+    // the full 600ms every time" or "the floor is masking real convergence
+    // that happens sooner" -- the existing diagnostics can't distinguish
+    // these. `firstStableAtMs` records the elapsed poll time the FIRST time
+    // stableStreak alone (independent of the floor) would have qualified,
+    // purely for observation -- does not change the floor, the lock timing,
+    // or any other real behavior. Once several real captures show this
+    // value consistently well under 600ms, that's real evidence
+    // `_refocusMinMs` could be safely lowered in a future round; if it
+    // consistently lands near 600ms, that's real evidence the floor is
+    // already well-calibrated and shouldn't be touched.
+    int? firstStableAtMs;
     try {
       await _beginAutofocus();
       final beginAutofocusMs = sw.elapsedMilliseconds;
@@ -3103,6 +3121,11 @@ class FrontCaptureController extends ChangeNotifier {
               stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
             }
             lastSample = sample;
+          }
+          if (attempt == 1 &&
+              firstStableAtMs == null &&
+              stableStreak >= _refocusStableStreakRequired) {
+            firstStableAtMs = nowMs;
           }
           if (pollSw.elapsedMilliseconds >= _refocusMinMs &&
               stableStreak >= _refocusStableStreakRequired) {
@@ -3133,6 +3156,7 @@ class FrontCaptureController extends ChangeNotifier {
         'maxSharpnessObserved': maxSample,
         'driftRetried': driftRetried,
         'waitedMs': sw.elapsedMilliseconds,
+        'firstStableAtMs': firstStableAtMs,
       });
       _refocusDebug = {
         'waitedMs': sw.elapsedMilliseconds,
@@ -3144,6 +3168,13 @@ class FrontCaptureController extends ChangeNotifier {
         'finalSharpness': lastSample,
         'maxSharpnessObserved': maxSample,
         'driftRetried': driftRetried,
+        // See firstStableAtMs's own declaration comment above -- diagnostic
+        // only, decoupled from the _refocusMinMs floor. Null means the
+        // stability signal never independently qualified within this
+        // attempt's poll window (rare/expected if the floor itself was
+        // reached with stableStreak still below the required streak on the
+        // very last iteration).
+        'firstStableAtMs': firstStableAtMs,
       };
     } catch (e) {
       debugPrint('[front] refocus failed (non-fatal): $e');
