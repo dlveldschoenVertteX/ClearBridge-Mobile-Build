@@ -1,0 +1,180 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Admin read access — custom claim: admin == true
+    match /{document=**} {
+      allow read: if request.auth != null && request.auth.token.admin == true;
+    }
+
+    // System doc (training_status) — admin read/write
+    match /system/{docId} {
+      allow read, write: if request.auth != null && request.auth.token.admin == true;
+    }
+
+    // Captures collection — admin full access, users own records
+    match /captures/{captureId} {
+      allow read, write: if request.auth != null && request.auth.token.admin == true;
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      // Forge protection: clients can only create pending captures with no
+      // pipeline-written fields pre-set. nfiqScore/nfiqPass/status are
+      // written exclusively by the Cloud Function via Admin SDK.
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.get('status', 'pending') == 'pending'
+        && request.resource.data.get('nfiqScore', 0) == 0
+        && request.resource.data.get('nfiqPass', false) == false
+        && !('scoredAt' in request.resource.data)
+        && !('processingStartedAt' in request.resource.data)
+        && !('lastCaptureCallAt' in request.resource.data);
+      allow update, delete: if false;
+    }
+
+    // Capture debug telemetry — per-detect-cycle approach trajectory
+    // (gyro/CV values), written client-side alongside a capture for
+    // retuning axis targets and CV retraining. Deliberately a separate
+    // collection from `captures` (not a subcollection) so an oversized or
+    // failed telemetry write can never block the critical capture write —
+    // this data is diagnostic, not part of the scoring pipeline.
+    match /captureTelemetry/{captureId} {
+      allow read, write: if request.auth != null && request.auth.token.admin == true;
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // Deletion requests (POPIA right-to-deletion) — user submits a
+    // request via the app (BetaThankYouScreen), an admin reviews/actions it
+    // manually (no auto-delete of captures/user docs from this collection
+    // alone — that's a deliberate manual review step, not automated).
+    // userId is the doc ID (one active request per user; re-submitting just
+    // refreshes requestedAt while status is still pending).
+    match /deletionRequests/{userId} {
+      allow read, write: if request.auth != null && request.auth.token.admin == true;
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.userId == userId
+        && request.resource.data.get('status', 'pending') == 'pending';
+      // Resubmission allowed only while still pending, and only to refresh
+      // requestedAt — status itself is admin-only (client can't self-resolve
+      // its own request).
+      allow update: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.userId == userId
+        && resource.data.get('status', 'pending') == 'pending'
+        && request.resource.data.get('status', 'pending') == 'pending';
+      allow delete: if false;
+    }
+
+    // Application Rules:
+    // - Authenticated users can read their own applications.
+    // - Users can create their own records but cannot Forge status or payment info.
+    // - Users can NEVER modify sensitive fields (status, ref, deadline, cert).
+    // - Users can NEVER delete application records.
+    match /applications/{applicationId} {
+      allow read: if request.auth != null
+        && (resource == null || resource.data.userId == request.auth.uid);
+
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.status == 'pending'
+        && !('deadlineAt' in request.resource.data)
+        && !('certificateUrl' in request.resource.data);
+
+      allow update: if request.auth != null
+        && resource.data.userId == request.auth.uid
+        && request.resource.data.userId == request.auth.uid
+        // Protect sensitive fields from client modification
+        && request.resource.data.status == resource.data.status
+        && (!('paymentReference' in resource.data) || request.resource.data.paymentReference == resource.data.paymentReference)
+        && (!('deadlineAt' in resource.data) || request.resource.data.deadlineAt == resource.data.deadlineAt)
+        && (!('certificateUrl' in resource.data) || request.resource.data.certificateUrl == resource.data.certificateUrl)
+        // ClearCoin idempotency flags are Cloud-Function-only — clients can't
+        // forge them (e.g. set clearCoinReset to keep coins after purchase).
+        && request.resource.data.get('clearCoinAwarded', false)
+             == resource.data.get('clearCoinAwarded', false)
+        && request.resource.data.get('clearCoinReset', false)
+             == resource.data.get('clearCoinReset', false);
+
+      allow delete: if false;
+    }
+
+    // Clearances Collection Rules:
+    // - Users can only read their own clearances
+    // - Clearances are created/updated by Cloud Functions (Admin SDK bypasses rules)
+    match /clearances/{clearanceId} {
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow create: if false; // Cloud Functions (Admin SDK) only
+      allow update: if false;
+      allow delete: if false;
+    }
+
+    // Pending Payment Rules:
+    // - Users can create and read their own pending payment records.
+    // - Records cannot be modified or deleted by the user.
+    match /pending_payments/{reference} {
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+      allow read: if request.auth != null && resource.data.userId == request.auth.uid;
+      allow update, delete: if false;
+    }
+
+    // User Profile Rules:
+    // - Users can read and update their own profile.
+    // - clearCoinBalance: Cloud Function only (onApplicationClearCoins via Admin SDK).
+    // - lastCaptureCallAt: Cloud Function only (rate-limit timestamp, cannot be
+    //   client-reset to bypass the 60 s cooldown on processEnhanceAndScore).
+    // - Identity fields (idNumber, firstName, surname) locked once set —
+    //   prevents impersonation after initial submission. Admin SDK can still
+    //   update via support tooling.
+    match /users/{userId} {
+      allow read: if request.auth != null && request.auth.uid == userId;
+      allow create: if request.auth != null && request.auth.uid == userId
+        && request.resource.data.get('clearCoinBalance', 0) == 0;
+      allow update: if request.auth != null && request.auth.uid == userId
+        // clearCoinBalance is Cloud-Function-only
+        && request.resource.data.get('clearCoinBalance', 0)
+             == resource.data.get('clearCoinBalance', 0)
+        // lastCaptureCallAt is Cloud-Function-only (rate limit enforcement)
+        && request.resource.data.get('lastCaptureCallAt', null)
+             == resource.data.get('lastCaptureCallAt', null)
+        // Identity fields lock once set — can only be set on first write (empty→value)
+        // or kept unchanged on subsequent writes.
+        && (resource.data.get('idNumber', '') == ''
+            || request.resource.data.get('idNumber', '') == resource.data.get('idNumber', ''))
+        && (resource.data.get('firstName', '') == ''
+            || request.resource.data.get('firstName', '') == resource.data.get('firstName', ''))
+        && (resource.data.get('surname', '') == ''
+            || request.resource.data.get('surname', '') == resource.data.get('surname', ''));
+    }
+
+    // Referral Codes:
+    // - Any authenticated user can read (for referral validation lookups).
+    // - Only the owning user can create their own code doc.
+    // - completions must start at 0 — increments are Cloud Function only.
+    // - No updates or deletes — codes are immutable once created.
+    match /referralCodes/{code} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.get('completions', 0) == 0;
+      allow update, delete: if false;
+    }
+
+    // OTP records — Admin SDK only (Cloud Functions write/delete, clients blocked).
+    match /otps/{phoneNumber} {
+      allow read, write: if false;
+    }
+
+    // Beta referral tracking (new system):
+    // - Any authenticated user can read (validate a code before signup).
+    // - Only the owning referrer can create their own code doc.
+    // - completions must start at 0 — increments are Cloud Function only.
+    // - Updates are Cloud Functions only (increment completions). No deletes.
+    match /referrals/{code} {
+      allow read: if request.auth != null;
+      allow create: if request.auth != null
+        && request.resource.data.referrerId == request.auth.uid
+        && request.resource.data.get('completions', 0) == 0;
+      allow update, delete: if false;
+    }
+  }
+}
