@@ -1,5 +1,88 @@
 # ClearBridge Mobile — persistent context
 
+## Focus-lever audit: camera-2 macro wired as a dedicated final capture; focus-zone-splice audited on real matchability (not NFIQ) and found to be a real, additional negative (2026-08-20, round 23)
+Direct follow-up to the earlier "audit focus levers" request. Two real
+findings, one implemented, one closes out a standing open question with a
+decisive answer.
+
+**Camera "2" (macro) wired as a dedicated final capture.** New
+`_captureMacroShot()` (`front_capture_controller.dart`) fires after the
+main 8-frame burst (and the currently-disabled sweep burst) but before
+the upload screen -- a real, separate camera "2" session, never
+interleaved into the main burst. Guide grown 20%
+(`PadSilhouetteShape.scaled(1.2)`) per explicit CTO direction, to pull
+the thumb physically closer to this lens. Focus convergence reuses the
+existing `_retargetAndConverge` poll loop (measured, not a blind delay --
+this project's own hard-learned lesson from the original secondary-
+camera focus fix, round 5) via a dedicated local sharpness listener, not
+`_onFrame` (which carries main-camera-specific state that doesn't apply
+to this lens). Uploads under the existing `secondaryCameras` field/path
+convention `main.py`'s own secondary-camera scoring loop already
+consumes -- no backend consumption changes needed, since that loop
+already derives camera "2"'s real sensor-corrected crop region from
+`cameraLensInfo` (fixed 2026-07-29).
+
+**Real, proactively-caught conflict, fixed alongside it**: pulling the
+thumb closer will raise this camera's own measured native wavelength,
+and the existing secondary-camera selection gate
+(`_SECONDARY_MAX_WAVELENGTH_PX = 19.5`, non-IR) would very likely have
+silently blocked this feature's own output from ever winning selection --
+shipping a "get closer" feature that then gets vetoed by a "too close"
+gate. New `_SECONDARY_MAX_WAVELENGTH_PX_MACRO = 35.0`, scoped to camera
+"2" only (camera "3"'s own IR ceiling untouched), matching round 17's own
+real matchability finding and exact number for the identical reason.
+Flagged as provisional pending real device data, same as every other
+threshold in this pipeline. Not yet device-tested.
+
+**Focus-zone-splice: real matchability audit (SourceAFIS vs. the ink
+scan, not NFIQ2), decisive negative.** Direct answer to "does it improve
+ridge continuity, not just NFIQ" -- reproduced the ACTUAL production
+`focusZoneSplice` candidate (`main.py`'s own `afis_print.generate(enhance
+='focusZoneSplice', ...)` call, byte-for-byte) for all 10 real captures
+with `focusZoneShots` data, compared against the plain `native` full-
+frame candidate on the same real SourceAFIS-vs-ink-scan gate used
+throughout this session.
+
+**First pass was contaminated by a real harness bug, caught before
+trusting the result**: 6/10 captures showed byte-identical native/splice
+output. Root cause was in MY test script, not production --
+`_focus_zone_splice`'s own shape-equality safety check
+(`_focus_zone_splice`'s docstring: "the client's own decode pipeline uses
+the identical... center-square crop for the zone shots as the main
+burst, specifically so these stay pixel-aligned") silently no-ops when
+shapes don't match, and my harness downloaded the main ambient/flash
+frames RAW/rectangular instead of replicating
+`_download_front_only_frames`'s own center-square crop -- a real
+methodological gap in the test, not a production defect. Fixed the
+harness to match production's `_load()` exactly and re-ran; all 10
+captures then showed genuine engagement (real, differing scores).
+
+**Corrected result: native mean 1.004, splice mean 0.771, splice wins
+4/10 (40%, worse than a coin flip).** Splicing the per-zone dedicated-
+focus stills into the delivered print does not improve real matchability
+-- it trends measurably WORSE on average. This is a second, independent,
+additional negative on top of what was already known: `focusZoneSplice`
+has also never once won real production selection on NFIQ2 (needs to
+beat `native` by a 5.0 margin, never observed to in the last 15+ real
+captures checked). Combined with the same round's earlier finding that
+the whole focus-zone-bracket costs ~12-16s of real device time per
+capture (unchanged since round 8), this closes the loop the CTO's
+original question was pointing at: the feature is real, expensive, and
+now shown on the metric that actually matters (not just NFIQ) to not be
+helping. **Recommending this be disabled** (`_focusZoneBracketEnabled =
+false`) to reclaim the real per-capture time cost, though this is a
+product call, not actioned unilaterally without explicit direction.
+
+**Also confirmed, not new this round**: the lens-probe diagnostic
+(`capture_harness`'s `LensProbeScreen`, round 15) is fully on-device with
+zero Firestore/Storage upload by design -- I have no way to see its
+captured stills or its `getCameraExtensionSupport` result from this
+session. The real, already-established evidence (camera "2": 2.37mm
+focal length, 3.92x2.94mm sensor, smallest/shortest of all four cameras)
+still points at it being a real macro-ish sensor; the definitive answer
+needs the CTO's own visual comparison against a stock-Macro-mode
+reference photo.
+
 ## First real device test of the round-17 wavelength-gate raise (16->35): confirmed working, strong score, one new unexplained wrinkle flagged (2026-08-20, round 22)
 CTO ran a real capture (`d0ec5195`) on the just-built/deployed APK, the
 first real device test of round 17's `_liveWavelengthTooHighPx` raise
