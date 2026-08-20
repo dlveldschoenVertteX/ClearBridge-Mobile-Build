@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
@@ -226,19 +227,61 @@ def _ensure_models():
         (_THUMB_SEG_PATH, 'thumb_seg_unet.onnx', False),
     ]
     src_dir = os.path.dirname(os.path.abspath(__file__))
+    # Real concurrency bug found 2026-08-20 (full-codebase audit). This used to
+    # be a bare check-then-write straight onto `local_path`:
+    #
+    #     if not os.path.exists(local_path):
+    #         shutil.copy(bundled, local_path)          # non-atomic
+    #         bucket.blob(...).download_to_filename(local_path)   # non-atomic
+    #
+    # The deployed service runs with max_instance_request_concurrency = 80, so
+    # many requests genuinely share one instance and one /tmp. Two failure modes
+    # followed, both silent under light load and both certain under real load:
+    #   * two requests on a cold instance both see the file missing and write
+    #     the SAME path concurrently -- neither shutil.copy nor
+    #     download_to_filename is atomic, so their writes interleave and the
+    #     resulting model file is corrupt; and
+    #   * worse, a third request's os.path.exists() returns True while the file
+    #     is still only PARTIALLY written, so it never waits and simply loads a
+    #     truncated model.
+    # Either way ort.InferenceSession() then fails on a corrupt ONNX, and since
+    # _nfiq_session is a module-level global, one bad load poisons that instance
+    # for every later request until it is recycled (and the NFIQ model is
+    # required=True, so those requests hard-fail).
+    #
+    # Fix: write to a process-unique temp file in the same directory, then
+    # os.replace() into place. os.replace is atomic on POSIX, so a reader
+    # either sees no file at all or a complete one -- never a partial one.
+    # Concurrent writers now simply race to publish identical bytes, which is
+    # harmless. Also removes the redundant-download cost only in the sense that
+    # correctness no longer depends on who wins.
+    def _publish_atomically(dest: str, produce) -> None:
+        tmp = f'{dest}.tmp.{os.getpid()}.{threading.get_ident()}'
+        try:
+            produce(tmp)
+            os.replace(tmp, dest)      # atomic on POSIX
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
     for local_path, remote_name, required in model_specs:
         if not os.path.exists(local_path):
             # Prefer the model bundled with the function source (faster cold start,
             # no Storage round-trip). Fall back to Firebase Storage if absent.
             bundled = os.path.join(src_dir, remote_name)
             if os.path.exists(bundled):
-                shutil.copy(bundled, local_path)
+                _publish_atomically(local_path, lambda t, b=bundled: shutil.copy(b, t))
                 logger.info(f'Model loaded from bundle: {remote_name} ({os.path.getsize(local_path) // 1024 // 1024} MB)')
                 continue
             remote_path = f'{_STORAGE_MODEL_PREFIX}/{remote_name}'
             try:
                 logger.info(f'Downloading model {remote_path} → {local_path}')
-                bucket.blob(remote_path).download_to_filename(local_path)
+                _publish_atomically(
+                    local_path,
+                    lambda t, r=remote_path: bucket.blob(r).download_to_filename(t))
                 logger.info(f'Model ready: {local_path} ({os.path.getsize(local_path) // 1024 // 1024} MB)')
             except Exception as e:
                 if required:
@@ -272,6 +315,33 @@ def _get_nfiq_session():
     memory=options.MemoryOption.GB_4,
     cpu=4,
     min_instances=0,
+    # Explicitly ONE request per instance (audit, 2026-08-20). This was never
+    # set, so it silently defaulted to Cloud Run's 80 -- confirmed on the live
+    # service (max_instance_request_concurrency: 80). That default is meant for
+    # cheap IO-bound handlers; this one is the opposite of that, and 80 of them
+    # would share a single 4 GB instance.
+    #
+    # Real per-request cost here: 8+ full-resolution frames decoded (~4266x3200
+    # each), ECC stack alignment, ONNX sessions, and a 16-variant render loop.
+    # Peak RSS is comfortably in the hundreds of MB, so even a handful of truly
+    # concurrent requests exhausts 4 GB -- and an OOM kills EVERY in-flight
+    # request on that instance, not just the one that overshot. This file's own
+    # rate limit is per-USER, so it does nothing to bound instance-wide
+    # concurrency: N different users capturing at once is N concurrent requests,
+    # which is exactly the shape of the ~30-subject beta cohort this is about to
+    # onboard.
+    #
+    # It also removes a whole class of shared-/tmp races between requests (see
+    # _ensure_models, which was genuinely corrupting model files under
+    # concurrency and is now atomic independently of this setting).
+    #
+    # Real, deliberate tradeoff, stated plainly: concurrency=1 means more
+    # instances under parallel load and therefore more cold starts, rather than
+    # queueing behind a shared one. For a 4 GB memory-bound CV pipeline that is
+    # the correct trade -- a cold start costs seconds, an OOM costs the whole
+    # capture -- but it is a one-line revert if the cold-start cost ever proves
+    # worse in practice than this reasoning predicts.
+    concurrency=1,
 )
 def processEnhanceAndScore(req: https_fn.CallableRequest):
     """
