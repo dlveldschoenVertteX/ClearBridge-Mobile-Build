@@ -2924,33 +2924,61 @@ class FrontCaptureController extends ChangeNotifier {
   /// image stream to still be running (reads `_liveAbsSharpness`, which
   /// `_onFrame` only updates while streaming) -- callers MUST run this
   /// before `_stopStream()`.
+  ///
+  /// Real bug found + fixed 2026-08-20: this only ever asked "has the
+  /// reading stopped changing", never "is this a genuinely sharp reading
+  /// at all" -- the exact same gap already found and fixed once in
+  /// `_refocus()` (2026-08-17, real CTO report: "focus locks onto the
+  /// background"), just never ported to this shared helper. A lens that
+  /// settles on background behind the thumb converges (stops changing)
+  /// just as confidently as one that settles on the thumb itself --
+  /// directly implicated by a real device screenshot of the camera-2
+  /// macro shot showing background detail bleeding into a supposedly
+  /// thumb-focused capture. Now tracks the PEAK sharpness seen during the
+  /// poll and, if the value it settles on is well below that peak
+  /// (`_refocusDriftAcceptRatio`, same already-validated constant
+  /// `_refocus()` uses), retries once (re-issuing auto focus/exposure at
+  /// the same point) before locking -- identical logic to `_refocus()`,
+  /// just applied here too since every zone-bracket and macro-camera shot
+  /// goes through this same convergence path, not just the primary hold.
   Future<double?> _retargetAndConverge(Offset pt,
       {int minMs = _focusZoneMinMs, int maxMs = _focusZoneMaxMs}) async {
     final cam = _camera;
     if (cam == null) return null;
-    try {
-      await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
-      await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
-      await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
-    } catch (_) {}
-    double? lastSample = _liveAbsSharpness;
-    var stableStreak = 0;
-    final pollSw = Stopwatch()..start();
-    while (pollSw.elapsedMilliseconds < maxMs) {
-      await Future<void>.delayed(const Duration(milliseconds: _refocusPollIntervalMs));
-      if (_disposed) break;
-      final sample = _liveAbsSharpness;
-      if (sample != null && sample > 0) {
-        if (lastSample != null && lastSample! > 0) {
-          final change = (sample - lastSample!).abs() / lastSample!;
-          stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+    double? lastSample;
+    var maxSample = 0.0;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await cam.setFocusMode(FocusMode.auto).timeout(_zoneFocusCallTimeout);
+        await cam.setFocusPoint(pt).timeout(_zoneFocusCallTimeout);
+        await cam.setExposurePoint(pt).timeout(_zoneFocusCallTimeout);
+      } catch (_) {}
+      lastSample = _liveAbsSharpness;
+      var stableStreak = 0;
+      final pollSw = Stopwatch()..start();
+      while (pollSw.elapsedMilliseconds < maxMs) {
+        await Future<void>.delayed(const Duration(milliseconds: _refocusPollIntervalMs));
+        if (_disposed) break;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample > 0) {
+          if (sample > maxSample) maxSample = sample;
+          if (lastSample != null && lastSample! > 0) {
+            final change = (sample - lastSample!).abs() / lastSample!;
+            stableStreak = change < _refocusStableRatio ? stableStreak + 1 : 0;
+          }
+          lastSample = sample;
         }
-        lastSample = sample;
+        if (pollSw.elapsedMilliseconds >= minMs &&
+            stableStreak >= _refocusStableStreakRequired) {
+          break;
+        }
       }
-      if (pollSw.elapsedMilliseconds >= minMs &&
-          stableStreak >= _refocusStableStreakRequired) {
-        break;
-      }
+      final driftedLow = attempt == 1 &&
+          maxSample > 0 &&
+          lastSample != null &&
+          lastSample! < maxSample * _refocusDriftAcceptRatio &&
+          !_disposed;
+      if (!driftedLow) break;
     }
     try {
       await cam.setFocusMode(FocusMode.locked).timeout(_zoneFocusCallTimeout);
