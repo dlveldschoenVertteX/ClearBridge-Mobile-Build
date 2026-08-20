@@ -1,5 +1,93 @@
 # ClearBridge Mobile — persistent context
 
+## Capture-settings (AE/AF/brightness) + backend-enhancement audit (2026-08-20, round 28)
+CTO asked for a dedicated audit of capture logic/settings (brightness
+detection, AF, AE) plus a backend enhancement audit, debug and optimize.
+
+**AE -- real gap found and fixed.** Every FOCUS call in
+`front_capture_controller.dart` wraps its platform-channel await in
+`.timeout(_zoneFocusCallTimeout)`. NOT ONE of the ~13 EXPOSURE calls did,
+despite being the same channel with the same documented hang risk. The site
+that matters is `_maybeAdjustExposure`: it is the only exposure path running
+OUTSIDE any outer bound (the burst's own are now covered by round 27's
+`_burstCaptureTimeoutMs`), and it fires from `_onFrame` during the hold. Its
+failure mode is silent, not loud -- `_evChangeInFlight` is cleared only by
+`whenComplete()`, which never runs if the future never completes, so ONE
+stalled native call permanently latches that flag and kills glare/exposure
+adaptation for the entire remaining session while capture still looks fine.
+Now bounded on all three calls; a TimeoutException lands in the existing
+`catchError` and the flag clears, so adaptation self-heals next frame.
+
+**AE/brightness/AF -- audited and found CORRECT, no change made.** Stated
+explicitly so a future round doesn't re-litigate: brightness sampling is
+properly gated to flash-off frames only (`_lastStableBrightness`); the
+205/150 glare thresholds carry a real hysteresis gap so EV cannot
+oscillate; `_appliedEvOffset` is reconciled against real hardware min/max on
+every adjustment so internal accounting cannot diverge from the sensor;
+calibration is time-bounded (`_calibDurationMs` 500ms) with `_calibStart`
+set unconditionally before the stream opens, so the `start != null` guard in
+`_onFrame` can never strand the capture; and AF convergence already has the
+peak-tracking drift retry (ported into `_retargetAndConverge` in round 26).
+
+**Backend concurrency -- two real findings, both fixed.** The deployed
+service runs `max_instance_request_concurrency: 80` (confirmed live) --
+never set, so it silently took Cloud Run's IO-bound default.
+1. `_ensure_models()` was a non-atomic check-then-write onto shared `/tmp`:
+   under real concurrency two requests write the SAME path at once and
+   corrupt it, and worse a third sees `os.path.exists() == True` while the
+   file is only partially written and loads a TRUNCATED model.
+   `ort.InferenceSession` then fails on corrupt ONNX, and since
+   `_nfiq_session` is a module-level global one bad load poisons that
+   instance for every later request until recycled (NFIQ is
+   `required=True`, so those hard-fail). Now writes to a process/thread-
+   unique temp file and publishes via `os.replace()` (atomic on POSIX):
+   readers see either no file or a complete one, and concurrent writers just
+   race to publish identical bytes.
+2. Set `concurrency=1`. This is a memory-bound CV pipeline (8+ full-res
+   frames decoded, ECC alignment, ONNX sessions, 16-variant loop, peak RSS
+   in the hundreds of MB) against a 4 GB instance; dozens of concurrent
+   requests exhaust it, and an OOM kills EVERY in-flight request on that
+   instance. The existing rate limit is per-USER so bounds nothing
+   instance-wide -- N users capturing at once is N concurrent requests,
+   exactly the shape of the ~30-subject cohort being onboarded. Verified
+   `concurrency=1` is accepted by the installed firebase-functions 0.6.0 and
+   lands in the emitted endpoint spec BEFORE committing. Real tradeoff
+   (more cold starts under parallel load) documented in-line; one-line
+   revert.
+
+**Backend enhancement optimization -- real, but smaller than hypothesised,
+and reported as such.** `stack` and `focusStack` call
+`_stack_face_on`/`_focus_stack_face_on` on the SAME frame list, so each
+redoes the identical ECC alignment and only the combine differs. Same
+redundancy class as the 2026-07-16 outage, but `stack_cache` could not help
+because it caches the COMBINED result and these two legitimately differ --
+the shareable work is the alignment. It outlived the original fix because
+these variants only became live for front_only_v1 in round 11 (before that
+they returned None on every real capture, so it was invisible). Added an
+optional alignment cache threaded through both, negative results cached too.
+
+**Measured honestly on a real capture (`d0ec5195`, 4x 3200x3200):** output
+is BYTE-IDENTICAL with and without the cache (md5 match on both variants --
+this changes no enhancement result); isolated `_align_face_on_stack` costs
+1.56-3.94s against a ~0.0000s cache hit, so the real saving is **~2-4s per
+request**. The end-to-end A/B was **INCONCLUSIVE (0.94x)** -- sandbox timing
+noise is +/-10s and swamps the effect. Recording that plainly rather than
+quoting the favourable isolated number as an end-to-end speedup: my initial
+hypothesis that alignment DOMINATED these variants was **wrong**, the
+combine and downstream Gabor work dominate. Worth keeping (free, correct,
+a few seconds back against a 70s budget that round 14 showed really does
+run out) but it is NOT a fix for that budget problem.
+
+**Still open on the enhancement side, not actioned**: the variant loop's own
+economics. Real production trace (round 14) shows the 70s budget genuinely
+exhausting and skipping later variants -- several of which are this
+project's historically strongest scorers. The real lever is not
+micro-caching but ordering/pruning the 16-variant pool by measured
+historical win rate, so the strongest candidates are evaluated FIRST rather
+than whichever happens to precede the timeout. That needs a real
+win-rate-per-variant analysis across the capture library before acting, and
+is a genuine product/pipeline decision.
+
 ## Full-platform audit: 6 real findings, 5 fixed (2026-08-20, round 27)
 CTO asked for a thorough audit of the entire platform codebase (~50k Dart,
 ~12k Python) with a mandate to fix and optimize. Scoped to the real
