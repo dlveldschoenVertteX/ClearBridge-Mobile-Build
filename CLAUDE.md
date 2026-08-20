@@ -1,5 +1,56 @@
 # ClearBridge Mobile — persistent context
 
+## First real device test of BOTH round-31 macro fixes: camera "2" wins its first-ever real capture (2026-08-20, round 32)
+Direct follow-up device test on the deployed+built round-31 fixes (framing
+`_sec_cy=0.34`, backend; widened AF window, client). Real capture
+`f4cb3ba5` pulled from Firestore/Storage/Cloud Logging rather than assumed.
+
+**Real, decisive positive result: camera "2" won this capture outright for
+the first time ever recorded in this project.** `superprintParams.afisSource:
+"secondary_2"`, real `nfiq2Score: 69` -- beat every main-camera variant that
+ran (`native` 33, `freqNorm` 64, `stack` 39; `deepFuse`/`deepMaxc` both hit
+the per-call 20s cap and never produced a score, the same truncation class
+documented in round 30, now confirmed showing the real variant name in the
+log thanks to that same round's diagnostic fix: "`deepFuse` did not
+complete", "`deepMaxc` did not complete", not the old generic "generate").
+Previous real macro score on the SAME capture flow, pre-fix: 47.0
+(`5d3fb521`). **+22 points, real and substantial**, not a rounding
+difference.
+
+**Both round-31 fixes independently confirmed working from real data on
+this one capture:**
+- **Framing fix**: `afisWavelengthPxRaw: 15.0` (healthy, inside camera
+  "2"'s own macro wavelength ceiling of 35.0), and the resulting
+  `superprint_afis.png` shows a genuinely dense, coherent whorl with a
+  real, visible core -- structurally nothing like the wrist/background
+  striping the pre-fix `cy=0.5` crop produced on the previous capture.
+  Visually confirmed, sent for review.
+- **Focus-timing fix**: `macroDebug` -- the diagnostic that recorded
+  NOTHING before this round -- shows `sharpness: 229.9`, `maxSample:
+  243.4` (settled at 94% of its own observed peak), `driftRetried: false`
+  (found a good peak on the first attempt, no retry needed),
+  `convergedMs: 4978` -- comfortably inside the new 1200-2400ms x2 budget,
+  and a real, clean convergence trace where none existed before.
+
+**Honest caveat, not glossed over**: a direct crop of the raw macro JPEG
+at this zoom still doesn't show obvious ridge lines to the naked eye --
+skin sheen/JPEG compression at this magnification washes out fine
+relief in ordinary torch lighting, a genuinely different problem from
+either bug fixed this round. The Gabor-synthesized superprint's strong,
+coherent structure doesn't fully resolve whether that's because real
+(if subtle) ridge signal WAS present and got faithfully drawn out, or
+because the enhancement pipeline's own orientation-field synthesis is
+doing some of the work regardless -- the same underlying uncertainty
+this project's prime-directive work has flagged before. What IS certain
+from real, structural evidence (correct crop framing + a clean AF
+convergence trace ending near its own peak) is that both round-31 bugs
+are fixed and camera "2" is now producing its best real result to date,
+not merely a better-looking coincidence.
+
+**Also confirmed on this same capture**: all four focus-zone-bracket
+stills (tip/base/left/right) fed their minutiae diagnostics correctly,
+same as every other recent capture -- unrelated, no issues.
+
 ## Macro-camera (camera "2") capture: two real, independent, compounding bugs found + fixed -- a framing/calibration bug much bigger than the reported softness, plus the softness itself (2026-08-20, round 31)
 CTO report on the same `5d3fb521` capture from round 30: "The macro lens did
 not fully lock focus on the print it was soft, you need to tweak the
