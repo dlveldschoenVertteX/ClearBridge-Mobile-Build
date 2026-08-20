@@ -1,5 +1,86 @@
 # ClearBridge Mobile — persistent context
 
+## AFIS variant pool reordered by MEASURED win rate across all 116 real captures (2026-08-20, round 29)
+Direct follow-up to round 28's own closing recommendation, on explicit CTO
+approval ("yes reorder the variant pool by win rate"). Not a guess at what
+"should" win — measured against every real scored `front_only_v1` capture in
+Firestore.
+
+**Why order matters at all, stated plainly first**: selection is
+max-of-variants, so when the loop runs to completion the order changes
+nothing — the same candidate wins either way. It matters ONLY when
+`_variants_deadline` (70s) truncates the loop. Round 14's real Cloud Logging
+trace is direct proof that happens on real captures: one stuck fuse pair
+burned the budget and the loop logged "skipping remaining variants from
+fuseMaxc onward", dropping `deepFuse`, `deepMaxc`, `mosaicFreq`,
+`pyfingHybridFreqNorm` and `deepAmbBestFl` — several of this project's own
+historically strongest scorers. Under budget pressure the pool was being cut
+in whatever order it happened to be *declared*, with no relationship to what
+actually wins.
+
+**Real measurement, n=116 real scored captures**, each winner classified
+from its own `superprintParams`:
+
+| variant | wins | mean nfiq2 |
+|---|---|---|
+| freqNorm | 26 | 58.4 |
+| native | 22 | 40.7 |
+| stack | 7 | 43.6 |
+| focusStack | 6 | 30.5 |
+| fuseAvg | 6 | 45.8 |
+| deepFuse | 6 | 67.2 |
+| fuseMaxc | 4 | 63.5 |
+| **deepMaxc** | 3 | **81.0 (highest of any variant)** |
+| fuseSoft | 2 | 52.0 |
+| nnsHybrid | 2 | — |
+| coherenceDiff | 1 | — |
+| **mosaicFreq, deepAmbBestFl, pyfingSnfen, pyfingHybrid, pyfingHybridFreqNorm** | **0** | — |
+
+(Also present but outside the variant tuple: 19 `minutiae` wins, 7 `sweep`,
+4 `secondary` — separate candidate blocks, not part of this reorder.)
+
+**Five of sixteen variants have never once won a real capture** — yet
+`mosaicFreq` sat at position 8, ahead of BOTH `deepFuse` and `deepMaxc`, and
+`deepMaxc` has the highest mean quality of anything in the pool.
+
+**Hard constraint, verified before touching anything, not a preference:
+`native` must stay first.** `_native_nfiq` is the baseline for three separate
+safety margins (`_FUSION_VARIANT_NAMES`, `_NEURAL_GUARDED_VARIANT_NAMES`,
+`_FREQNORM_RISK_VARIANT_NAMES`), and every one of those guards is written
+`... and _native_nfiq is not None` — so a guarded variant running before
+native would silently skip its own margin check and could win UNGUARDED.
+Those margins exist specifically to stop false-match-prone candidates
+displacing a more matchable print (round 14's freqNorm false-match guard is
+one of them), so this ordering must never be "optimised" past it.
+
+**Implemented as a separate, reviewable policy rather than by churning the
+tuple**: the `_afis_variants` tuple keeps its original order and all of its
+heavily-documented inline reasoning untouched; a new `_VARIANT_PRIORITY`
+tuple plus one `sorted()` applies the evaluation order. A newly added variant
+missing from `_VARIANT_PRIORITY` still runs (sorted to the tail) but logs a
+warning rather than being silently buried.
+
+**Two deliberate deviations from strict win-count order, both reasoned**:
+`deepMaxc` is kept adjacent to `deepFuse` (they share the expensive ECC stack
+via `stack_cache`, so the second is nearly free back-to-back), and the
+expensive multi-pair `fuse*` family (`_FUSE_PAIR_NAMES` — which loops every
+flash pair under its own 20s hard cap, the exact mechanism that exhausted the
+budget in round 14) is deliberately placed AFTER the high-value `deep*`
+family, moving from position 5 to 7.
+
+**Net effect, quantified**: expected quality at truncation is higher at every
+cutoff from 4 to 8 variants. `deepFuse` moves 9→4, `deepMaxc` 10→5, and the
+five never-won variants move from positions [8, 11, 12, 13, 14] to
+[12, 13, 14, 15, 16]. Verified safe: 16 variants in, 16 out, none lost or
+duplicated, `native` first.
+
+**Cannot regress a capture whose loop completes** — identical set, identical
+max-of-variants selection. It can only change which candidates survive a
+truncated loop, and the measurement says the survivors are now the ones that
+actually win. Not yet confirmed against a real capture that actually hits the
+deadline; the next one that does is what shows the recovered candidates
+landing.
+
 ## Capture-settings (AE/AF/brightness) + backend-enhancement audit (2026-08-20, round 28)
 CTO asked for a dedicated audit of capture logic/settings (brightness
 detection, AF, AE) plus a backend enhancement audit, debug and optimize.

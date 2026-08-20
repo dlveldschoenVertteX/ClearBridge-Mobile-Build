@@ -1086,6 +1086,78 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 # quality.
                 ('nnsHybrid', dict(enhance='nnsHybrid')),
             )
+            # ── Evaluation order by MEASURED win rate (CTO-approved, 2026-08-20) ──
+            # The tuple above stays in its original, heavily-documented order so
+            # none of that reasoning is churned; the evaluation ORDER is applied
+            # here as an explicit, separately-reviewable policy.
+            #
+            # Why this matters: selection is max-of-variants, so with the FULL
+            # loop completing, order changes nothing -- the same candidate wins
+            # either way. It matters only when `_variants_deadline` truncates the
+            # loop, and round 14's real Cloud Logging trace proves that happens:
+            # one stuck fuse pair burned the budget and the loop logged "skipping
+            # remaining variants from fuseMaxc onward", dropping deepFuse,
+            # deepMaxc, mosaicFreq, pyfingHybridFreqNorm and deepAmbBestFl. So
+            # under pressure the pool was being cut in whatever order it happened
+            # to be declared, not by what actually wins.
+            #
+            # Measured over ALL 116 real scored front_only_v1 captures in
+            # Firestore, classifying each winner from its own superprintParams:
+            #   freqNorm 26 (mean nfiq2 58.4) | native 22 (40.7) | stack 7 (43.6)
+            #   focusStack 6 (30.5) | fuseAvg 6 (45.8) | deepFuse 6 (67.2)
+            #   fuseMaxc 4 (63.5) | deepMaxc 3 (81.0) | fuseSoft 2 (52.0)
+            #   nnsHybrid 2 | coherenceDiff 1
+            #   NEVER WON, 0/116: mosaicFreq, deepAmbBestFl, pyfingSnfen,
+            #                     pyfingHybrid, pyfingHybridFreqNorm
+            # Five of sixteen variants have never once won a real capture, yet
+            # mosaicFreq sat at position 8 -- ahead of deepFuse AND deepMaxc,
+            # the latter having the highest mean quality of any variant (81.0).
+            #
+            # HARD CONSTRAINT, not a preference: 'native' must stay first.
+            # `_native_nfiq` is the baseline for three separate safety margins
+            # (_FUSION_VARIANT_NAMES, _NEURAL_GUARDED_VARIANT_NAMES,
+            # _FREQNORM_RISK_VARIANT_NAMES), and each guard is written
+            # `... and _native_nfiq is not None`, so a guarded variant running
+            # before native would silently skip its own margin check and could
+            # win UNGUARDED. Those margins exist to keep false-match-prone
+            # candidates from displacing a more matchable print, so this
+            # ordering must never be "optimised" past it.
+            #
+            # deepMaxc is kept adjacent to deepFuse rather than in strict
+            # win-count order: they share the expensive ECC stack via
+            # stack_cache, so evaluating them back-to-back makes the second
+            # nearly free. The expensive multi-pair fuse* family
+            # (_FUSE_PAIR_NAMES, which loops every flash pair under its own 20s
+            # hard cap -- the exact thing that exhausted the budget in round 14)
+            # is deliberately placed AFTER the high-value deep* family.
+            _VARIANT_PRIORITY = (
+                'native',                 # 22 wins  -- REQUIRED FIRST (guard baseline)
+                'freqNorm',               # 26 wins  -- most frequent winner
+                'stack',                  #  7 wins
+                'deepFuse',               #  6 wins, mean 67.2
+                'deepMaxc',               #  3 wins, mean 81.0 (best quality; shares stack_cache)
+                'focusStack',             #  6 wins
+                'fuseAvg',                #  6 wins  -- expensive multi-pair family from here
+                'fuseMaxc',               #  4 wins
+                'fuseSoft',               #  2 wins
+                'nnsHybrid',              #  2 wins
+                'coherenceDiff',          #  1 win
+                'deepAmbBestFl',          #  0 wins
+                'mosaicFreq',             #  0 wins
+                'pyfingHybridFreqNorm',   #  0 wins
+                'pyfingHybrid',           #  0 wins
+                'pyfingSnfen',            #  0 wins
+            )
+            _unranked = [n for n, _ in _afis_variants if n not in _VARIANT_PRIORITY]
+            if _unranked:
+                # A newly added variant is not silently buried at the tail
+                # without anyone noticing -- it still runs, but say so.
+                logger.warning('AFIS variants missing from _VARIANT_PRIORITY '
+                                '(evaluated last): %s', _unranked)
+            _afis_variants = tuple(sorted(
+                _afis_variants,
+                key=lambda kv: (_VARIANT_PRIORITY.index(kv[0])
+                                if kv[0] in _VARIANT_PRIORITY else len(_VARIANT_PRIORITY))))
             # Wall-clock budget on the whole variant loop -- found 2026-07-16
             # (real device capture 9efb7d1e): the deepFuse/deepMaxc/deepSoft
             # family each independently redo the expensive ambient/flash
