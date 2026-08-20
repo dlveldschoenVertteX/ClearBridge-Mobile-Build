@@ -1,5 +1,59 @@
 # ClearBridge Mobile — persistent context
 
+## Learned scale-normalizer, first local CPU smoke test: real, clean positive trend (2026-08-19, round 18)
+Per the CTO's direction ("I believe that the normalization training will be
+more successful... let's move forward with a local CPU test, if it goes
+well for the first 15 epochs we will see a trend"), built the scale-only
+learned normalizer proposed as the C2CL-inspired alternative to hand-tuned
+`_FREQ_SCALE_MIN`.
+
+**Built** (`ml/scale_normalize/`): `ScaleRegressorNet` (small CNN, 5 conv
+blocks + global-average-pool + 2-layer head, ~198K params, GroupNorm not
+BatchNorm2d per this project's own already-learned lesson), trained
+self-supervised on synthetic scale distortion applied to real source
+material — 63 real `superprint_afis.png` renders already downloaded this
+session's SourceAFIS matchability sweep, same "apply a KNOWN distortion to
+real clean material, train the net to invert it" pattern that trained
+cleanly for `ml/deform_correct` (unlike the earlier SD302f real-pair
+approach, which never converged). Deliberately narrower than
+`deform_correct`'s full per-pixel deformation field: predicts a single
+scalar log-scale correction factor, a much more constrained/tractable
+target, per this round's own plan.
+
+**First local CPU run, 15 epochs, ~50s wall time, real and clean — no
+mean-collapse, no divergence, no NaN**:
+
+| | train_loss | val_loss | val_scale_mae |
+|---|---|---|---|
+| epoch 1 | 0.163 | 0.050 | 0.254 |
+| epoch 15 | 0.014 | 0.007 | 0.090 |
+
+val_loss mean dropped 43% from the first half of training to the second
+half. By epoch 15 the network's predicted scale factor is off by ~0.09 on
+average (real units) against a true synthetic range spanning ~0.3x-3.5x —
+a real, fast improvement, not noise.
+
+**Honest caveat, stated plainly**: validation is only 12 distinct source
+images (63 real captures split 51 train/12 val) — real project-domain
+data, not synthetic filler, but small enough that some of this
+improvement could be partial memorization of those 12 images' own content
+rather than a fully general scale-invariant feature. The clean,
+non-collapsing curve is a genuinely good sign the architecture/training
+setup are sound — it is NOT yet proof this generalizes, and is NOT yet
+validated against real matchability (the only metric that actually
+matters per this project's prime directive) or wired into
+`afis_print.generate()` in any way.
+
+**Real next step, not yet built**: apply the trained network's predicted
+correction to a real capture and run it through the SAME real SourceAFIS-
+vs-ground-truth sweep already built this session, compared against the
+current `freq_normalize`/`_FREQ_SCALE_MIN=0.7` baseline (which that same
+sweep just confirmed is already near-optimal on this small sample) — that
+comparison, not the training loss curve, is what decides whether this is
+worth pursuing further (a bigger real corpus, more epochs, eventually
+SageMaker) or a dead end, same standing discipline as every other ML
+candidate in this pipeline.
+
 ## Distance-gate reversed on explicit CTO product call: real matchability wants closer, not farther (2026-08-19, round 17)
 Direct follow-up to the mask-vs-matchability sweep: the real winners all sit
 at wlRaw 28-30, squarely inside what `_liveWavelengthTooHighPx=16.0` was
