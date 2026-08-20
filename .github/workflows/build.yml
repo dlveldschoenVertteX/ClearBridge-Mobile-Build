@@ -36,6 +36,24 @@ jobs:
       - run: flutter pub get
         working-directory: capture_harness
 
+      # Static analysis BEFORE the expensive Gradle build (added 2026-08-20,
+      # full-codebase audit). This repo had no analysis and no tests in CI at
+      # all, so the first signal for even a hard compile error was a ~3min
+      # Gradle failure -- exactly how the real
+      # `CameraExtensionCharacteristics.EXTENSION_MACRO` breakage surfaced on
+      # 2026-08-20 (that reference does not exist in the Android SDK; analyze
+      # reports it in seconds). Placed before `flutter build` so a broken
+      # commit fails fast and burns far fewer CI minutes, which this project
+      # actively budgets for.
+      #
+      # Deliberately errors-only (--no-fatal-warnings --no-fatal-infos): the
+      # goal is catching real breakage without a backlog of pre-existing style
+      # lints blocking every build on day one. Tighten later once the warning
+      # backlog is triaged.
+      - name: Analyze (capture_harness)
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+        working-directory: capture_harness
+
       - run: flutter build apk --release --target-platform android-arm64
         working-directory: capture_harness
 
@@ -135,6 +153,24 @@ jobs:
       - run: flutter pub get
         working-directory: sweep_capture_test
 
+      # Static analysis BEFORE the expensive Gradle build (added 2026-08-20,
+      # full-codebase audit). This repo had no analysis and no tests in CI at
+      # all, so the first signal for even a hard compile error was a ~3min
+      # Gradle failure -- exactly how the real
+      # `CameraExtensionCharacteristics.EXTENSION_MACRO` breakage surfaced on
+      # 2026-08-20 (that reference does not exist in the Android SDK; analyze
+      # reports it in seconds). Placed before `flutter build` so a broken
+      # commit fails fast and burns far fewer CI minutes, which this project
+      # actively budgets for.
+      #
+      # Deliberately errors-only (--no-fatal-warnings --no-fatal-infos): the
+      # goal is catching real breakage without a backlog of pre-existing style
+      # lints blocking every build on day one. Tighten later once the warning
+      # backlog is triaged.
+      - name: Analyze (sweep_capture_test)
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+        working-directory: sweep_capture_test
+
       - run: flutter build apk --release --target-platform android-arm64
         working-directory: sweep_capture_test
 
@@ -229,6 +265,24 @@ jobs:
             gradle-beta-${{ runner.os }}-
 
       - run: flutter pub get
+        working-directory: clearbridge_beta
+
+      # Static analysis BEFORE the expensive Gradle build (added 2026-08-20,
+      # full-codebase audit). This repo had no analysis and no tests in CI at
+      # all, so the first signal for even a hard compile error was a ~3min
+      # Gradle failure -- exactly how the real
+      # `CameraExtensionCharacteristics.EXTENSION_MACRO` breakage surfaced on
+      # 2026-08-20 (that reference does not exist in the Android SDK; analyze
+      # reports it in seconds). Placed before `flutter build` so a broken
+      # commit fails fast and burns far fewer CI minutes, which this project
+      # actively budgets for.
+      #
+      # Deliberately errors-only (--no-fatal-warnings --no-fatal-infos): the
+      # goal is catching real breakage without a backlog of pre-existing style
+      # lints blocking every build on day one. Tighten later once the warning
+      # backlog is triaged.
+      - name: Analyze (clearbridge_beta)
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
         working-directory: clearbridge_beta
 
       - name: Decode keystore
