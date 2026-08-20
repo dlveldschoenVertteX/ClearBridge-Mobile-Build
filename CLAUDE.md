@@ -1,5 +1,140 @@
 # ClearBridge Mobile — persistent context
 
+## Full-platform audit: 6 real findings, 5 fixed (2026-08-20, round 27)
+CTO asked for a thorough audit of the entire platform codebase (~50k Dart,
+~12k Python) with a mandate to fix and optimize. Scoped to the real
+production path (`clearbridge_beta/`, `functions/processEnhanceAndScore/`,
+`packages/mac_capture/`) plus build/deploy/security infrastructure.
+
+**Method note**: `ruff`/`flake8` are available in-sandbox and were run over
+the backend -- it came back statically clean (the one F821, `np` in a
+QUOTED return annotation in `pyfing_client.py`, is not evaluated at runtime
+and is cosmetic). No Dart toolchain exists here, so Dart findings are from
+targeted manual audit of this project's OWN documented recurring bug
+classes, which is where the real defects were.
+
+**1. CRITICAL -- the main 8-shot burst had no hang protection. FIXED.**
+Every other camera sequence in `front_capture_controller.dart` already had
+an outer timeout (`_sweepBurstTimeoutMs` 34s, `_macroCaptureTimeoutMs` 45s,
+the removed secondary-camera loop had 28s) -- but `_fireBurst`, the path
+100% of real captures go through, had none. Per-shot try/catch does not
+help; this file's own `_sweepBurstTimeoutMs` docs already state that
+`takePicture()` is a raw platform-channel await with no bound and
+"try/catch alone does not protect against that". A stall there means
+`_finishAndUpload` never runs -> no Firestore doc -> capture lost for good,
+UI stuck in `capturing` -- the same class as this project's real
+stuck-capture/ANR history. New `_burstCaptureTimeoutMs` = 75s, derived from
+this project's own measured timings (~15-18s focus-zone bracket per round-8
+telemetry + ~8-16s burst = ~34s realistic worst case, so >2x margin).
+Non-destructive: `rawShots` accumulates in place, so a timeout still
+uploads a partial burst instead of losing everything. Writes
+`burstCaptureDebug`.
+
+**2. SECURITY (high) -- client-controlled `basePath` was never validated.
+FIXED.** `basePath` is separate client input from captureId/userId and the
+ownership check constrained neither it nor anything derived from it, yet it
+flowed verbatim into two Admin SDK paths (which bypass Storage rules):
+`_download_best_frames` -> `list_blobs(prefix=base_path)`, reachable today
+as the fallback branch whenever `captureMode` is anything other than
+arc/oscillating/front_only_v1 (i.e. simply omitting it) -- letting a caller
+with their OWN valid captureId read a VICTIM's raw fingerprint frames and
+have them processed into the caller's own readable capture doc
+(cross-tenant biometric disclosure, "special personal information" under
+POPIA); and `_delete_capture_frames(base_path)` -> `list_blobs(prefix)` +
+`blob.delete()` on every match, i.e. arbitrary cross-tenant deletion, where
+a prefix as short as `captures` matches every frame in the bucket. The
+delete is latent only because `_BETA_PHASE = True` skips deletion during
+beta -- it arms the moment that flips for GA. Note the live front_only_v1
+READ path was already safe (it resolves paths from the ownership-verified
+doc and ignores `base_path`), so this is defence-in-depth there and a real
+fix on the other two. Fix: require `basePath == captures/{userId}/{captureId}`
+exactly, before the rate limit or any compute. Verified every client in the
+repo builds precisely that string, so it cannot break a legitimate caller;
+strict equality rather than `startswith` on purpose (a prefix test still
+admits `{captureId}_other`).
+
+**3. SECURITY/OPS -- the live Firestore rules existed ONLY in production.
+FIXED.** `firebase.json` referenced `firestore.rules` and
+`firestore.indexes.json`; neither file existed. So any unscoped `firebase
+deploy` failed outright, and worse, anyone "fixing" that with a stub would
+have silently OVERWRITTEN the live ruleset -- which is the entire security
+boundary for a public repo shipping a public Firebase client key (the
+`AIzaSy...` key is not a secret by design; the rules are what actually
+protect the data). Fetched both verbatim from the live rulesets via the
+Firebase Rules API (firestore ruleset `e14bc036`) and Firestore Admin API,
+verified byte-for-byte identical to production, so deploying them is now a
+guaranteed no-op rather than a change. Also verified the already-tracked
+`storage.rules` still matches its live ruleset (`f3e44261`) -- it does. No
+rule semantics altered, and kept verbatim (no added header) so future diffs
+against live stay meaningful.
+
+**4. Telemetry buffer was unbounded -> long sessions lost ALL diagnostics.
+FIXED.** The entire `_telemetry` list is written into ONE captureTelemetry
+document, but Firestore hard-limits a document to 1 MiB. At the 150ms
+throttle (~6.7/sec, plus `wavelengthAttempt` on its own) that is crossed in
+~11-18 minutes, after which the whole write fails -- silently, since it is
+deliberately fire-and-forget with a caught exception. Exactly backwards
+from its purpose: this project's real reports are of LONG stuck sessions
+("sweeps forever", "takes long to lock"), so the runs most worth diagnosing
+were the ones guaranteed to yield nothing. Capped at 2500 entries (~600KB)
+with drop-oldest restricted to high-volume throttled event types --
+checkpoints (`refocusLocked`/`holdComplete`/`shotFired`) are never dropped.
+Simulated a 45-minute session (~29,750 events): holds the cap at ~610KB and
+preserves all 45 `refocusLocked` + all 8 `shotFired`. Emits
+`samplesDropped` so a truncated trajectory can't be mistaken for a complete
+one.
+
+**5. CI had NO static analysis and NO tests at all. PARTLY FIXED.** Zero
+`*_test.dart` files repo-wide and no analyze step, so the first signal for
+even a hard compile error was a ~3min Gradle failure -- exactly how the
+real `EXTENSION_MACRO` breakage surfaced earlier the same day (a reference
+that does not exist in the Android SDK; `flutter analyze` catches it in
+seconds). Added `flutter analyze` to all three build jobs, before the
+expensive Gradle step so breakage fails fast and burns fewer CI minutes
+(which this project actively budgets). Errors-only
+(`--no-fatal-warnings --no-fatal-infos`) since the pre-existing warning
+backlog is unknown from this sandbox -- safe to land, worth tightening
+once triaged. The absence of any test suite is NOT fixed and is a real
+structural gap.
+
+**Verified clean (checked, no action needed)**: resource disposal across
+the active app (every Timer/StreamSubscription/AnimationController is
+cancelled/disposed); the backend callable's auth chain (unauthenticated
+reject -> uid match -> capture ownership -> atomic transactional 60s rate
+limit, correctly ordered so abuse cannot consume compute); NFIQ2 range
+validation (genuine defence-in-depth on both sidecar and client after the
+`898`/`586` incidents); no private keys, service accounts or `.env` tracked
+in the public repo; `storage.rules` matches live; upload/write ordering in
+`_finishAndUpload` (uploads -> doc -> trigger, with failures surfacing via
+`_fail` rather than producing a doc that references missing files); and all
+known hand-copied geometry constants currently AGREE across the
+client/backend boundary (`defaultShape.cy` 0.37 == `main.py`'s `_sec_cy`;
+the 0.35/0.70 sub-guide formulas match between `_focusPointForZone`,
+`_fz_subguides` and `_patch_subguides`).
+
+**Open, NOT fixed -- needs a CTO decision or a toolchain this sandbox
+lacks:**
+- **No `pubspec.lock` for `clearbridge_beta`** (only the root app has one).
+  CI runs `flutter pub get` and floats to newest-compatible on every build,
+  so the APK tested is not guaranteed to be the APK shipped -- this project
+  has already been burned once (the `firebase_core` 4.12.0 cap exists for
+  exactly this reason, and its own pubspec comment flags the gap). Cannot
+  generate a lockfile without a Flutter toolchain: run
+  `cd clearbridge_beta && flutter pub get` and commit the resulting
+  `pubspec.lock`.
+- **`referralCodes` / `referrals` are world-readable to any authenticated
+  user** (`allow read: if request.auth != null`). Since Firestore `read`
+  covers list as well as get, and this app uses anonymous auth, anyone can
+  enumerate every referral code and its owner's uid -- enabling referral
+  fraud and leaking the user graph. Deliberately NOT changed: the rules
+  themselves document this as intentional for "validate a code before
+  signup", so tightening it (validate via a callable instead) is a product
+  decision, not a unilateral one.
+- **No test suite anywhere.** The highest-value first target is not widget
+  tests but pure-logic unit tests over the geometry/threshold code that has
+  actually broken repeatedly here (`PadSilhouetteShape` -> `guideRegion`
+  transforms, the sub-guide formulas, wavelength scaling).
+
 ## Real device report: camera-2 macro focus locking onto background -- same bug class already fixed once, ported to the shared convergence helper (2026-08-20, round 26)
 CTO reported "a real blur issue... it's picking up the background" on the
 camera-2 macro capture, with a screenshot showing the live guide/preview
