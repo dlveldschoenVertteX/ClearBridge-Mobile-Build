@@ -560,6 +560,23 @@ class FrontCaptureController extends ChangeNotifier {
   // 2026-07-29, needs no changes here).
   static const String _macroCameraName = '2';
   static const double _macroGuideScaleFactor = 1.2;
+  // Real bound on the WHOLE macro-capture sequence (open + focus + shutter
+  // + upload), added 2026-08-20 after a real device test where camera "2"
+  // never produced a result. Matches this file's own already-established
+  // rule for exactly this camera (_sweepBurstTimeoutMs's own docs: "The
+  // whole ... sequence is wrapped in ONE .timeout() -- takePicture() is a
+  // raw platform-channel await with no bound of its own, so a hang on any
+  // single [step] must not block the rest of the capture forever (try/
+  // catch alone does not protect against that)") -- camera "2" specifically
+  // has a long, real history in this project of being the slowest camera
+  // to open/upload (multiple prior rounds: "camera '2' still timed out at
+  // the exact same step", "camera '2' has by far the slowest upload").
+  // 45s budgeted: real CameraService.initializeCamera() retry structure
+  // alone can take up to ~32s worst case (12s attempt + 20s retry), plus
+  // real margin for one focus-converge + shutter + at least one real
+  // upload attempt. Self-skipping on expiry -- can only ever cost this one
+  // candidate, never the main capture already safely uploaded elsewhere.
+  static const int _macroCaptureTimeoutMs = 45000;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -4738,76 +4755,86 @@ class FrontCaptureController extends ChangeNotifier {
     if (svc == null) return null;
     Map<String, dynamic>? result;
     try {
-      final cams = await svc.getAvailableCameras();
-      CameraDescription? macroDesc;
-      for (final c in cams) {
-        if (c.lensDirection == CameraLensDirection.back &&
-            c.name == _macroCameraName) {
-          macroDesc = c;
-          break;
+      // Real bound on the whole sequence -- see _macroCaptureTimeoutMs's
+      // own docs above for why try/catch alone can't protect against a
+      // hang here (takePicture() has no timeout of its own, and camera
+      // "2" has a long real history in this project of being slow to
+      // open/upload). A TimeoutException here falls through to the
+      // existing outer catch below, same self-skipping treatment as any
+      // other failure in this sequence.
+      result = await (() async {
+        final cams = await svc.getAvailableCameras();
+        CameraDescription? macroDesc;
+        for (final c in cams) {
+          if (c.lensDirection == CameraLensDirection.back &&
+              c.name == _macroCameraName) {
+            macroDesc = c;
+            break;
+          }
         }
-      }
-      if (macroDesc == null) {
-        debugPrint('[front] macro camera ($_macroCameraName) not present on this device, skipping');
-        return null;
-      }
+        if (macroDesc == null) {
+          debugPrint('[front] macro camera ($_macroCameraName) not present on this device, skipping');
+          return null;
+        }
 
-      _apply(
-        (s) => s.copyWith(
-          confirmationText: 'Capturing close-up detail…',
-          activeGuideShape: PadSilhouetteShape.defaultShape.scaled(_macroGuideScaleFactor),
-        ),
-        force: true,
-      );
-      unawaited(HapticFeedback.lightImpact());
+        _apply(
+          (s) => s.copyWith(
+            confirmationText: 'Capturing close-up detail…',
+            activeGuideShape: PadSilhouetteShape.defaultShape.scaled(_macroGuideScaleFactor),
+          ),
+          force: true,
+        );
+        unawaited(HapticFeedback.lightImpact());
 
-      await svc.initializeCamera(cameraDescription: macroDesc);
-      final macroCam = svc.controller;
-      if (macroCam == null) return null;
-      _camera = macroCam;
-      // Real bug found on first real device test (2026-08-20): the screen's
-      // own `_cameraLayer()` reads `_cameraService.controller` fresh on
-      // every BUILD, not continuously -- rebuilds only happen in response
-      // to this controller's `notifyListeners()` (via `_apply`). The only
-      // `_apply` call before this point ran BEFORE `initializeCamera()`
-      // even started swapping cameras, so the screen's one and only
-      // rebuild in this whole step happened while the controller was still
-      // mid-swap (old camera disposed / new one not yet ready) --
-      // `_cameraLayer()`'s own null/uninitialized fallback renders a flat
-      // `ColoredBox` (black), and with no further rebuild ever fired,
-      // nothing ever replaced it: a real device confirmed exactly this
-      // (guide + banner visible, camera feed solid black). Forcing a fresh
-      // emit here, now that `macroCam` is the real, already-initialized
-      // camera "2" controller, is what actually binds `CameraPreview` to
-      // its live texture.
-      _apply((s) => s, force: true);
+        await svc.initializeCamera(cameraDescription: macroDesc);
+        final macroCam = svc.controller;
+        if (macroCam == null) return null;
+        _camera = macroCam;
+        // Real bug found on first real device test (2026-08-20): the
+        // screen's own `_cameraLayer()` reads `_cameraService.controller`
+        // fresh on every BUILD, not continuously -- rebuilds only happen
+        // in response to this controller's `notifyListeners()` (via
+        // `_apply`). The only `_apply` call before this point ran BEFORE
+        // `initializeCamera()` even started swapping cameras, so the
+        // screen's one and only rebuild in this whole step happened while
+        // the controller was still mid-swap (old camera disposed / new
+        // one not yet ready) -- `_cameraLayer()`'s own null/uninitialized
+        // fallback renders a flat `ColoredBox` (black), and with no
+        // further rebuild ever fired, nothing ever replaced it: a real
+        // device confirmed exactly this (guide + banner visible, camera
+        // feed solid black). Forcing a fresh emit here, now that
+        // `macroCam` is the real, already-initialized camera "2"
+        // controller, is what actually binds `CameraPreview` to its live
+        // texture.
+        _apply((s) => s, force: true);
 
-      _liveAbsSharpness = null;
-      const macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6);
-      void macroFrameListener(CameraImage image) {
+        _liveAbsSharpness = null;
+        const macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6);
+        void macroFrameListener(CameraImage image) {
+          try {
+            final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
+            _liveAbsSharpness =
+                HybridCaptureService.ema(_liveAbsSharpness ?? raw, raw);
+          } catch (_) {}
+        }
+        await macroCam.startImageStream(macroFrameListener);
         try {
-          final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
-          _liveAbsSharpness =
-              HybridCaptureService.ema(_liveAbsSharpness ?? raw, raw);
-        } catch (_) {}
-      }
-      await macroCam.startImageStream(macroFrameListener);
-      try {
-        await _retargetAndConverge(const Offset(0.5, 0.5),
-            minMs: _refocusMinMs, maxMs: _refocusMaxMs);
-      } finally {
-        try {
-          await macroCam.stopImageStream();
-        } catch (_) {}
-      }
+          await _retargetAndConverge(const Offset(0.5, 0.5),
+              minMs: _refocusMinMs, maxMs: _refocusMaxMs);
+        } finally {
+          try {
+            await macroCam.stopImageStream();
+          } catch (_) {}
+        }
 
-      final xfile = await macroCam.takePicture();
-      final jpeg = await xfile.readAsBytes();
-      final path = '$basePath/secondary_${_macroCameraName}_macro_0.jpg';
-      await _uploadWithRetry(jpeg, path, timeout: const Duration(seconds: 20));
+        final xfile = await macroCam.takePicture();
+        final jpeg = await xfile.readAsBytes();
+        final path = '$basePath/secondary_${_macroCameraName}_macro_0.jpg';
+        await _uploadWithRetry(jpeg, path, timeout: const Duration(seconds: 20));
 
-      result = {'name': _macroCameraName, 'paths': [path]};
-      _apply((s) => s.copyWith(confirmationText: '✓ Close-up captured'), force: true);
+        _apply((s) => s.copyWith(confirmationText: '✓ Close-up captured'), force: true);
+        return {'name': _macroCameraName, 'paths': [path]};
+      }()).timeout(const Duration(milliseconds: _macroCaptureTimeoutMs));
     } catch (e) {
       debugPrint('[front] macro capture ($_macroCameraName) failed (non-fatal): $e');
     } finally {
