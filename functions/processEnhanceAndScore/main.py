@@ -95,6 +95,21 @@ _SECONDARY_MAX_WAVELENGTH_PX = 19.5
 # cameras (RGGB/GBRG/GRBG/BGGR) which cover all current test-device cameras.
 _IR_CFA_VALUES: frozenset = frozenset({'MONO', 'NIR'})
 _SECONDARY_MAX_WAVELENGTH_PX_IR = 16.0
+# Camera "2" (macro) ceiling, 2026-08-20: the client's new dedicated macro
+# shot (front_capture_controller.dart's _captureMacroShot) deliberately
+# grows the on-screen guide 20% to pull the thumb CLOSER to this lens --
+# which will very likely raise its own measured native wavelength above
+# the generic 19.5px ceiling above, silently blocking this feature's own
+# output from ever winning selection. Same real reasoning, same real
+# number as the main-camera gate's own round-17 raise (16.0 -> 35.0):
+# "we need ridge continuity more than we need NFIQ... real matchability
+# favors closer capture, not farther" -- a pure safety backstop against a
+# genuine outlier, not an optimization target. Provisional like every
+# other threshold in this pipeline: no real backend afisWavelengthPxRaw
+# data exists yet for camera "2" specifically at this new closer working
+# distance -- re-check against the first several real macro captures the
+# same way round 17 itself was validated, not assumed permanent.
+_SECONDARY_MAX_WAVELENGTH_PX_MACRO = 35.0
 # IR-tuned Gabor sigma ratio: IR ridge contrast is steeper (less ambient
 # scattering) and may benefit from a tighter envelope. Used as a second
 # max-of-variants candidate when scoring a MONO/NIR camera frame, alongside
@@ -1576,8 +1591,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                     # in secondaryCamScores for diagnostics regardless.
                     _sec_wl = _sp.get('afisWavelengthPx') or 0.0
                     _is_ir_cam = _sec_cfa in _IR_CFA_VALUES
-                    _wl_ceiling = (_SECONDARY_MAX_WAVELENGTH_PX_IR if _is_ir_cam
-                                   else _SECONDARY_MAX_WAVELENGTH_PX)
+                    _is_macro_cam = _cam.get('name') == '2'
+                    _wl_ceiling = (
+                        _SECONDARY_MAX_WAVELENGTH_PX_IR if _is_ir_cam
+                        else _SECONDARY_MAX_WAVELENGTH_PX_MACRO if _is_macro_cam
+                        else _SECONDARY_MAX_WAVELENGTH_PX)
                     if _best_lap < _SECONDARY_MIN_LAPLACIAN:
                         logger.info(
                             'secondary cam %s blocked from winning: lap=%.1f < %.1f',

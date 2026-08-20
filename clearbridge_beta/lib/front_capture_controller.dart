@@ -548,6 +548,18 @@ class FrontCaptureController extends ChangeNotifier {
   // economics first: fewer zones, parallel or deferred upload, and a real
   // reason to expect a single unstacked frame to beat the main burst.
   static const bool _sweepBurstHybridEnabled = false;
+  // Camera "2" (macro) dedicated final shot, added 2026-08-20 per explicit
+  // CTO direction. Real evidence camera "2" is a genuine macro-ish sensor
+  // (not just a naming guess): shortest focal length (2.37mm vs main's
+  // 4.15mm) and smallest sensor (3.92x2.94mm vs main's 5.98x4.49mm) of all
+  // four cameras, already noted repeatedly across this project's real
+  // cameraLensInfo data. See _captureMacroShot's own docstring for the
+  // full mechanism (guide grown 20%, uploaded under the existing
+  // `secondaryCameras` field main.py's secondary-camera scoring loop
+  // already consumes -- that loop's own sensor-corrected FOV math, fixed
+  // 2026-07-29, needs no changes here).
+  static const String _macroCameraName = '2';
+  static const double _macroGuideScaleFactor = 1.2;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -4324,6 +4336,14 @@ class FrontCaptureController extends ChangeNotifier {
       final sweepBurstDebug = _sweepBurstHybridEnabled
           ? await _captureSweepBurst(basePath, tipAngleDeg)
           : <String, dynamic>{'attempted': false, 'reason': 'feature disabled'};
+
+      // Camera "2" (macro) dedicated final shot -- see _captureMacroShot's
+      // own docstring. Runs after the main burst (and the sweep burst,
+      // when enabled) but before the camera/guide disappear behind the
+      // uploading screen, so it's genuinely the LAST real capture step,
+      // never interleaved into the 8-frame burst itself.
+      final macroCamera = await _captureMacroShot(basePath);
+
       await _transitionToUploading();
 
       // Decode and encode all burst frames now (deferred until after the
@@ -4603,6 +4623,7 @@ class FrontCaptureController extends ChangeNotifier {
           'manualExposureSupport': manualExposureSupport,
         if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
         'sweepBurstDebug': sweepBurstDebug,
+        if (macroCamera != null) 'secondaryCameras': [macroCamera],
       }, SetOptions(merge: true));
 
       var completed = 0;
@@ -4671,6 +4692,116 @@ class FrontCaptureController extends ChangeNotifier {
 
   // _captureSecondaryBurst and _waitForSecondaryFocusLock removed 2026-08-03
   // (secondary / IR camera removed -- see CLAUDE.md round-21 notes).
+
+  /// Camera "2" (macro) dedicated final shot -- a real, physically separate
+  /// camera from the main 8-frame ambient/flash burst, fired once AFTER
+  /// that burst (and its own image stream) has already completed, never
+  /// interleaved into it. Called from `_finishAndUpload`, before
+  /// `_transitionToUploading()`, so the guide + live preview are still on
+  /// screen exactly like the (currently disabled) sweep burst and the
+  /// focus-zone bracket -- same established "don't drop to a bare
+  /// Processing… screen while a real camera step is still happening"
+  /// discipline as both of those.
+  ///
+  /// Guide grown `_macroGuideScaleFactor` (20%) larger than the main
+  /// capture's own `PadSilhouetteShape.defaultShape` -- explicit CTO
+  /// direction: pull the thumb physically closer to this lens (bigger
+  /// on-screen guide -> closer thumb, the same convention this project's
+  /// own guide-shape history already relies on, e.g. the retired
+  /// `ambientClose` stage). This is a pure capture-time UX signal, not
+  /// fed into the backend crop math -- main.py's own secondary-camera
+  /// scoring loop already derives camera "2"'s real crop region from
+  /// `cameraLensInfo` (sensor-corrected focal-length ratio, fixed
+  /// 2026-07-29), independent of whatever was shown on screen.
+  ///
+  /// Focus convergence is measured, not guessed (this project's own
+  /// hard-learned lesson from the original secondary-camera focus fix,
+  /// round 5 CLAUDE.md: "secondary-camera focus now actually measured,
+  /// not guessed"). Reuses `_retargetAndConverge`'s existing poll-for-
+  /// stability loop, but deliberately does NOT reuse `_onFrame` as the
+  /// frame source -- `_onFrame` is full of main-camera-specific state
+  /// (guideRegion-derived ROI, the live wavelength gate, per-frame
+  /// telemetry) that has no meaning for this different lens. Instead a
+  /// small local listener feeds the exact same `_liveAbsSharpness` field
+  /// `_retargetAndConverge` already polls, using a plain centred ROI.
+  /// Safe to write directly into that shared field: the main burst's own
+  /// stream is already stopped by this point (`_fireBurst` calls
+  /// `_stopStream()` before the main burst even fires), so there is no
+  /// concurrent writer to race.
+  ///
+  /// Self-skipping at every step (missing camera id, failed open, failed
+  /// capture, failed upload) -- can only ever ADD a candidate to the
+  /// backend's own max-of-variants selection, never block or regress the
+  /// real capture the main burst already produced.
+  Future<Map<String, dynamic>?> _captureMacroShot(String basePath) async {
+    final svc = _cameraService;
+    if (svc == null) return null;
+    Map<String, dynamic>? result;
+    try {
+      final cams = await svc.getAvailableCameras();
+      CameraDescription? macroDesc;
+      for (final c in cams) {
+        if (c.lensDirection == CameraLensDirection.back &&
+            c.name == _macroCameraName) {
+          macroDesc = c;
+          break;
+        }
+      }
+      if (macroDesc == null) {
+        debugPrint('[front] macro camera ($_macroCameraName) not present on this device, skipping');
+        return null;
+      }
+
+      _apply(
+        (s) => s.copyWith(
+          confirmationText: 'Capturing close-up detail…',
+          activeGuideShape: PadSilhouetteShape.defaultShape.scaled(_macroGuideScaleFactor),
+        ),
+        force: true,
+      );
+      unawaited(HapticFeedback.lightImpact());
+
+      await svc.initializeCamera(cameraDescription: macroDesc);
+      final macroCam = svc.controller;
+      if (macroCam == null) return null;
+      _camera = macroCam;
+
+      _liveAbsSharpness = null;
+      const macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6);
+      void macroFrameListener(CameraImage image) {
+        try {
+          final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
+          _liveAbsSharpness =
+              HybridCaptureService.ema(_liveAbsSharpness ?? raw, raw);
+        } catch (_) {}
+      }
+      await macroCam.startImageStream(macroFrameListener);
+      try {
+        await _retargetAndConverge(const Offset(0.5, 0.5),
+            minMs: _refocusMinMs, maxMs: _refocusMaxMs);
+      } finally {
+        try {
+          await macroCam.stopImageStream();
+        } catch (_) {}
+      }
+
+      final xfile = await macroCam.takePicture();
+      final jpeg = await xfile.readAsBytes();
+      final path = '$basePath/secondary_${_macroCameraName}_macro_0.jpg';
+      await _uploadWithRetry(jpeg, path, timeout: const Duration(seconds: 20));
+
+      result = {'name': _macroCameraName, 'paths': [path]};
+      _apply((s) => s.copyWith(confirmationText: '✓ Close-up captured'), force: true);
+    } catch (e) {
+      debugPrint('[front] macro capture ($_macroCameraName) failed (non-fatal): $e');
+    } finally {
+      try {
+        await svc.disposeCamera();
+      } catch (_) {}
+      _camera = null;
+    }
+    return result;
+  }
 
   /// REAL ROOT CAUSE, found 2026-08-05: `putData()` returns an `UploadTask`
   /// -- a real, cancellable native upload, not a plain Future. The previous
