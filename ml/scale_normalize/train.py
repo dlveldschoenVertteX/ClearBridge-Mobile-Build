@@ -18,10 +18,10 @@ from dataset import ScaleDistortionDataset, load_split
 from model import ScaleRegressorNet
 
 
-def run(epochs: int, source_glob: str, train_len: int, val_len: int, seed: int = 0) -> None:
+def run(epochs: int, source_globs, train_len: int, val_len: int, seed: int = 0) -> None:
     torch.manual_seed(seed)
 
-    train_sources, val_sources = load_split(source_glob, val_frac=0.2, seed=seed)
+    train_sources, val_sources = load_split(source_globs, val_frac=0.2, seed=seed)
     print(f'sources: {len(train_sources)} train images, {len(val_sources)} val images', flush=True)
 
     train_ds = ScaleDistortionDataset(train_sources, length=train_len, seed=seed)
@@ -99,13 +99,19 @@ def run(epochs: int, source_glob: str, train_len: int, val_len: int, seed: int =
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--epochs', type=int, default=15)
-    ap.add_argument('--source-glob', type=str,
-                     default='/tmp/claude-0/-home-user-ClearBridge-Mobile-Build/'
-                              '7c276512-7b7e-5f85-8f5b-2eb1bc5e7593/scratchpad/ps/sp/*.png')
+    ap.add_argument('--source-glob', type=str, action='append', dest='source_globs',
+                     default=None,
+                     help='May be passed multiple times to mix source corpora '
+                          '(e.g. MAC3D superprints + NIST SD302 contact prints).')
     ap.add_argument('--train-len', type=int, default=400)
     ap.add_argument('--val-len', type=int, default=80)
     args = ap.parse_args()
 
+    source_globs = args.source_globs or [
+        '/tmp/claude-0/-home-user-ClearBridge-Mobile-Build/'
+        '7c276512-7b7e-5f85-8f5b-2eb1bc5e7593/scratchpad/ps/sp/*.png'
+    ]
+
     t0 = time.time()
-    run(args.epochs, args.source_glob, args.train_len, args.val_len)
+    run(args.epochs, source_globs, args.train_len, args.val_len)
     print(f'\ntotal wall time: {time.time() - t0:.1f}s')

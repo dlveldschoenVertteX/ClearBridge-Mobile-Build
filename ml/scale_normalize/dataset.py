@@ -33,8 +33,20 @@ CANVAS = 224
 LOG_SCALE_RANGE = (np.log(0.3), np.log(3.5))
 
 
-def _load_sources(pattern: str) -> List[np.ndarray]:
-    paths = sorted(glob.glob(pattern))
+def _load_sources(patterns) -> List[np.ndarray]:
+    """`patterns` may be a single glob string or a list of them -- lets a
+    caller mix multiple real source corpora (e.g. MAC3D superprints + NIST
+    SD302 contact prints) into one pool. Both domains are equally valid
+    source material for this task specifically because training operates
+    on binarized/near-binarized ridge texture, not raw photometric detail
+    -- a real scanner print and a real captured-then-Gabor-enhanced print
+    occupy the same kind of pixel domain (CTO's own real-world observation,
+    2026-08-19)."""
+    if isinstance(patterns, str):
+        patterns = [patterns]
+    paths = []
+    for pattern in patterns:
+        paths.extend(sorted(glob.glob(pattern)))
     imgs = []
     for p in paths:
         img = cv2.imread(p, cv2.IMREAD_GRAYSCALE)
@@ -100,10 +112,10 @@ class ScaleDistortionDataset(Dataset):
         return x, y
 
 
-def load_split(pattern: str, val_frac: float = 0.2, seed: int = 0):
-    sources = _load_sources(pattern)
+def load_split(patterns, val_frac: float = 0.2, seed: int = 0):
+    sources = _load_sources(patterns)
     if not sources:
-        raise RuntimeError(f'no source images matched {pattern}')
+        raise RuntimeError(f'no source images matched {patterns}')
     rng = random.Random(seed)
     idx = list(range(len(sources)))
     rng.shuffle(idx)
