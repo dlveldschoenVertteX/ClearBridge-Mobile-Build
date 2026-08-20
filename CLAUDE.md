@@ -81,6 +81,84 @@ actually win. Not yet confirmed against a real capture that actually hits the
 deadline; the next one that does is what shows the recovered candidates
 landing.
 
+## First real device test of the round-29 reorder: confirmed live, but surfaced a NEW real anomaly -- 'native' itself hit the per-variant 20s hard cap (2026-08-20, round 30)
+Direct follow-up to round 29's deploy. First real capture on the reordered
+build (`5d3fb521`, cold Cloud Run instance -- all 4 models downloaded fresh
+at request start), pulled via real Cloud Logging + Firestore rather than
+assumed from "test done" alone.
+
+**Real, positive confirmation the deploy is live and the truncation scenario
+the reorder was built for is still a real, recurring thing, not a one-off
+from round 14.** This capture's variant loop hit `_variants_deadline` and
+logged "skipping remaining variants from deepMaxc onward" -- the exact
+failure class round 29 reordered the pool around. Final result:
+`nfiq2Score: 75` via `freqNorm` (confirmed from `superprintParams.afisFreqScale:
+0.9` and the matching `AFIS variant freqNorm nfiq=75.0` log line) --
+`freqNorm` was already position 2 pre- and post-reorder, so this capture
+doesn't by itself demonstrate the promoted variants (`deepFuse`/`deepMaxc`)
+recovering anything; it confirms the mechanism the reorder targets is real.
+
+**New, real, NOT previously seen anomaly, flagged honestly rather than
+folded into the "reorder worked" narrative**: the real Cloud Logging trace
+for this request --
+```
+21:13:35  Enhanced flat print saved
+21:13:57  _call_with_hard_deadline: generate did not complete within 20.0s ()
+21:14:15  AFIS variant freqNorm nfiq=75.0
+21:14:35  _call_with_hard_deadline: generate did not complete within 20.0s ()
+21:14:55  _call_with_hard_deadline: generate did not complete within 20.0s ()
+21:14:55  AFIS variant loop: time budget exceeded, skipping remaining variants from deepMaxc onward
+```
+-- shows **three separate variants** (positions 1/3/4 in the new order --
+`native`, `stack`, `deepFuse`, inferred from ordering since the timeout log
+line only records `fn.__name__` ("generate"), not the variant name; a real,
+now-documented gap in this diagnostic) each independently hit the SAME
+20.0s `_FUSE_PAIR_HARD_TIMEOUT_SEC` hard cap, with only `freqNorm` (position
+2) completing normally in between. **`native` hitting this cap at all is
+new**: `native` is the plain single-frame variant -- no ECC alignment, no
+stacking, no fusion -- and every prior real Cloud Logging trace this project
+has captured (e.g. round 14's own `17:04:59 AFIS variant native nfiq=59.0`)
+shows it completing fast, well inside its window. Confirmed via source read
+that `_call_with_hard_deadline`'s 20s cap wraps EVERY variant's
+`afis_print.generate()` call uniformly (`main.py` ~line 1351), not just the
+fuse-pair family the constant's name suggests -- so this isn't a new code
+path, just the first time a supposedly-cheap variant has been observed
+hitting it.
+
+**Real, deliberate consequence for round 29's own promotion**: `deepFuse`
+was moved from position 9 to 4 specifically so it would get evaluated before
+the budget ran out -- but on THIS capture it ran early (as designed) and
+STILL timed out on its own 20s cap, and `deepMaxc` (position 5, this
+project's highest-mean-quality variant) never got a turn regardless, because
+three variants ahead of it burned 60 of the 70s budget on timeouts alone.
+Reordering alone cannot rescue a variant that independently hangs for the
+full per-call cap -- this capture is real, direct evidence that the
+per-variant 20s ceiling itself, not just evaluation order, is now the
+binding constraint when several calls stall in the same request.
+
+**Not diagnosed further this round, stated plainly rather than guessed at**:
+whether this is genuine cold-Cloud-Run-instance CPU contention (all 4 models
+were downloading/loading in the same ~15s window right before the variant
+loop started, and this was a fresh instance) or a real, content-specific
+slowness in `afis_print.generate()` on this particular burst. The pattern
+(native slow, freqNorm fast, stack slow, deepFuse slow) doesn't cleanly fit
+a simple "cold instance, gets faster as it warms up" story, since a fast
+call sits in the middle of three slow ones. Real next steps, not yet built:
+(1) have the per-call timeout log the variant name, not just `fn.__name__`
+-- a one-line fix, closes the diagnostic gap that forced this round to infer
+which three variants stalled from ordering rather than reading it directly;
+(2) watch whether this recurs on a warm instance (this session's next real
+capture, if it lands on an already-warm Cloud Run revision, is a natural
+comparison point) before concluding cold-start is the cause.
+
+**Also confirmed working on this same real capture, not the focus of this
+round but worth noting**: camera-2 macro capture completed and uploaded
+(`secondaryCameras: [{'name': '2', 'paths': [...macro_0.jpg]}]`, scored
+47.0, lost fairly to freqNorm's 75), and all 4 focus-zone-bracket stills
+(tip/base/left/right) fed their own minutiae-patch diagnostics correctly
+(`source: focusZone` on all four, per round 23's wiring) -- both real,
+positive, unrelated confirmations from the same capture.
+
 ## Capture-settings (AE/AF/brightness) + backend-enhancement audit (2026-08-20, round 28)
 CTO asked for a dedicated audit of capture logic/settings (brightness
 detection, AF, AE) plus a backend enhancement audit, debug and optimize.

@@ -1358,6 +1358,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         guide_region=_guide_region,
                         stack_cache=_stack_cache,
                         timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                        label=_vname,
                         **_vkw)
                     if _pair_result is None:
                         continue
@@ -1439,6 +1440,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             guide_region=_guide_region,
                             stack_cache={},
                             timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                            label=f'burst2_{_b2_name}',
                             **_b2_kw)
                         if _b2_result is None:
                             continue
@@ -1537,6 +1539,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             guide_region=_guide_region,
                             stack_cache=_stack_cache,
                             timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                            label='focusZoneSplice',
                             enhance='focusZoneSplice',
                             focus_zone_frames=_fz_arg,
                         )
@@ -3783,7 +3786,7 @@ def _score_nfiq(image: np.ndarray, sfm_coverage: float = 1.0) -> dict:
         return {'nfiq_score': 0.0, 'error': str(e)}
 
 
-def _call_with_hard_deadline(fn, *args, timeout_sec: float, **kwargs):
+def _call_with_hard_deadline(fn, *args, timeout_sec: float, label: str = None, **kwargs):
     """Runs `fn(*args, **kwargs)` but stops WAITING on it after `timeout_sec`
     -- returns None on timeout instead of blocking forever, same "can only
     skip a candidate, never hang the request" contract as every other
@@ -3826,8 +3829,15 @@ def _call_with_hard_deadline(fn, *args, timeout_sec: float, **kwargs):
     try:
         return fut.result(timeout=max(0.1, timeout_sec))
     except Exception as e:   # noqa: BLE001 — TimeoutError or any exception from fn itself
+        # `label` names the actual caller (e.g. the AFIS variant name) when
+        # given -- added 2026-08-20 (round 30) after a real capture's Cloud
+        # Logging trace showed three separate variants hitting this same
+        # cap in one request, and the bare fn.__name__ ("generate" for
+        # every one of them, since they all call afis_print.generate) made
+        # it impossible to tell which three without inferring from
+        # surrounding log lines and evaluation order.
         logger.warning('_call_with_hard_deadline: %s did not complete within %.1fs (%s)',
-                        getattr(fn, '__name__', repr(fn)), timeout_sec, e)
+                        label or getattr(fn, '__name__', repr(fn)), timeout_sec, e)
         return None
     finally:
         ex.shutdown(wait=False)
@@ -3881,7 +3891,8 @@ def _score_ground_truth(image: np.ndarray, sfm_coverage: float = 1.0) -> dict:
     """
     score = _call_with_hard_deadline(
         nfiq2_client.score_nfiq2, image,
-        timeout_sec=_GROUND_TRUTH_SCORE_TIMEOUT_SEC)
+        timeout_sec=_GROUND_TRUTH_SCORE_TIMEOUT_SEC,
+        label='score_ground_truth')
     if score is None:
         return {'nfiq_score': 0.0, 'error': 'nfiq2 ground truth unavailable'}
     return {'nfiq_score': float(score), 'error': None}
