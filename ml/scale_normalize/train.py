@@ -18,7 +18,8 @@ from dataset import ScaleDistortionDataset, load_split
 from model import ScaleRegressorNet
 
 
-def run(epochs: int, source_globs, train_len: int, val_len: int, seed: int = 0) -> None:
+def run(epochs: int, source_globs, train_len: int, val_len: int, seed: int = 0,
+        checkpoint_path: str = None) -> None:
     torch.manual_seed(seed)
 
     train_sources, val_sources = load_split(source_globs, val_frac=0.2, seed=seed)
@@ -46,6 +47,7 @@ def run(epochs: int, source_globs, train_len: int, val_len: int, seed: int = 0) 
     loss_fn = torch.nn.MSELoss()
 
     history = []
+    best_val = float('inf')
     for epoch in range(1, epochs + 1):
         model.train()
         train_loss = 0.0
@@ -84,6 +86,14 @@ def run(epochs: int, source_globs, train_len: int, val_len: int, seed: int = 0) 
         history.append((epoch, train_loss, val_loss, val_mae_scale))
         print(f'epoch {epoch:2d}/{epochs}  lr={sched.get_last_lr()[0]:.5f}  train_loss={train_loss:.4f}  '
               f'val_loss={val_loss:.4f}  val_scale_mae={val_mae_scale:.4f}', flush=True)
+
+        # Save the BEST-val checkpoint, not the final epoch's -- the cosine
+        # schedule's own late-training curve (see train_mixed.log) still
+        # shows real epoch-to-epoch val_loss noise even after decay, so the
+        # last epoch isn't reliably the best one.
+        if checkpoint_path and val_loss < best_val:
+            best_val = val_loss
+            torch.save({'model_state': model.state_dict(), 'epoch': epoch, 'val_loss': val_loss}, checkpoint_path)
 
     print('\n=== TREND CHECK ===')
     first_half = [h[2] for h in history[:len(history)//2]]

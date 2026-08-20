@@ -1,5 +1,109 @@
 # ClearBridge Mobile — persistent context
 
+## Learned scale-normalizer: mixed MAC3D+SD302 checkpoint validated against the real SourceAFIS gate — no clear win, real mechanistic reason found (2026-08-20, round 19)
+Direct follow-up to the CTO's "move to NIST SD302" instruction: retrained the
+mixed-corpus checkpoint (113 real MAC3D superprints + 300 sampled NIST SD302
+contact prints, cosine LR schedule) with checkpoint saving added to
+`train.py` (previously never saved a checkpoint — every prior local run's
+weights were unrecoverable once the process exited), then ran it through
+this project's own established real-data validation gates rather than
+trusting the training-loss curve alone, per this pipeline's standing
+discipline (see `pyfingHybrid`/`nnsHybrid`/`coherenceDiff`/`deform_correct`
+v1-v3 — every one of those was measured against real matchability before
+any adoption decision, several came back negative despite a healthy loss
+curve).
+
+**Circularity check run first, not skipped.** The self-supervised training
+scheme treats every real source image (all 63 cached MAC3D superprints
+included) as canonically-scaled (log_scale=0) by construction — it only
+ever learns to detect a distortion applied ON TOP of those images, never
+their own pre-existing native scale offset. Since those same 63 real
+captures are literally in the training source pool, there was a real risk
+the network would just tautologically predict ~0 on all of them regardless
+of true wavelength. Checked directly: correlation between the model's raw
+prediction on each of the 63 real (unperturbed) captures and that
+capture's already-established classical ridge-wavelength estimate
+(`wl_raw`, from this session's earlier `sweep_results.json`) came back
+**r=+0.527** — a real, moderate positive correlation, not zero, so the
+network did retain some transferable scale-sensitive signal rather than
+pure memorized identity. But the model's own predicted range is far
+narrower than reality (std=0.080 log-scale vs. classical's std=0.220) —
+it's a much more conservative/muted corrector than the classical estimate,
+consistent with partial (not total) anchor-memorization pulling
+predictions toward 0.
+
+**Real SourceAFIS gate vs. the CTO's ink scan (n=63, same harness as
+`run_sweep.py`, only the probe DPI estimate swapped — classical
+`wl_raw`-based vs. model-predicted):**
+
+| condition | mean best score | wins | losses | ties |
+|---|---|---|---|---|
+| classical (wl_raw-based DPI) | 2.618 | — | — | — |
+| model-predicted DPI | 3.109 | 34/63 | 28/63 | 1/63 |
+
+A 54% win rate at these absolute score magnitudes is not a real
+differentiator — both conditions sit deep in the noise-floor territory
+this exact gate was already established to occupy earlier this session (a
+single low-quality ink scan can't reliably separate genuine from impostor
+at this quality level; genuine and impostor captures alike score
+single-digit-to-low-teens against it). Some individual deltas are large in
+both directions (e.g. `69a2d180` +27.8, `5363a49b` -14.0) but with no
+consistent pattern tying big wins/losses to anything measurable (not
+concentrated in the CTO's own genuine captures) — reads as gate noise, not
+signal.
+
+**Real, mechanistic explanation for why the model doesn't clearly win**:
+the muted prediction range found in the circularity check directly
+predicts this outcome. Captures that most need aggressive correction
+(high native `wl_raw`, e.g. 16-17px, where classical DPI reaches
+850-950) get pulled by the model to a much narrower 500-600 DPI band —
+under-correcting exactly the captures where correction should matter most.
+This is the same class of finding as `ridgeRestoreHybrid` v2's real
+regression from small-volume real-data mixing, though the failure
+mechanism here is different (under-correction from anchor-conservatism,
+not signal dilution from a mismatched second corpus).
+
+**Genuine-vs-impostor cross-capture gate (the more decisive test per this
+project's own established preference for it over the single-ink-scan
+comparison) could NOT be run this round**: only 1 genuine pair exists
+among the 63 currently-cached local superprints (the cache was built from
+a top-NFIQ2 selection, not full per-user coverage — most of this
+project's 10 real multi-capture users have only 0-1 of their repeat
+captures cached locally). Attempted to download the 16 missing captures
+directly from Storage to fill this out properly; blocked by
+`DefaultCredentialsError` — this fresh sandbox has no GCP service-account
+credentials configured (the temporary key used earlier this session did
+not persist). **Flagged honestly, not silently skipped**: the ink-scan
+gate result above is the best real evidence available this round, and it
+does not show a clear win. The cross-capture gate remains the real next
+check once credentials are available again, and per this project's own
+standing discipline, is what should actually decide viability, not this
+weaker proxy.
+
+**Conclusion, stated plainly**: the mixed MAC3D+SD302 checkpoint does not
+currently demonstrate a real matchability improvement over the
+already-existing classical ridge-wavelength DPI estimate already used in
+production (`estimate_dpi.py`/`_ridge_wavelength_robust`, the same
+mechanism `mindtct_client._normalize_dpi` and this session's SourceAFIS
+sweep both already rely on). The clean, monotonic training-loss curves
+from every run this session (63-image, 113-image, 113-image scheduled,
+mixed 331-image scheduled) were real and never in question — the gap is
+between "trains cleanly on its own synthetic task" and "the trained
+correction helps the real downstream matcher," and this round's real data
+says it doesn't yet, for a real, identified reason (anchor-conservatism
+muting the correction exactly where it's needed most). **Not recommending
+further scale-normalizer iteration (bigger SD302 volume, more epochs,
+SageMaker) without first addressing the circularity in the training setup
+itself** — e.g. holding a fraction of real captures OUT of the source pool
+entirely and only ever using them as scale-unknown eval targets, never as
+distortion-anchor material, so the network is forced to learn transferable
+scale features rather than exploit its own anchors. That's a real,
+buildable next step, not a dead end — but a different fix than "more of
+the same data," which this round's evidence argues against by itself.
+`train.py`'s new checkpoint-saving capability (real, added this round —
+previously no run's weights were ever recoverable) is committed and
+useful regardless of this checkpoint's own result.
+
 ## Scale-normalizer data plan: NIST SD302 approved as a second source, explicitly sequenced behind MAC3D stability (2026-08-19, round 18 cont.)
 CTO direction, real and well-reasoned: since training operates on
 BINARIZED prints (not continuous-tone), a real digital scanner print is
