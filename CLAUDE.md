@@ -1,5 +1,30 @@
 # ClearBridge Mobile — persistent context
 
+## Scale-normalizer data plan: NIST SD302 approved as a second source, explicitly sequenced behind MAC3D stability (2026-08-19, round 18 cont.)
+CTO direction, real and well-reasoned: since training operates on
+BINARIZED prints (not continuous-tone), a real digital scanner print is
+equally valid source material for the same self-supervised synthetic-
+scale-distortion task -- meaning the much larger, cleaner NIST SD302
+corpus (SD302a/b/d contact prints, already used successfully once before
+in this project for `ml/deform_correct`'s own synthetic-distortion
+training) is a legitimate second data source, not just this session's 63
+MAC3D superprints. Same "apply a known distortion, inflate px scale,
+supervise against the known ground truth" pattern already built.
+
+**Explicit sequencing, CTO's own call**: do NOT mix in SD302 until the
+MAC3D-only track shows a genuinely stable progression on its own. This
+directly avoids a real, already-documented failure mode in this exact
+project: `ridgeRestoreHybrid` v2 (2026-08-08) mixed 59 real captures into
+an SD302-trained checkpoint at exactly this small a volume and
+REGRESSED (mean -3.1, win rate 54%->31%) versus the SD302-only v1 --
+"the 59 real crops... diluted the model's clean ridge-restoration signal
+without teaching it anything that transfers, at this small a mixing
+volume." Same risk class here, same avoidance strategy. NIST SD302
+integration is approved in principle, gated on MAC3D-only training
+demonstrating real stability first (more epochs/data, and critically,
+validated against the real SourceAFIS matchability sweep, not just a
+smoothly-decreasing loss curve).
+
 ## Learned scale-normalizer, first local CPU smoke test: real, clean positive trend (2026-08-19, round 18)
 Per the CTO's direction ("I believe that the normalization training will be
 more successful... let's move forward with a local CPU test, if it goes
