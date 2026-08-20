@@ -1,5 +1,48 @@
 # ClearBridge Mobile — persistent context
 
+## First real device test of the round-17 wavelength-gate raise (16->35): confirmed working, strong score, one new unexplained wrinkle flagged (2026-08-20, round 22)
+CTO ran a real capture (`d0ec5195`) on the just-built/deployed APK, the
+first real device test of round 17's `_liveWavelengthTooHighPx` raise
+(16.0 -> 35.0 -- the explicit CTO call that real matchability favors
+closer capture, not farther). Pulled the real Firestore doc rather than
+assume anything from "test done" alone.
+
+**Real, positive confirmation.** `liveWavelengthDebug.wavelengthGateThresholdPx:
+35.0` -- the raised gate is live in production on this real capture, not
+just committed. `sampleCount: 186` (healthy, nowhere near the historical
+`sampleCount:0` problem), `wavelengthGateExpired: false` (the hold
+resolved on its own, never needed the 6s escape hatch). The real backend
+measurement, `afisWavelengthPxRaw: 28.0` -- squarely inside the 16-35px
+band the OLD gate would have blocked and the new one now allows -- and the
+capture scored a real, strong **NFIQ2 74** (`afisMask: guide+unet`,
+`henryClass: AW`). Direct, real evidence the CTO's product call is working
+as intended: a closer capture that the pre-round-17 gate would have
+rejected now gets through and scores well.
+
+**One new, real, unexplained discrepancy -- flagged honestly, not acted
+on (n=1).** This same capture's LIVE-domain wavelength estimate
+(`liveWavelengthStillPx: 12.19`) is ~2.3x smaller than the real backend
+measurement of the actual captured frame (`afisWavelengthPxRaw: 28.0`).
+This directly contradicts the round-13 calibration (`_wavelengthScaleToStill`
+returns a flat `1.0`, justified at the time by 5 real data points averaging
+close to a 1:1 live-vs-backend ratio) -- this capture's ratio is ~0.44, well
+outside that established range. Per round 13's own stated caveat ("if a
+future `_stillDecodeTargetWidth` or preview-resolution change shows real
+drift again, re-validate... rather than assuming 1.0 holds forever"), this
+is exactly the kind of fresh data point that question would need -- but
+one real capture isn't enough to act on by itself, same "don't tune blind
+off a single data point" discipline as everywhere else in this project.
+Not investigated further this round; worth checking again once a few more
+real captures on this same build land, to see whether this is a real,
+reproducible drift or a one-off (e.g. this specific capture's hold took an
+unusually long time to resolve gate-wise, `wavelengthNullAttempts: 25` out
+of `sharpnessSampleCount: 1733` -- not obviously anomalous by itself, but
+noted in case a pattern emerges).
+
+No code changes this round -- this is real-device confirmation of an
+already-shipped, already-deployed change, plus one flagged (not actioned)
+observation for the future.
+
 ## Mask-preference reorder (guide+unet over guide+flashdiff) tested and REJECTED — the earlier aggregate comparison was confounded, controlled test shows no real advantage (2026-08-20, round 21)
 Direct follow-up to round 20's own closing suggestion ("worth considering
 whether `guide+unet` should be preferred more aggressively over
