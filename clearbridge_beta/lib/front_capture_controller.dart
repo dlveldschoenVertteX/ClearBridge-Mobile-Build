@@ -1701,9 +1701,44 @@ class FrontCaptureController extends ChangeNotifier {
   DateTime? _telemetryLastSampleAt;
   static const int _telemetrySampleIntervalMs = 150;
 
+  // High-volume, throttled event types -- safe to thin out under pressure.
+  // Everything else (refocusLocked, holdComplete, shotFired, ...) is a
+  // low-volume checkpoint and is never dropped.
+  static const Set<String> _telemetryDroppableEvents = {'sample', 'wavelengthAttempt'};
+  // Hard cap on retained telemetry entries. REAL BUG this fixes (found
+  // 2026-08-20, full-codebase audit): `_telemetry` was unbounded, and the
+  // ENTIRE list is written into ONE captureTelemetry document -- but a
+  // Firestore document is hard-limited to 1 MiB. At the 150ms sample
+  // throttle (~6.7 entries/sec, plus wavelengthAttempt on its own throttle),
+  // a session crosses that limit in roughly 11-18 minutes, at which point
+  // the whole write fails and EVERY sample is silently lost.
+  //
+  // That is precisely backwards from what this telemetry exists for: this
+  // project's own real device reports are of LONG, stuck sessions ("sweeps
+  // forever", "takes long to lock even when I follow instructions") -- the
+  // exact sessions that would blow the limit, so the runs most worth
+  // diagnosing were the ones guaranteed to produce no data at all.
+  //
+  // 2500 entries is ~600KB at a conservative 250B/entry -- comfortably
+  // inside 1 MiB with real margin -- while still retaining ~6 minutes of
+  // continuous sampling. Drop-oldest is deliberate: the window immediately
+  // before the burst is the diagnostically valuable one, so a long session
+  // keeps its run-up to capture rather than its idle beginning.
+  static const int _telemetryMaxEntries = 2500;
+  int _telemetryDropped = 0;
+
   void _logTelemetry(String event, {double? coverage, Map<String, dynamic>? extra}) {
     final t0 = _telemetrySessionStart;
     if (t0 == null) return;
+    if (_telemetry.length >= _telemetryMaxEntries) {
+      // Drop the oldest DROPPABLE entry, preserving checkpoints. Falls back
+      // to the oldest entry overall so the cap always holds, whatever the
+      // event mix turns out to be.
+      final idx = _telemetry.indexWhere(
+          (e) => _telemetryDroppableEvents.contains(e['event']));
+      _telemetry.removeAt(idx >= 0 ? idx : 0);
+      _telemetryDropped++;
+    }
     _telemetry.add({
       'tMs': DateTime.now().difference(t0).inMilliseconds,
       'event': event,
@@ -1774,6 +1809,7 @@ class FrontCaptureController extends ChangeNotifier {
     _burst1Shots = null;
     _burst1Gyro = null;
     _telemetry.clear();
+    _telemetryDropped = 0;
     _telemetrySessionStart = DateTime.now();
     _telemetryLastSampleAt = null;
     _wasInCoverageRange = false;
@@ -4785,6 +4821,12 @@ class FrontCaptureController extends ChangeNotifier {
               'userId': userId,
               'createdAt': FieldValue.serverTimestamp(),
               'samples': _telemetry,
+              // Honest truncation marker -- non-zero means this session ran
+              // long enough to hit _telemetryMaxEntries and the earliest
+              // droppable samples were thinned out. Without this, a
+              // truncated trajectory would look like a complete one to
+              // whoever analyses it next.
+              'samplesDropped': _telemetryDropped,
             });
           } catch (e) {
             debugPrint('[front] captureTelemetry write failed (non-blocking): $e');
