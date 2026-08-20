@@ -39,10 +39,12 @@ class MainActivity : FlutterActivity() {
         // 2.37mm focal length, 3.92x2.94mm sensor, smallest/shortest of the
         // four) already points at a likely macro sensor. `getCameraExtensionSupport`
         // is new: Android's Camera2 Extensions API (API 31+) lets a device
-        // formally advertise CameraExtensionCharacteristics.EXTENSION_MACRO
-        // as a supported *mode* rather than a distinct camera ID -- if this
-        // device implements it, that's a direct, no-visual-comparison-needed
-        // confirmation. Deliberately scoped to capture_harness only (a
+        // formally advertise supported extension *modes* (Bokeh/HDR/Night/
+        // etc.) rather than a distinct camera ID -- see that function's own
+        // 2026-08-20 fix note for why this can't directly settle "is Macro
+        // one of them" (no such extension type exists in the real API); the
+        // visual (photo-comparison) side of this probe is what actually
+        // answers that question. Deliberately scoped to capture_harness only (a
         // standalone test build, per this project's own standing policy of
         // keeping one-off diagnostic tooling out of the production
         // clearbridge_beta app) -- see the removed diagnostic-screen
@@ -105,23 +107,35 @@ class MainActivity : FlutterActivity() {
     }
 
     // New, 2026-08-19: does this device formally advertise Camera2
-    // Extensions support, and specifically EXTENSION_MACRO, per camera id?
-    // Camera2 Extensions (API 31+) is how newer/flagship devices expose
-    // Macro as a vendor-implemented MODE layered on a base camera, rather
-    // than as its own distinct physical camera id -- if this device
-    // implements it, `getSupportedExtensions()` on that base camera's
-    // CameraExtensionCharacteristics will list EXTENSION_MACRO (value 4)
-    // directly, settling the "which camera id is Macro" question without
-    // needing any visual comparison at all. Real, honest expectation
-    // stated plainly: this device (a rugged/budget phone, per this
-    // project's own device history) is far more likely to implement Macro
-    // the OLDER way -- a genuinely separate low-res camera id switched to
-    // directly by the OEM camera app, which Camera2 Extensions has no way
-    // to see -- so an empty/false result here does NOT rule Macro out, it
-    // just means the visual (photo-comparison) side of this probe is the
-    // real answer. Wrapped in try/catch per-id and gated on API 31 (older
-    // OS versions don't have the class at all) so this can only ever
-    // report false/empty, never crash the probe screen.
+    // Extensions support per camera id? Camera2 Extensions (API 31+) is how
+    // newer/flagship devices expose modes like Bokeh/HDR/Night as a vendor-
+    // implemented MODE layered on a base camera, rather than as its own
+    // distinct physical camera id.
+    //
+    // Real bug found + fixed 2026-08-20 (first real CI compile of this
+    // file since it was written -- the capture_harness build had never
+    // actually run this code path until now): the original comment/code
+    // here referenced `CameraExtensionCharacteristics.EXTENSION_MACRO`,
+    // which does not exist -- confirmed via the real Kotlin compiler error
+    // ("Unresolved reference"), then cross-checked against the actual
+    // Android SDK: the real constants on this class are
+    // EXTENSION_AUTOMATIC/EXTENSION_BOKEH/EXTENSION_HDR/EXTENSION_NIGHT/
+    // EXTENSION_BEAUTY/EXTENSION_FACE_RETOUCH -- there is no formal "Macro"
+    // extension type in the Camera2 Extensions API at all. The premise this
+    // probe was built on (settle "which camera id is Macro" by checking for
+    // a Macro extension flag) was never checkable this way. Real, honest
+    // expectation stated plainly: this device (a rugged/budget phone, per
+    // this project's own device history) is far more likely to implement
+    // Macro the OLDER way anyway -- a genuinely separate low-res camera id
+    // switched to directly by the OEM camera app, which Camera2 Extensions
+    // has no way to see regardless -- so the visual (photo-comparison) side
+    // of this probe (`LensProbeScreen`) remains the real answer either way.
+    // `supportsMacro` is kept in the returned map (always `false` now) so
+    // the Dart side doesn't need a schema change; `supportedExtensions`
+    // (the real, valid data this API can report) is unaffected and still
+    // useful diagnostic context. Wrapped in try/catch per-id and gated on
+    // API 31 (older OS versions don't have the class at all) so this can
+    // only ever report false/empty, never crash the probe screen.
     private fun cameraExtensionSupportByCameraId(): Map<String, Map<String, Any?>> {
         val cameraManager = applicationContext
             .getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -136,7 +150,7 @@ class MainActivity : FlutterActivity() {
                 val supported = extChars.supportedExtensions
                 support[id] = mapOf(
                     "extensionsApiAvailable" to true,
-                    "supportsMacro" to supported.contains(CameraExtensionCharacteristics.EXTENSION_MACRO),
+                    "supportsMacro" to false,
                     "supportedExtensions" to supported.toList(),
                 )
             } catch (e: Exception) {
