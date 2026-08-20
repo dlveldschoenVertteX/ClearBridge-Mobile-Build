@@ -5087,13 +5087,86 @@ class FrontCaptureController extends ChangeNotifier {
         focusDebug['convergedMs'] = focusSw.elapsedMilliseconds;
         _macroDebug = focusDebug;
 
+        // Ambient+flash pair instead of a single shot -- real fix,
+        // 2026-08-20 (round 34), direct CTO report on the round-33 mask:
+        // "almost perfect but I can still see some background texture
+        // being mistaken for ridge pattern". Root-caused via code read:
+        // this candidate has always been scored via generate()'s bare
+        // GUIDE mask with no content-aware refinement at all, because
+        // neither of this pipeline's two real segmentation mechanisms can
+        // engage for a single-frame macro shot -- _flash_diff_mask needs a
+        // genuine ambient/flash pair to differentiate near-camera skin
+        // from background via torch falloff, and this shot only ever
+        // captured one frame; _unet_mask WAS tried and confirmed (measured
+        // locally against this exact camera's real raw content) to grab
+        // ~85% of the frame -- badly over-segmenting on this camera's
+        // domain, correctly caught and rejected by its own existing
+        // runaway-coverage gate, not a near-miss. Rather than invent a new,
+        // untested segmentation mechanism for one camera, this gives
+        // _flash_diff_mask the real ambient/flash pair it needs -- the
+        // SAME proven mechanism already relied on throughout the rest of
+        // this pipeline, physics-based (torch falloff ~ distance^2) rather
+        // than a learned model that may not generalise to this lens's very
+        // different FOV/resolution/domain.
+        //
+        // Real, deliberate cost: one extra shutter press + torch-settle
+        // delay + one extra upload on top of the existing single shot --
+        // comfortably inside the 60s _macroCaptureTimeoutMs headroom
+        // (round 31), but a genuine addition, not free.
+        Uint8List? flashJpeg;
+        try {
+          // EV pulldown before the flash shot -- without it, this project's
+          // own well-documented recurring failure (torch blows out an
+          // already-close/decently-lit pad, leaving near-zero contrast) is
+          // an even bigger risk here than on the main camera: this macro
+          // shot's whole point is a much closer working distance, and
+          // torch intensity falls off with distance^2. A blown-out flash
+          // frame would fail _flash_diff_mask's own existing blowout guard
+          // (_FLASH_DIFF_MIN_FLASH_LAPLACIAN) and skip harmlessly -- safe,
+          // but would make this whole round-34 fix a silent no-op on
+          // exactly the captures most likely to need it. -1.0 reuses this
+          // project's own original, more conservative front-burst flash
+          // step (predating the later adaptive EV curve) as a real,
+          // previously-validated starting point rather than a fresh guess.
+          try {
+            final minEv = await macroCam.getMinExposureOffset().timeout(_zoneFocusCallTimeout);
+            final maxEv = await macroCam.getMaxExposureOffset().timeout(_zoneFocusCallTimeout);
+            await macroCam.setExposureOffset((-1.0).clamp(minEv, maxEv))
+                .timeout(_zoneFocusCallTimeout);
+          } catch (_) {}
+          await macroCam.setFlashMode(FlashMode.torch).timeout(_zoneFocusCallTimeout);
+          await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+          final flXfile = await macroCam.takePicture();
+          flashJpeg = await flXfile.readAsBytes();
+        } catch (e) {
+          debugPrint('[front] macro flash shot failed (non-fatal, ambient-only): $e');
+        } finally {
+          try {
+            await macroCam.setFlashMode(FlashMode.off).timeout(_zoneFocusCallTimeout);
+          } catch (_) {}
+          try {
+            await macroCam.setExposureOffset(0.0).timeout(_zoneFocusCallTimeout);
+          } catch (_) {}
+        }
+
         final xfile = await macroCam.takePicture();
         final jpeg = await xfile.readAsBytes();
-        final path = '$basePath/secondary_${_macroCameraName}_macro_0.jpg';
-        await _uploadWithRetry(jpeg, path, timeout: const Duration(seconds: 20));
+        final ambPath = '$basePath/secondary_${_macroCameraName}_macro_amb_0.jpg';
+        await _uploadWithRetry(jpeg, ambPath, timeout: const Duration(seconds: 20));
+
+        String? flPath;
+        if (flashJpeg != null) {
+          flPath = '$basePath/secondary_${_macroCameraName}_macro_fl_0.jpg';
+          await _uploadWithRetry(flashJpeg, flPath, timeout: const Duration(seconds: 20));
+        }
 
         _apply((s) => s.copyWith(confirmationText: '✓ Close-up captured'), force: true);
-        return {'name': _macroCameraName, 'paths': [path]};
+        return {
+          'name': _macroCameraName,
+          'paths': flPath != null ? [ambPath, flPath] : [ambPath],
+          'ambientPath': ambPath,
+          if (flPath != null) 'flashPath': flPath,
+        };
       }()).timeout(const Duration(milliseconds: _macroCaptureTimeoutMs));
     } catch (e) {
       debugPrint('[front] macro capture ($_macroCameraName) failed (non-fatal): $e');

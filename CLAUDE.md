@@ -1,5 +1,78 @@
 # ClearBridge Mobile — persistent context
 
+## Macro-camera background-texture-as-ridges: real root cause found, gives camera "2" its first real ambient/flash pair (2026-08-20, round 34)
+Direct CTO follow-up on round 33's widened mask: "the mask is almost
+perfect but I can still see some background texture being mistaken for
+ridge pattern." Investigated via code read + a local test against this
+camera's own real raw content, not another guess.
+
+**Real root cause: this candidate has NEVER had any content-aware
+segmentation at all.** `afis_print.generate()`'s masking logic tries
+`_flash_diff_mask` (needs a real ambient/flash PAIR to isolate near-camera
+skin via torch falloff) first, then `_unet_mask` as a fallback. Camera
+"2"'s macro shot has only ever fired ONE frame -- `_flash_diff_mask` can
+never engage (no pair to diff), leaving `_unet_mask` as the only option.
+**Tested `_unet_mask` directly against the real raw macro frame from the
+round-32/33 capture**: it segments ~85% of the whole 3264x2448 frame --
+badly over-segmenting on this camera's very different FOV/resolution
+domain (the model was trained on flash-diff pseudo-labels from front-
+camera-style guide-cropped frames, not this camera's raw full-frame
+content). Correctly caught and rejected by the existing runaway-coverage
+accept-gate ("detector grabbed everything -> untrustworthy") -- not a
+near-miss, a genuine domain-generalization failure. Every real camera-"2"
+candidate to date, including round 32's own winning capture, was scored
+via the bare geometric guide mask with zero awareness of what's actually
+in frame -- so when round 33 widened that guide (correctly, to stop
+clipping real pad content), it also widened how much unmasked background
+now falls inside it, making the pre-existing "no real segmentation"
+gap visibly worse.
+
+**Fixed**: rather than invent a new, untested segmentation mechanism for
+one camera, gave `_flash_diff_mask` the real ambient/flash pair it needs
+-- the same proven, physics-based mechanism (torch falloff ~ distance^2)
+already relied on throughout the rest of this pipeline, not a learned
+model that may not generalise to this lens's domain.
+
+- **Client** (`_captureMacroShot`): now fires TWO frames after focus
+  converges -- flash on (with a real EV pulldown first, see below), then
+  flash off -- instead of one, uploaded under `secondary_2_macro_amb_0.jpg`/
+  `_fl_0.jpg`. New `ambientPath`/`flashPath` fields on the `secondaryCameras`
+  doc entry alongside the existing `paths` list (unchanged, still consumed
+  by the stack/focusStack machinery). Real, deliberate cost: one extra
+  shutter press + a `_burstFlashSettleMs` torch-settle delay + one extra
+  upload, comfortably inside round 31's 60s `_macroCaptureTimeoutMs`
+  headroom but not free.
+- **EV pulldown before the flash shot**: without it, this is an even
+  bigger blowout risk than on the main camera -- this project has
+  repeatedly documented torch overexposing an already-close pad, and the
+  whole point of the macro shot is a much closer working distance than
+  the main camera ever uses. `-1.0` reuses this project's own original,
+  already-validated front-burst flash step (predating the later adaptive
+  EV curve) as a real starting point, not a fresh guess. A blown-out
+  flash frame would just fail `_flash_diff_mask`'s own existing
+  `_FLASH_DIFF_MIN_FLASH_LAPLACIAN` guard and self-skip harmlessly back to
+  the bare guide -- safe, but would make this whole fix a silent no-op on
+  exactly the captures most likely to need it, so worth getting right.
+- **Backend** (`main.py`): the secondary-camera loop already downloads
+  every path in `paths` (for the existing stack/focusStack burst
+  machinery) -- new code maps `ambientPath`/`flashPath` back to their
+  already-downloaded images (no extra download) and threads them into
+  `afis_print.generate(..., ambient_burst=..., flash_burst=...)`, which
+  `_flash_diff_mask` now has real content to work with. Backward
+  compatible: absent on any capture without these fields (older captures,
+  or camera "3", untouched), `_sec_ambient_burst`/`_sec_flash_burst` stay
+  `None` and behavior is unchanged.
+
+**Verified**: wiring sanity-checked locally (same real frame as a stand-in
+for both slots, since a genuine ambient/flash pair only exists once a
+fresh real capture runs this code) -- no crash, and correctly falls back
+to the bare `guide` mask when the diff is degenerate (identical frames),
+confirming the self-skip safety property holds. **Not yet device-tested
+with a real pair** -- the actual segmentation result (does flash-diff
+correctly separate the pad from the quilt background on real, distinct
+ambient/flash frames) can only be confirmed by the next real macro
+capture on this build.
+
 ## Macro-camera mask still too small + persistent softness root-caused: AF/sharpness ROI were NEVER aimed at the real pad location (2026-08-20, round 33)
 Direct CTO report on the round-32 winning capture (`f4cb3ba5`, real
 nfiq2Score 69, `afisSource: secondary_2`): "the mask is not correct... get

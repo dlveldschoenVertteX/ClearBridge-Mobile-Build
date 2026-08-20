@@ -1691,6 +1691,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _all_simgs = [f[1] for f in _sframes]
                         _all_gyros = [0.0] * len(_all_simgs)
                         _all_illums = [None] * len(_all_simgs)
+                        _spath_to_img = {f[0]: f[1] for f in _sframes}
                     else:
                         _spath = _spaths[0]
                         _sbytes = _download_storage_file(_spath)
@@ -1698,6 +1699,35 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _all_simgs = [_simg]
                         _all_gyros = [0.0]
                         _all_illums = [None]
+                        _spath_to_img = {_spath: _simg}
+
+                    # Real ambient/flash pair for camera "2" (2026-08-20,
+                    # round 34) -- direct CTO report the mask "almost
+                    # perfect but I can still see some background texture
+                    # being mistaken for ridge pattern". This candidate had
+                    # never had a real ambient/flash pair to give
+                    # `_flash_diff_mask` (needs torch-falloff differencing
+                    # to isolate near-camera skin from background), and
+                    # locally testing `_unet_mask` against this camera's own
+                    # real raw content found it grabs ~85% of the frame --
+                    # badly over-segmenting, correctly rejected by its own
+                    # existing runaway-coverage gate, not a fixable
+                    # near-miss. So every camera-"2" candidate had been
+                    # scored via the bare guide mask with zero content
+                    # awareness. Client now uploads both frames under
+                    # `ambientPath`/`flashPath` when available (backward
+                    # compatible -- older captures without these fields, or
+                    # camera "3", fall straight through unchanged).
+                    _sec_ambient_burst = None
+                    _sec_flash_burst = None
+                    _sec_amb_path = _cam.get('ambientPath')
+                    _sec_fl_path = _cam.get('flashPath')
+                    if _sec_amb_path and _sec_fl_path:
+                        _sec_amb_img = _spath_to_img.get(_sec_amb_path)
+                        _sec_fl_img = _spath_to_img.get(_sec_fl_path)
+                        if _sec_amb_img is not None and _sec_fl_img is not None:
+                            _sec_ambient_burst = [_sec_amb_img]
+                            _sec_flash_burst = [_sec_fl_img]
                     # Laplacian of the best frame — already computed for multi-
                     # path bursts; compute on demand for single-path captures.
                     _best_lap = (
@@ -1825,6 +1855,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         guide_region=_sec_guide,
                         freq_normalize=True,
                         stack_cache={},
+                        ambient_burst=_sec_ambient_burst,
+                        flash_burst=_sec_flash_burst,
                     )
                     if _simg_res is None:
                         continue
