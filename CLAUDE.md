@@ -1,5 +1,31 @@
 # ClearBridge Mobile — persistent context
 
+## Camera-2 macro capture: round-24 fixes confirmed working on a real device (2026-08-20, round 25)
+Direct follow-up to round 24's two fixes (rebuild-after-swap, 45s outer
+timeout). Real device retest, `8ed1c600`: both fixes confirmed working
+end to end, no repeat of either bug.
+
+**Real, positive confirmation.** `secondaryCameras` on the capture doc
+now shows a real, non-null entry (`{'name': '2', 'paths':
+['.../secondary_2_macro_0.jpg']}`) — the upload actually landed this
+time, unlike the two prior real attempts (`c27d0004`/`d0ec5195`, both
+`secondaryCameras: null`). Backend confirms the full pipeline ran: real
+`secondaryCamScores: {'2': 54.0}` shows camera "2"'s frame was
+downloaded, processed, and scored. Main camera's own frame won this
+particular capture (`nfiq2Score: 67` vs. camera "2"'s 54) — expected,
+healthy max-of-variants behavior, not a failure; camera "2" simply
+wasn't the sharper candidate on this specific attempt, and nothing
+suggests the new `_SECONDARY_MAX_WAVELENGTH_PX_MACRO` gate caused any
+problem (it lost on its own merits, not via a block).
+
+**Not yet confirmed**: whether camera "2" has ever actually WON
+selection on a real capture with this feature live -- n=1 real capture
+since the fix, and it lost fairly. Worth watching over more real
+captures before drawing any conclusion about whether the macro guide/
+closer-capture idea is paying off on the metric that matters (real
+matchability, not just whether the pipeline runs). No code changes this
+round — this is real-device confirmation only.
+
 ## Camera-2 macro capture, first real device test: two real bugs found and fixed (2026-08-20, round 24)
 Direct follow-up to round 23's brand-new `_captureMacroShot()`. First real
 device test (screenshot) showed the guide + "Capturing close-up detail…"
