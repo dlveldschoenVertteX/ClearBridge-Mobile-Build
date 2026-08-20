@@ -648,6 +648,15 @@ class FrontCaptureController extends ChangeNotifier {
   // real capture confirms whether this actually closes the gap.
   static const int _macroFocusMinMs = 1200;
   static const int _macroFocusMaxMs = 2400;
+  // Real measured pad centre for camera "2" (2026-08-20, round 33) --
+  // MUST stay equal to main.py's own `_sec_cy` for the same camera, since
+  // this is the single source of truth for where the pad actually sits in
+  // this lens's raw frame; drifting the two independently is exactly the
+  // bug class this project has already been burned by more than once
+  // (`_scoreRoi`/`_focusPointScreenSpace`). Used as both the AF/AE retarget
+  // point and the sharpness-ROI centre for the macro shot -- see
+  // _captureMacroShot's own inline comment for the real evidence.
+  static const double _macroFocusTargetCy = 0.34;
   // decodeStillJpegToLuma's own default (2048) was chosen purely for
   // decode speed/peak-memory safety on budget devices (still_jpeg_
   // downscaler.dart's own docstring), never evaluated as a data-quality
@@ -5027,7 +5036,34 @@ class FrontCaptureController extends ChangeNotifier {
         _apply((s) => s, force: true);
 
         _liveAbsSharpness = null;
-        const macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6);
+        // Both the sharpness-measurement ROI and the AF target point below
+        // were anchored to frame-CENTRE (0.5, 0.5) -- real, direct bug
+        // found 2026-08-20 (round 33) after a CTO report that captures were
+        // still soft even after round 31's wider convergence window. Round
+        // 31/32 already established, from real measurement, that camera
+        // "2"'s pad actually sits at roughly cy=0.34-0.36, not 0.5 (see
+        // `_sec_cy` in main.py's secondary-camera scoring loop) -- but
+        // NEITHER of these two capture-time signals was ever updated to
+        // match. Autofocus was being aimed at whatever sits at dead centre
+        // of the frame (per round-31/32's own raw-frame reviews, that's
+        // near the flexion crease or lower, not the ridge-bearing pad), and
+        // the sharpness ROI it converges against was a large box centred on
+        // that same wrong point, likely dominated by background/non-pad
+        // content given how much brighter/higher-contrast the surrounding
+        // fabric measured versus the pad itself on a real capture (round
+        // 33: pad Laplacian 1619 vs adjacent background 2282 on the same
+        // frame). A clean, stable convergence against the WRONG target
+        // explains "macroDebug shows a healthy settle, but the pad is
+        // still soft" -- the signal was never tracking the pad to begin
+        // with. Both recentred on `_macroFocusTargetCy` (0.34, matching
+        // `_sec_cy` exactly -- one real measured value, not two
+        // independently-drifting copies, the same lesson this project has
+        // already learned the hard way from `_scoreRoi`/
+        // `_focusPointScreenSpace` drift). ROI also tightened from a
+        // generous 0.6x0.6 box to 0.5x0.4, still comfortably larger than
+        // the real measured pad extent (ry~0.111) with margin, but less
+        // likely to be dominated by whatever's outside the pad.
+        const macroRoi = Rect.fromLTWH(0.25, 0.15, 0.5, 0.4);
         void macroFrameListener(CameraImage image) {
           try {
             final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
@@ -5039,7 +5075,8 @@ class FrontCaptureController extends ChangeNotifier {
         final focusDebug = <String, dynamic>{};
         final focusSw = Stopwatch()..start();
         try {
-          await _retargetAndConverge(const Offset(0.5, 0.5),
+          await _retargetAndConverge(
+              const Offset(0.5, _macroFocusTargetCy),
               minMs: _macroFocusMinMs, maxMs: _macroFocusMaxMs,
               debugOut: focusDebug);
         } finally {

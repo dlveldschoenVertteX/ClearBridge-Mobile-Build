@@ -1780,11 +1780,43 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         _sec_cy = (0.37 if _cam.get('name') == '3'
                                    else 0.34 if _cam.get('name') == '2'
                                    else 0.5)
+                        # Camera "2" rx/ry, real data override (2026-08-20,
+                        # round 33) -- direct CTO report ("mask is not
+                        # correct... capture the entire fingerprint pad...
+                        # extremely small superprint") on the very capture
+                        # that first won selection via this camera (round
+                        # 32, f4cb3ba5). Measured the real pad extent
+                        # directly from that capture's own raw frame the
+                        # same way `_sec_cy` was measured in round 31: tip
+                        # near y=0.247, main flexion crease near y=0.470 --
+                        # ry needs to span ~0.111 (half-height) to cover it,
+                        # not the ratio-derived 0.0724 this was computing
+                        # (a real 53% undersize -- the ratio formula's
+                        # underlying assumption, that the subject sits at
+                        # the SAME physical distance from camera "2" as it
+                        # did from the main camera, doesn't hold here: the
+                        # macro guide is deliberately grown 20%
+                        # [_macroGuideScaleFactor] specifically to pull the
+                        # user closer, which the ratio math has no way to
+                        # account for). rx was already close (measured
+                        # ~0.094 vs the ratio's 0.0969) -- not the source of
+                        # the complaint. Both bumped with real margin above
+                        # the bare measurement (not just matched exactly)
+                        # since a slightly generous crop that includes a
+                        # sliver of background is a far smaller cost than
+                        # clipping real ridge-bearing pad content again --
+                        # content-aware refinement/crease-trim can still
+                        # clean up the margin. Camera "3" is untouched,
+                        # still ratio-derived -- no real evidence this same
+                        # gap applies there. Flagged provisional (n=1),
+                        # same discipline as `_sec_cy`.
+                        _sec_rx = 0.11 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
+                        _sec_ry = 0.13 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
                         _sec_guide = {
                             'cx': 0.5,
                             'cy': _sec_cy,
-                            'rx': _guide_region['rx'] * _rx_ratio,
-                            'ry': _guide_region['ry'] * _ry_ratio,
+                            'rx': _sec_rx,
+                            'ry': _sec_ry,
                             'tipAngleDeg': 0.0,
                             'n': _guide_region.get('n', 2.5),
                         }

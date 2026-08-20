@@ -1,5 +1,97 @@
 # ClearBridge Mobile — persistent context
 
+## Macro-camera mask still too small + persistent softness root-caused: AF/sharpness ROI were NEVER aimed at the real pad location (2026-08-20, round 33)
+Direct CTO report on the round-32 winning capture (`f4cb3ba5`, real
+nfiq2Score 69, `afisSource: secondary_2`): "the mask is not correct... get
+it to capture the entire fingerprint pad... now it is extremely small
+superprint" plus "there is still a focus issue the captures were soft."
+Pulled the exact same real capture's own raw macro frame and measured
+directly, same discipline as round 31, rather than guess at new numbers.
+
+**Mask-size bug, real and measured.** Cropped the raw frame at several
+candidate boundaries and located the true pad extent precisely: tip near
+y=0.247, the main flexion crease near y=0.470 -- a real half-height of
+**ry~0.111**, against the round-31 fix's own `ry=0.0724` (a genuine 53%
+undersize). `rx` was already close (measured ~0.094 vs. the ratio-derived
+0.0969) -- not the source of the complaint. Root cause: `_sec_guide`'s
+rx/ry are derived from a sensor/focal-length FOV ratio that implicitly
+assumes the subject sits at the SAME physical distance from camera "2" as
+it did from the main camera during the primary capture -- but the macro
+guide is deliberately grown 20% (`_macroGuideScaleFactor`) specifically to
+pull the user closer, an assumption the ratio math has no way to account
+for. Round 31 already fixed `cy` with real data but explicitly left rx/ry
+"untouched this round -- one variable at a time" -- this is that
+follow-up, now with real corroborating evidence from BOTH the CTO's own
+subjective report and a direct pixel measurement pointing the same
+direction.
+
+**Fixed** (`main.py`): camera "2" now uses explicit, real-measured
+`rx=0.11`/`ry=0.13` (deliberate margin above the bare measurement, not
+just matched exactly -- a slightly generous crop that includes a sliver
+of background costs far less than clipping real ridge-bearing content
+again, and existing content-aware refinement/crease-trim can clean up the
+margin). Camera "3" untouched, still ratio-derived -- no evidence this
+same gap applies there. **Verified locally, not just asserted**:
+regenerated the real capture's superprint with the new bounds -- canvas
+grew from 391x264 to 654x320 (~2x), visually confirmed (sent to CTO) as a
+much fuller print with a wider whorl/core structure, not just a bigger
+white margin.
+
+**Softness: real, direct root cause found via code read, not guessed.**
+Re-checked `_captureMacroShot` line by line rather than re-tuning the
+already-widened (round 31) AF timing window blind. Found it: BOTH the AF
+target point (`_retargetAndConverge(const Offset(0.5, 0.5), ...)`) AND the
+sharpness-measurement ROI (`macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6)`,
+centred at (0.5, 0.5)) were still anchored to frame-CENTRE -- neither was
+ever updated when round 31/this round established, from real measurement,
+that the pad actually sits at cy~0.34-0.36, not 0.5. Autofocus was being
+aimed at whatever sits at dead centre of the frame (per round 31/32's own
+raw-frame reviews: near the flexion crease or lower, not the ridge-bearing
+pad), and the sharpness signal it converges against was a large box
+centred on that same wrong point. Direct measurement on this exact real
+capture confirms the risk was real, not theoretical: pad-region Laplacian
+variance 1619 vs. the immediately adjacent background 2282 on the SAME
+frame -- the surrounding fabric is genuinely higher-contrast than the pad,
+so a sharpness signal not tightly centred on the pad risks tracking the
+wrong content's focus state. This directly explains the paradox from
+round 32: `macroDebug` showed a clean, healthy convergence (settled at 94%
+of its own peak, no drift retry) while the pad itself was still reportedly
+soft -- a clean convergence against the WRONG target proves nothing about
+focus quality ON the pad.
+
+**Fixed** (`front_capture_controller.dart`): new `_macroFocusTargetCy =
+0.34`, deliberately kept equal to `main.py`'s own `_sec_cy` for camera
+"2" -- one real measured value, not two independently-drifting copies,
+the same lesson this project has already been burned by more than once
+(`_scoreRoi`/`_focusPointScreenSpace`). Used as both the AF/AE retarget
+point (`Offset(0.5, _macroFocusTargetCy)`, was `Offset(0.5, 0.5)`) and the
+sharpness-ROI centre. ROI also tightened `0.6x0.6 -> 0.5x0.4` (still
+comfortably larger than the measured pad extent, ry~0.111, with margin,
+but less likely to be dominated by non-pad content).
+
+**Secondary, unconfirmed hypothesis, flagged not acted on**: a rough
+optical estimate (magnification from the pad's measured on-sensor size vs.
+its real-world width, thin-lens approximation) puts the achieved working
+distance for this capture at roughly 54mm -- uncomfortably close to camera
+"2"'s own real, device-reported `minFocusDistanceDiopters: 20.0` (a hard
+50mm minimum focus distance). If the macro guide's 20% "pull closer" boost
+is routinely landing users at or past this lens's true minimum focus
+distance, no amount of AF-target/timing correction can produce a sharp
+image -- it would be a genuine hardware limit. Not acted on this round
+since the AF-target bug above is a much stronger, code-confirmed
+explanation on its own, and stacking a guide-size change on top risks
+conflating which fix helped if this round's data comes back positive. Real
+next step if softness persists even with a correctly-aimed AF: revisit
+`_macroGuideScaleFactor` (1.2) with this estimate in mind.
+
+**Not yet device-tested** -- the mask fix is verified via local
+regeneration of the real capture's own raw frame (not a guess), but the
+AF-target/ROI fix is a live-camera-hardware change that can only be
+confirmed by a fresh real macro capture, same standing discipline as
+every other capture-side change this project. The next real capture is
+what shows whether `macroDebug`'s peak sharpness reads meaningfully
+higher now that both signals are actually looking at the pad.
+
 ## First real device test of BOTH round-31 macro fixes: camera "2" wins its first-ever real capture (2026-08-20, round 32)
 Direct follow-up device test on the deployed+built round-31 fixes (framing
 `_sec_cy=0.34`, backend; widened AF window, client). Real capture
