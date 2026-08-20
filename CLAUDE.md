@@ -1,5 +1,46 @@
 # ClearBridge Mobile — persistent context
 
+## Mask-preference reorder (guide+unet over guide+flashdiff) tested and REJECTED — the earlier aggregate comparison was confounded, controlled test shows no real advantage (2026-08-20, round 21)
+Direct follow-up to round 20's own closing suggestion ("worth considering
+whether `guide+unet` should be preferred more aggressively over
+`guide+flashdiff` in the mask-selection order"). Before implementing that
+reorder in `afis_print.py` (currently `_flash_diff_mask` is tried first,
+`_unet_mask` only as a fallback when it returns `None`), ran the real
+controlled test the suggestion itself hadn't had yet: forced `_unet_mask`
+on the exact same 12 real captures that currently resolve to
+`guide+flashdiff` under the fixed seed (round 20), same burst content, same
+guide region, only the detector swapped (`_flash_diff_mask` monkeypatched
+to return `None`, isolating exactly the choice this reorder would make).
+
+**Real result: no advantage, and the earlier evidence for the reorder was
+confounded.** flashdiff mean 0.650, forced-unet mean 0.667 — a wash. Unet
+wins only 4/12 (33%, worse than a coin flip). On 5 of 12, `_unet_mask`'s
+own coverage accept-gate REJECTED the detected mask outright and fell back
+to bare `guide` — it isn't even reliably producing a usable pad mask on
+these specific captures, let alone a better one.
+
+This directly explains why round 20's own aggregate numbers
+(`guide+unet` mean 3.872 vs `guide+flashdiff` mean 1.351,
+`mask_correlation.json`, n=21 vs n=19) looked so lopsided: those are
+DIFFERENT real captures that happened to route to different mask paths in
+production, not the same captures scored under both masks. Flash-diff and
+unet plausibly engage on systematically different kinds of captures to
+begin with (e.g. flash-diff needs a usable ambient/flash pair at all;
+unet is the fallback when it doesn't), so the aggregate group means
+reflect whatever real quality differences already existed between those
+two capture populations, not a clean causal effect of the mask choice
+itself. Same confound class already caught once before in this project
+(the pad-gate "more fusion = better" reversal, 2026-08-13) — an aggregate
+comparison across non-matched groups looked like a real effect until a
+same-item controlled test said otherwise.
+
+**Not implementing the reorder.** The real, controlled, causal test — not
+the aggregate one — is the one that should decide this, and it argues
+against the change. `_flash_diff_mask`-first stays as-is. No code change
+made this round; this closes out round 20's own open suggestion with a
+real negative, rather than leaving it as an unverified TODO or acting on
+it blind.
+
 ## Flash-diff mask seed fix, real follow-up test: does NOT close the matchability gap toward guide+unet — a visually-correct fix that didn't move the real score (2026-08-20, round 20)
 Direct follow-up to round 16's flash-diff mask fix (`339a1e2`, committed,
 NOT deployed): that round found and fixed a real bug (`_isolate_thumb_lobe`
