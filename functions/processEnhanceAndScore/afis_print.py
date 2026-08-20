@@ -693,6 +693,8 @@ _STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
 def _align_face_on_stack(
     cand: List[Optional[np.ndarray]],
     gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
 ) -> Optional[Tuple[List[np.ndarray], List[Optional[float]]]]:
     """ECC-affine align near-identical same-pose frames to the sharpest
     (cand[0]) reference and return the aligned float32 stack (reference first).
@@ -710,6 +712,25 @@ def _align_face_on_stack(
     first, then each accepted frame in the order appended), so it stays
     correct even though some candidates get dropped along the way. Callers
     that don't need gyro weighting (_stack_face_on) simply discard it."""
+    # Optional caller-owned alignment cache (audit, 2026-08-20). ECC affine
+    # registration is the single most expensive step in this module -- the
+    # 2026-07-16 production outage (capture 9efb7d1e, one variant taking 15+
+    # minutes and blowing the Cloud Run timeout) was caused precisely by
+    # redoing it once per variant. `stack_cache` fixed that for the deep*
+    # family by caching the COMBINED result, but `stack` and `focusStack`
+    # were left out: they call _stack_face_on / _focus_stack_face_on on the
+    # SAME frame list and so each redo this identical alignment, then combine
+    # it differently (flat mean vs sharpness-weighted). Caching the combined
+    # result cannot help there because the two results legitimately differ --
+    # the shareable work is the alignment itself, which is what this caches.
+    #
+    # Those two variants only became live for front_only_v1 in round 11
+    # (before that they returned None on every real capture, so the
+    # redundancy was invisible), which is why it outlived the original fix.
+    # Safe to share the returned stack: both consumers only READ it
+    # (np.stack(...) / np.mean(...)), neither mutates it in place.
+    if align_cache is not None and align_key is not None and align_key in align_cache:
+        return align_cache[align_key]
     pairs = list(zip(cand, gyros if gyros is not None else [None] * len(cand)))
     grays = [
         (c if c is None or c.ndim == 2 else cv2.cvtColor(c, cv2.COLOR_BGR2GRAY), gy)
@@ -745,14 +766,20 @@ def _align_face_on_stack(
                 stack_gyros.append(gy)
         except cv2.error:
             continue
-    if len(stack) < 2:
-        return None
-    return stack, stack_gyros
+    # Cache negative results too -- a burst that fails the correlation guard
+    # fails it identically for both consumers, and re-running the full ECC
+    # sweep just to rediscover that is the most expensive possible no-op.
+    _aligned = None if len(stack) < 2 else (stack, stack_gyros)
+    if align_cache is not None and align_key is not None:
+        align_cache[align_key] = _aligned
+    return _aligned
 
 
 def _stack_face_on(
     cand: List[Optional[np.ndarray]],
     gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
 ) -> Optional[np.ndarray]:
     """Align (ECC affine) and AVERAGE near-identical same-pose frames -> a
     denoised full-resolution grayscale (pure noise reduction). Returns None if
@@ -767,7 +794,8 @@ def _stack_face_on(
     reweighting trades away more noise-averaging benefit than it recovers on
     the majority of captures that don't have a genuine outlier frame. Kept as
     a plain, unweighted mean on purpose."""
-    result = _align_face_on_stack(cand)
+    result = _align_face_on_stack(
+        cand, align_cache=align_cache, align_key=align_key)
     if result is None:
         return None
     stack, _stack_gyros = result
@@ -777,6 +805,8 @@ def _stack_face_on(
 def _focus_stack_face_on(
     cand: List[Optional[np.ndarray]],
     gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
 ) -> Optional[np.ndarray]:
     """Align (ECC affine) same-pose frames, then combine by LOCAL SHARPNESS
     rather than a flat mean -- classic focus stacking. Each output pixel is a
@@ -801,7 +831,8 @@ def _focus_stack_face_on(
     smaller, better-justified change than introducing weighting where none
     existed. Missing/None gyro values default to full (1.0) weight, so
     callers without gyro data see byte-identical behaviour to before this."""
-    result = _align_face_on_stack(cand, gyros=gyros)
+    result = _align_face_on_stack(
+        cand, gyros=gyros, align_cache=align_cache, align_key=align_key)
     if result is None:
         return None
     stack, stack_gyros = result
@@ -2979,8 +3010,18 @@ def generate(
                 same_gyros = [p[1] for p in _burst_pool_pairs]
         # focus_stack: sharpness-weighted combine (keep the best-focused region
         # of each frame -- targets soft pad edges); stack: flat average (denoise).
-        stacked = (_focus_stack_face_on(same_frames, gyros=same_gyros) if focus_stack
-                   else _stack_face_on(same_frames))
+        # Both branches align the SAME `same_frames` list and differ only in
+        # how they combine it, so they share one alignment via the caller's
+        # request-scoped stack_cache -- see _align_face_on_stack's own cache
+        # docs. Distinct key from the deep* family's 'da'/'df' slots, which
+        # cache a different frame set entirely.
+        stacked = (_focus_stack_face_on(same_frames, gyros=same_gyros,
+                                        align_cache=stack_cache,
+                                        align_key='align_same_pose')
+                   if focus_stack
+                   else _stack_face_on(same_frames,
+                                       align_cache=stack_cache,
+                                       align_key='align_same_pose'))
         if stacked is not None:
             gray = stacked
             params['afisStacked'] = len(same_frames)
