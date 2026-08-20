@@ -1,5 +1,49 @@
 # ClearBridge Mobile — persistent context
 
+## Camera-2 macro capture, first real device test: two real bugs found and fixed (2026-08-20, round 24)
+Direct follow-up to round 23's brand-new `_captureMacroShot()`. First real
+device test (screenshot) showed the guide + "Capturing close-up detail…"
+banner rendering correctly, but the camera feed underneath was solid
+black, and the CTO reported "camera 2 had no live stream." Pulled the
+matching real Firestore doc rather than trust the screenshot alone.
+
+**Bug 1, confirmed and fixed: no rebuild after the camera swap.**
+`_cameraLayer()` reads `_cameraService.controller` fresh only on
+`build()`, and rebuilds only fire via this controller's own
+`notifyListeners()` (`_apply`). The only `_apply` call in
+`_captureMacroShot` ran BEFORE `initializeCamera()` even started
+swapping to camera "2" — so the screen's one rebuild for this whole step
+happened while the controller was still mid-swap (old camera disposed,
+new one not yet ready), and `_cameraLayer()`'s own null/uninitialized
+fallback rendered a flat black `ColoredBox`. With no further rebuild ever
+fired, nothing ever replaced it — exactly what the screenshot showed.
+Fixed with a second, forced `_apply` call right after the swap completes.
+
+**Bug 2, found via the real Firestore data, likely the more consequential
+one: no overall timeout on the sequence.** The same real capture from
+this test (`c27d0004`) landed with `secondaryCameras: null` — meaning
+`_captureMacroShot` didn't just have a rendering problem, it failed to
+produce ANY result on this run (self-skipping already caught whatever
+happened, so the main capture wasn't affected). Re-read this file's own
+already-established discipline for exactly this class of risk:
+`_sweepBurstTimeoutMs`'s own docs state plainly that try/catch alone
+cannot protect against a hang, since `takePicture()` is a raw platform-
+channel await with no timeout of its own — and camera "2" has a long,
+real history in this project of being the slowest camera to open/upload
+(multiple earlier rounds hit this exact failure mode on this exact
+camera). `_captureMacroShot` never got the same outer-timeout treatment
+every other per-camera-turn sequence in this file already has. Fixed:
+wrapped the whole open+focus+capture+upload sequence in one real 45s
+bound (`_macroCaptureTimeoutMs` — real camera-open retry structure alone
+can take up to ~32s worst case per `CameraService`'s own internal 12s+20s
+retry, plus margin for focus/shutter/one real upload attempt).
+
+**Not fully confirmed yet** — both fixes are real, well-evidenced, and
+directly explain the observed symptom, but neither has been re-tested on
+a real device. The next real capture with these fixes is what confirms
+whether the feed renders correctly AND whether `secondaryCameras`
+actually lands non-null.
+
 ## Focus-lever audit: camera-2 macro wired as a dedicated final capture; focus-zone-splice audited on real matchability (not NFIQ) and found to be a real, additional negative (2026-08-20, round 23)
 Direct follow-up to the earlier "audit focus levers" request. Two real
 findings, one implemented, one closes out a standing open question with a
