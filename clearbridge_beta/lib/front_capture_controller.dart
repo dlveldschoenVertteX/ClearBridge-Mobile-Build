@@ -3359,12 +3359,31 @@ class FrontCaptureController extends ChangeNotifier {
     final step = wantsDarker ? _glareEvStep : -_glareEvStep;
     _evChangeInFlight = true;
     _lastGlareEvAdjustAt = now;
-    cam.getMinExposureOffset().then((min) async {
-      final max = await cam.getMaxExposureOffset();
+    // Bounded native calls (added 2026-08-20, capture-settings audit). Every
+    // FOCUS call in this file already wraps its platform-channel await in
+    // .timeout(_zoneFocusCallTimeout) -- but none of the EXPOSURE calls did,
+    // despite being the same channel with the same documented hang risk.
+    //
+    // This site is the one that actually matters, because it is the only
+    // exposure path that runs OUTSIDE any outer bound: it fires from _onFrame
+    // during the hold (the burst's own exposure calls are now covered by
+    // _burstCaptureTimeoutMs). The failure mode is quiet rather than loud --
+    // `_evChangeInFlight` is only cleared by whenComplete(), which never runs
+    // if the underlying future never completes, so a single stalled native
+    // call permanently latches that flag and silently kills glare/exposure
+    // adaptation for the ENTIRE remaining session while capture otherwise
+    // appears to work. That is precisely the sort of silent degradation this
+    // project has repeatedly lost real device rounds to.
+    //
+    // TimeoutException lands in the existing catchError, and whenComplete
+    // then clears the flag as normal, so adaptation self-heals on the next
+    // frame instead of being lost for good.
+    cam.getMinExposureOffset().timeout(_zoneFocusCallTimeout).then((min) async {
+      final max = await cam.getMaxExposureOffset().timeout(_zoneFocusCallTimeout);
       final target = (_appliedEvOffset + step).clamp(min, max);
       if ((target - _appliedEvOffset).abs() < 0.05) return;
       _appliedEvOffset = target;
-      await cam.setExposureOffset(_appliedEvOffset);
+      await cam.setExposureOffset(_appliedEvOffset).timeout(_zoneFocusCallTimeout);
     }).catchError((_) {}).whenComplete(() => _evChangeInFlight = false);
   }
 
