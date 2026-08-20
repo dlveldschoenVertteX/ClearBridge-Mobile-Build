@@ -35,6 +35,14 @@ def run(epochs: int, source_glob: str, train_len: int, val_len: int, seed: int =
     print(f'model params: {n_params:,}', flush=True)
 
     opt = torch.optim.Adam(model.parameters(), lr=1e-3)
+    # Cosine LR decay -- added after the 113-image run showed real val_loss
+    # oscillation late in training (epochs 51-57 climbing back to 0.015-0.034
+    # after already reaching 0.0064-0.0092) on a FLAT lr=1e-3 the whole way.
+    # That pattern (converges, then bounces) is the standard signature of a
+    # step size too large to settle once near a minimum -- a smooth decay to
+    # ~0 by the final epoch is the standard fix, not a new hyperparameter to
+    # tune (T_max=epochs, no separate schedule shape to pick).
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=epochs)
     loss_fn = torch.nn.MSELoss()
 
     history = []
@@ -71,9 +79,10 @@ def run(epochs: int, source_glob: str, train_len: int, val_len: int, seed: int =
                 nv += x.size(0)
         val_loss /= max(1, nv)
         val_mae_scale /= max(1, nv)
+        sched.step()
 
         history.append((epoch, train_loss, val_loss, val_mae_scale))
-        print(f'epoch {epoch:2d}/{epochs}  train_loss={train_loss:.4f}  '
+        print(f'epoch {epoch:2d}/{epochs}  lr={sched.get_last_lr()[0]:.5f}  train_loss={train_loss:.4f}  '
               f'val_loss={val_loss:.4f}  val_scale_mae={val_mae_scale:.4f}', flush=True)
 
     print('\n=== TREND CHECK ===')
