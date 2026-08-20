@@ -341,6 +341,55 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             message='captureId does not belong to the authenticated user',
         )
 
+    # ── basePath containment ──────────────────────────────────────────────────
+    # Found 2026-08-20 in a full-codebase audit. `basePath` is a SEPARATE piece
+    # of client-controlled input from captureId/userId, and the ownership check
+    # above does not constrain it at all -- yet it is used verbatim as a Cloud
+    # Storage prefix by two real code paths, both via the Admin SDK, which
+    # bypasses Storage rules entirely:
+    #
+    #   1. _download_best_frames(base_path) -> bucket.list_blobs(prefix=base_path).
+    #      Reachable today: it is the fallback download branch taken whenever
+    #      captureMode is not arc/oscillating/front_only_v1 -- i.e. a caller
+    #      simply omitting captureMode. A caller passing their OWN valid
+    #      captureId/userId (so the ownership check passes) alongside ANOTHER
+    #      user's basePath would have this function read that other user's raw
+    #      fingerprint frames and process them into the caller's own capture
+    #      doc, which the caller can then read back under the Firestore rules.
+    #      That is cross-tenant disclosure of biometric data -- "special
+    #      personal information" under POPIA, the exact category this project's
+    #      own consent flow is built around.
+    #   2. _delete_capture_frames(base_path) -> list_blobs(prefix=base_path)
+    #      followed by blob.delete() on every match. An arbitrary caller-chosen
+    #      prefix here means arbitrary cross-tenant deletion; a short prefix
+    #      such as 'captures' would match every capture frame in the bucket.
+    #      Currently masked only because _BETA_PHASE is True (frame deletion is
+    #      skipped during beta) -- so this one is latent rather than live, but
+    #      it is armed the moment that flag flips for GA, which is exactly what
+    #      it exists to do.
+    #
+    # Neither risk depends on guessing a UUID in bulk: captureIds appear in
+    # Storage paths, logs and screenshots, and only ONE victim id is needed.
+    #
+    # Fix is containment, checked before the rate limit is consumed or any
+    # compute runs: basePath must be exactly the path the client is supposed to
+    # build. Verified against every real client in this repo
+    # (front_capture_controller, oscillating_capture_controller,
+    # fingerprint_frame_upload_service, and the harness copies) -- all of them
+    # construct 'captures/$userId/$id' verbatim, so strict equality cannot break
+    # a legitimate caller. Strict equality rather than a startswith() prefix
+    # test on purpose: a prefix test would still admit sibling paths such as
+    # 'captures/{uid}/{captureId}_other'.
+    _expected_base_path = f'captures/{user_id}/{capture_id}'
+    if base_path != _expected_base_path:
+        logger.warning(
+            'basePath containment violation: got %r, expected %r (user=%s)',
+            base_path, _expected_base_path, user_id)
+        raise https_fn.HttpsError(
+            code=https_fn.FunctionsErrorCode.PERMISSION_DENIED,
+            message='basePath does not match the authenticated user and capture',
+        )
+
     # ── Rate limit: 60 s per user ─────────────────────────────────────────────
     # Prevents cost-bomb abuse — each invocation runs a 4 GB / 4 vCPU pipeline.
     # Transaction ensures the check+write is atomic so concurrent requests
