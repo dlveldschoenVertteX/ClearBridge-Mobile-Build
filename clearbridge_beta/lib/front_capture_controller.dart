@@ -4765,6 +4765,22 @@ class FrontCaptureController extends ChangeNotifier {
       final macroCam = svc.controller;
       if (macroCam == null) return null;
       _camera = macroCam;
+      // Real bug found on first real device test (2026-08-20): the screen's
+      // own `_cameraLayer()` reads `_cameraService.controller` fresh on
+      // every BUILD, not continuously -- rebuilds only happen in response
+      // to this controller's `notifyListeners()` (via `_apply`). The only
+      // `_apply` call before this point ran BEFORE `initializeCamera()`
+      // even started swapping cameras, so the screen's one and only
+      // rebuild in this whole step happened while the controller was still
+      // mid-swap (old camera disposed / new one not yet ready) --
+      // `_cameraLayer()`'s own null/uninitialized fallback renders a flat
+      // `ColoredBox` (black), and with no further rebuild ever fired,
+      // nothing ever replaced it: a real device confirmed exactly this
+      // (guide + banner visible, camera feed solid black). Forcing a fresh
+      // emit here, now that `macroCam` is the real, already-initialized
+      // camera "2" controller, is what actually binds `CameraPreview` to
+      // its live texture.
+      _apply((s) => s, force: true);
 
       _liveAbsSharpness = null;
       const macroRoi = Rect.fromLTWH(0.2, 0.2, 0.6, 0.6);
