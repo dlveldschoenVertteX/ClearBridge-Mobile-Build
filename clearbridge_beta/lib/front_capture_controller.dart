@@ -368,6 +368,40 @@ class FrontCaptureController extends ChangeNotifier {
   // instead of the bare 2-frame minimum.
   static const int _burstFrameCount = 8;
   static const int _burstShotDelayMs = 0;
+  // Outer bound on the WHOLE capture-side sequence inside _fireBurst (the
+  // focus-zone bracket + _stopStream + the 8-shot burst loop), added
+  // 2026-08-20 during a full-codebase audit. REAL, STRUCTURAL GAP, not a
+  // hypothetical: every other camera sequence in this file already has one
+  // (_sweepBurstTimeoutMs 34s for the sweep burst, _macroCaptureTimeoutMs
+  // 45s for the camera-2 macro shot, and the since-removed secondary-camera
+  // loop had its own 28s) -- but _fireBurst, the ONE path 100% of real
+  // captures actually go through, never got the same treatment.
+  //
+  // Why the existing per-shot try/catch is NOT sufficient, in this file's
+  // own already-documented words (_sweepBurstTimeoutMs): "takePicture() is
+  // a raw platform-channel await with no bound of its own, so a hang on any
+  // single [step] must not block the rest of the capture forever (try/catch
+  // alone does not protect against that)". A hang here is maximally bad:
+  // _finishAndUpload never runs, so the Firestore doc is never written and
+  // the capture is silently lost for good, while the UI sits in `capturing`
+  // forever -- matching the real "isn't responding" / stuck-capture class
+  // this project has already hit more than once from camera-session stalls.
+  //
+  // 75s budget, derived from this project's OWN real measured timings, not
+  // guessed: the focus-zone bracket's real cost is ~15-18s (round-8 real
+  // telemetry: hold complete 14.3s -> first burst shot 32.1s, per-zone
+  // convergedMs 1224-4304ms x 5 incl. restore-to-centre), and the 8-shot
+  // burst itself runs ~8-16s at the observed real per-shot spacing --
+  // ~34s realistic worst case, so 75s is a >2x margin that cannot fire on
+  // a healthy capture. Pure safety backstop, never an optimization target,
+  // same framing as every other bound in this file.
+  //
+  // Deliberately NON-destructive on expiry: `rawShots` accumulates in place
+  // as each shot lands, so whatever was already captured survives and the
+  // capture still proceeds to upload with a partial burst (strictly better
+  // than losing it entirely). Recorded in `burstCaptureDebug` so a real
+  // capture shows whether this ever actually fires.
+  static const int _burstCaptureTimeoutMs = 75000;
 
   // Burst+sweep hybrid capture (2026-08-03, see
   // docs/BURST_VIDEO_HYBRID_SCOPE.md): best-effort extra stills captured at
@@ -1273,6 +1307,13 @@ class FrontCaptureController extends ChangeNotifier {
   bool _starting = false;
   bool _streamRunning = false;
   bool _burstInFlight = false;
+  // True if the capture-side sequence in _fireBurst ever exceeded
+  // _burstCaptureTimeoutMs -- see that constant's own docs. Written to the
+  // capture doc as `burstCaptureDebug.timedOut` so a real capture shows
+  // whether this backstop actually fires in practice (expected: never, on
+  // a healthy device). If it DOES start firing on real captures, that is
+  // itself the signal worth investigating, not a reason to raise the bound.
+  bool _burstCaptureTimedOut = false;
 
   // Second-burst round tracking (_secondBurstEnabled). 1 = normal/first
   // hold; 2 = the redundant bonus hold currently in progress. _burst1Shots
@@ -3455,114 +3496,138 @@ class FrontCaptureController extends ChangeNotifier {
       if (preCollectedShots != null) {
         rawShots.addAll(preCollectedShots);
       } else {
-        // Per-zone refocus bracket -- MUST run before _stopStream() (needs
-        // the live _liveAbsSharpness signal to verify convergence). Round-1
-        // only, so this can never double up with the also-flagged-off
-        // redundant-second-burst feature if both are ever enabled together.
-        if (_focusZoneBracketEnabled && _burstRound == 1) {
-          rawShots.addAll(await _captureFocusZoneShots());
-          // Re-snapshot now that the real ~21s bracket has run -- see
-          // snapshotWavelengthDebug's own docs above for why the earlier
-          // call alone left this stale for exactly this path.
-          snapshotWavelengthDebug();
-        }
-        await _stopStream();
+        // Whole capture-side sequence is bounded -- see
+        // _burstCaptureTimeoutMs's own docs for the real structural gap
+        // this closes and why per-shot try/catch alone cannot. On expiry we
+        // keep every shot already collected (rawShots accumulates in place)
+        // and fall through to the normal upload path with a partial burst,
+        // rather than losing the capture entirely to a stuck native call.
+        try {
+          await (() async {
+          // Per-zone refocus bracket -- MUST run before _stopStream() (needs
+          // the live _liveAbsSharpness signal to verify convergence). Round-1
+          // only, so this can never double up with the also-flagged-off
+          // redundant-second-burst feature if both are ever enabled together.
+          if (_focusZoneBracketEnabled && _burstRound == 1) {
+            rawShots.addAll(await _captureFocusZoneShots());
+            // Re-snapshot now that the real ~21s bracket has run -- see
+            // snapshotWavelengthDebug's own docs above for why the earlier
+            // call alone left this stale for exactly this path.
+            snapshotWavelengthDebug();
+          }
+          await _stopStream();
 
-        // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
-        // flash (torch ON with negative EV). At 10cm the torch at full ambient EV
-        // blows out the pad centre completely (confirmed on first real capture:
-        // NFIQ2=9). Alternating gives the backend both lighting conditions;
-        // _download_front_only_frames already splits frames into ambient_frames
-        // and flash_frames so AFIS can pick the best-exposed set.
-        var wasFlashLastShot = false;
-        var flashShotIndex = 0;
-        for (var i = 0; i < _burstFrameCount; i++) {
-          final wantFlash = torchCapable && i.isOdd;
-          try {
-            if (wantFlash) {
-              await _flash!.activate();
-              if (minEv != null && maxEv != null) {
-                final multiplier = _flashEvBracketMultipliers[
-                    flashShotIndex % _flashEvBracketMultipliers.length];
-                final target = _appliedEvOffset + flashEvStep * multiplier;
-                await cam.setExposureOffset(target.clamp(minEv, maxEv));
-              }
-              await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
-            } else {
-              await _flash?.deactivate();
-              if (minEv != null && maxEv != null) {
-                await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
-              }
-              // Real asymmetry found 2026-07-24: the flash-ON transition above
-              // gets an explicit settle delay before its shot fires, but the
-              // flash-OFF transition (torch physically switching off AND the EV
-              // offset dropping back from flashEvStep to base) went straight
-              // into takePicture() with zero settle time -- only when this shot
-              // actually FOLLOWS a real flash shot (`wasFlashLastShot`, not
-              // just "this is an ambient slot" -- torch-incapable/bright-mode
-              // bursts never fire flash at all, so they must NOT pick up this
-              // delay on every single shot). If the sensor needs real time to
-              // re-converge exposure after either change -- which is exactly
-              // why the activate() side already waits -- every other "ambient"
-              // shot in a normal-mode burst could be captured mid-transition,
-              // still influenced by the prior flash frame's EV state.
-              // Symmetric fix: same settle window on the way back down. Not
-              // yet device-tested -- same standing discipline as every other
-              // capture-side change this project.
-              if (wasFlashLastShot) {
+          // Alternate: even-indexed shots are ambient (torch OFF), odd shots are
+          // flash (torch ON with negative EV). At 10cm the torch at full ambient EV
+          // blows out the pad centre completely (confirmed on first real capture:
+          // NFIQ2=9). Alternating gives the backend both lighting conditions;
+          // _download_front_only_frames already splits frames into ambient_frames
+          // and flash_frames so AFIS can pick the best-exposed set.
+          var wasFlashLastShot = false;
+          var flashShotIndex = 0;
+          for (var i = 0; i < _burstFrameCount; i++) {
+            final wantFlash = torchCapable && i.isOdd;
+            try {
+              if (wantFlash) {
+                await _flash!.activate();
+                if (minEv != null && maxEv != null) {
+                  final multiplier = _flashEvBracketMultipliers[
+                      flashShotIndex % _flashEvBracketMultipliers.length];
+                  final target = _appliedEvOffset + flashEvStep * multiplier;
+                  await cam.setExposureOffset(target.clamp(minEv, maxEv));
+                }
                 await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+              } else {
+                await _flash?.deactivate();
+                if (minEv != null && maxEv != null) {
+                  await cam.setExposureOffset(_appliedEvOffset.clamp(minEv, maxEv));
+                }
+                // Real asymmetry found 2026-07-24: the flash-ON transition above
+                // gets an explicit settle delay before its shot fires, but the
+                // flash-OFF transition (torch physically switching off AND the EV
+                // offset dropping back from flashEvStep to base) went straight
+                // into takePicture() with zero settle time -- only when this shot
+                // actually FOLLOWS a real flash shot (`wasFlashLastShot`, not
+                // just "this is an ambient slot" -- torch-incapable/bright-mode
+                // bursts never fire flash at all, so they must NOT pick up this
+                // delay on every single shot). If the sensor needs real time to
+                // re-converge exposure after either change -- which is exactly
+                // why the activate() side already waits -- every other "ambient"
+                // shot in a normal-mode burst could be captured mid-transition,
+                // still influenced by the prior flash frame's EV state.
+                // Symmetric fix: same settle window on the way back down. Not
+                // yet device-tested -- same standing discipline as every other
+                // capture-side change this project.
+                if (wasFlashLastShot) {
+                  await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+                }
               }
+            } catch (_) {}
+            if (wantFlash) flashShotIndex++;
+            wasFlashLastShot = wantFlash;
+            try {
+              final xfile = await cam.takePicture();
+              // Timing-only marker (2026-08-17 diagnostic pass) -- the image
+              // stream is already stopped by this point (_stopStream() above,
+              // required so takePicture() doesn't fight the stream for the
+              // sensor), so focusValue/liveAbsSharpness in this event are
+              // necessarily the FROZEN last live reading from before the
+              // stream stopped, not a fresh per-shot measurement -- there is
+              // no live signal available during the actual burst. Real value
+              // here is the wall-clock spacing between shots, directly
+              // comparable against each shot's own eventual laplacianScore.
+              _logTelemetry('shotFired', extra: {'shotIndex': i, 'flashOn': wantFlash});
+              final jpeg = await xfile.readAsBytes();
+              // Locked-shutter-speed investigation, Stage 1 (2026-08-02): the
+              // `camera` plugin has no public API for manual SENSOR_EXPOSURE_
+              // TIME/SENSITIVITY control (confirmed against the plugin's own
+              // changelog), so real shutter-speed locking would need a native
+              // Camera2Interop lift. Before spending that, read what the HAL's
+              // own auto-exposure actually did for THIS shot straight out of
+              // the JPEG's EXIF -- zero plugin/native change, just bytes we
+              // already have.
+              final exif = parseJpegExposureExif(jpeg);
+              rawShots.add(_RawShot(
+                jpeg: jpeg,
+                flashOn: _flash?.isFlashOn ?? false,
+                laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
+                timestamp: DateTime.now(),
+                exif: exif,
+                gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+              ));
+              // MAC3D capture-UX-polish mockup dev-handoff note: "fire a light
+              // haptic tick on each burst frame, stronger buzz on capture
+              // completion" -- the completion buzz already existed
+              // (HapticFeedback.heavyImpact() below); this adds the per-frame
+              // tick, same call already used elsewhere in this file for
+              // real-time "something just happened" confirmation.
+              unawaited(HapticFeedback.selectionClick());
+            } catch (e) {
+              debugPrint('[front] burst shot $i failed (non-fatal): $e');
             }
-          } catch (_) {}
-          if (wantFlash) flashShotIndex++;
-          wasFlashLastShot = wantFlash;
-          try {
-            final xfile = await cam.takePicture();
-            // Timing-only marker (2026-08-17 diagnostic pass) -- the image
-            // stream is already stopped by this point (_stopStream() above,
-            // required so takePicture() doesn't fight the stream for the
-            // sensor), so focusValue/liveAbsSharpness in this event are
-            // necessarily the FROZEN last live reading from before the
-            // stream stopped, not a fresh per-shot measurement -- there is
-            // no live signal available during the actual burst. Real value
-            // here is the wall-clock spacing between shots, directly
-            // comparable against each shot's own eventual laplacianScore.
-            _logTelemetry('shotFired', extra: {'shotIndex': i, 'flashOn': wantFlash});
-            final jpeg = await xfile.readAsBytes();
-            // Locked-shutter-speed investigation, Stage 1 (2026-08-02): the
-            // `camera` plugin has no public API for manual SENSOR_EXPOSURE_
-            // TIME/SENSITIVITY control (confirmed against the plugin's own
-            // changelog), so real shutter-speed locking would need a native
-            // Camera2Interop lift. Before spending that, read what the HAL's
-            // own auto-exposure actually did for THIS shot straight out of
-            // the JPEG's EXIF -- zero plugin/native change, just bytes we
-            // already have.
-            final exif = parseJpegExposureExif(jpeg);
-            rawShots.add(_RawShot(
-              jpeg: jpeg,
-              flashOn: _flash?.isFlashOn ?? false,
-              laplacianScore: _focusValue > 0 ? _focusValue * (_focusPeak + 1e-6) : null,
-              timestamp: DateTime.now(),
-              exif: exif,
-              gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
-            ));
-            // MAC3D capture-UX-polish mockup dev-handoff note: "fire a light
-            // haptic tick on each burst frame, stronger buzz on capture
-            // completion" -- the completion buzz already existed
-            // (HapticFeedback.heavyImpact() below); this adds the per-frame
-            // tick, same call already used elsewhere in this file for
-            // real-time "something just happened" confirmation.
-            unawaited(HapticFeedback.selectionClick());
-          } catch (e) {
-            debugPrint('[front] burst shot $i failed (non-fatal): $e');
+            _apply(
+              (s) => s.copyWith(burstProgress: (i + 1) / _burstFrameCount),
+              force: true,
+            );
+            if (i < _burstFrameCount - 1) {
+              await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
+            }
           }
-          _apply(
-            (s) => s.copyWith(burstProgress: (i + 1) / _burstFrameCount),
-            force: true,
-          );
-          if (i < _burstFrameCount - 1) {
-            await Future<void>.delayed(const Duration(milliseconds: _burstShotDelayMs));
-          }
+          }()).timeout(const Duration(milliseconds: _burstCaptureTimeoutMs));
+        } on TimeoutException {
+          // A native camera call stalled past the bound. The underlying
+          // call cannot be cancelled from Dart (see _uploadWithRetry's own
+          // docs on the same limitation for uploads) -- but the camera is
+          // disposed shortly after this, in _transitionToUploading, which
+          // is what actually tears the stuck session down. Stop the stream
+          // defensively here too, since a timeout may well have skipped
+          // the _stopStream() call above, and takePicture()/upload must
+          // never contend with a still-running stream.
+          _burstCaptureTimedOut = true;
+          debugPrint('[front] burst capture sequence exceeded '
+              '${_burstCaptureTimeoutMs}ms -- proceeding with '
+              '${rawShots.length} shot(s) already captured');
+          await _stopStream();
         }
       }
       // Always restore torch-off and base EV when done.
@@ -4668,6 +4733,11 @@ class FrontCaptureController extends ChangeNotifier {
           'manualExposureSupport': manualExposureSupport,
         if (torchExposureProbe != null) 'torchExposureProbe': torchExposureProbe,
         'sweepBurstDebug': sweepBurstDebug,
+        'burstCaptureDebug': {
+          'timedOut': _burstCaptureTimedOut,
+          'timeoutMs': _burstCaptureTimeoutMs,
+          'shotsCaptured': rawShots.length,
+        },
         if (macroCamera != null) 'secondaryCameras': [macroCamera],
       }, SetOptions(merge: true));
 
