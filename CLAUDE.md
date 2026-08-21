@@ -1,5 +1,39 @@
 # ClearBridge Mobile — persistent context
 
+## Real device confirmation of ALL THREE round-33/34 macro fixes together: camera "2" wins again, real flash-diff engagement, best macro score yet (2026-08-21, round 35)
+First real capture on the round-34 build (`b615f37b`). Pulled the full doc
+rather than assume from "test done" alone.
+
+**Real, decisive confirmation, all three fixes working together on one
+real capture**: `nfiq2Score: 75` via `afisSource: "secondary_2"` -- camera
+"2" won selection again (second real win in a row, up from round 32's 69),
+this project's best real macro score to date.
+
+- **Round 34 (ambient/flash pair) confirmed engaging for the first time
+  ever on a real capture**: `afisMask: "guide+flashdiff"` -- every prior
+  camera-"2" candidate, without exception, had scored `"guide"` (bare,
+  zero content-aware refinement) because this shot never had a real
+  ambient/flash pair before. `secondaryCameras` shows real
+  `ambientPath`/`flashPath` fields with genuinely distinct uploaded files
+  (`_amb_0.jpg`/`_fl_0.jpg`), and `_flash_diff_mask` engaged and passed
+  its own accept-gate -- the actual segmentation mechanism this round
+  built is confirmed live, not just non-crashing.
+- **Round 33 (AF/ROI retargeting) confirmed**: `macroDebug` shows
+  `sharpness: 246.5` exactly equal to `maxSample: 246.5` (settled AT its
+  own observed peak, ratio 1.0 -- even cleaner than round 32's 94%),
+  `driftRetried: false`, `convergedMs: 4874`. A genuinely clean
+  convergence, and per round 33's own fix this is now measured against
+  the real pad location, not frame-centre.
+- **Round 33 (mask widening) implicitly confirmed**: `afisMaskCoverPx:
+  221237` -- a real, substantial covered area, consistent with the ~2x
+  canvas growth verified locally last round, not a tiny sliver.
+
+No code changes this round -- real-device confirmation only. This closes
+the loop on rounds 31-34: framing, focus, mask size, and background
+segmentation were all real, independent, compounding bugs on this one
+camera, and this capture is the first real evidence all four fixes hold
+together rather than individually.
+
 ## Macro-camera background-texture-as-ridges: real root cause found, gives camera "2" its first real ambient/flash pair (2026-08-20, round 34)
 Direct CTO follow-up on round 33's widened mask: "the mask is almost
 perfect but I can still see some background texture being mistaken for
