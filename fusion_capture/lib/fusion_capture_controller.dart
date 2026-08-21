@@ -229,6 +229,10 @@ class FusionCaptureController extends ChangeNotifier {
   static const double _coverageMax = 0.85;
   static const int _holdDurationMs = 1500;
   static const int _frontPhaseTimeoutMs = 75000;
+  /// Bound on the 8-shot burst itself. Derived the same way
+  /// clearbridge_beta derived its own _burstCaptureTimeoutMs: 8 real
+  /// shutter presses plus torch settles, with better than 2x margin.
+  static const int _burstTimeoutMs = 45000;
 
   // ---- phase 2: tilt stations ----
   // ~10-12 degrees, NOT 15-18. Measured on real multi-angle data
@@ -254,8 +258,6 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _sweepSettleMs = 1200;
   static const int _sweepPhaseTimeoutMs = 60000;
 
-  static const Duration _callTimeout = Duration(seconds: 3);
-
   /// See [_kStillDecodeTargetWidth] -- the single definition of this value.
   ///
   /// REAL BUG this fixes (first device test, 2026-08-21): this app uploaded
@@ -275,6 +277,11 @@ class FusionCaptureController extends ChangeNotifier {
   /// the exact failure class this project has hit repeatedly on raw awaits.
   static const Duration _uploadTimeout = Duration(seconds: 45);
 
+  /// Bound for the non-upload network calls (auth, the Firestore write).
+  /// Both are unbounded awaits by default and both sit AFTER every frame is
+  /// captured, so a stall in either loses the entire session.
+  static const Duration _networkTimeout = Duration(seconds: 30);
+
   final List<_Shot> _shots = [];
   final Map<String, dynamic> _debug = {};
   final Map<String, Map<String, double>> _guideRegions = {};
@@ -283,6 +290,13 @@ class FusionCaptureController extends ChangeNotifier {
   Size? _screenSize;
   Size? _previewSize;
   int _sensorOrientation = 90;
+  /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
+  /// WAITING but does not cancel the work behind the future -- without this
+  /// an abandoned station loop keeps driving takePicture() while the NEXT
+  /// phase is already using the camera. Overlapping camera sessions are a
+  /// documented ANR source in this project, so every capture loop checks
+  /// this and bails within one iteration.
+  bool _abortPhase = false;
   bool _disposed = false;
 
   // live signals from the preview stream
@@ -336,7 +350,15 @@ class FusionCaptureController extends ChangeNotifier {
       _sensorOrientation = cam.description.sensorOrientation;
       _flash = AdaptiveFlashController(cam);
       final mainRegion = _guideRegionFor(PadSilhouetteShape.defaultShape);
-      if (mainRegion != null) _guideRegions['main'] = mainRegion;
+      if (mainRegion != null) {
+        _guideRegions['main'] = mainRegion;
+      } else {
+        // Every offline candidate is cropped by this region, so a capture
+        // without one is not analysable. Record it rather than shipping a
+        // silently unusable capture.
+        _debug['guideRegionUnavailable'] = true;
+        debugPrint('[fusion] WARNING: no guideRegion (previewSize missing)');
+      }
 
       if (_frontEnabled) {
         await _runFrontPhase();
@@ -370,28 +392,52 @@ class FusionCaptureController extends ChangeNotifier {
         ));
     try {
       await _startStream();
-      await _awaitHold().timeout(
+      final held = await _awaitHold(
           const Duration(milliseconds: _frontPhaseTimeoutMs));
-      await _fireFrontBurst();
+      if (!held) _debug['frontHoldTimedOut'] = true;
+      // The BURST needs its own bound too. Previously only the hold was
+      // wrapped, leaving 8 raw takePicture() calls completely unprotected --
+      // and this file's sibling in clearbridge_beta documents exactly why
+      // that is not safe: takePicture() is a raw platform-channel await with
+      // no timeout of its own, so try/catch alone cannot save a stalled
+      // shutter. A hang there would strand the session before any upload,
+      // losing the whole capture.
+      await _fireFrontBurst()
+          .timeout(const Duration(milliseconds: _burstTimeoutMs));
       await _shrinkCaptured();
     } on TimeoutException {
-      // Non-fatal: a hold that never completes should not lose the session.
-      // Whatever was captured still uploads, and the phase is marked so the
-      // offline analysis knows this capture is incomplete rather than
-      // silently treating it as a clean three-phase session.
+      // Non-fatal: whatever was captured still uploads, and the phase is
+      // marked so offline analysis knows this capture is incomplete rather
+      // than treating it as a clean three-phase session.
       _debug['frontPhaseTimedOut'] = true;
+      _abortPhase = true;
     } finally {
+      _abortPhase = false;
       await _stopStream();
     }
   }
 
-  Future<void> _awaitHold() async {
-    final completer = Completer<void>();
+  /// Waits for a satisfied hold, or gives up after [limit]. Returns true if
+  /// the hold completed.
+  ///
+  /// Owns its OWN deadline rather than relying on the caller's
+  /// `.timeout()`. A caller-side timeout stops the caller WAITING but does
+  /// nothing to the work behind the future -- the periodic poll would keep
+  /// running forever, calling _apply() every 100ms and fighting the UI of
+  /// every later phase. Every exit path here cancels both timers.
+  Future<bool> _awaitHold(Duration limit) async {
+    final completer = Completer<bool>();
     Timer? poll;
+    Timer? deadline;
+    void finish(bool ok) {
+      poll?.cancel();
+      deadline?.cancel();
+      if (!completer.isCompleted) completer.complete(ok);
+    }
+    deadline = Timer(limit, () => finish(false));
     poll = Timer.periodic(const Duration(milliseconds: 100), (_) {
       if (_disposed) {
-        poll?.cancel();
-        if (!completer.isCompleted) completer.complete();
+        finish(false);
         return;
       }
       final onTarget = _focusValue >= _focusThreshold &&
@@ -420,10 +466,7 @@ class FusionCaptureController extends ChangeNotifier {
             silhouetteState: PadSilhouetteState.locked,
             clearDistanceHint: true,
           ));
-      if (p >= 1.0) {
-        poll?.cancel();
-        if (!completer.isCompleted) completer.complete();
-      }
+      if (p >= 1.0) finish(true);
     });
     return completer.future;
   }
@@ -439,6 +482,7 @@ class FusionCaptureController extends ChangeNotifier {
     await _stopStream();
     var wasFlashLastShot = false;
     for (var i = 0; i < _burstFrameCount; i++) {
+      if (_abortPhase || _disposed) break;
       final wantFlash = i.isOdd;
       try {
         if (wantFlash) {
@@ -503,6 +547,9 @@ class FusionCaptureController extends ChangeNotifier {
       await _shrinkCaptured();
     } on TimeoutException {
       _debug['tiltPhaseTimedOut'] = true;
+      _abortPhase = true;
+    } finally {
+      _abortPhase = false;
     }
   }
 
@@ -533,6 +580,9 @@ class FusionCaptureController extends ChangeNotifier {
       await _shrinkCaptured();
     } on TimeoutException {
       _debug['sweepPhaseTimedOut'] = true;
+      _abortPhase = true;
+    } finally {
+      _abortPhase = false;
     }
   }
 
@@ -553,6 +603,7 @@ class FusionCaptureController extends ChangeNotifier {
     final cam = _camera;
     if (cam == null) return;
     for (var i = 0; i < count; i++) {
+      if (_abortPhase || _disposed) break;
       final key = keyFor(i);
       onStation?.call(i);
       _apply((s) => s.copyWith(
@@ -567,6 +618,7 @@ class FusionCaptureController extends ChangeNotifier {
       // Ambient first, then flash -- flash last so the torch is off again
       // before the next station's cue is shown.
       for (final wantFlash in [false, true]) {
+        if (_abortPhase || _disposed) break;
         try {
           if (wantFlash) {
             await _flash?.activate();
@@ -745,8 +797,21 @@ class FusionCaptureController extends ChangeNotifier {
       await _cameraService.disposeCamera();
     } catch (_) {}
 
-    final uid = FirebaseAuth.instance.currentUser?.uid ??
-        (await FirebaseAuth.instance.signInAnonymously()).user?.uid;
+    // Bounded: an unbounded sign-in is a network call that can hang, and a
+    // hang here strands the session on "Uploading..." with everything
+    // already captured -- the worst possible place to lose a capture.
+    String? uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) {
+      try {
+        final cred = await FirebaseAuth.instance
+            .signInAnonymously()
+            .timeout(_networkTimeout);
+        uid = cred.user?.uid;
+      } catch (e) {
+        _fail('Sign-in failed: $e');
+        return;
+      }
+    }
     if (uid == null) {
       _fail('Sign-in failed');
       return;
@@ -769,21 +834,32 @@ class FusionCaptureController extends ChangeNotifier {
       _apply((s) => s.copyWith(
             statusText: 'Uploading ${done + 1} of ${_shots.length}…',
           ));
-      try {
-        // Normally already shrunk at its phase boundary; this only does
-        // real work if a phase timed out before its shrink pass ran.
-        if (!shot.shrunk) {
-          shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
-          shot.shrunk = true;
-        }
-        await _storage
-            .ref(path)
-            .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
-            .timeout(_uploadTimeout);
-      } catch (e) {
-        debugPrint('[fusion] upload failed ${shot.tag}: $e');
-        continue;
+      // Normally already shrunk at its phase boundary; this only does real
+      // work if a phase timed out before its shrink pass ran.
+      if (!shot.shrunk) {
+        shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+        shot.shrunk = true;
       }
+      // Retry once. Without it a single transient network blip permanently
+      // drops that frame from a 20-frame session -- and with 20 independent
+      // uploads the odds of at least one blip are not small. Production
+      // uses _uploadWithRetry for the same reason.
+      var uploaded = false;
+      for (var attempt = 1; attempt <= 2 && !uploaded; attempt++) {
+        try {
+          await _storage
+              .ref(path)
+              .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
+              .timeout(_uploadTimeout);
+          uploaded = true;
+        } catch (e) {
+          debugPrint('[fusion] upload attempt $attempt failed ${shot.tag}: $e');
+          if (attempt == 2) {
+            _debug['uploadFailed_${shot.tag}'] = e.toString();
+          }
+        }
+      }
+      if (!uploaded) continue;
       done++;
       final meta = <String, dynamic>{
         'path': path,
@@ -840,7 +916,7 @@ class FusionCaptureController extends ChangeNotifier {
         if (sweepShots.isNotEmpty) 'sweepShots': sweepShots,
         'fusionGuideRegions': _guideRegions,
         'fusionDebug': _debug,
-      }, SetOptions(merge: true));
+      }, SetOptions(merge: true)).timeout(_networkTimeout);
 
       // Backend trigger is OFF by default -- see _triggerProductionBackend.
       if (_triggerProductionBackend) {
