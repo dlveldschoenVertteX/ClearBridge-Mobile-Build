@@ -41,20 +41,45 @@ geometric guide with zero awareness of what is actually in frame.
 rotation ignores the `BoxFit.cover` crop/scale — exactly the bug that made
 real captures score single digits until it was found and fixed (NFIQ2 → 72).
 
-## Backend contract: zero production changes
+## Isolation — code AND data
 
-Captures are written with `captureMode: 'front_only_v1'` **on purpose**, so
-the existing deployed backend processes phase 1 normally and yields a real
-baseline score for free. The extra phases ride along in fields the backend
-simply ignores:
+**Code.** Own app id (`com.clearbridge.fusion`, installs alongside the
+others), own pubspec, own gradle, own CI job. `packages/mac_capture` is a
+**read-only** dependency — zero shared files modified. Nothing outside
+`fusion_capture/` imports anything from it.
 
-- `fusionVersion: 'fusion_v1'` — what actually identifies these captures
-- `tiltShots[]`, `sweepShots[]` — extra phase frames
-- `fusionGuideRegions{}` — per-station still-space mask regions
-- `fusionDebug{}` — per-phase timeouts, tilt target angles
+**Data — the part that actually mattered.** An earlier draft wrote
+`captureMode: 'front_only_v1'` so the deployed backend would score phase 1
+for free. That was a real contamination hazard and was removed: this project
+makes decisions from historical capture stats (the 116-capture variant
+win-rate study, the mask-vs-matchability sweeps), and every one of those
+filters on `captureMode == 'front_only_v1'`. Experimental captures landing in
+that population would have skewed the very baseline this experiment is
+measured against.
 
-`captureMode` is left alone precisely so nothing in production has to learn a
-new mode. Offline analysis in `fusion_brain/` reads the extra fields.
+Captures are therefore written as:
+
+- `captureMode: 'fusion_v1'` — cannot be picked up by any existing
+  production query
+- `isExperiment: true` — explicit intent for anything written later
+- `fusionVersion: 'fusion_v1'`
+- `tiltShots[]`, `sweepShots[]`, `fusionGuideRegions{}`, `fusionDebug{}`
+
+`fusion_brain/`'s own analysis also skips any doc carrying `isExperiment` or
+`fusionVersion`, so this experiment cannot contaminate even its own
+baselines.
+
+**The production Cloud Function is not called** (`_triggerProductionBackend
+= false`). With `captureMode: 'fusion_v1'` the backend would not take its
+front_only_v1 path anyway — it would fall through to `_download_best_frames`
+and mix phase-1, tilt and sweep frames into one undifferentiated set.
+Scoring happens offline in `fusion_brain/`, which already runs the real
+production `afis_print.generate()`, so nothing is lost.
+
+**Consequence to expect:** these captures stay at `status: 'pending'`
+forever and never get an NFIQ2 score in the app. That is the correct
+behaviour for an isolated experiment — the score comes from offline
+analysis, not from production.
 
 ## Honest status
 

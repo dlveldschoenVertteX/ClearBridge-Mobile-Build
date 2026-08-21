@@ -262,6 +262,11 @@ def main(limit: int = 4, require_sweep: bool = False, scan: int = 60):
         v = d.to_dict()
         if v.get('status') != 'scored':
             continue
+        # Never let experimental fusion_capture captures into a baseline
+        # population. They are deliberately marked so no analysis -- this
+        # one included -- silently mixes experiment with production.
+        if v.get('isExperiment') or v.get('fusionVersion'):
+            continue
         sweep_paths = (v.get('sweepBurstDebug') or {}).get('paths') or {}
         if require_sweep and not sweep_paths:
             continue

@@ -163,6 +163,23 @@ class FusionCaptureController extends ChangeNotifier {
   static const bool _tiltEnabled = true;
   static const bool _sweepEnabled = true;
 
+  /// Whether to invoke the deployed production Cloud Function on this
+  /// capture. OFF on purpose.
+  ///
+  /// With `captureMode: 'fusion_v1'`, `main.py` does NOT take its
+  /// front_only_v1 path -- it falls through to `_download_best_frames`,
+  /// which lists every blob under basePath and would mix phase-1, tilt and
+  /// sweep frames into one undifferentiated set. That is not a meaningful
+  /// result, and making it meaningful would require a backend change, which
+  /// is precisely what an isolated experiment must not need.
+  ///
+  /// Baselines are computed OFFLINE instead, in fusion_brain/, which already
+  /// runs the real production `afis_print.generate()` against these frames --
+  /// so nothing is lost by leaving production untouched. Flip this on only
+  /// with a deliberate decision about how the backend should treat
+  /// fusion_v1.
+  static const bool _triggerProductionBackend = false;
+
   // ---- phase 1: front hold + burst (values proven in front_only_v1) ----
   static const int _burstFrameCount = 8;
   static const int _burstFlashSettleMs = 70;
@@ -690,15 +707,24 @@ class FusionCaptureController extends ChangeNotifier {
         'userId': uid,
         'captureId': captureId,
         'basePath': basePath,
-        // Deliberately front_only_v1 so the EXISTING production backend
-        // processes the phase-1 burst normally and yields a real baseline
-        // score for free, with zero production changes. The extra phases
-        // ride along in fields the backend simply ignores. fusionVersion is
-        // what actually identifies these captures for offline analysis --
-        // captureMode is left alone precisely so nothing in production has
-        // to learn a new mode.
-        'captureMode': 'front_only_v1',
+        // DATA ISOLATION -- deliberately NOT 'front_only_v1'.
+        //
+        // An earlier draft used front_only_v1 so the deployed backend would
+        // score phase 1 for free. That is a real contamination hazard: this
+        // project makes decisions from historical capture stats (the
+        // 116-capture variant win-rate study, the mask-vs-matchability
+        // sweeps), and every one of those filters on
+        // captureMode == 'front_only_v1'. Experimental captures landing in
+        // that population would silently skew the very numbers used to judge
+        // production -- corrupting the baseline this experiment is supposed
+        // to be measured AGAINST.
+        //
+        // 'fusion_v1' can never be mistaken for a production capture by any
+        // existing query, and isExperiment makes the intent explicit for
+        // anything written later that does not know about fusion at all.
+        'captureMode': 'fusion_v1',
         'fusionVersion': 'fusion_v1',
+        'isExperiment': true,
         'fusionPhases': {
           'front': _frontEnabled,
           'tilt': _tiltEnabled,
@@ -716,18 +742,20 @@ class FusionCaptureController extends ChangeNotifier {
         'fusionDebug': _debug,
       }, SetOptions(merge: true));
 
-      unawaited(FirebaseFunctions.instanceFor(region: 'africa-south1')
-          .httpsCallable('processEnhanceAndScore')
-          .call({
-            'captureId': captureId,
-            'userId': uid,
-            'basePath': basePath,
-            'captureMode': 'front_only_v1',
-          })
-          .catchError((Object e) {
-            debugPrint('[fusion] trigger failed (non-fatal): $e');
-            return null as dynamic;
-          }));
+      // Backend trigger is OFF by default -- see _triggerProductionBackend.
+      if (_triggerProductionBackend) {
+        unawaited(FirebaseFunctions.instanceFor(region: 'africa-south1')
+            .httpsCallable('processEnhanceAndScore')
+            .call({
+              'captureId': captureId,
+              'userId': uid,
+              'basePath': basePath,
+            })
+            .catchError((Object e) {
+              debugPrint('[fusion] trigger failed (non-fatal): $e');
+              return null as dynamic;
+            }));
+      }
 
       _apply((s) => s.copyWith(
             phase: FusionPhase.complete,

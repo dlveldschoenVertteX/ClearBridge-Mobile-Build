@@ -211,6 +211,9 @@ def analyse(cap_id: str, doc: dict) -> Optional[dict]:
 
 
 def main():
+    # NOTE: these are explicit historical capture ids, so experimental
+    # fusion_capture captures (isExperiment: true) can never enter this set
+    # by accident.
     ids = ['353cb00b-a70f-4ce7-9005-6db8e70e3616',
            '3edf5455-0334-4068-b487-63e63b09e749',
            '2927b6bd-0cc1-4f75-bdca-44a0e87f98fc']
