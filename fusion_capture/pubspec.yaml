@@ -38,7 +38,12 @@ dependencies:
   cloud_firestore: ^6.1.3
   firebase_storage: ^13.1.0
   cloud_functions: ^6.0.7
-  sensors_plus: ^6.1.1
+  # NOTE: no sensors_plus here on purpose. mac_capture pins ^4.0.2, and
+  # declaring ^6.1.1 alongside it is an unsatisfiable constraint -- that is
+  # exactly what failed this app's first CI run. It was never used by this
+  # app anyway; if a future phase genuinely needs device motion, declare
+  # ^4.0.2 to match mac_capture (or take it transitively, as
+  # sweep_capture_test does).
 
 dev_dependencies:
   flutter_test:
