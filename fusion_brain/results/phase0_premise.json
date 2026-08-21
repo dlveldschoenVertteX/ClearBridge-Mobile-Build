@@ -1,0 +1,110 @@
+[
+  {
+    "capture": "b615f37b-4fe2-4a08-bb26-833cbb93b115",
+    "rows": [
+      {
+        "source": "front_v1",
+        "total": 109,
+        "corroborated": 82,
+        "unique_in_overlap": 19,
+        "unique_new_coverage": 8
+      },
+      {
+        "source": "focuszone_tip",
+        "total": 121,
+        "corroborated": 86,
+        "unique_in_overlap": 33,
+        "unique_new_coverage": 2
+      },
+      {
+        "source": "focuszone_base",
+        "total": 85,
+        "corroborated": 58,
+        "unique_in_overlap": 20,
+        "unique_new_coverage": 7
+      },
+      {
+        "source": "focuszone_left",
+        "total": 297,
+        "corroborated": 119,
+        "unique_in_overlap": 96,
+        "unique_new_coverage": 82
+      },
+      {
+        "source": "focuszone_right",
+        "total": 302,
+        "corroborated": 168,
+        "unique_in_overlap": 109,
+        "unique_new_coverage": 25
+      },
+      {
+        "source": "macro_cam2",
+        "total": 95,
+        "corroborated": 54,
+        "unique_in_overlap": 31,
+        "unique_new_coverage": 10
+      }
+    ],
+    "registered": [
+      "focuszone_base",
+      "focuszone_left",
+      "focuszone_right",
+      "focuszone_tip",
+      "macro_cam2"
+    ]
+  },
+  {
+    "capture": "f4cb3ba5-d10b-4af5-b29d-ddd462f0b2e0",
+    "rows": [
+      {
+        "source": "front_v1",
+        "total": 161,
+        "corroborated": 135,
+        "unique_in_overlap": 21,
+        "unique_new_coverage": 5
+      },
+      {
+        "source": "focuszone_tip",
+        "total": 129,
+        "corroborated": 83,
+        "unique_in_overlap": 19,
+        "unique_new_coverage": 27
+      },
+      {
+        "source": "focuszone_base",
+        "total": 228,
+        "corroborated": 182,
+        "unique_in_overlap": 43,
+        "unique_new_coverage": 3
+      },
+      {
+        "source": "focuszone_left",
+        "total": 152,
+        "corroborated": 115,
+        "unique_in_overlap": 31,
+        "unique_new_coverage": 6
+      },
+      {
+        "source": "focuszone_right",
+        "total": 277,
+        "corroborated": 209,
+        "unique_in_overlap": 65,
+        "unique_new_coverage": 3
+      },
+      {
+        "source": "macro_cam2",
+        "total": 215,
+        "corroborated": 141,
+        "unique_in_overlap": 69,
+        "unique_new_coverage": 5
+      }
+    ],
+    "registered": [
+      "focuszone_base",
+      "focuszone_left",
+      "focuszone_right",
+      "focuszone_tip",
+      "macro_cam2"
+    ]
+  }
+]
