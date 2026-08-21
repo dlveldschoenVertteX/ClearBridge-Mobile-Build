@@ -238,6 +238,125 @@ jobs:
             print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
           PYEOF
 
+
+  build-fusion-capture:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    # Standalone FUSION architecture build (fusion_capture/) -- a three-phase
+    # session (front burst -> small-angle tilt -> sweep) whose phases each
+    # contribute INDEPENDENT whole-print candidates rather than pixels
+    # blended into one image. Isolated from clearbridge_beta on purpose: four
+    # separate image-space fusion attempts in this project all lost to a
+    # single un-fused candidate on real matchability, so this stays a
+    # research build until it proves itself. If it fails, deleting
+    # fusion_capture/ costs nothing that ships.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-fusion-${{ runner.os }}-${{ hashFiles('fusion_capture/android/**/*.gradle*', 'fusion_capture/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-fusion-${{ runner.os }}-
+
+      - run: flutter pub get
+        working-directory: fusion_capture
+
+      # Static analysis BEFORE the expensive Gradle build (added 2026-08-20,
+      # full-codebase audit). This repo had no analysis and no tests in CI at
+      # all, so the first signal for even a hard compile error was a ~3min
+      # Gradle failure -- exactly how the real
+      # `CameraExtensionCharacteristics.EXTENSION_MACRO` breakage surfaced on
+      # 2026-08-20 (that reference does not exist in the Android SDK; analyze
+      # reports it in seconds). Placed before `flutter build` so a broken
+      # commit fails fast and burns far fewer CI minutes, which this project
+      # actively budgets for.
+      #
+      # Deliberately errors-only (--no-fatal-warnings --no-fatal-infos): the
+      # goal is catching real breakage without a backlog of pre-existing style
+      # lints blocking every build on day one. Tighten later once the warning
+      # backlog is triaged.
+      - name: Analyze (fusion_capture)
+        run: flutter analyze --no-fatal-warnings --no-fatal-infos
+        working-directory: fusion_capture
+
+      - run: flutter build apk --release --target-platform android-arm64
+        working-directory: fusion_capture
+
+      - name: Delete old fusion-capture artifact to free storage quota
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api "repos/${{ github.repository }}/actions/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name == "fusion-capture-apk" and .expired == false) | .id' \
+            2>/dev/null | while read id; do
+            gh api -X DELETE "repos/${{ github.repository }}/actions/artifacts/$id" || true
+          done
+
+      - uses: actions/upload-artifact@v4
+        # See the "build" job's four-angle upload-artifact step for why this
+        # is best-effort: it's not a dependency of the publish steps below.
+        continue-on-error: true
+        with:
+          name: fusion-capture-apk
+          path: fusion_capture/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 7
+
+      - name: Publish fusion-capture APK to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release delete latest-fusion-capture-apk --yes 2>/dev/null || true
+          git push --delete origin latest-fusion-capture-apk 2>/dev/null || true
+          gh release create latest-fusion-capture-apk \
+            --title "Latest Fusion Capture APK (build ${{ github.run_number }})" \
+            --notes "Commit: ${{ github.sha }}" \
+            "fusion_capture/build/app/outputs/flutter-apk/app-release.apk#clearbridge-fusion-capture.apk"
+          echo "Fusion capture: https://github.com/${{ github.repository }}/releases/download/latest-fusion-capture-apk/clearbridge-fusion-capture.apk"
+
+      - name: Upload fusion-capture APK to Firebase Storage
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        run: |
+          pip install google-auth requests --quiet
+          python3 - <<'PYEOF'
+          import json, os, requests, google.auth.transport.requests as gtr
+          from google.oauth2 import service_account
+
+          sa = json.loads(os.environ['FIREBASE_SA_KEY'])
+          creds = service_account.Credentials.from_service_account_info(
+              sa, scopes=['https://www.googleapis.com/auth/cloud-platform'])
+          creds.refresh(gtr.Request())
+          token = creds.token
+          bucket = 'clearbridge-dc699.firebasestorage.app'
+          name = 'clearbridge-fusion-capture-latest.apk'
+          path = 'fusion_capture/build/app/outputs/flutter-apk/app-release.apk'
+
+          with open(path, 'rb') as f:
+            data = f.read()
+          r = requests.post(
+            f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
+            f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
+            headers={'Authorization': f'Bearer {token}',
+                     'Content-Type': 'application/vnd.android.package-archive'},
+            data=data, timeout=120)
+          if r.status_code in (200, 201):
+            print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
+          else:
+            print(f'✗ Upload failed: {r.status_code} {r.text[:100]}')
+          PYEOF
+
   build-clearbridge-beta:
     runs-on: ubuntu-latest
     permissions:
