@@ -110,6 +110,46 @@ class FusionState {
   }
 }
 
+/// Decode width every captured still is downscaled to before upload.
+/// Matches clearbridge_beta's own _stillDecodeTargetWidth (3200).
+const int _kStillDecodeTargetWidth = 3200;
+
+/// Decode + downscale + grayscale-encode one captured still.
+///
+/// The decode MUST run on the main isolate -- decodeStillJpegToLuma uses a
+/// Flutter-engine API (`instantiateImageCodec`) and cannot run inside
+/// `compute()`. Only the encode is offloaded, which is exactly how
+/// clearbridge_beta does it.
+///
+/// Returns the original bytes unchanged on any failure: a decode problem
+/// should cost upload size, never the frame itself.
+Future<Uint8List> _shrinkForUpload(Uint8List jpeg, int sensorOrientation) async {
+  try {
+    final decoded = await decodeStillJpegToLuma(
+      jpeg,
+      sensorOrientation,
+      targetWidth: _kStillDecodeTargetWidth,
+    );
+    if (decoded == null) return jpeg;
+    return await compute(
+      _encodeIsolate,
+      _EncodeArgs(decoded.luma, decoded.width, decoded.height),
+    );
+  } catch (_) {
+    return jpeg;
+  }
+}
+
+class _EncodeArgs {
+  const _EncodeArgs(this.luma, this.width, this.height);
+  final Uint8List luma;
+  final int width;
+  final int height;
+}
+
+Uint8List _encodeIsolate(_EncodeArgs a) =>
+    encodeGrayscaleJpeg(a.luma, a.width, a.height);
+
 class _Shot {
   _Shot({
     required this.jpeg,
@@ -117,7 +157,8 @@ class _Shot {
     required this.flashOn,
     this.exif,
   });
-  final Uint8List jpeg;
+  Uint8List jpeg;          // replaced in-place by _shrinkCaptured()
+  bool shrunk = false;
   final String tag;        // storage/Firestore key, e.g. 'tilt_left_fl'
   final bool flashOn;
   final JpegExposureExif? exif;
@@ -215,6 +256,25 @@ class FusionCaptureController extends ChangeNotifier {
 
   static const Duration _callTimeout = Duration(seconds: 3);
 
+  /// See [_kStillDecodeTargetWidth] -- the single definition of this value.
+  ///
+  /// REAL BUG this fixes (first device test, 2026-08-21): this app uploaded
+  /// raw `takePicture()` bytes with no decode step, so every frame went up
+  /// at FULL sensor resolution in colour -- measured 20-29 MB each, ~420 MB
+  /// for a 20-shot session, at 20-30s per upload. The app sat on
+  /// "Uploading..." for 6+ minutes and looked hung because it effectively
+  /// was. Production never did this: it decodes to single-channel luma at
+  /// this width and re-encodes before upload, which is why its frames are a
+  /// fraction of the size. Same treatment here.
+  // (constant lives at file scope as _kStillDecodeTargetWidth so the
+  // top-level helper and the controller cannot drift apart -- this project
+  // has been burned more than once by one value living in two places.)
+
+  /// Hard bound on a single upload. `putData` is an unbounded await, and an
+  /// upload that stalls with no bound is indistinguishable from a hang --
+  /// the exact failure class this project has hit repeatedly on raw awaits.
+  static const Duration _uploadTimeout = Duration(seconds: 45);
+
   final List<_Shot> _shots = [];
   final Map<String, dynamic> _debug = {};
   final Map<String, Map<String, double>> _guideRegions = {};
@@ -222,6 +282,7 @@ class FusionCaptureController extends ChangeNotifier {
   String? _captureId;
   Size? _screenSize;
   Size? _previewSize;
+  int _sensorOrientation = 90;
   bool _disposed = false;
 
   // live signals from the preview stream
@@ -272,6 +333,7 @@ class FusionCaptureController extends ChangeNotifier {
       }
       final pv = cam.value.previewSize;
       if (pv != null) _previewSize = Size(pv.width, pv.height);
+      _sensorOrientation = cam.description.sensorOrientation;
       _flash = AdaptiveFlashController(cam);
       final mainRegion = _guideRegionFor(PadSilhouetteShape.defaultShape);
       if (mainRegion != null) _guideRegions['main'] = mainRegion;
@@ -311,6 +373,7 @@ class FusionCaptureController extends ChangeNotifier {
       await _awaitHold().timeout(
           const Duration(milliseconds: _frontPhaseTimeoutMs));
       await _fireFrontBurst();
+      await _shrinkCaptured();
     } on TimeoutException {
       // Non-fatal: a hold that never completes should not lose the session.
       // Whatever was captured still uploads, and the phase is marked so the
@@ -437,6 +500,7 @@ class FusionCaptureController extends ChangeNotifier {
               _tiltStations[i].targetAngleDeg;
         },
       ).timeout(const Duration(milliseconds: _tiltPhaseTimeoutMs));
+      await _shrinkCaptured();
     } on TimeoutException {
       _debug['tiltPhaseTimedOut'] = true;
     }
@@ -466,6 +530,7 @@ class FusionCaptureController extends ChangeNotifier {
           if (zr != null) _guideRegions[_sweepStations[i].key] = zr;
         },
       ).timeout(const Duration(milliseconds: _sweepPhaseTimeoutMs));
+      await _shrinkCaptured();
     } on TimeoutException {
       _debug['sweepPhaseTimedOut'] = true;
     }
@@ -543,6 +608,25 @@ class FusionCaptureController extends ChangeNotifier {
       ry: base.ry,
       taper: base.taper,
     );
+  }
+
+  /// Downscale everything captured so far that has not been shrunk yet, and
+  /// release the raw bytes.
+  ///
+  /// Called at the END of each phase rather than after each shot on purpose.
+  /// Doing it inline during the 8-shot burst would insert a decode between
+  /// shots and stretch a ~2s burst to ~10s, letting the finger drift -- which
+  /// defeats the same-pose stacking the burst exists for. Deferring to the
+  /// phase boundary keeps peak memory at ~8 raw frames (the level
+  /// clearbridge_beta already runs at in production) instead of all 20
+  /// (~400 MB at the measured 20-29 MB per frame), which is a real OOM risk
+  /// on a device that is also holding camera buffers.
+  Future<void> _shrinkCaptured() async {
+    for (final shot in _shots) {
+      if (shot.shrunk) continue;
+      shot.jpeg = await _shrinkForUpload(shot.jpeg, _sensorOrientation);
+      shot.shrunk = true;
+    }
   }
 
   // ------------------------------------------------------------------
@@ -674,17 +758,33 @@ class FusionCaptureController extends ChangeNotifier {
     final tiltShots = <Map<String, dynamic>>[];
     final sweepShots = <Map<String, dynamic>>[];
 
+    final sensorOrientation = _sensorOrientation;
+    var done = 0;
     for (final shot in _shots) {
       final path = '$basePath/${shot.tag}.jpg';
+      // Real progress, not a static banner. A 20-shot session is genuinely
+      // slow even downscaled, and "Uploading..." with no counter is
+      // indistinguishable from a hang -- which is exactly how the first
+      // device test read.
+      _apply((s) => s.copyWith(
+            statusText: 'Uploading ${done + 1} of ${_shots.length}…',
+          ));
       try {
-        await _storage.ref(path).putData(
-              shot.jpeg,
-              SettableMetadata(contentType: 'image/jpeg'),
-            );
+        // Normally already shrunk at its phase boundary; this only does
+        // real work if a phase timed out before its shrink pass ran.
+        if (!shot.shrunk) {
+          shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+          shot.shrunk = true;
+        }
+        await _storage
+            .ref(path)
+            .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
+            .timeout(_uploadTimeout);
       } catch (e) {
         debugPrint('[fusion] upload failed ${shot.tag}: $e');
         continue;
       }
+      done++;
       final meta = <String, dynamic>{
         'path': path,
         'tag': shot.tag,
