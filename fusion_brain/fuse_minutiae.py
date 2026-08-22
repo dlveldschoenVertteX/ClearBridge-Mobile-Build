@@ -130,20 +130,48 @@ def fuse(
     anchor: str,
     min_inlier_frac: float = 0.20,
     min_inlier_count: int = 15,
+    max_added: Optional[int] = None,
 ) -> Tuple[List[Minutia], Dict[str, SourceReliability], Dict[str, int]]:
     """Returns (fused minutiae in anchor space, per-source reliability
-    verdicts, per-source count of minutiae actually contributed)."""
+    verdicts, per-source count of minutiae actually contributed).
+
+    `max_added` caps the TOTAL number of new minutiae merged in, keeping the
+    highest-quality ones (mindtct's own per-minutia reliability) across all
+    passing sources. Added after the Stage A ablation
+    (`results/PHASE2_TPS_FINDINGS.md`) measured a real, monotonic
+    dose-response: on the one real capture available, merging the top 10-20
+    new minutiae matched or beat the anchor on both references, while
+    merging all 85 lost on both -- and a random-noise control of the same
+    SIZE cost about the same as the real points did, which says a large part
+    of the penalty is template density itself rather than the quality of
+    what is added.
+
+    None = no cap (the original Phase 1 behaviour, kept so the regression
+    comparison stays exact).
+    """
     reliability = gate_sources(minu, transforms, anchor,
                                min_inlier_frac, min_inlier_count)
     tags = classify(reg_minu, cov)
 
-    fused: List[Minutia] = list(reg_minu[anchor])   # anchor is always kept whole
+    candidates: List[Minutia] = []
     contributed: Dict[str, int] = {}
     for name, verdict in reliability.items():
         if not verdict.passed:
             contributed[name] = 0
             continue
         added = [m for m, tag in tags[name] if tag == 'unique_new_coverage']
-        fused.extend(added)
+        candidates.extend(added)
         contributed[name] = len(added)
+
+    if max_added is not None and len(candidates) > max_added:
+        candidates.sort(key=lambda m: -m.quality)
+        candidates = candidates[:max_added]
+        # Recount per source so the reported contribution reflects what was
+        # actually merged, not what was offered.
+        kept = {}
+        for m in candidates:
+            kept[m.source] = kept.get(m.source, 0) + 1
+        contributed = {k: kept.get(k, 0) for k in contributed}
+
+    fused: List[Minutia] = list(reg_minu[anchor]) + candidates
     return fused, reliability, contributed
