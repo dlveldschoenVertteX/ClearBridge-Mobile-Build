@@ -3,3 +3,4 @@
 # POPIA). The cache is local scratch only; it is rebuilt on demand from
 # Storage by anyone with real credentials.
 results/cache/
+results/cache_fusion_v1/
