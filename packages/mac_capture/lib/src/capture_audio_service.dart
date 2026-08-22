@@ -30,6 +30,8 @@ class CaptureAudioService {
   final List<String> _pipPaths = [];
   String? _sweepStartPath;
   String? _sweepCompletePath;
+  String? _countdownTickPath;
+  String? _countdownGoPath;
 
   // Zone specs: (frequencyHz, pipDurationMs, totalPeriodMs)
   // totalPeriodMs = pip + silence padding; LoopMode.one loops at this rate.
@@ -47,6 +49,7 @@ class CaptureAudioService {
       _finalPlayer  .setAsset('assets/audio/brand_jingle.wav'   ).catchError((_) => null),
       _initBeepFiles(),
       _initCueFiles(),
+      _initCountdownFiles(),
     ]);
   }
 
@@ -90,6 +93,53 @@ class CaptureAudioService {
         frequencyHz: 1500, pipDurationMs: 140, totalDurationMs: 140,
       ));
       _sweepCompletePath = completePath;
+    } catch (_) {}
+  }
+
+  // Pre-capture "3…2…1" countdown (2026-08-22, fusion_capture): a station or
+  // burst previously fired the instant its settle delay elapsed, with no
+  // final cue -- real device feedback was "it just fires without me being
+  // ready". Two distinct synthesized tones, same _generatePip machinery
+  // already proven for the per-zone beep/sweep cues above: a short, neutral
+  // tick for each of "3"/"2"/"1" (identical tone each count -- the on-screen
+  // numeral is what conveys which count it is, not the pitch), then a
+  // brighter, longer tone for the actual shutter moment so "the tick that
+  // means GO" is unmistakably distinct from "one more count to go".
+  Future<void> _initCountdownFiles() async {
+    try {
+      final tmpDir = await getTemporaryDirectory();
+      final tickPath = '${tmpDir.path}/cb_countdown_tick.wav';
+      File(tickPath).writeAsBytesSync(_generatePip(
+        frequencyHz: 900, pipDurationMs: 90, totalDurationMs: 90,
+      ));
+      _countdownTickPath = tickPath;
+      final goPath = '${tmpDir.path}/cb_countdown_go.wav';
+      File(goPath).writeAsBytesSync(_generatePip(
+        frequencyHz: 1500, pipDurationMs: 160, totalDurationMs: 160,
+      ));
+      _countdownGoPath = goPath;
+    } catch (_) {}
+  }
+
+  /// Plays one countdown tick ("3", "2", or "1").
+  Future<void> playCountdownTick() async {
+    final path = _countdownTickPath;
+    if (path == null) return;
+    try {
+      await _cuePlayer.stop();
+      await _cuePlayer.setFilePath(path);
+      unawaited(_cuePlayer.play());
+    } catch (_) {}
+  }
+
+  /// Plays the countdown's final "go" cue, right as the shutter fires.
+  Future<void> playCountdownGo() async {
+    final path = _countdownGoPath;
+    if (path == null) return;
+    try {
+      await _cuePlayer.stop();
+      await _cuePlayer.setFilePath(path);
+      unawaited(_cuePlayer.play());
     } catch (_) {}
   }
 

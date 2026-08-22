@@ -11,6 +11,13 @@ import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart' show HapticFeedback;
 import 'package:mac_capture/mac_capture.dart';
+// Taken transitively via mac_capture (pins ^4.0.2), same as
+// clearbridge_beta's own front_capture_controller.dart -- not declared
+// directly in this app's own pubspec.yaml, matching that established,
+// already-working pattern rather than risking a second, possibly
+// conflicting version constraint (exactly what broke this app's first CI
+// run, for a different package).
+import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 /// Which phase of the fusion session is running.
@@ -63,6 +70,10 @@ class FusionState {
     this.distanceHint,
     this.errorMessage,
     this.captureId,
+    this.countdownValue,
+    this.gyroSteady = true,
+    this.stationIndex,
+    this.stationsDone = 0,
   });
 
   final FusionPhase phase;
@@ -77,6 +88,19 @@ class FusionState {
   final String? distanceHint;
   final String? errorMessage;
   final String? captureId;
+  /// 3, 2, 1, or 0 ("go") during the pre-shutter countdown; null the rest of
+  /// the time. Drives the big pulsing numeral overlay -- see _runCountdown.
+  final int? countdownValue;
+  /// Live gyro-derived phone stability, updated continuously (not just
+  /// during a countdown) so the tilt ring can show real, real-time feedback
+  /// rather than only reacting at the moment of capture.
+  final bool gyroSteady;
+  /// Which station (0-based) is currently active during phase 2/3, for the
+  /// tilt ring's discrete station markers. Null outside a station phase.
+  final int? stationIndex;
+  /// How many stations in the CURRENT phase have fully captured their
+  /// ambient+flash pair -- drives the ring's completed/green markers.
+  final int stationsDone;
 
   FusionState copyWith({
     FusionPhase? phase,
@@ -92,6 +116,12 @@ class FusionState {
     bool clearDistanceHint = false,
     String? errorMessage,
     String? captureId,
+    int? countdownValue,
+    bool clearCountdown = false,
+    bool? gyroSteady,
+    int? stationIndex,
+    bool clearStationIndex = false,
+    int? stationsDone,
   }) {
     return FusionState(
       phase: phase ?? this.phase,
@@ -106,6 +136,10 @@ class FusionState {
       distanceHint: clearDistanceHint ? null : (distanceHint ?? this.distanceHint),
       errorMessage: errorMessage ?? this.errorMessage,
       captureId: captureId ?? this.captureId,
+      countdownValue: clearCountdown ? null : (countdownValue ?? this.countdownValue),
+      gyroSteady: gyroSteady ?? this.gyroSteady,
+      stationIndex: clearStationIndex ? null : (stationIndex ?? this.stationIndex),
+      stationsDone: stationsDone ?? this.stationsDone,
     );
   }
 }
@@ -190,6 +224,7 @@ class FusionCaptureController extends ChangeNotifier {
   final FirebaseFirestore _firestore;
   final FirebaseStorage _storage;
   final HybridCaptureService _hybrid = HybridCaptureService();
+  final CaptureAudioService _audio = CaptureAudioService();
 
   CameraController? get _camera => _cameraService.controller;
   CameraService get cameraService => _cameraService;
@@ -258,6 +293,21 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _sweepSettleMs = 1200;
   static const int _sweepPhaseTimeoutMs = 60000;
 
+  // ---- pre-shutter countdown (real device feedback, 2026-08-22): every
+  // station/burst previously fired the instant positioning finished, with
+  // no final beat for the user to settle -- "it just fires without me
+  // being ready". 700ms/tick matches this project's own already-validated
+  // countdown cadence (front_capture_controller.dart's per-camera capture
+  // sequence, "3…"/"2…"/"1… ~700ms apart"), not a fresh guess. ----
+  static const int _countdownTickMs = 700;
+  static const int _countdownGoHoldMs = 250;
+
+  /// Same steadiness bound front_capture_controller.dart already validates
+  /// (_maxSteadyDegPerSec) -- reused verbatim rather than re-guessed, since
+  /// this is the identical question (is the PHONE moving enough to blur the
+  /// shot right now), just asked continuously here instead of gating a hold.
+  static const double _maxSteadyDegPerSec = 6.0;
+
   /// See [_kStillDecodeTargetWidth] -- the single definition of this value.
   ///
   /// REAL BUG this fixes (first device test, 2026-08-21): this app uploaded
@@ -306,6 +356,12 @@ class FusionCaptureController extends ChangeNotifier {
   double _coverage = 0.0;
   DateTime? _holdStart;
 
+  // live phone-motion signal, independent of the preview stream (device
+  // sensor, not camera frames) -- see _maxSteadyDegPerSec.
+  StreamSubscription<GyroscopeEvent>? _gyroSub;
+  double _gyroMagnitudeDegPerSec = 0.0;
+  bool _gyroSteadyLast = true;
+
   void _apply(FusionState Function(FusionState) f) {
     if (_disposed) return;
     _state = f(_state);
@@ -337,6 +393,29 @@ class FusionCaptureController extends ChangeNotifier {
           guideShape: PadSilhouetteShape.defaultShape,
           captureId: _captureId,
         ));
+
+    unawaited(_audio.init());
+    _gyroSteadyLast = true;
+    _gyroSub ??= gyroscopeEventStream().listen((event) {
+      final degPerSec = math.sqrt(
+            event.x * event.x + event.y * event.y + event.z * event.z,
+          ) *
+          (180.0 / math.pi);
+      _gyroMagnitudeDegPerSec = HybridCaptureService.ema(
+        _gyroMagnitudeDegPerSec,
+        degPerSec,
+        alpha: 0.35,
+      );
+      final steady = _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
+      // Only push a state update when the STEADY/UNSTEADY verdict actually
+      // flips, not on every raw sample -- gyro events arrive far faster
+      // than any UI needs to redraw, and rebuilding on every sample would
+      // just be wasted churn for a value the ring only shows as a colour.
+      if (steady != _gyroSteadyLast) {
+        _gyroSteadyLast = steady;
+        _apply((s) => s.copyWith(gyroSteady: steady));
+      }
+    });
 
     try {
       await _cameraService.initializeCamera();
@@ -404,7 +483,8 @@ class FusionCaptureController extends ChangeNotifier {
       // losing the whole capture.
       await _fireFrontBurst()
           .timeout(const Duration(milliseconds: _burstTimeoutMs));
-      await _shrinkCaptured();
+      // Decode/encode is deferred to _finishAndUpload now (see that
+      // method's own docs) -- no shrink pass here.
     } on TimeoutException {
       // Non-fatal: whatever was captured still uploads, and the phase is
       // marked so offline analysis knows this capture is incomplete rather
@@ -471,9 +551,46 @@ class FusionCaptureController extends ChangeNotifier {
     return completer.future;
   }
 
+  /// "3…2…1" pre-shutter beat: bold pulsing numeral (screen overlay, see
+  /// fusion_capture_screen.dart), a tick + light haptic per count, then a
+  /// distinct "go" tone/haptic right as the shutter is about to fire.
+  ///
+  /// Real device feedback (2026-08-22): every station previously fired the
+  /// instant its settle delay elapsed, with nothing telling the user the
+  /// shutter was about to go -- "it just fires without me being ready".
+  /// This is the fix, shared by the front burst and every tilt/sweep
+  /// station so the whole session has one consistent pre-capture beat, not
+  /// three different conventions.
+  ///
+  /// Deliberately timing-only, not a gyro GATE -- it does not delay or
+  /// re-run itself if the phone is currently unsteady. `state.gyroSteady`
+  /// is already live throughout the whole session (see the gyro listener
+  /// in `start()`) and the ring/banner reflect it in real time regardless
+  /// of the countdown, so the user already has that signal without this
+  /// needing to block on it. Blocking here would reintroduce exactly the
+  /// kind of unpredictable extra delay item 1 (defer processing to the
+  /// end) was about removing.
+  Future<void> _runCountdown() async {
+    for (final n in [3, 2, 1]) {
+      if (_abortPhase || _disposed) return;
+      _apply((s) => s.copyWith(countdownValue: n));
+      unawaited(HapticFeedback.lightImpact());
+      unawaited(_audio.playCountdownTick());
+      await Future<void>.delayed(const Duration(milliseconds: _countdownTickMs));
+    }
+    if (_abortPhase || _disposed) return;
+    _apply((s) => s.copyWith(countdownValue: 0));
+    unawaited(HapticFeedback.mediumImpact());
+    unawaited(_audio.playCountdownGo());
+    await Future<void>.delayed(const Duration(milliseconds: _countdownGoHoldMs));
+    _apply((s) => s.copyWith(clearCountdown: true));
+  }
+
   Future<void> _fireFrontBurst() async {
     final cam = _camera;
     if (cam == null) return;
+    await _runCountdown();
+    if (_abortPhase || _disposed) return;
     _apply((s) => s.copyWith(
           phase: FusionPhase.frontBurst,
           detailText: 'Hold still — capturing',
@@ -530,6 +647,8 @@ class FusionCaptureController extends ChangeNotifier {
           detailText: 'Small tilts reveal the sides of your print',
           silhouetteState: PadSilhouetteState.capturing,
           phaseProgress: 0.0,
+          stationsDone: 0,
+          clearStationIndex: true,
         ));
     try {
       await _runStations(
@@ -544,7 +663,7 @@ class FusionCaptureController extends ChangeNotifier {
               _tiltStations[i].targetAngleDeg;
         },
       ).timeout(const Duration(milliseconds: _tiltPhaseTimeoutMs));
-      await _shrinkCaptured();
+      // Decode/encode is deferred to _finishAndUpload now.
     } on TimeoutException {
       _debug['tiltPhaseTimedOut'] = true;
       _abortPhase = true;
@@ -563,6 +682,8 @@ class FusionCaptureController extends ChangeNotifier {
           statusText: 'Phase 3 of 3 — Texture',
           detailText: 'Follow the guide',
           phaseProgress: 0.0,
+          stationsDone: 0,
+          clearStationIndex: true,
         ));
     try {
       await _runStations(
@@ -577,7 +698,7 @@ class FusionCaptureController extends ChangeNotifier {
           if (zr != null) _guideRegions[_sweepStations[i].key] = zr;
         },
       ).timeout(const Duration(milliseconds: _sweepPhaseTimeoutMs));
-      await _shrinkCaptured();
+      // Decode/encode is deferred to _finishAndUpload now.
     } on TimeoutException {
       _debug['sweepPhaseTimedOut'] = true;
       _abortPhase = true;
@@ -610,9 +731,17 @@ class FusionCaptureController extends ChangeNotifier {
             detailText: cueFor(i),
             guideShape: guideFor(i),
             silhouetteState: PadSilhouetteState.aligning,
+            stationIndex: i,
           ));
       unawaited(HapticFeedback.lightImpact());
       await Future<void>.delayed(Duration(milliseconds: settleMs));
+      if (_abortPhase || _disposed) break;
+
+      // The settle delay above is real repositioning time (the cue/guide
+      // just changed); the countdown is a separate, final "get ready" beat
+      // right before the shutter actually fires -- see _runCountdown.
+      await _runCountdown();
+      if (_abortPhase || _disposed) break;
 
       _apply((s) => s.copyWith(silhouetteState: PadSilhouetteState.capturing));
       // Ambient first, then flash -- flash last so the torch is off again
@@ -644,6 +773,7 @@ class FusionCaptureController extends ChangeNotifier {
             phaseProgress: (i + 1) / count,
             overallProgress: phaseBase + 0.33 * ((i + 1) / count),
             silhouetteState: PadSilhouetteState.locked,
+            stationsDone: i + 1,
           ));
     }
   }
@@ -665,14 +795,14 @@ class FusionCaptureController extends ChangeNotifier {
   /// Downscale everything captured so far that has not been shrunk yet, and
   /// release the raw bytes.
   ///
-  /// Called at the END of each phase rather than after each shot on purpose.
-  /// Doing it inline during the 8-shot burst would insert a decode between
-  /// shots and stretch a ~2s burst to ~10s, letting the finger drift -- which
-  /// defeats the same-pose stacking the burst exists for. Deferring to the
-  /// phase boundary keeps peak memory at ~8 raw frames (the level
-  /// clearbridge_beta already runs at in production) instead of all 20
-  /// (~400 MB at the measured 20-29 MB per frame), which is a real OOM risk
-  /// on a device that is also holding camera buffers.
+  /// Called ONCE, from `_finishAndUpload`, after all three phases are done
+  /// -- not per-phase. It used to run at each phase boundary specifically
+  /// to bound peak memory (~8 raw frames instead of ~20), but real device
+  /// feedback was that the felt pause it caused between phases read as
+  /// resistance mid-session. Still per-shot (never inline during the
+  /// 8-shot burst itself) for the original, still-valid reason: a decode
+  /// between shots would stretch a ~2s burst to ~10s and let the finger
+  /// drift, defeating the same-pose stacking the burst exists for.
   Future<void> _shrinkCaptured() async {
     for (final shot in _shots) {
       if (shot.shrunk) continue;
@@ -789,13 +919,30 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _finishAndUpload() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.uploading,
-          statusText: 'Uploading…',
+          statusText: 'Processing captured images…',
           detailText: '',
           overallProgress: 1.0,
         ));
     try {
       await _cameraService.disposeCamera();
     } catch (_) {}
+
+    // REAL DEVICE FEEDBACK (2026-08-22): decode/encode used to run at the
+    // end of EACH phase (see the phase methods' own "Decode/encode is
+    // deferred" comments) so peak memory stayed bounded to one phase's raw
+    // frames at a time -- but that meant a real, felt pause dropped in
+    // between every phase, mid-session, reading as resistance ("as if
+    // images are processing immediately"). All of it now happens here
+    // instead, in ONE pass, after the user's part of the session is
+    // completely over -- the only place a processing pause is expected
+    // rather than a surprise. Real, deliberate trade: peak memory is now
+    // every raw shot from all three phases at once (front+tilt+sweep, up
+    // to 20 frames) instead of one phase's worth -- accepted because the
+    // pre-shrink build already held a full 20-shot raw session in memory
+    // end-to-end without an OOM (its real failure was upload TIME at full
+    // resolution, never a crash) -- real precedent this is safe on the
+    // device this was tested on, not just an assumption.
+    await _shrinkCaptured();
 
     // Bounded: an unbounded sign-in is a network call that can hang, and a
     // hang here strands the session on "Uploading..." with everything
@@ -948,6 +1095,9 @@ class FusionCaptureController extends ChangeNotifier {
   @override
   void dispose() {
     _disposed = true;
+    unawaited(_gyroSub?.cancel());
+    _gyroSub = null;
+    _audio.dispose();
     unawaited(_cameraService.disposeCamera());
     super.dispose();
   }

@@ -38,12 +38,12 @@ dependencies:
   cloud_firestore: ^6.1.3
   firebase_storage: ^13.1.0
   cloud_functions: ^6.0.7
-  # NOTE: no sensors_plus here on purpose. mac_capture pins ^4.0.2, and
-  # declaring ^6.1.1 alongside it is an unsatisfiable constraint -- that is
-  # exactly what failed this app's first CI run. It was never used by this
-  # app anyway; if a future phase genuinely needs device motion, declare
-  # ^4.0.2 to match mac_capture (or take it transitively, as
-  # sweep_capture_test does).
+  # NOTE: no sensors_plus entry here on purpose, same as sweep_capture_test.
+  # mac_capture already pins ^4.0.2, so it's imported directly
+  # (fusion_capture_controller.dart's gyro listener) as a TRANSITIVE
+  # dependency with no entry of our own -- declaring a second, possibly
+  # different constraint here is exactly what failed this app's first CI
+  # run (^6.1.1 alongside mac_capture's ^4.0.2, unsatisfiable).
 
 dev_dependencies:
   flutter_test:
