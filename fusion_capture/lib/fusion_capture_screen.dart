@@ -80,12 +80,11 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
                   ? s.holdProgress
                   : s.phaseProgress,
             ),
-          // Curated oscillating-8-phase dial, adapted for tilt's discrete
-          // left/tip/right stations (see _TiltRingPainter for why this
-          // isn't a literal ported angle reading) -- centred over the
-          // guide the same way oscillating_capture_screen.dart centres its
-          // own dial, replacing the old text-only instruction for this
-          // phase specifically.
+          // oscillating-8-phase's own angle dial, ported literally now that
+          // the tilt phase tracks a real device angle -- see _TiltRingPanel.
+          // Centred over the guide the same way
+          // oscillating_capture_screen.dart centres its own dial, replacing
+          // the old text-only instruction for this phase specifically.
           if (s.phase == FusionPhase.tilt)
             Center(
               child: Padding(
@@ -394,62 +393,84 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
   }
 }
 
-/// Tilt phase's curated dial -- ported from oscillating_capture_screen.dart's
-/// `_GuidancePanel`/`_BiometricGuidePainter` (same ring chrome: base ring,
-/// 270° track, glowing marker, scan-fill), adapted for what this phase
-/// actually has to show. Oscillating's dial plots a CONTINUOUS measured
-/// angle because the phone physically orbits a stationary thumb, so the
-/// device's own rotation IS the signal. Tilt is the opposite: the phone
-/// stays still and the THUMB tilts (see TiltStation's own docstring --
-/// "nothing on-device can observe how far the user's finger actually
-/// tilted"), so there is no literal angle to plot. What ported instead:
-/// discrete station identity/progress (3 fixed markers, not a swept
-/// pointer) plus a genuinely live, real signal gyro CAN measure -- whether
-/// the PHONE itself is currently steady enough not to blur the shot.
+/// Tilt phase's dial -- ported from oscillating_capture_screen.dart's own
+/// `_GuidancePanel`/`_BiometricGuidePainter`, literally this time. The
+/// earlier "curated" version (discrete station markers, no continuous
+/// angle) was built when the mechanic had the THUMB tilt while the phone
+/// stayed still -- no sensor could track that, so a literal angle dial
+/// would have been lying. Real device feedback asked for oscillating's
+/// actual degree-measure mechanic; FusionCaptureController's tilt phase now
+/// has the PHONE tilt around a stationary thumb instead (see TiltStation's
+/// own docstring), which makes `state.currentAngleDeg` a real,
+/// DeviceOrientationService-measured value -- so this dial can now plot it
+/// honestly, the same way oscillating's own does.
+///
+/// Range is +-20 around each station's OWN target rather than oscillating's
+/// fixed +-20/0 window, since fusion's targets are smaller (~11 degrees,
+/// not 15-20) -- centring the range on the target keeps the same visual
+/// sensitivity oscillating's dial has instead of compressing a smaller real
+/// swing into the same 0-20 window.
 class _TiltRingPanel extends StatelessWidget {
   const _TiltRingPanel({required this.state});
   final FusionState state;
 
+  static const double _rangeHalfWidth = 20.0;
+  static const double _toleranceDeg = 5.0; // matches _tiltHoldToleranceDeg
+
   @override
   Widget build(BuildContext context) {
-    final steady = state.gyroSteady;
+    final target = state.targetAngleDeg;
+    final rangeMin = target - _rangeHalfWidth;
+    final rangeMax = target + _rangeHalfWidth;
+
+    final String deltaText;
+    if (state.onTarget) {
+      deltaText = 'On target ✓';
+    } else {
+      // deltaDeg = current - target. The ring maps higher values
+      // clockwise/right (_BiometricGuidePainter), so deltaDeg > 0 means the
+      // reading is already right of target -- the correction needed is LEFT.
+      final dir = state.deltaDeg > 0 ? 'left' : 'right';
+      deltaText = '${state.deltaDeg.abs().round()}° more $dir';
+    }
+
     final capturing = state.silhouetteState == PadSilhouetteState.capturing;
-    final locked = state.silhouetteState == PadSilhouetteState.locked;
-    final accent = !steady
-        ? CaptureColors.warning
-        : capturing
-            ? CaptureColors.gold
-            : locked
-                ? CaptureColors.success
-                : CaptureColors.cyan;
-    final centreLabel = !steady
-        ? 'HOLD'
-        : capturing
-            ? 'SCAN'
-            : '${state.stationsDone}/3';
+    final accent = state.onTarget ? CaptureColors.success : CaptureColors.cyan;
+    final String centreLabel;
+    if (capturing) {
+      centreLabel = 'SCAN';
+    } else if (state.onTarget) {
+      centreLabel = 'LOCKED';
+    } else {
+      centreLabel = '${state.deltaDeg.abs().round()}°';
+    }
 
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         SizedBox(
-          width: 196,
-          height: 196,
+          width: 208,
+          height: 208,
           child: Stack(
             alignment: Alignment.center,
             children: [
               CustomPaint(
-                size: const Size(196, 196),
+                size: const Size(208, 208),
                 painter: _TiltRingPainter(
-                  activeIndex: state.stationIndex ?? -1,
-                  completedCount: state.stationsDone,
-                  silhouetteState: state.silhouetteState,
-                  steady: steady,
+                  currentDeg: state.currentAngleDeg,
+                  targetDeg: target,
+                  rangeMin: rangeMin,
+                  rangeMax: rangeMax,
+                  toleranceDeg: _toleranceDeg,
+                  onTarget: state.onTarget,
+                  progress: state.holdProgress,
+                  capturing: capturing,
                 ),
               ),
               Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  Icon(Icons.fingerprint, size: 42, color: accent),
+                  Icon(Icons.fingerprint, size: 46, color: accent),
                   const SizedBox(height: 2),
                   Text(
                     centreLabel,
@@ -465,15 +486,42 @@ class _TiltRingPanel extends StatelessWidget {
             ],
           ),
         ),
-        const SizedBox(height: 12),
+        const SizedBox(height: 10),
         Text(
-          !steady ? 'HOLD PHONE STEADY' : state.detailText,
+          deltaText,
           textAlign: TextAlign.center,
           style: TextStyle(
-            color: !steady ? CaptureColors.warning : Colors.white,
-            fontSize: 19,
+            color: state.onTarget ? CaptureColors.success : Colors.white,
+            fontSize: 20,
             fontWeight: FontWeight.w700,
-            height: 1.3,
+          ),
+        ),
+        if (capturing) ...[
+          const SizedBox(height: 4),
+          Text(
+            'Capturing…',
+            style: TextStyle(
+              color: CaptureColors.gold,
+              fontSize: 11,
+              fontWeight: FontWeight.w700,
+              letterSpacing: 1.2,
+            ),
+          ),
+        ] else if (state.onTarget) ...[
+          const SizedBox(height: 4),
+          const Text(
+            'Hold steady…',
+            style: TextStyle(color: Colors.white70, fontSize: 11),
+          ),
+        ],
+        const SizedBox(height: 10),
+        Text(
+          state.tooFast
+              ? 'Speed: ⚠ SLOW DOWN'
+              : 'Speed: ${state.angularVelocityDegPerSec.round()}°/sec',
+          style: TextStyle(
+            color: state.tooFast ? CaptureColors.warning : CaptureColors.silverDim,
+            fontSize: 11,
           ),
         ),
       ],
@@ -481,33 +529,44 @@ class _TiltRingPanel extends StatelessWidget {
   }
 }
 
+/// Ported verbatim from oscillating_capture_screen.dart's own
+/// `_BiometricGuidePainter` -- same track geometry, same lock-zone/scan-fill/
+/// marker rendering. Only the constructor's field names changed to match
+/// this file's own state shape.
 class _TiltRingPainter extends CustomPainter {
   const _TiltRingPainter({
-    required this.activeIndex,
-    required this.completedCount,
-    required this.silhouetteState,
-    required this.steady,
+    required this.currentDeg,
+    required this.targetDeg,
+    required this.rangeMin,
+    required this.rangeMax,
+    required this.toleranceDeg,
+    required this.onTarget,
+    required this.progress,
+    required this.capturing,
   });
 
-  final int activeIndex; // -1 before the first station starts
-  final int completedCount;
-  final PadSilhouetteState silhouetteState;
-  final bool steady;
+  final double currentDeg;
+  final double targetDeg;
+  final double rangeMin;
+  final double rangeMax;
+  final double toleranceDeg;
+  final bool onTarget;
+  final double progress; // 0..1 scan fill
+  final bool capturing;
 
-  // Identical track geometry to oscillating's own _BiometricGuidePainter --
-  // a 270° arc centred on straight-up, leaving the bottom 90° open.
+  // Alignment track spans 270°, centred on straight-up: from 135° left of
+  // top to 135° right of top. In canvas radians (0 = 3 o'clock, +CW), that
+  // is -225° (=-1.25pi) sweeping +270° (=1.5pi).
   static const double _trackStart = -1.25 * math.pi;
   static const double _trackSweep = 1.5 * math.pi;
-  // Left -> tip/up -> right, evenly spaced along that same track -- matches
-  // the cue order (left, up, right) so the marker sequence visibly travels
-  // the direction the instructions imply, even without a continuous
-  // measured angle behind it.
-  static const List<double> _stationT = [0.0, 0.5, 1.0];
 
-  double _angleForT(double t) => _trackStart + t * _trackSweep;
+  double _canvasAngle(double phi) {
+    final t = ((phi - rangeMin) / (rangeMax - rangeMin)).clamp(0.0, 1.0);
+    return _trackStart + t * _trackSweep;
+  }
 
-  Offset _pointAt(Offset c, double r, double t) {
-    final a = _angleForT(t);
+  Offset _pointAt(Offset c, double r, double phi) {
+    final a = _canvasAngle(phi);
     return c + Offset(math.cos(a), math.sin(a)) * r;
   }
 
@@ -516,15 +575,8 @@ class _TiltRingPainter extends CustomPainter {
     final center = Offset(size.width / 2, size.height / 2);
     final radius = math.min(size.width, size.height) / 2 - 14;
     final rect = Rect.fromCircle(center: center, radius: radius);
-    final capturing = silhouetteState == PadSilhouetteState.capturing;
-    final locked = silhouetteState == PadSilhouetteState.locked;
-    final live = !steady
-        ? CaptureColors.warning
-        : capturing
-            ? CaptureColors.gold
-            : locked
-                ? CaptureColors.success
-                : CaptureColors.cyan;
+    final lock = CaptureColors.success;
+    final live = onTarget ? lock : CaptureColors.cyan;
 
     canvas.drawCircle(
       center,
@@ -547,51 +599,56 @@ class _TiltRingPainter extends CustomPainter {
         ..strokeCap = StrokeCap.round,
     );
 
-    // Scan-fill: a full ring glow while the shot pair is actually firing --
-    // echoes oscillating's own "scan" fill language for the one moment
-    // that's genuinely a scan here too.
-    if (capturing) {
+    final loA = _canvasAngle((targetDeg - toleranceDeg).clamp(rangeMin, rangeMax));
+    final hiA = _canvasAngle((targetDeg + toleranceDeg).clamp(rangeMin, rangeMax));
+    canvas.drawArc(
+      rect,
+      loA,
+      hiA - loA,
+      false,
+      Paint()
+        ..color = live.withValues(alpha: onTarget ? 0.9 : 0.5)
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 10
+        ..strokeCap = StrokeCap.round,
+    );
+
+    if (progress > 0) {
       canvas.drawArc(
         rect,
         -math.pi / 2,
-        2 * math.pi,
+        2 * math.pi * progress.clamp(0.0, 1.0),
         false,
         Paint()
-          ..color = CaptureColors.gold.withValues(alpha: 0.55)
+          ..color = capturing ? CaptureColors.gold : lock
           ..style = PaintingStyle.stroke
           ..strokeWidth = 4
           ..strokeCap = StrokeCap.round,
       );
     }
 
-    for (var i = 0; i < 3; i++) {
-      final pt = _pointAt(center, radius, _stationT[i]);
-      final done = i < completedCount;
-      final active = i == activeIndex && !done;
-      final color = done ? CaptureColors.success : (active ? live : CaptureColors.silverDim);
-      if (active) {
-        canvas.drawCircle(pt, 15, Paint()..color = color.withValues(alpha: 0.25));
-      }
-      canvas.drawCircle(
-        pt,
-        active ? 9 : 6,
-        Paint()..color = color.withValues(alpha: done || active ? 1.0 : 0.6),
-      );
-      canvas.drawCircle(
-        pt,
-        active ? 9 : 6,
-        Paint()
-          ..color = CaptureColors.void_
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2,
-      );
-    }
+    final overshoot = (rangeMax - rangeMin) * 0.15;
+    final markDeg = currentDeg.clamp(rangeMin - overshoot, rangeMax + overshoot);
+    final markPt = _pointAt(center, radius, markDeg);
+    canvas.drawCircle(markPt, 11, Paint()..color = live.withValues(alpha: 0.28));
+    canvas.drawCircle(markPt, 6, Paint()..color = live);
+    canvas.drawCircle(
+      markPt,
+      6,
+      Paint()
+        ..color = CaptureColors.void_
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
   }
 
   @override
   bool shouldRepaint(_TiltRingPainter old) =>
-      old.activeIndex != activeIndex ||
-      old.completedCount != completedCount ||
-      old.silhouetteState != silhouetteState ||
-      old.steady != steady;
+      old.currentDeg != currentDeg ||
+      old.targetDeg != targetDeg ||
+      old.rangeMin != rangeMin ||
+      old.rangeMax != rangeMax ||
+      old.onTarget != onTarget ||
+      old.progress != progress ||
+      old.capturing != capturing;
 }

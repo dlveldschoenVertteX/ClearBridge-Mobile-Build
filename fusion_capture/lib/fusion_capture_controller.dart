@@ -33,17 +33,41 @@ enum FusionPhase {
   error,
 }
 
+/// Which Euler component of [RelativeOrientation] a tilt station's
+/// targetAngleDeg is measured against. Identical convention to
+/// oscillating_capture_controller.dart's `_AngleAxis`: LEFT/RIGHT are a
+/// left-right pan (device Y axis = pitch); TIP is a nose-up/down tilt
+/// (device X axis = roll) -- a physically different motion, ported as its
+/// own axis rather than (as this project has been burned by before) reusing
+/// pitch for a motion that isn't actually a pitch.
+enum TiltAxis { pitch, roll }
+
 /// One tilt station. `cue` is what the user is asked to do; `key` is the
-/// Firestore/Storage tag. Angle is the DESIGN TARGET, not a measurement --
-/// nothing on-device can observe how far the user's finger actually tilted
-/// (device sensors see the phone, not the finger), so the achieved angle is
-/// only recoverable offline by registering the captured frame against the
-/// face-on anchor. Recorded here as intent, never asserted as fact.
+/// Firestore/Storage tag.
+///
+/// REAL DEVICE FEEDBACK (2026-08-22): the original design had the THUMB
+/// tilt while the phone stayed still, on the reasoning that device sensors
+/// "see the phone, not the finger" -- true, but it meant `targetAngleDeg`
+/// was pure design intent with no live signal to guide the user to it or to
+/// confirm they'd reached it, which is exactly what the feedback flagged
+/// ("still a little off... there is a degree measure... before capture is
+/// taken"). Ported oscillating_8phase's own real mechanic instead: the
+/// PHONE tilts around a stationary thumb, and the device's own fused
+/// orientation sensor (`DeviceOrientationService`, already built, already
+/// wired into this app's own MainActivity.kt) becomes a genuine live signal
+/// -- the same one oscillating already uses in production. targetAngleDeg
+/// is now a real, live-trackable target, not just intent. Values kept at
+/// this project's own real fusion_brain measurement (~11 degrees -- more
+/// tilt is not better, see fusion_brain/results/PHASE0B_TILT_FINDINGS.md),
+/// not oscillating's larger 15-20 degree targets -- the "only difference"
+/// from the ported mechanic, per direct instruction.
 class TiltStation {
-  const TiltStation(this.key, this.cue, this.targetAngleDeg);
+  const TiltStation(this.key, this.cue, this.targetAngleDeg,
+      {this.axis = TiltAxis.pitch});
   final String key;
   final String cue;
   final double targetAngleDeg;
+  final TiltAxis axis;
 }
 
 /// One sweep station: the guide translates to `progress` (0=left, 1=right)
@@ -74,6 +98,11 @@ class FusionState {
     this.gyroSteady = true,
     this.stationIndex,
     this.stationsDone = 0,
+    this.currentAngleDeg = 0.0,
+    this.targetAngleDeg = 0.0,
+    this.deltaDeg = 0.0,
+    this.angularVelocityDegPerSec = 0.0,
+    this.tooFast = false,
   });
 
   final FusionPhase phase;
@@ -101,6 +130,16 @@ class FusionState {
   /// How many stations in the CURRENT phase have fully captured their
   /// ambient+flash pair -- drives the ring's completed/green markers.
   final int stationsDone;
+  /// Live DeviceOrientationService reading for the ACTIVE tilt station's own
+  /// axis (pitch or roll) -- the real, continuously-updated angle the tilt
+  /// ring now plots, ported from oscillating_capture_controller.dart's own
+  /// currentAngleDeg/targetAngleDeg/deltaDeg. Meaningful only during
+  /// FusionPhase.tilt; 0 elsewhere.
+  final double currentAngleDeg;
+  final double targetAngleDeg;
+  final double deltaDeg; // currentAngleDeg - targetAngleDeg, signed
+  final double angularVelocityDegPerSec;
+  final bool tooFast;
 
   FusionState copyWith({
     FusionPhase? phase,
@@ -122,6 +161,11 @@ class FusionState {
     int? stationIndex,
     bool clearStationIndex = false,
     int? stationsDone,
+    double? currentAngleDeg,
+    double? targetAngleDeg,
+    double? deltaDeg,
+    double? angularVelocityDegPerSec,
+    bool? tooFast,
   }) {
     return FusionState(
       phase: phase ?? this.phase,
@@ -140,6 +184,11 @@ class FusionState {
       gyroSteady: gyroSteady ?? this.gyroSteady,
       stationIndex: clearStationIndex ? null : (stationIndex ?? this.stationIndex),
       stationsDone: stationsDone ?? this.stationsDone,
+      currentAngleDeg: currentAngleDeg ?? this.currentAngleDeg,
+      targetAngleDeg: targetAngleDeg ?? this.targetAngleDeg,
+      deltaDeg: deltaDeg ?? this.deltaDeg,
+      angularVelocityDegPerSec: angularVelocityDegPerSec ?? this.angularVelocityDegPerSec,
+      tooFast: tooFast ?? this.tooFast,
     );
   }
 }
@@ -225,6 +274,17 @@ class FusionCaptureController extends ChangeNotifier {
   final FirebaseStorage _storage;
   final HybridCaptureService _hybrid = HybridCaptureService();
   final CaptureAudioService _audio = CaptureAudioService();
+  /// Real device orientation for the tilt phase's angle dial -- same
+  /// service oscillating_capture_controller.dart already uses in
+  /// production. Reads Android's GAME_ROTATION_VECTOR sensor over the
+  /// `clearbridge/orientation` EventChannel, already registered in this
+  /// app's own MainActivity.kt (present since this app's own scaffold --
+  /// confirmed before relying on it, not assumed).
+  final DeviceOrientationService _orientation = DeviceOrientationService();
+  Timer? _tiltAnglePoll;
+  double _tiltAngularVelocity = 0.0;
+  double _tiltLastAngle = 0.0;
+  DateTime? _tiltLastAngleAt;
 
   CameraController? get _camera => _cameraService.controller;
   CameraService get cameraService => _cameraService;
@@ -270,19 +330,41 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _burstTimeoutMs = 45000;
 
   // ---- phase 2: tilt stations ----
-  // ~10-12 degrees, NOT 15-18. Measured on real multi-angle data
-  // (fusion_brain Phase 0b): a -11.8 deg frame contributed 107 new edge
-  // minutiae vs 87 at -17.0 deg -- more tilt is not better, because added
-  // perspective distortion eventually costs more than the extra revealed
-  // surface. A face-on CONTROL frame contributed 4, which is what makes the
-  // effect geometric rather than frame-to-frame noise.
+  // ~10-12 degrees, NOT 15-18 (oscillating's own LEFT/RIGHT targets).
+  // Measured on real multi-angle data (fusion_brain Phase 0b): a -11.8 deg
+  // frame contributed 107 new edge minutiae vs 87 at -17.0 deg -- more tilt
+  // is not better, because added perspective distortion eventually costs
+  // more than the extra revealed surface. A face-on CONTROL frame
+  // contributed 4, which is what makes the effect geometric rather than
+  // frame-to-frame noise. This is the "only difference" from oscillating's
+  // own mechanic per direct instruction -- everything else about how a
+  // station is reached and confirmed (live angle tracking, hold-to-lock,
+  // axis convention) is ported as-is; see TiltStation's own docstring for
+  // why the mechanic itself changed this round. tilt_tip's axis/sign
+  // matches oscillating's own real, already-validated TOP convention
+  // (roll, negative = phone tilts DOWN = camera looks up over the tip)
+  // rather than a fresh guess.
   static const List<TiltStation> _tiltStations = [
-    TiltStation('tilt_left', 'Roll thumb slightly LEFT', -11.0),
-    TiltStation('tilt_tip', 'Roll thumb slightly UP (toward tip)', 11.0),
-    TiltStation('tilt_right', 'Roll thumb slightly RIGHT', 11.0),
+    TiltStation('tilt_left', 'Tilt phone LEFT', -11.0),
+    TiltStation('tilt_tip', 'Tilt phone DOWN, looking over your thumb tip',
+        -11.0, axis: TiltAxis.roll),
+    TiltStation('tilt_right', 'Tilt phone RIGHT', 11.0),
   ];
-  static const int _tiltSettleMs = 1400;   // real time to reposition
+  // Reused verbatim from oscillating_capture_controller.dart -- real,
+  // already-validated numbers, not re-guessed for this smaller-angle
+  // context. Honest caveat: validated at oscillating's own 15-20 degree
+  // targets, not yet confirmed at fusion's smaller ~11 degree ones -- a
+  // 5 degree tolerance is a bigger fraction of an 11 degree target than of
+  // a 20 degree one. Flagged, not tuned blind; the next real device test
+  // is what confirms whether this needs its own calibration.
+  static const double _tiltHoldToleranceDeg = 5.0;
+  static const double _tiltMaxAngularVelocityDegPerSec = 30.0;
   static const int _tiltPhaseTimeoutMs = 60000;
+  /// Live angle poll rate. Independent of the camera's own image stream --
+  /// DeviceOrientationService reads a separate sensor channel
+  /// (GAME_ROTATION_VECTOR), so this does not need a live camera frame to
+  /// sample, unlike oscillating's own per-camera-frame sampling.
+  static const int _tiltPollMs = 60;
 
   // ---- phase 3: sweep stations ----
   static const List<SweepStation> _sweepStations = [
@@ -395,6 +477,7 @@ class FusionCaptureController extends ChangeNotifier {
         ));
 
     unawaited(_audio.init());
+    _orientation.start();
     _gyroSteadyLast = true;
     _gyroSub ??= gyroscopeEventStream().listen((event) {
       final degPerSec = math.sqrt(
@@ -474,6 +557,13 @@ class FusionCaptureController extends ChangeNotifier {
       final held = await _awaitHold(
           const Duration(milliseconds: _frontPhaseTimeoutMs));
       if (!held) _debug['frontHoldTimedOut'] = true;
+      // Zero the tilt phase's orientation reference to whatever pose the
+      // phone is actually in right now -- the same timing
+      // oscillating_capture_controller.dart uses (captureReference() at its
+      // own FRONT calibration). This is the user's natural hold, so every
+      // later tilt target is measured relative to how THEY actually hold
+      // the phone, not an arbitrary app-launch orientation.
+      _orientation.captureReference();
       // The BURST needs its own bound too. Previously only the hold was
       // wrapped, leaving 8 raw takePicture() calls completely unprotected --
       // and this file's sibling in clearbridge_beta documents exactly why
@@ -640,36 +730,171 @@ class FusionCaptureController extends ChangeNotifier {
   // phase 2 -- small-angle tilt
   // ------------------------------------------------------------------
 
+  /// Ported from oscillating_capture_controller.dart's own running-phase
+  /// mechanic (`_handleBurstFrame` + its `_BurstStep` model), not the
+  /// discrete-station design this phase shipped with earlier this session.
+  /// Real device feedback: the earlier UI showed WHICH station was active
+  /// but nothing tracked whether the user had actually reached it -- "there
+  /// is a degree measure when you tilt... before capture is taken" in
+  /// oscillating, and this phase had no equivalent. `_orientation` (real
+  /// device sensor, zeroed at the front hold -- see _runFrontPhase) now
+  /// makes that literally true here too: each station is a real hold-until-
+  /// locked at a live-tracked target angle, exactly like an oscillating
+  /// burst step, just at this project's own smaller ~11 degree targets
+  /// (fusion_brain Phase 0b) instead of oscillating's 15-20.
+  ///
+  /// Deliberately NOT ported: oscillating's CV-classifier confirmation and
+  /// per-pose refocus-on-arrival. Neither exists in this app yet (no
+  /// trained angle classifier, no wired AF refocus call) and neither was
+  /// asked for -- the ask was the degree measure and hold-to-lock mechanic,
+  /// which this delivers with the same live sensor oscillating itself uses.
   Future<void> _runTiltPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.tilt,
           statusText: 'Phase 2 of 3 — Edge detail',
           detailText: 'Small tilts reveal the sides of your print',
-          silhouetteState: PadSilhouetteState.capturing,
+          silhouetteState: PadSilhouetteState.aligning,
+          guideShape: PadSilhouetteShape.defaultShape,
           phaseProgress: 0.0,
           stationsDone: 0,
           clearStationIndex: true,
         ));
+    final cam = _camera;
+    if (cam == null) return;
+    _tiltAngularVelocity = 0.0;
+    _tiltLastAngleAt = null;
     try {
-      await _runStations(
-        count: _tiltStations.length,
-        settleMs: _tiltSettleMs,
-        phaseBase: 0.33,
-        cueFor: (i) => _tiltStations[i].cue,
-        keyFor: (i) => _tiltStations[i].key,
-        guideFor: (i) => PadSilhouetteShape.defaultShape,
-        onStation: (i) {
-          _debug['${_tiltStations[i].key}_targetAngleDeg'] =
-              _tiltStations[i].targetAngleDeg;
-        },
-      ).timeout(const Duration(milliseconds: _tiltPhaseTimeoutMs));
+      for (var i = 0; i < _tiltStations.length; i++) {
+        if (_abortPhase || _disposed) break;
+        final station = _tiltStations[i];
+        _debug['${station.key}_targetAngleDeg'] = station.targetAngleDeg;
+        _tiltLastAngleAt = null; // crossing stations can change axis -- see
+        // oscillating's own _lastAxis handling; drop the stale sample so it
+        // can't register as a bogus angular-velocity spike.
+        _apply((s) => s.copyWith(
+              detailText: station.cue,
+              silhouetteState: PadSilhouetteState.aligning,
+              stationIndex: i,
+              targetAngleDeg: station.targetAngleDeg,
+            ));
+        final held = await _awaitTiltAngleHold(station)
+            .timeout(const Duration(milliseconds: _tiltPhaseTimeoutMs));
+        if (!held) {
+          _debug['${station.key}_holdTimedOut'] = true;
+          continue; // best-effort -- move on to the next station rather
+          // than losing the whole phase over one unreached angle.
+        }
+        if (_abortPhase || _disposed) break;
+
+        await _runCountdown();
+        if (_abortPhase || _disposed) break;
+
+        _apply((s) => s.copyWith(silhouetteState: PadSilhouetteState.capturing));
+        for (final wantFlash in [false, true]) {
+          if (_abortPhase || _disposed) break;
+          try {
+            if (wantFlash) {
+              await _flash?.activate();
+              await Future<void>.delayed(
+                  const Duration(milliseconds: _burstFlashSettleMs));
+            }
+            final x = await cam.takePicture();
+            final bytes = await x.readAsBytes();
+            _shots.add(_Shot(
+              jpeg: bytes,
+              tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
+              flashOn: wantFlash,
+              exif: parseJpegExposureExif(bytes),
+            ));
+          } catch (e) {
+            debugPrint('[fusion] tilt station ${station.key} flash=$wantFlash failed: $e');
+          } finally {
+            if (wantFlash) await _flash?.deactivate();
+          }
+        }
+        unawaited(HapticFeedback.heavyImpact());
+        _apply((s) => s.copyWith(
+              phaseProgress: (i + 1) / _tiltStations.length,
+              overallProgress: 0.33 + 0.33 * ((i + 1) / _tiltStations.length),
+              silhouetteState: PadSilhouetteState.locked,
+              stationsDone: i + 1,
+            ));
+      }
       // Decode/encode is deferred to _finishAndUpload now.
     } on TimeoutException {
       _debug['tiltPhaseTimedOut'] = true;
       _abortPhase = true;
     } finally {
+      _tiltAnglePoll?.cancel();
+      _tiltAnglePoll = null;
       _abortPhase = false;
     }
+  }
+
+  /// Polls the real device angle on [station]'s own axis until it has sat
+  /// within [_tiltHoldToleranceDeg] of the target for [_holdDurationMs],
+  /// mirroring oscillating_capture_controller.dart's `_handleBurstFrame`.
+  /// Owns its own Completer/Timer the same way `_awaitHold` does, so a
+  /// caller-side `.timeout()` can stop WAITING without leaving the poll
+  /// loop running in the background fighting the next station's UI.
+  Future<bool> _awaitTiltAngleHold(TiltStation station) {
+    final completer = Completer<bool>();
+    DateTime? holdStart;
+    _tiltAnglePoll?.cancel();
+    void finish(bool ok) {
+      _tiltAnglePoll?.cancel();
+      _tiltAnglePoll = null;
+      if (!completer.isCompleted) completer.complete(ok);
+    }
+
+    _tiltAnglePoll = Timer.periodic(const Duration(milliseconds: _tiltPollMs), (_) {
+      if (_disposed || _abortPhase) {
+        finish(false);
+        return;
+      }
+      final orient = _orientation.relativeOrientation();
+      final angle = station.axis == TiltAxis.roll ? orient.roll : orient.pitch;
+
+      final now = DateTime.now();
+      if (_tiltLastAngleAt != null) {
+        final dt = now.difference(_tiltLastAngleAt!).inMicroseconds / 1e6;
+        if (dt > 0.001) {
+          final raw = (angle - _tiltLastAngle).abs() / dt;
+          _tiltAngularVelocity = HybridCaptureService.ema(_tiltAngularVelocity, raw, alpha: 0.35);
+        }
+      }
+      _tiltLastAngle = angle;
+      _tiltLastAngleAt = now;
+
+      final dist = (angle - station.targetAngleDeg).abs();
+      final tooFast = _tiltAngularVelocity > _tiltMaxAngularVelocityDegPerSec;
+
+      if (dist <= _tiltHoldToleranceDeg && !tooFast) {
+        holdStart ??= DateTime.now();
+        final heldMs = DateTime.now().difference(holdStart!).inMilliseconds;
+        final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
+        _apply((s) => s.copyWith(
+              currentAngleDeg: angle,
+              deltaDeg: angle - station.targetAngleDeg,
+              onTarget: true,
+              holdProgress: progress,
+              angularVelocityDegPerSec: _tiltAngularVelocity,
+              tooFast: false,
+            ));
+        if (heldMs >= _holdDurationMs) finish(true);
+      } else {
+        holdStart = null;
+        _apply((s) => s.copyWith(
+              currentAngleDeg: angle,
+              deltaDeg: angle - station.targetAngleDeg,
+              onTarget: false,
+              holdProgress: 0.0,
+              angularVelocityDegPerSec: _tiltAngularVelocity,
+              tooFast: tooFast,
+            ));
+      }
+    });
+    return completer.future;
   }
 
   // ------------------------------------------------------------------
@@ -971,43 +1196,90 @@ class FusionCaptureController extends ChangeNotifier {
     final sweepShots = <Map<String, dynamic>>[];
 
     final sensorOrientation = _sensorOrientation;
-    var done = 0;
-    for (final shot in _shots) {
-      final path = '$basePath/${shot.tag}.jpg';
-      // Real progress, not a static banner. A 20-shot session is genuinely
-      // slow even downscaled, and "Uploading..." with no counter is
-      // indistinguishable from a hang -- which is exactly how the first
-      // device test read.
-      _apply((s) => s.copyWith(
-            statusText: 'Uploading ${done + 1} of ${_shots.length}…',
-          ));
+
+    // REAL DEVICE BUG (2026-08-22, capture ffb1682f): the front burst -- the
+    // one anchor this whole experiment cannot function without -- uploaded
+    // 0/8 frames, EVERY one hitting the full 45s timeout on BOTH retry
+    // attempts (a contiguous ~12-minute dead stretch: 8 shots x 2 attempts x
+    // 45s), while every later tilt/sweep shot on the SAME capture uploaded
+    // cleanly once the loop reached them. Root cause of the old shape: retry
+    // was PER-SHOT (try, wait up to 45s, retry, wait up to 45s again, THEN
+    // move to the next shot) -- so a transient connectivity gap at the START
+    // of the loop burns the entire retry budget of every shot unlucky enough
+    // to be first, one at a time, before the loop ever reaches a shot that
+    // would have succeeded once the network recovered. Restructured into two
+    // passes ACROSS all shots instead: pass 1 tries every shot once with a
+    // short timeout, so a bad stretch is discovered quickly rather than paid
+    // for per-shot; pass 2 retries only what failed, after a short backoff,
+    // with the full timeout. A transient outage now costs one fast pass
+    // through the whole batch, not 90s+ multiplied by however many shots
+    // happen to go first -- and specifically protects the front anchor from
+    // being wiped out by bad luck in upload order.
+    const firstPassTimeout = Duration(seconds: 20);
+    const retryBackoff = Duration(seconds: 3);
+
+    Future<bool> attemptUpload(_Shot shot, Duration timeout) async {
       // Normally already shrunk at its phase boundary; this only does real
       // work if a phase timed out before its shrink pass ran.
       if (!shot.shrunk) {
         shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
         shot.shrunk = true;
       }
-      // Retry once. Without it a single transient network blip permanently
-      // drops that frame from a 20-frame session -- and with 20 independent
-      // uploads the odds of at least one blip are not small. Production
-      // uses _uploadWithRetry for the same reason.
-      var uploaded = false;
-      for (var attempt = 1; attempt <= 2 && !uploaded; attempt++) {
-        try {
-          await _storage
-              .ref(path)
-              .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
-              .timeout(_uploadTimeout);
-          uploaded = true;
-        } catch (e) {
-          debugPrint('[fusion] upload attempt $attempt failed ${shot.tag}: $e');
-          if (attempt == 2) {
-            _debug['uploadFailed_${shot.tag}'] = e.toString();
-          }
+      final path = '$basePath/${shot.tag}.jpg';
+      try {
+        await _storage
+            .ref(path)
+            .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
+            .timeout(timeout);
+        return true;
+      } catch (e) {
+        debugPrint('[fusion] upload failed ${shot.tag}: $e');
+        _debug['uploadFailed_${shot.tag}'] = e.toString();
+        return false;
+      }
+    }
+
+    final uploadedTags = <String>{};
+    var done = 0;
+    final total = _shots.length;
+
+    // Pass 1: one fast attempt per shot, in order.
+    final failedFirstPass = <_Shot>[];
+    for (final shot in _shots) {
+      _apply((s) => s.copyWith(
+            statusText: 'Uploading ${done + 1} of $total…',
+          ));
+      final ok = await attemptUpload(shot, firstPassTimeout);
+      if (ok) {
+        uploadedTags.add(shot.tag);
+        done++;
+        _debug.remove('uploadFailed_${shot.tag}');
+      } else {
+        failedFirstPass.add(shot);
+      }
+    }
+
+    // Pass 2: retry only failures, after a short backoff -- by now whatever
+    // transient condition caused pass 1's failures has had real time to
+    // clear -- with the full, longer timeout for genuinely slow links.
+    if (failedFirstPass.isNotEmpty) {
+      await Future.delayed(retryBackoff);
+      for (final shot in failedFirstPass) {
+        _apply((s) => s.copyWith(
+              statusText: 'Retrying upload ${done + 1} of $total…',
+            ));
+        final ok = await attemptUpload(shot, _uploadTimeout);
+        if (ok) {
+          uploadedTags.add(shot.tag);
+          done++;
+          _debug.remove('uploadFailed_${shot.tag}');
         }
       }
-      if (!uploaded) continue;
-      done++;
+    }
+
+    for (final shot in _shots) {
+      if (!uploadedTags.contains(shot.tag)) continue;
+      final path = '$basePath/${shot.tag}.jpg';
       final meta = <String, dynamic>{
         'path': path,
         'tag': shot.tag,
@@ -1097,6 +1369,9 @@ class FusionCaptureController extends ChangeNotifier {
     _disposed = true;
     unawaited(_gyroSub?.cancel());
     _gyroSub = null;
+    _tiltAnglePoll?.cancel();
+    _tiltAnglePoll = null;
+    _orientation.dispose();
     _audio.dispose();
     unawaited(_cameraService.disposeCamera());
     super.dispose();
