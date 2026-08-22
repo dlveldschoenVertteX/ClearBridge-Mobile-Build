@@ -20,23 +20,47 @@ class FusionCaptureScreen extends StatefulWidget {
   State<FusionCaptureScreen> createState() => _FusionCaptureScreenState();
 }
 
-class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
+class _FusionCaptureScreenState extends State<FusionCaptureScreen>
+    with TickerProviderStateMixin {
   late final FusionCaptureController _controller;
   bool _started = false;
+
+  // Scan line through the guide during the front-phase burst -- ported
+  // directly from front_capture_screen.dart's own `_scanAnim` (real device
+  // feedback there: the secondary-camera phase had no visible motion at
+  // all, no way to tell the app was doing anything; front_only_v1's front
+  // phase already has this cue, so this phase should keep it).
+  late final AnimationController _scanAnim;
+  bool _wasBursting = false;
 
   @override
   void initState() {
     super.initState();
     _controller = FusionCaptureController();
     _controller.addListener(_onChanged);
+    _scanAnim = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 2000),
+    );
   }
 
-  void _onChanged() => setState(() {});
+  void _onChanged() {
+    final bursting = _controller.state.phase == FusionPhase.frontBurst;
+    if (bursting && !_wasBursting) {
+      _scanAnim.repeat(reverse: true);
+    } else if (!bursting && _wasBursting) {
+      _scanAnim.stop();
+      _scanAnim.value = 0;
+    }
+    _wasBursting = bursting;
+    setState(() {});
+  }
 
   @override
   void dispose() {
     _controller.removeListener(_onChanged);
     _controller.dispose();
+    _scanAnim.dispose();
     super.dispose();
   }
 
@@ -63,9 +87,55 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
     }
   }
 
+  bool _isFrontPhase(FusionPhase p) =>
+      p == FusionPhase.frontHold || p == FusionPhase.frontBurst;
+
   @override
   Widget build(BuildContext context) {
     final s = _controller.state;
+    final size = MediaQuery.of(context).size;
+    final isFrontPhase = _isFrontPhase(s.phase);
+    final isBursting = s.phase == FusionPhase.frontBurst;
+
+    // 270x270 ring centred at cy=0.37 -- matches front_only_v1's own ring
+    // geometry exactly (PadSilhouetteShape.defaultShape.cy), so a real
+    // front_only_v1 user sees the identical layout here.
+    const ringD = 270.0;
+    const ringR = ringD / 2;
+    final ringCx = size.width / 2;
+    final ringCy = size.height * 0.37;
+    final ringLeft = ringCx - ringR;
+    final ringTop = ringCy - ringR;
+    const meterW = 40.0;
+    const meterH = 180.0;
+    const meterGap = 10.0;
+    final meterTop = ringCy - meterH / 2;
+    final brightLeft = ringLeft - meterGap - meterW;
+    final focusLeft = ringLeft + ringD + meterGap;
+
+    // Ring progress/colour -- ported from front_capture_screen.dart's own
+    // _ringState.
+    final double ringProgress;
+    final Color ringColor;
+    if (isBursting) {
+      ringProgress = s.phaseProgress;
+      ringColor = CaptureColors.silverBright;
+    } else if (s.phase == FusionPhase.frontHold && s.onTarget) {
+      ringProgress = s.holdProgress;
+      ringColor = CaptureColors.cyan;
+    } else {
+      ringProgress = 0.0;
+      ringColor = CaptureColors.cyan;
+    }
+
+    // Same 30% cutoff front_only_v1's own low-quality warning uses,
+    // gated the same way (holding phase only, so it can't misfire before
+    // the thumb is even placed).
+    final lowQuality = s.phase == FusionPhase.frontHold &&
+        (s.lightingValue < 0.30 || s.focusValue < 0.30);
+    final brightWarn = lowQuality && s.lightingValue < 0.30;
+    final focusWarn = lowQuality && s.focusValue < 0.30;
+
     return Scaffold(
       backgroundColor: CaptureColors.void_,
       body: Stack(
@@ -76,10 +146,113 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
             CapturePadSilhouetteOverlay(
               state: s.silhouetteState,
               shape: s.guideShape ?? PadSilhouetteShape.defaultShape,
-              progress: s.phase == FusionPhase.frontHold
-                  ? s.holdProgress
-                  : s.phaseProgress,
+              // Front phase suppresses the overlay's own built-in boundary
+              // arc (progress=0) in favour of the external circular ring
+              // below -- byte-for-byte the same choice front_only_v1's own
+              // screen makes ("the new external ring replaces it").
+              progress: isFrontPhase ? 0 : s.phaseProgress,
             ),
+          // Front phase: 270x270 external progress ring + BRIGHT/FOCUS
+          // vertical meters + burst scan line/counter/dots + confirmation
+          // banner -- a direct port of front_only_v1's own capture screen,
+          // laid out identically around the same guide geometry.
+          if (isFrontPhase) ...[
+            Positioned(
+              left: ringLeft,
+              top: ringTop,
+              child: _FusionRing(progress: ringProgress, color: ringColor),
+            ),
+            Positioned(
+              left: brightLeft,
+              top: meterTop,
+              child: _FusionVerticalMeter(
+                value: s.lightingValue,
+                color: CaptureColors.gold,
+                icon: Icons.wb_sunny_outlined,
+                label: 'BRIGHT',
+                warning: brightWarn,
+              ),
+            ),
+            Positioned(
+              left: focusLeft,
+              top: meterTop,
+              child: _FusionVerticalMeter(
+                value: s.focusValue,
+                color: CaptureColors.cyan,
+                icon: Icons.center_focus_strong_outlined,
+                label: 'FOCUS',
+                warning: focusWarn,
+              ),
+            ),
+            if (isBursting)
+              Positioned.fill(
+                child: IgnorePointer(
+                  child: AnimatedBuilder(
+                    animation: _scanAnim,
+                    builder: (_, __) {
+                      final lineY = ringTop + 16 + (ringD - 32) * _scanAnim.value;
+                      return Stack(children: [
+                        Positioned(
+                          top: lineY,
+                          left: ringLeft + 20,
+                          width: ringD - 40,
+                          height: 2,
+                          child: const DecoratedBox(
+                            decoration: BoxDecoration(
+                              gradient: LinearGradient(
+                                colors: [
+                                  Colors.transparent,
+                                  Color(0x9900BFFF),
+                                  Color(0xFF00BFFF),
+                                  Color(0x9900BFFF),
+                                  Colors.transparent,
+                                ],
+                                stops: [0.0, 0.2, 0.5, 0.8, 1.0],
+                              ),
+                            ),
+                          ),
+                        ),
+                      ]);
+                    },
+                  ),
+                ),
+              ),
+            if (isBursting) ...[
+              Positioned(
+                top: ringTop + 20,
+                left: ringLeft,
+                width: ringD,
+                child: Text(
+                  '${(s.phaseProgress * 8).ceil()} / 8',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 12,
+                    fontWeight: FontWeight.w700,
+                    color: CaptureColors.silverBright,
+                    letterSpacing: 1.0,
+                  ),
+                ),
+              ),
+              Positioned(
+                top: ringTop + ringD - 34,
+                left: ringLeft,
+                width: ringD,
+                child: _FusionBurstDots(filled: (s.phaseProgress * 8).ceil(), total: 8),
+              ),
+            ],
+            if (s.confirmationText != null)
+              Positioned(
+                top: ringTop - 60,
+                left: 40,
+                right: 40,
+                child: _FusionConfirmationBanner(
+                  text: s.confirmationText!,
+                  lightingValue: s.lightingValue,
+                  focusValue: s.focusValue,
+                ),
+              ),
+          ],
           // oscillating-8-phase's own angle dial, ported literally now that
           // the tilt phase tracks a real device angle -- see _TiltRingPanel.
           // Centred over the guide the same way
@@ -97,6 +270,15 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
               children: [
                 _header(s),
                 const Spacer(),
+                if (lowQuality)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 10),
+                    child: _FusionWarningRow(
+                      text: focusWarn
+                          ? 'Hold steadier — image is too soft'
+                          : 'Move to better light — image is too dark',
+                    ),
+                  ),
                 if (s.distanceHint != null && _showGuide(s.phase))
                   _distanceBanner(s.distanceHint!),
                 _instruction(s),
@@ -230,8 +412,13 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen> {
   Widget _instruction(FusionState s) {
     // The tilt ring panel (centred over the guide) already carries this
     // same cue text below its dial -- showing it a second time at the
-    // bottom was the "only text" complaint's other half.
-    if (s.detailText.isEmpty || s.phase == FusionPhase.tilt) {
+    // bottom was the "only text" complaint's other half. Sweep's own real
+    // cue text lives entirely in the distanceHint banner now (see
+    // _runSweepStations), matching the real sweep architecture's own
+    // single-message design -- showing detailText too would duplicate it.
+    if (s.detailText.isEmpty ||
+        s.phase == FusionPhase.tilt ||
+        s.phase == FusionPhase.sweep) {
       return const SizedBox.shrink();
     }
     return Padding(
@@ -651,4 +838,322 @@ class _TiltRingPainter extends CustomPainter {
       old.onTarget != onTarget ||
       old.progress != progress ||
       old.capturing != capturing;
+}
+
+// ── Front phase: ported directly from clearbridge_beta's own
+// front_capture_screen.dart, per real device feedback that this phase
+// should look exactly like front_only_v1, not a stripped-down version of
+// it. Same ring geometry, same meter design, same burst counter/dots,
+// same confirmation banner shape -- only the field names differ
+// (FusionState's lightingValue/focusValue/confirmationText instead of
+// FrontCaptureState's). One approximation, disclosed rather than silent:
+// front_only_v1 renders its mono counter/percentage text via GoogleFonts'
+// JetBrains Mono; this app has no google_fonts dependency (deliberately --
+// see this app's own pubspec.yaml note on why a second, possibly
+// conflicting package constraint is worth avoiding here), so those spots
+// use the platform's plain monospace font family instead. Visually close,
+// not byte-identical.
+
+class _FusionRing extends StatelessWidget {
+  const _FusionRing({required this.progress, required this.color});
+  final double progress;
+  final Color color;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _FusionRingPainter(progress: progress, color: color),
+      size: const Size(270, 270),
+    );
+  }
+}
+
+class _FusionRingPainter extends CustomPainter {
+  const _FusionRingPainter({required this.progress, required this.color});
+  final double progress;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    const strokeW = 14.0;
+    final r = cx - strokeW / 2 - 2;
+    final rect = Rect.fromCircle(center: Offset(cx, cy), radius: r);
+
+    canvas.drawArc(
+      rect,
+      0,
+      math.pi * 2,
+      false,
+      Paint()
+        ..color = color.withValues(alpha: 0.12)
+        ..strokeWidth = strokeW
+        ..style = PaintingStyle.stroke,
+    );
+
+    if (progress > 0) {
+      canvas.drawArc(
+        rect,
+        -math.pi / 2,
+        math.pi * 2 * progress.clamp(0.0, 1.0),
+        false,
+        Paint()
+          ..color = color
+          ..strokeWidth = strokeW
+          ..style = PaintingStyle.stroke
+          ..strokeCap = StrokeCap.round,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(_FusionRingPainter old) =>
+      old.progress != progress || old.color != color;
+}
+
+class _FusionVerticalMeter extends StatelessWidget {
+  const _FusionVerticalMeter({
+    required this.value,
+    required this.color,
+    required this.icon,
+    required this.label,
+    this.warning = false,
+  });
+  final double value;
+  final Color color;
+  final IconData icon;
+  final String label;
+  final bool warning;
+
+  @override
+  Widget build(BuildContext context) {
+    final v = value.clamp(0.0, 1.0);
+    final activeColor = warning ? CaptureColors.warning : color;
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        SizedBox(
+          width: 40,
+          height: 180,
+          child: Stack(
+            alignment: Alignment.topCenter,
+            children: [
+              Positioned.fill(
+                child: CustomPaint(
+                  painter: _FusionMeterPainter(value: v, color: activeColor),
+                ),
+              ),
+              Padding(
+                padding: const EdgeInsets.only(top: 2),
+                child: Container(
+                  padding: const EdgeInsets.all(3),
+                  decoration: BoxDecoration(
+                    color: CaptureColors.void_.withValues(alpha: 0.85),
+                    shape: BoxShape.circle,
+                  ),
+                  child: Icon(icon, color: activeColor.withValues(alpha: 0.85), size: 14),
+                ),
+              ),
+            ],
+          ),
+        ),
+        const SizedBox(height: 6),
+        Text(
+          label,
+          style: const TextStyle(
+            color: CaptureColors.silverDim,
+            fontSize: 8,
+            fontWeight: FontWeight.w700,
+            letterSpacing: 0.8,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          '${(v * 100).round()}%',
+          style: const TextStyle(
+            fontFamily: 'monospace',
+            fontSize: 11,
+            fontWeight: FontWeight.w600,
+            color: CaptureColors.silver,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _FusionMeterPainter extends CustomPainter {
+  const _FusionMeterPainter({required this.value, required this.color});
+  final double value;
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const trackW = 6.0;
+    final cx = size.width / 2;
+    final track = RRect.fromRectAndRadius(
+      Rect.fromLTWH(cx - trackW / 2, 0, trackW, size.height),
+      const Radius.circular(3),
+    );
+    canvas.drawRRect(track, Paint()..color = CaptureColors.steel);
+
+    final fillH = size.height * value;
+    if (fillH > 0) {
+      final fillRect = RRect.fromRectAndRadius(
+        Rect.fromLTWH(cx - trackW / 2, size.height - fillH, trackW, fillH),
+        const Radius.circular(3),
+      );
+      canvas.drawRRect(fillRect, Paint()..color = color.withValues(alpha: 0.55));
+    }
+
+    final handleY = (size.height - fillH).clamp(8.0, size.height - 8.0);
+    final handleCenter = Offset(cx, handleY);
+    canvas.drawCircle(handleCenter, 8, Paint()..color = color.withValues(alpha: 0.25));
+    canvas.drawCircle(handleCenter, 5.5, Paint()..color = CaptureColors.silverBright);
+    canvas.drawCircle(
+      handleCenter,
+      5.5,
+      Paint()
+        ..color = color
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 2,
+    );
+  }
+
+  @override
+  bool shouldRepaint(_FusionMeterPainter old) =>
+      old.value != value || old.color != color;
+}
+
+class _FusionBurstDots extends StatelessWidget {
+  const _FusionBurstDots({required this.filled, required this.total});
+  final int filled;
+  final int total;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisAlignment: MainAxisAlignment.center,
+      children: List.generate(total, (i) {
+        final on = i < filled;
+        return Container(
+          margin: const EdgeInsets.symmetric(horizontal: 3),
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(
+            shape: BoxShape.circle,
+            color: on
+                ? CaptureColors.silverBright
+                : CaptureColors.silverBright.withValues(alpha: 0.22),
+            boxShadow: on
+                ? [
+                    BoxShadow(
+                      color: CaptureColors.silverBright.withValues(alpha: 0.7),
+                      blurRadius: 6,
+                    ),
+                  ]
+                : null,
+          ),
+        );
+      }),
+    );
+  }
+}
+
+class _FusionConfirmationBanner extends StatelessWidget {
+  const _FusionConfirmationBanner({
+    required this.text,
+    required this.lightingValue,
+    required this.focusValue,
+  });
+  final String text;
+  final double lightingValue;
+  final double focusValue;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 10),
+            decoration: BoxDecoration(
+              color: CaptureColors.success.withValues(alpha: 0.16),
+              borderRadius: BorderRadius.circular(100),
+              border: Border.all(color: CaptureColors.success.withValues(alpha: 0.50)),
+            ),
+            child: Text(
+              text,
+              style: const TextStyle(
+                color: CaptureColors.success,
+                fontSize: 15,
+                fontWeight: FontWeight.w700,
+              ),
+            ),
+          ),
+          if (text == '✓ Captured') ...[
+            const SizedBox(height: 10),
+            Row(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  'BRIGHT ${(lightingValue.clamp(0.0, 1.0) * 100).round()}%',
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: CaptureColors.silverDim,
+                  ),
+                ),
+                const SizedBox(width: 14),
+                Text(
+                  'FOCUS ${(focusValue.clamp(0.0, 1.0) * 100).round()}%',
+                  style: const TextStyle(
+                    fontFamily: 'monospace',
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: CaptureColors.silverDim,
+                  ),
+                ),
+              ],
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
+class _FusionWarningRow extends StatelessWidget {
+  const _FusionWarningRow({required this.text});
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    const color = CaptureColors.warning;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withValues(alpha: 0.30)),
+      ),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          const Icon(Icons.info_outline, color: color, size: 14),
+          const SizedBox(width: 6),
+          Flexible(
+            child: Text(
+              text,
+              textAlign: TextAlign.center,
+              style: const TextStyle(color: color, fontSize: 12),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
 }

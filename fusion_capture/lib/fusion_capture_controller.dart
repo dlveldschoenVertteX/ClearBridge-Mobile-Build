@@ -103,6 +103,10 @@ class FusionState {
     this.deltaDeg = 0.0,
     this.angularVelocityDegPerSec = 0.0,
     this.tooFast = false,
+    this.lightingValue = 0.5,
+    this.focusValue = 0.0,
+    this.confirmationText,
+    this.zoneCaptureFlash = false,
   });
 
   final FusionPhase phase;
@@ -140,6 +144,30 @@ class FusionState {
   final double deltaDeg; // currentAngleDeg - targetAngleDeg, signed
   final double angularVelocityDegPerSec;
   final bool tooFast;
+  /// Mean ROI luma, 0..1 -- the SAME underlying signal already driving the
+  /// coverage-based distance gate (see `_coverage` on the controller; this
+  /// app's fixed-size guide never separately measures "is a thumb actually
+  /// in frame" the way front_only_v1's real coverage signal does, so one
+  /// mean-luma reading serves both jobs). Surfaced under its own name here
+  /// because that is the accurate description of what it measures --
+  /// front_only_v1's own BRIGHT meter is this exact same computation.
+  final double lightingValue;
+  /// Peak-normalised live sharpness -- same definition as front_only_v1's
+  /// own FOCUS meter (front_capture_controller.dart's `focusValue` getter).
+  final double focusValue;
+  /// Front-phase-only confirmation banner text (e.g. '✓ Captured'), ported
+  /// from front_only_v1's own `confirmationText` field/pattern -- null the
+  /// rest of the time.
+  final String? confirmationText;
+  /// Sweep phase only: true for the real duration of a zone's shutter
+  /// sequence, false while the guide is translating/settling between zones.
+  /// Ported from the real sweep architecture's own `zoneCaptureFlash` field
+  /// (sweep_capture_test's SweepCaptureController/SweepTestState) -- flips
+  /// the guide to its green/locked highlight during capture, gold otherwise,
+  /// replacing a verbal countdown per that architecture's own real,
+  /// already-validated design (removed the countdown entirely, 2026-08-14,
+  /// "allow the camera to pick up if thumb is in mask").
+  final bool zoneCaptureFlash;
 
   FusionState copyWith({
     FusionPhase? phase,
@@ -166,6 +194,11 @@ class FusionState {
     double? deltaDeg,
     double? angularVelocityDegPerSec,
     bool? tooFast,
+    double? lightingValue,
+    double? focusValue,
+    String? confirmationText,
+    bool clearConfirmationText = false,
+    bool? zoneCaptureFlash,
   }) {
     return FusionState(
       phase: phase ?? this.phase,
@@ -189,6 +222,12 @@ class FusionState {
       deltaDeg: deltaDeg ?? this.deltaDeg,
       angularVelocityDegPerSec: angularVelocityDegPerSec ?? this.angularVelocityDegPerSec,
       tooFast: tooFast ?? this.tooFast,
+      lightingValue: lightingValue ?? this.lightingValue,
+      focusValue: focusValue ?? this.focusValue,
+      confirmationText: clearConfirmationText
+          ? null
+          : (confirmationText ?? this.confirmationText),
+      zoneCaptureFlash: zoneCaptureFlash ?? this.zoneCaptureFlash,
     );
   }
 }
@@ -367,12 +406,26 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _tiltPollMs = 60;
 
   // ---- phase 3: sweep stations ----
+  // Real device feedback (2026-08-22): this phase should look exactly like
+  // the real sweep architecture (sweep_capture_test's own
+  // SweepCaptureController) -- ported its own real, validated timing
+  // constants and mechanic (animated glide + content-driven readiness gate
+  // + zoneCaptureFlash, no countdown) rather than the generic snap+settle
+  // this phase used before. See _runSweepStations for the full mechanic.
   static const List<SweepStation> _sweepStations = [
     SweepStation('sweep_left', 0.0),
     SweepStation('sweep_center', 0.5),
     SweepStation('sweep_right', 1.0),
   ];
-  static const int _sweepSettleMs = 1200;
+  /// Guide glide duration between zones -- matches the real architecture's
+  /// own `_zoneMoveMs`.
+  static const int _sweepZoneMoveMs = 1400;
+  /// Content-driven per-zone readiness gate bounds -- matches the real
+  /// architecture's own `_zoneReadyMinWaitMs`/`_zoneReadyMaxWaitMs`, reusing
+  /// this phase's shared `_focusThreshold` (same relative-sharpness signal,
+  /// same 0.45 threshold already validated for the front hold).
+  static const int _sweepZoneReadyMinWaitMs = 300;
+  static const int _sweepZoneReadyMaxWaitMs = 1400;
   static const int _sweepPhaseTimeoutMs = 60000;
 
   // ---- pre-shutter countdown (real device feedback, 2026-08-22): every
@@ -444,10 +497,25 @@ class FusionCaptureController extends ChangeNotifier {
   double _gyroMagnitudeDegPerSec = 0.0;
   bool _gyroSteadyLast = true;
 
-  void _apply(FusionState Function(FusionState) f) {
+  // Throttle for high-frequency callers (the per-frame lighting/focus meter
+  // push from _onFrame) -- same "force param, else throttle" pattern
+  // front_capture_controller.dart's own _apply already uses, ported rather
+  // than reinvented. Every other call site in this file (hold/tilt/station
+  // polls, phase transitions) already fires at a naturally bounded rate, so
+  // they pass force: true and are unaffected.
+  DateTime? _lastEmitAt;
+  static const int _emitThrottleMs = 120;
+
+  void _apply(FusionState Function(FusionState) f, {bool force = false}) {
     if (_disposed) return;
     _state = f(_state);
-    notifyListeners();
+    final now = DateTime.now();
+    if (force ||
+        _lastEmitAt == null ||
+        now.difference(_lastEmitAt!).inMilliseconds >= _emitThrottleMs) {
+      _lastEmitAt = now;
+      notifyListeners();
+    }
   }
 
   void _fail(String message) {
@@ -724,6 +792,17 @@ class FusionCaptureController extends ChangeNotifier {
           ));
     }
     await _flash?.deactivate();
+    // Front-only-v1's own visual confirmation the instant the burst
+    // finishes ('✓ Captured' + a BRIGHT/FOCUS readout of the conditions it
+    // was shot under) -- ported directly rather than leaving this phase's
+    // completion silent. Dwells briefly so it's actually seen before the
+    // tilt phase's own cue replaces it (cleared explicitly there).
+    unawaited(HapticFeedback.mediumImpact());
+    _apply((s) => s.copyWith(
+          confirmationText: '✓ Captured',
+          silhouetteState: PadSilhouetteState.locked,
+        ), force: true);
+    await Future<void>.delayed(const Duration(milliseconds: 700));
   }
 
   // ------------------------------------------------------------------
@@ -758,6 +837,7 @@ class FusionCaptureController extends ChangeNotifier {
           phaseProgress: 0.0,
           stationsDone: 0,
           clearStationIndex: true,
+          clearConfirmationText: true,
         ));
     final cam = _camera;
     if (cam == null) return;
@@ -905,70 +985,148 @@ class FusionCaptureController extends ChangeNotifier {
     _apply((s) => s.copyWith(
           phase: FusionPhase.sweep,
           statusText: 'Phase 3 of 3 — Texture',
-          detailText: 'Follow the guide',
+          // Sweep's own real cue text lives entirely in distanceHint (see
+          // _runSweepStations) -- detailText is left at whatever the tilt
+          // phase last set, harmlessly, since the screen suppresses the
+          // bottom instruction text for this phase (matching how it
+          // already suppresses it for tilt, for the same "one banner, not
+          // two" reason).
           phaseProgress: 0.0,
           stationsDone: 0,
           clearStationIndex: true,
+          zoneCaptureFlash: false,
+          guideShape: _sweepGuideFor(_sweepStations[0]),
         ));
+    // Real sweep architecture keeps the preview stream open for the WHOLE
+    // zone loop so its content-driven readiness gate has a live signal --
+    // see _runSweepStations. This is a fresh open on top of an
+    // already-initialised camera controller (front phase already opened
+    // and cleanly closed its own stream on this exact controller earlier
+    // in the same session), not a reopen of a still-active session -- the
+    // documented real ANR this project hit (2026-07-30) was from
+    // reopening an image stream MID-sweep, which this is not.
+    await _startStream();
     try {
-      await _runStations(
-        count: _sweepStations.length,
-        settleMs: _sweepSettleMs,
-        phaseBase: 0.66,
-        cueFor: (i) => 'Follow the guide',
-        keyFor: (i) => _sweepStations[i].key,
-        guideFor: (i) => _sweepGuideFor(_sweepStations[i]),
-        onStation: (i) {
-          final zr = _guideRegionFor(_sweepGuideFor(_sweepStations[i]));
-          if (zr != null) _guideRegions[_sweepStations[i].key] = zr;
-        },
-      ).timeout(const Duration(milliseconds: _sweepPhaseTimeoutMs));
+      await _runSweepStations()
+          .timeout(const Duration(milliseconds: _sweepPhaseTimeoutMs));
       // Decode/encode is deferred to _finishAndUpload now.
     } on TimeoutException {
       _debug['sweepPhaseTimedOut'] = true;
       _abortPhase = true;
     } finally {
       _abortPhase = false;
+      await _stopStream();
     }
   }
 
-  /// Shared station loop for phases 2 and 3: cue -> settle -> ambient+flash
-  /// pair. Both phases capture a real PAIR at each station, because
-  /// flash-minus-ambient is what lets the backend separate near-camera skin
-  /// from background (torch falloff ~ distance^2) -- without a pair, a
-  /// candidate can only ever be scored against the bare geometric guide.
-  Future<void> _runStations({
-    required int count,
-    required int settleMs,
-    required double phaseBase,
-    required String Function(int) cueFor,
-    required String Function(int) keyFor,
-    required PadSilhouetteShape Function(int) guideFor,
-    void Function(int)? onStation,
-  }) async {
+  /// Real sweep-architecture hint text per zone, matching
+  /// sweep_capture_test's own SweepCaptureController phrasing verbatim --
+  /// the actual "sweep architecture we built" this phase is meant to look
+  /// like.
+  String _sweepHintFor(SweepStation z) {
+    switch (z.key) {
+      case 'sweep_left':
+        return 'Slowly move left';
+      case 'sweep_right':
+        return 'Slowly move right';
+      default:
+        return 'Slowly move to the middle';
+    }
+  }
+
+  /// Sweep-phase zone loop, ported from the real sweep architecture's own
+  /// zone loop (sweep_capture_test/lib/sweep_capture_controller.dart)
+  /// rather than the generic snap-to-position + fixed-settle-and-countdown
+  /// this phase used before. Real device feedback asked for this phase to
+  /// "look exactly like the sweep architecture we built" -- and that
+  /// architecture's visual identity IS this loop: the guide glides
+  /// continuously between zones (never snaps), a content-driven readiness
+  /// gate replaces any fixed wait, and the guide flips to its green
+  /// "locked" highlight (zoneCaptureFlash) only for the real duration of a
+  /// zone's own shutter sequence -- not a verbal countdown, which that
+  /// architecture's own real history explicitly REMOVED (2026-08-14,
+  /// "allow the camera to pick up if thumb is in mask").
+  ///
+  /// Deliberately narrower than the full real controller: no torch EV
+  /// curve, no gyro motion gate, no live wavelength distance gate, no
+  /// second ambient stacking shot -- those are capture-QUALITY mechanics
+  /// this phase's existing flash handling and the shared phase timeouts
+  /// already cover reasonably, and porting them is a materially bigger
+  /// lift than what was asked (visual/UX parity with the real
+  /// architecture). If real device data ever shows this phase needs them,
+  /// port from the same source file.
+  Future<void> _runSweepStations() async {
     final cam = _camera;
     if (cam == null) return;
-    for (var i = 0; i < count; i++) {
+    for (var i = 0; i < _sweepStations.length; i++) {
       if (_abortPhase || _disposed) break;
-      final key = keyFor(i);
-      onStation?.call(i);
+      final station = _sweepStations[i];
+      final zr = _guideRegionFor(_sweepGuideFor(station));
+      if (zr != null) _guideRegions[station.key] = zr;
+
+      // Animated glide from wherever the guide last was to this zone --
+      // the real architecture's own tween (_zoneMoveMs), replacing the old
+      // instant snap.
+      final from = i == 0 ? _sweepStations[0] : _sweepStations[i - 1];
+      final moveStart = DateTime.now();
+      while (true) {
+        if (_abortPhase || _disposed) break;
+        final elapsed = DateTime.now().difference(moveStart).inMilliseconds;
+        final t = (elapsed / _sweepZoneMoveMs).clamp(0.0, 1.0);
+        final progress = from.progress + (station.progress - from.progress) * t;
+        final dyFrac = from.dyFrac + (station.dyFrac - from.dyFrac) * t;
+        // Real sweep architecture drives its whole hint banner off ONE
+        // field (distanceHint), sequentially overwritten as the zone
+        // progresses through glide -> ready -> capture -- matched here
+        // rather than splitting glide-direction text into detailText,
+        // which would leave a stale "Hold still" message on screen
+        // through the NEXT zone's glide if not separately cleared.
+        _apply((s) => s.copyWith(
+              distanceHint: _sweepHintFor(station),
+              guideShape:
+                  _sweepGuideFor(SweepStation(station.key, progress, dyFrac: dyFrac)),
+              stationIndex: i,
+              silhouetteState: PadSilhouetteState.capturing,
+            ), force: true);
+        if (t >= 1.0) break;
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+      }
+      if (_abortPhase || _disposed) break;
+
+      // Content-driven readiness gate -- same real signal/threshold as the
+      // primary front hold (_focusValue >= _focusThreshold), applied per
+      // zone instead of once, matching the real sweep architecture's own
+      // _zoneReadyFocusThreshold gate. Fresh peak per zone so an earlier,
+      // sharper zone's peak can't starve this zone's own relative signal
+      // toward the max-wait fallback.
+      _focusPeak = 0.0;
+      final zoneLabel = station.key.replaceFirst('sweep_', '');
+      _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zoneLabel'),
+          force: true);
+      final readyStart = DateTime.now();
+      var readyDetected = false;
+      while (DateTime.now().difference(readyStart).inMilliseconds <
+          _sweepZoneReadyMaxWaitMs) {
+        if (_abortPhase || _disposed) break;
+        final elapsed = DateTime.now().difference(readyStart).inMilliseconds;
+        if (elapsed >= _sweepZoneReadyMinWaitMs && _focusValue >= _focusThreshold) {
+          readyDetected = true;
+          break;
+        }
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+      }
+      _debug['${station.key}_readyDetected'] = readyDetected;
+      if (_abortPhase || _disposed) break;
+
+      // Visual "capturing now" cue -- flips the guide to green/locked for
+      // the real duration of the shutter sequence, replacing the removed
+      // verbal countdown.
+      unawaited(HapticFeedback.mediumImpact());
       _apply((s) => s.copyWith(
-            detailText: cueFor(i),
-            guideShape: guideFor(i),
-            silhouetteState: PadSilhouetteState.aligning,
-            stationIndex: i,
-          ));
-      unawaited(HapticFeedback.lightImpact());
-      await Future<void>.delayed(Duration(milliseconds: settleMs));
-      if (_abortPhase || _disposed) break;
+            zoneCaptureFlash: true,
+            silhouetteState: PadSilhouetteState.locked,
+          ), force: true);
 
-      // The settle delay above is real repositioning time (the cue/guide
-      // just changed); the countdown is a separate, final "get ready" beat
-      // right before the shutter actually fires -- see _runCountdown.
-      await _runCountdown();
-      if (_abortPhase || _disposed) break;
-
-      _apply((s) => s.copyWith(silhouetteState: PadSilhouetteState.capturing));
       // Ambient first, then flash -- flash last so the torch is off again
       // before the next station's cue is shown.
       for (final wantFlash in [false, true]) {
@@ -983,23 +1141,23 @@ class FusionCaptureController extends ChangeNotifier {
           final bytes = await x.readAsBytes();
           _shots.add(_Shot(
             jpeg: bytes,
-            tag: '${key}_${wantFlash ? "fl" : "amb"}',
+            tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
             flashOn: wantFlash,
             exif: parseJpegExposureExif(bytes),
           ));
         } catch (e) {
-          debugPrint('[fusion] station $key flash=$wantFlash failed: $e');
+          debugPrint('[fusion] sweep station ${station.key} flash=$wantFlash failed: $e');
         } finally {
           if (wantFlash) await _flash?.deactivate();
         }
       }
       unawaited(HapticFeedback.heavyImpact());
       _apply((s) => s.copyWith(
-            phaseProgress: (i + 1) / count,
-            overallProgress: phaseBase + 0.33 * ((i + 1) / count),
-            silhouetteState: PadSilhouetteState.locked,
+            phaseProgress: (i + 1) / _sweepStations.length,
+            overallProgress: 0.66 + 0.33 * ((i + 1) / _sweepStations.length),
+            zoneCaptureFlash: false,
             stationsDone: i + 1,
-          ));
+          ), force: true);
     }
   }
 
@@ -1070,6 +1228,18 @@ class FusionCaptureController extends ChangeNotifier {
       // varies far too much across devices/lighting for a fixed threshold.
       _focusValue = _focusPeak > 0 ? (abs / _focusPeak).clamp(0.0, 1.0) : 0.0;
       _coverage = HybridCaptureService.meanLuma(image, roi: roi) / 255.0;
+      // Live-push to FusionState (throttled, see _apply) so the front-phase
+      // BRIGHT/FOCUS meters read live -- front_only_v1's own meters read
+      // straight off the controller's live value every rebuild; this app's
+      // state is immutable/notify-driven, so the value has to be pushed
+      // instead of polled. The hold-poll timer already refreshes the UI at
+      // 10Hz while a hold is active, but this covers the window before a
+      // hold starts and keeps the meters live even when on-target (where
+      // the hold poll's own _apply calls stop varying).
+      _apply((s) => s.copyWith(
+            lightingValue: _coverage,
+            focusValue: _focusValue,
+          ));
     } catch (_) {}
   }
 
