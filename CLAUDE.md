@@ -1,5 +1,72 @@
 # ClearBridge Mobile — persistent context
 
+## ACTIVE TRACK: fusion_brain — the "brain" that fuses all architectures into one superprint (2026-08-22, round 37)
+**Read `fusion_brain/README.md` first — it carries the full live roadmap and
+per-stage status.** This section is the short pointer so the track is not
+lost across sessions.
+
+**Goal (CTO):** one NNS/"main brain" that takes every architecture's data
+(front V1 burst, small-angle tilt, sweep) and builds a single composite
+superprint. The specific technique the CTO recalled from earlier Notion
+discussion — confirmed real and now built — is **minutiae points as
+anchors/control points for a thin-plate-spline (TPS) elastic stitch**
+(Ross & Jain, "Fingerprint Mosaicking Using Thin Plate Splines"; Bazen &
+Gerez; learned successor Cui/Feng et al. arXiv:2004.05972, a Siamese +
+encoder-decoder regressing a dense displacement field). Same technique
+this project already flagged as an unbuilt gap on 2026-07-17
+(`geom_correct.py`'s `elastic_flatten()` is still an identity placeholder).
+
+**Status, cheapest-test-first, every stage gated on real matchability:**
+- Phase 0 / 0b / 0c — premise checks. **ALL PASSED.** Different
+  architectures do contribute real, non-spurious, non-redundant minutiae
+  (0b: tilt contributes 22-32x a face-on control; 0c: confirmed on the
+  first REAL `fusion_v1` capture, 5/6 sources, 6th explained as a real
+  bad frame).
+- Phase 1 — classical consensus fusion (rigid registration + merge).
+  **FAILED**: ties the noise-floor ink scan, loses on both cross-session
+  references (34→28, 29→25).
+- Stage A — TPS elastic registration (`tps.py`, numerically self-tested).
+  **Hypothesis largely REFUTED**: bought only 28→29 against a ~6-point
+  deficit. Structural ceiling found — fitted `maxDisplacement` pins at
+  ~12px = `dist_tol`, so TPS only ever sees sub-tolerance residual.
+- **The real mechanism, found by Stage A's controls (this is the
+  load-bearing finding):**
+  1. A random-noise control of the same COUNT costs about the same as the
+     real added minutiae (−4.7/−5.7 vs −6/−4) → a large part of the
+     penalty is **template density itself**, largely independent of
+     whether added points carry signal.
+  2. Only 10-17 of 85 added minutiae fall inside the reference's own
+     extent → **the instrument is underpowered**; a wider-coverage
+     superprint cannot be fairly judged against a narrower reference.
+  3. Per-source ablation: **individual sources DO beat the anchor**
+     (tilt_right 37 vs 34). The premise holds; the indiscriminate
+     all-sources merge is what dilutes it.
+  4. Selectivity sweep: real monotonic dose-response — top-10/20 matches
+     or beats anchor on both references, top-85 loses on both. Shipped as
+     `fuse(max_added=...)`, default `None` (Phase 1 behaviour unchanged,
+     nothing silently tuned to n=1).
+- Stage B — **REFRAMED, deliberately NOT started.** Was: learned dense
+  registration net (retarget `ml/deform_correct`'s `DeformFieldUNet`).
+  Stage A showed better registration is worth ~1 point of a ~6 point
+  deficit, so that net optimises the wrong term — and building a model
+  before understanding the metric is this project's own documented failure
+  pattern (`ml/mosaic_register`, `ridgeRestoreHybrid` v2). Live version:
+  a **learned per-minutia reliability model** (which candidates are worth
+  merging). Gated on real scanner references for labels.
+- Stage C — compositing template → actual superprint IMAGE.
+  `tps.warp_image` built; blend via `sfm_pipeline._multiband_combine()`
+  (already built, unused). Not started.
+
+**Standing blocker this track keeps hitting, same one as the prime
+directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+
+of added coverage is unmeasurable and a density penalty of comparable size
+sits on top of the real effect.
+
+**Isolation:** everything lives in `fusion_brain/` (research, read-only
+imports of production, no Firebase writes, not in CI) and `fusion_capture/`
+(standalone experimental APK, `captureMode: 'fusion_v1'`, `isExperiment:
+true`, production backend trigger OFF). `rm -rf` either one, zero impact.
+
 ## Macro (camera "2") superprint sideways: real root cause found + fixed, permanent for the whole pipeline (2026-08-22, round 36)
 Direct CTO report reviewing round 35's own confirmed-best macro capture
 (`b615f37b`, real NFIQ2 75): "the print is sideways it should be upright,
