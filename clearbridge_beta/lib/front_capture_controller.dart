@@ -5150,12 +5150,13 @@ class FrontCaptureController extends ChangeNotifier {
         }
 
         final xfile = await macroCam.takePicture();
-        final jpeg = await xfile.readAsBytes();
+        final jpeg = await _normalizeMacroFrame(await xfile.readAsBytes(), macroDesc.sensorOrientation);
         final ambPath = '$basePath/secondary_${_macroCameraName}_macro_amb_0.jpg';
         await _uploadWithRetry(jpeg, ambPath, timeout: const Duration(seconds: 20));
 
         String? flPath;
         if (flashJpeg != null) {
+          flashJpeg = await _normalizeMacroFrame(flashJpeg, macroDesc.sensorOrientation);
           flPath = '$basePath/secondary_${_macroCameraName}_macro_fl_0.jpg';
           await _uploadWithRetry(flashJpeg, flPath, timeout: const Duration(seconds: 20));
         }
@@ -5177,6 +5178,54 @@ class FrontCaptureController extends ChangeNotifier {
       _camera = null;
     }
     return result;
+  }
+
+  /// REAL BUG, found 2026-08-22 (direct CTO report on a real macro capture's
+  /// superprint: "the print is sideways it should be upright"). Every OTHER
+  /// still-JPEG upload path in this file (main burst, focus-zone shots, the
+  /// redundant second burst, the sweep burst) routes its raw
+  /// `takePicture()` bytes through `decodeStillJpegToLuma` before upload --
+  /// that function's own docstring states its exact purpose: "rotated into
+  /// the SAME sensor (landscape) orientation the live preview stream's Y
+  /// planes use -- so the backend sees a consistent frame set regardless of
+  /// which capture path a given frame came from." `_captureMacroShot` was
+  /// the one exception -- it uploaded `xfile.readAsBytes()` completely raw,
+  /// with none of that normalization. The backend decodes every frame via
+  /// plain `cv2.imdecode` (confirmed: no EXIF-orientation handling at all),
+  /// so it was trusting the raw macro JPEG's own native sensor-readout
+  /// orientation -- correct for every other frame in the request (all
+  /// already pre-rotated client-side into the shared convention) but never
+  /// applied here, hence "sideways" specifically on this one candidate.
+  ///
+  /// Fixed by giving the macro shot the exact same treatment, using the
+  /// MACRO camera's own `sensorOrientation` (not the cached main-camera
+  /// `_sensorOrientation` -- a different physical lens module could in
+  /// principle be mounted at a different rotation, even though in practice
+  /// every device checked so far shares one orientation across all rear
+  /// cameras) so this stays correct even if that ever isn't true. Also
+  /// downscales to `_stillDecodeTargetWidth`, matching every other frame in
+  /// the pipeline -- previously the macro shot uploaded full native-sensor-
+  /// resolution JPEGs untouched, the one inconsistency left in this frame's
+  /// treatment relative to the rest of the burst.
+  ///
+  /// Defensive: any decode/encode failure falls back to the original bytes
+  /// unchanged -- this can only fix orientation, never turn a previously-
+  /// working upload into a failed one.
+  Future<Uint8List> _normalizeMacroFrame(Uint8List jpeg, int sensorOrientation) async {
+    try {
+      final decoded = await decodeStillJpegToLuma(
+        jpeg, sensorOrientation,
+        targetWidth: _stillDecodeTargetWidth,
+      );
+      if (decoded == null) return jpeg;
+      final result = await compute(
+        _encodeBurstWithSharpnessIsolate,
+        _BurstEncodeArgs(decoded.luma, decoded.width, decoded.height),
+      );
+      return result.jpeg;
+    } catch (_) {
+      return jpeg;
+    }
   }
 
   /// REAL ROOT CAUSE, found 2026-08-05: `putData()` returns an `UploadTask`

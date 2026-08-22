@@ -1,5 +1,70 @@
 # ClearBridge Mobile — persistent context
 
+## Macro (camera "2") superprint sideways: real root cause found + fixed, permanent for the whole pipeline (2026-08-22, round 36)
+Direct CTO report reviewing round 35's own confirmed-best macro capture
+(`b615f37b`, real NFIQ2 75): "the print is sideways it should be upright,
+this needs to be a permanent change to the projects superprint orientation."
+Root-caused via code read across the client/backend boundary rather than
+guessed, since the print's ridge flow/continuity was otherwise good (per the
+same review) -- this was an orientation bug, not a capture-quality one.
+
+**Real root cause**: `_captureMacroShot` (`front_capture_controller.dart`)
+was the ONE still-JPEG upload path in this entire file that skipped
+`decodeStillJpegToLuma` before upload -- every other path (main burst,
+focus-zone shots, the redundant second burst, the sweep burst) already
+routes raw `takePicture()` bytes through it first. That function's own
+docstring states exactly why it exists: "rotated into the SAME sensor
+(landscape) orientation the live preview stream's Y planes use -- so the
+backend sees a consistent frame set regardless of which capture path a
+given frame came from." The macro shot uploaded `xfile.readAsBytes()`
+completely raw instead. Confirmed the backend has no independent EXIF-
+orientation correction of its own to compensate: `_decode_image` in
+`main.py` decodes via plain `cv2.imdecode(arr, cv2.IMREAD_COLOR)`, which
+does not read/apply JPEG EXIF orientation at all -- it trusts whatever
+pixel-space convention the upload already arrives in. Every OTHER frame in
+a request arrives pre-normalized by the client; the macro frame alone
+didn't, so it kept its raw native sensor-readout orientation instead of the
+shared canonical one `_upright_from_tip`'s `tipAngleDeg` math assumes.
+
+**Fixed, client side** (`front_capture_controller.dart`): new
+`_normalizeMacroFrame(jpeg, sensorOrientation)` helper -- decodes via
+`decodeStillJpegToLuma` (same targetWidth=3200 as every other frame, so
+this also fixes a second, smaller inconsistency: the macro shot previously
+uploaded full native-sensor-resolution JPEGs, unlike every other frame in
+the pipeline) then re-encodes via the same `_encodeBurstWithSharpnessIsolate`
+isolate hop already used elsewhere. Applied to both the ambient and flash
+macro frames before upload. Uses the MACRO camera's own
+`macroDesc.sensorOrientation`, not the cached main-camera `_sensorOrientation`
+-- deliberately robust to a device where the secondary lens module is
+mounted at a different rotation than the main one, even though every real
+device checked so far shares one orientation across all rear cameras.
+Defensive: any decode/encode failure falls back to the original raw bytes
+unchanged, so this can only fix orientation, never turn a previously-
+working upload into a failed one.
+
+**Fixed, backend side** (`main.py`): `_sec_guide['tipAngleDeg']` was
+hardcoded `0.0` for every secondary camera. On the one real device this bug
+was found on, that happened to already match the main camera's own real
+`tipAngleDeg` (also 0.0 on that device, confirmed via `b615f37b`'s own
+`guideRegion.tipAngleDeg`) -- but it was a coincidence, not a derivation:
+another device where the main camera's `_sensorOrientation` resolves
+differently would compute a real `tipAngleDeg` of 90.0 for its main
+capture, and the secondary-camera hardcode would then silently mismatch it.
+Since the client fix above lands every camera's frames in the same shared
+coordinate convention (that's the whole point of `decodeStillJpegToLuma`),
+the correct value is whatever the SAME capture's own main `guideRegion.
+tipAngleDeg` already is -- changed to `_guide_region.get('tipAngleDeg',
+0.0)` instead of a bare `0.0`. Makes the fix genuinely device-independent,
+not just correct for the one device it was diagnosed on -- the permanent
+fix the CTO asked for, not a one-off patch.
+
+**Not yet device-tested** -- same standing discipline as every other
+capture-side change this project: both fixes are logically sound and
+directly explain the observed symptom (a client-side normalization step
+skipped for exactly one frame, on a backend with no independent orientation
+correction of its own), but need a fresh real macro capture to confirm the
+next `superprint_afis.png` for camera "2" actually renders upright.
+
 ## Real device confirmation of ALL THREE round-33/34 macro fixes together: camera "2" wins again, real flash-diff engagement, best macro score yet (2026-08-21, round 35)
 First real capture on the round-34 build (`b615f37b`). Pulled the full doc
 rather than assume from "test done" alone.

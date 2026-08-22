@@ -1842,12 +1842,30 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # same discipline as `_sec_cy`.
                         _sec_rx = 0.11 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
                         _sec_ry = 0.13 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
+                        # tipAngleDeg was hardcoded 0.0 here -- real bug,
+                        # found 2026-08-22 (direct CTO report: a macro
+                        # superprint came out sideways). Client-side, every
+                        # secondary-camera frame is now normalized through
+                        # the exact same decodeStillJpegToLuma rotation the
+                        # main burst already gets (see
+                        # front_capture_controller.dart's
+                        # `_normalizeMacroFrame`, added the same round) --
+                        # that function's own contract is to land every
+                        # frame in ONE shared coordinate convention
+                        # ("regardless of which capture path a given frame
+                        # came from"), so whatever tipAngleDeg value is
+                        # correct for the main capture's own guideRegion is
+                        # correct here too, on any device -- not necessarily
+                        # 0.0, which only happened to match on the one real
+                        # device this was found on. Real, permanent fix:
+                        # reuse the main capture's own measured value rather
+                        # than a hardcoded assumption.
                         _sec_guide = {
                             'cx': 0.5,
                             'cy': _sec_cy,
                             'rx': _sec_rx,
                             'ry': _sec_ry,
-                            'tipAngleDeg': 0.0,
+                            'tipAngleDeg': _guide_region.get('tipAngleDeg', 0.0),
                             'n': _guide_region.get('n', 2.5),
                         }
                     _simg_res, _sp = afis_print.generate(
