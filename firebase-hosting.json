@@ -2,7 +2,10 @@
   "hosting": {
     "public": "landing",
     "ignore": ["firebase-hosting.json"],
-    "rewrites": [{"source": "**", "destination": "/index.html"}],
+    "rewrites": [
+      { "source": "/admin_panel/**", "destination": "/admin_panel/index.html" },
+      { "source": "**", "destination": "/index.html" }
+    ],
     "headers": [
       {
         "source": "*.apk",

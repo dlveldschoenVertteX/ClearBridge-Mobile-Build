@@ -487,7 +487,49 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Deploy landing page to Firebase Hosting
+      # REAL BUG FIXED (2026-08-23): this job deploys `landing/` via
+      # firebase-hosting.json on EVERY push, and a Firebase Hosting deploy
+      # REPLACES the entire live release with whatever's in that deploy's
+      # `public` dir -- it is not additive. `landing/` never contained an
+      # admin_panel/ subfolder, so every one of these deploys since this job
+      # was added (2026-07-06) has silently wiped out whatever admin-panel
+      # build was live before, leaving /admin_panel/index.html with no
+      # matching file -- Firebase Hosting's catch-all rewrite then serves
+      # the landing page there instead, which is exactly the reported
+      # symptom ("admin url has the same information as my landing page").
+      # Fixed by building the admin panel HERE, every time, and copying it
+      # into landing/admin_panel/ before the hosting deploy -- so it can
+      # never again be silently dropped by a landing-page-only deploy.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: 'stable'
+          cache: true
+
+      - run: flutter pub get
+
+      # Soft-fail deliberately: this app (lib/, the discontinued four-angle/
+      # arc-sweep capture app) pulls in several native-focused plugins
+      # (google_mlkit_face_detection, tflite_flutter, flutter_pdfview,
+      # open_filex, flutter_paystack_plus) whose web support is not
+      # independently verified from this sandbox (no Flutter toolchain here
+      # to test against). If this step ever fails, `landing/admin_panel/`
+      # is simply never populated and the copy step below is skipped --
+      # the landing page's own deploy still proceeds exactly as it does
+      # today. That is strictly no worse than the current, already-broken
+      # state, never a new regression.
+      - name: Build admin panel for web
+        id: admin_web_build
+        continue-on-error: true
+        run: flutter build web --release --base-href=/admin_panel/
+
+      - name: Stage admin panel into landing/admin_panel
+        if: steps.admin_web_build.outcome == 'success'
+        run: |
+          rm -rf landing/admin_panel
+          mkdir -p landing/admin_panel
+          cp -r build/web/. landing/admin_panel/
+
+      - name: Deploy landing page (+ admin panel, if built) to Firebase Hosting
         env:
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
         run: |

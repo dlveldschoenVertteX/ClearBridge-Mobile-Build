@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <!--
+    Flutter's build tooling replaces $FLUTTER_BASE_HREF with whatever
+    --base-href is passed to `flutter build web` (or "/" if omitted) --
+    deliberately using the template placeholder rather than a hardcoded
+    value so this file stays correct regardless of where a given build is
+    deployed (site root, or a subpath like /admin_panel/, which is how
+    this app is deployed for the admin panel -- see .github/workflows/
+    build.yml's deploy-web job).
+  -->
+  <base href="$FLUTTER_BASE_HREF">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="ClearBridge admin panel">
+
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="ClearBridge">
+  <link rel="apple-touch-icon" href="icons/Icon-192.png">
+
+  <link rel="icon" type="image/png" href="favicon.png"/>
+
+  <title>ClearBridge</title>
+  <link rel="manifest" href="manifest.json">
+</head>
+<body>
+  <script src="flutter_bootstrap.js" async></script>
+</body>
+</html>
