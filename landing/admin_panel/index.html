@@ -293,11 +293,31 @@ const FIREBASE_CONFIG = {
 // NIST NFIQ2 sidecar score), nfiqPass (bool), henryClass, guideRegion,
 // afisSource (which internal variant won selection), processingStartedAt,
 // scoredAt}. listenCaptures() below has been updated to match; the
-// four-angle-era UI copy elsewhere on this page ("4-Angle Completion",
-// "SFM Success Rate", Gate 1's "300 unique 4-angle captures" target, the
-// funnel's "Completed 4-Angle Set" stage) still describes the OLD
-// architecture and needs a real decision on what the current equivalents
-// should be -- not guessed here.
+// four-angle-era UI copy has since been corrected throughout ("4-Angle
+// Completion" -> "AFIS Source Mix", "SFM Success Rate" -> "Scoring
+// Success Rate", Gate 1's "4-angle captures" wording, the funnel's
+// "Completed 4-Angle Set" stage) -- wording only, not the numeric
+// targets themselves (Gate 1's 300, the 65%/80% NFIQ thresholds, dates),
+// which are real product decisions left for the CTO to set, not guessed.
+//
+// REAL DATA AUDIT (2026-08-23): confirmed which widgets are genuinely
+// live vs. still static MOCK placeholder content copied from the
+// original design file and never wired to a real Firestore query --
+// COL.gates/COL.referrals/COL.payments are all DECLARED above but never
+// queried anywhere (no listenGates()/listenReferrals()/listenPayments()
+// exists). Genuinely live: Captures count/week, NFIQ pass rate/
+// distribution/7-day trend, AFIS Source Mix, Henry classification,
+// scoring completion rate, avg processing time, user signup total/
+// weekly (see listenUsers()'s own real-field-name fix below). Still
+// static mock, NOT live: Gate Milestones roadmap list, User Funnel
+// (beyond what listenCaptures derives), Retention/k-factor numbers,
+// Payments/Revenue, Infrastructure status list, Weekly Rhythm, and the
+// Performance/crash-rate numbers -- these read as real dashboard tiles
+// but are hand-typed placeholder values that were never real to begin
+// with, not stale real data. Wiring any of them to real collections
+// would need those collections/fields to actually exist and be written
+// by the app/backend first -- a real product decision, not something to
+// silently fabricate here.
 const COL = {
   captures:  "captures",    // {userId, createdAt, status, captureMode, nfiq2Score, nfiqPass, henryClass, guideRegion, afisSource}
   users:     "users",       // {createdAt, lastActive, consentedAt, downloadedAt, referredBy}
@@ -533,7 +553,7 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
       <div class="g2" style="margin-bottom:18px;">
         <div class="card card-click" style="padding:18px;" onclick="go('gates')">
           <div class="eye" style="margin-bottom:4px;">Gate 1 Progress</div>
-          <div style="font-size:11px;color:var(--dim);margin-bottom:16px;">300 unique 4-angle captures · Jun 30</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:16px;">300 unique scored captures · Jun 30</div>
           <div style="text-align:center;padding:4px 0;">
             <div class="mono" style="font-size:58px;font-weight:900;color:var(--cyan);letter-spacing:-.04em;line-height:1;text-shadow:0 0 40px rgba(0,191,255,.4);" id="g1-big">—</div>
             <div style="font-size:13px;color:var(--dim);margin:3px 0 16px;">/ 300</div>
@@ -729,7 +749,7 @@ const MOCK = {
     { stage:"Consented to POPIA",    n:243, cv:59.0,  hi:false },
     { stage:"Downloaded APK",        n:200, cv:82.3,  hi:false },
     { stage:"Started Capture",       n:189, cv:94.5,  hi:false },
-    { stage:"Completed 4-Angle Set", n:187, cv:98.9,  hi:true  },
+    { stage:"Completed Capture",     n:187, cv:98.9,  hi:true  },
     { stage:"Claimed R50 Voucher",   n:0,   cv:null,  hi:false, locked:true },
   ],
   channels: [
@@ -738,7 +758,7 @@ const MOCK = {
   ],
   gates: [
     { id:0, label:"Angle-gate bug fix",               st:"done",    eta:null,       note:"",              cnt:null, tgt:null },
-    { id:1, label:"300 unique 4-angle captures",       st:"active",  eta:"Jun 30",   note:"",              cnt:187,  tgt:300  },
+    { id:1, label:"300 unique scored captures",         st:"active",  eta:"Jun 30",   note:"",              cnt:187,  tgt:300  },
     { id:2, label:"80%+ NFIQ pass rate (field data)",  st:"active",  eta:"Jul 15",   note:"Current 58.4%", cnt:null, tgt:null },
     { id:3, label:"AFISwitch demo · 80%+ proof",       st:"blocked", eta:"Sep 1",    note:"Awaits Gate 2", cnt:null, tgt:null },
     { id:4, label:"Production launch (Payments+AFIS)", st:"blocked", eta:"Oct 1",    note:"Awaits Gate 3", cnt:null, tgt:null },
@@ -960,10 +980,33 @@ function listenCaptures() {
     // architecture now has. Checked defensively (top-level fallback) since
     // this field has moved once before; only replaces the mock shape if
     // real data with this field is actually present.
+    //
+    // REAL BUG FIXED (2026-08-23): confirmed against afis_print.py's own
+    // generate() (line ~2744) that for the MAIN variant-loop winners
+    // (native/freqNorm/stack/focusStack/fuseAvg/fuseMaxc/fuseSoft/
+    // deepFuse/deepMaxc/deepSoft/mosaicFreq/deepAmbBestFl/pyfingSnfen/
+    // pyfingHybrid*/nnsHybrid/coherenceDiff -- the majority of real
+    // captures), afisSource is NOT a string at all -- it's an object,
+    // {frameIndex, angleDeg}, with no variant NAME recorded anywhere.
+    // Only the special-cased candidates (secondary camera, minutiae
+    // patches, sweep, distanceStage2) overwrite it with a real string
+    // (afisSource: _sname/_zname/'sweepFusion'/etc, main.py ~line 1912+).
+    // Using the raw object as an object key previously stringified to
+    // the literal text "[object Object]", silently merging ~46% of real
+    // captures into one garbage-labeled bucket. Bucketed honestly
+    // instead of rendering the coercion artifact. The real underlying
+    // gap (main-loop wins have no recorded variant name) is a backend
+    // fix, not something this dashboard can recover on its own.
     const srcCounts = {};
     complete.forEach(d => {
-      const src = (d.superprintParams && d.superprintParams.afisSource) || d.afisSource;
-      if (src) srcCounts[src] = (srcCounts[src]||0) + 1;
+      const raw = (d.superprintParams && d.superprintParams.afisSource) || d.afisSource;
+      let label = null;
+      if (typeof raw === 'string') {
+        label = raw;
+      } else if (raw && typeof raw === 'object') {
+        label = 'mainVariant (name not logged)';
+      }
+      if (label) srcCounts[label] = (srcCounts[label]||0) + 1;
     });
     if (Object.keys(srcCounts).length) D.angles = srcCounts;
 
@@ -972,14 +1015,46 @@ function listenCaptures() {
     // legacy 0-1 internal ResNet18 proxy this used to read (see this
     // project's own history: the internal proxy is foolable and was
     // explicitly replaced by the real sidecar as the trustworthy signal).
+    //
+    // REAL BUG FIXED (2026-08-23): the pass-rate numerator was filtered
+    // from `docs` (every capture, any status/era) while the denominator
+    // `wn` was filtered to only captures carrying a real nfiq2Score --
+    // any doc with nfiqPass:true set (e.g. by an older schema/proxy) but
+    // no nfiq2Score field inflated the numerator past the denominator,
+    // producing an observed 140.6% pass rate. Numerator now drawn from
+    // the same `wn` population as the denominator, so this can never
+    // mathematically exceed 100% again.
     const wn = docs.filter(d => typeof d.nfiq2Score === 'number');
     if (wn.length) {
-      const p = docs.filter(d => d.nfiqPass === true);
+      const p = wn.filter(d => d.nfiqPass === true);
       D.nfiq.pass = Math.round(p.length/wn.length*1000)/10;
       D.nfiq.fail = Math.round((100-D.nfiq.pass)*10)/10;
       const bins = new Array(10).fill(0);
       wn.forEach(d => bins[Math.min(9, Math.floor(d.nfiq2Score/10))]++);
       D.nfiq.dist = bins;
+
+      // Real 7-day trend (2026-08-23): D.nfiq.trend was static MOCK data
+      // ([45,52,48,55,60,55,58.4]) that never changed regardless of real
+      // captures -- the "7-day trend" sparkline and "+X% vs 7d ago" delta
+      // were always showing canned demo numbers. Computed for real here:
+      // daily pass rate for the 7 calendar days ending today, oldest
+      // first. A day with zero scored captures reads as 0% rather than
+      // "no data" -- the chart has no separate empty-day rendering, and
+      // an early-launch day genuinely having nothing to show is itself
+      // real information, not a rendering gap worth engineering around.
+      const trend = [];
+      for (let i = 6; i >= 0; i--) {
+        const dayStart = new Date(); dayStart.setHours(0,0,0,0); dayStart.setDate(dayStart.getDate()-i);
+        const dayEnd = new Date(dayStart); dayEnd.setDate(dayEnd.getDate()+1);
+        const dayDocs = wn.filter(d => {
+          const t = d.createdAt?.toDate?.();
+          return t && t >= dayStart && t < dayEnd;
+        });
+        trend.push(dayDocs.length
+          ? Math.round(dayDocs.filter(d => d.nfiqPass === true).length/dayDocs.length*1000)/10
+          : 0);
+      }
+      D.nfiq.trend = trend;
     }
 
     // Repurposed from "SFM success rate" (SfM/oscillating reconstruction
@@ -1021,9 +1096,24 @@ function listenUsers() {
   DB.collection(COL.users).onSnapshot(snap => {
     D.users.total = snap.size;
     const w = new Date(); w.setDate(w.getDate()-7);
-    const m = new Date(); m.setDate(m.getDate()-30);
-    D.users.week = snap.docs.filter(d=>d.data().createdAt?.toDate?.()>w).length;
-    D.users.mau  = snap.docs.filter(d=>d.data().lastActive?.toDate?.()>m).length;
+    // REAL BUG FIXED (2026-08-23): user_details_popia_screen.dart's own
+    // real write to this collection (`FirebaseFirestore.instance
+    // .collection('users').doc(uid).set({..., consents: {..., consentedAt:
+    // FieldValue.serverTimestamp()}})`) has no top-level `createdAt`
+    // field at all -- reading `d.data().createdAt` always returned
+    // undefined, so "New (7d)" was structurally stuck at 0 regardless of
+    // real signups. `consents.consentedAt` is the real, closest
+    // equivalent timestamp the app actually writes.
+    D.users.week = snap.docs.filter(d=>d.data().consents?.consentedAt?.toDate?.()>w).length;
+    // MAU has NO real signal to compute from: grepped the whole app, no
+    // client-side write of a `lastActive` (or any last-activity) field
+    // exists anywhere -- it was always reading a field that's never
+    // written, so it always showed a real-looking but entirely fake 0.
+    // Left unset (renders as "--", see renderAll) rather than a
+    // misleading always-zero number. Real MAU tracking would need a new
+    // app-side feature (writing some activity timestamp somewhere) --
+    // not something this dashboard can recover on its own.
+    D.users.mau = null;
     drawn = {};
     renderAll();
   });
@@ -1098,7 +1188,7 @@ function renderOverview() {
 
   set('k-users',   D.users.total);
   set('k-users-7d',D.users.week);
-  set('k-mau',     D.users.mau);
+  set('k-mau',     D.users.mau === null ? '—' : D.users.mau);
 
   // Gate 1
   set('g1-big', D.captures.total);
