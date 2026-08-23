@@ -19,6 +19,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Real failure found 2026-08-23 (first-ever run of this workflow):
+      # firebase-tools' own codebase-analysis step (which runs locally
+      # before handing off to Cloud Build) needs `functions/node_modules`
+      # on disk to introspect the `firebase-functions` package -- it does
+      # not run `npm install` itself. Without this: "Couldn't find
+      # firebase-functions package in your source code... Error: An
+      # unexpected error has occurred." Same class of gap already
+      # documented for deploy-functions.yml's own Python venv step, just
+      # the Node.js equivalent.
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm install
+
       - name: Deploy bootstrapFirstAdmin to Firebase
         env:
           FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
