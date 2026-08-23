@@ -362,6 +362,18 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
       style="width:100%;padding:10px;background:var(--cyan);border:none;border-radius:9px;color:#0B0F1A;font-weight:800;font-size:13px;cursor:pointer;font-family:inherit;">
       Sign in
     </button>
+    <div id="google-signin-row" style="margin-top:10px;">
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px;">
+        <div style="flex:1;height:1px;background:var(--rim);"></div>
+        <span style="font-size:10px;color:var(--dim);">or</span>
+        <div style="flex:1;height:1px;background:var(--rim);"></div>
+      </div>
+      <button id="google-signin-btn" onclick="doGoogleSignIn()"
+        style="width:100%;padding:10px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-weight:700;font-size:13px;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:8px;">
+        <svg width="16" height="16" viewBox="0 0 48 48" aria-hidden="true"><path fill="#FFC107" d="M43.6 20.5H42V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 12.9 4 4 12.9 4 24s8.9 20 20 20 20-8.9 20-20c0-1.3-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.6 18.9 13 24 13c3.1 0 5.8 1.1 8 3l5.7-5.7C34.6 6.1 29.6 4 24 4 16.2 4 9.5 8.4 6.3 14.7z"/><path fill="#4CAF50" d="M24 44c5.5 0 10.4-2.1 14.2-5.5l-6.6-5.6C29.6 34.7 27 35.6 24 35.6c-5.2 0-9.6-3.3-11.2-7.9l-6.6 5C9.4 39.6 16.1 44 24 44z"/><path fill="#1976D2" d="M43.6 20.5H42V20H24v8h11.3c-.8 2.3-2.2 4.3-4.1 5.9l6.6 5.6C41.5 36.4 44 30.7 44 24c0-1.3-.1-2.7-.4-3.5z"/></svg>
+        Sign in with Google
+      </button>
+    </div>
     <div id="login-error" style="margin-top:11px;font-size:11.5px;color:var(--red);min-height:14px;"></div>
     <div style="margin-top:8px;text-align:center;">
       <a href="#" id="login-toggle" onclick="toggleLoginMode();return false;"
@@ -858,7 +870,23 @@ function toggleLoginMode() {
   document.getElementById('login-toggle').textContent = isCreate
     ? 'Already have an admin account? Sign in'
     : 'First time? Create the admin account';
+  // Google sign-in only makes sense for an EXISTING admin account (the
+  // create flow's own bootstrapFirstAdmin gate doesn't care which
+  // provider you're signed in with, but there's no bootstrap benefit to
+  // offering Google here specifically, and hiding it keeps the create
+  // flow's password-confirmation UI the only thing on screen).
+  document.getElementById('google-signin-row').style.display = isCreate ? 'none' : '';
   document.getElementById('login-error').textContent = '';
+}
+
+function doGoogleSignIn() {
+  const err = document.getElementById('login-error');
+  const btn = document.getElementById('google-signin-btn');
+  err.textContent = '';
+  btn.disabled = true;
+  AUTH.signInWithPopup(new firebase.auth.GoogleAuthProvider())
+    .catch(e => { err.textContent = e.message || 'Google sign-in failed.'; })
+    .finally(() => { btn.disabled = false; });
 }
 
 function doAuthAction() {
