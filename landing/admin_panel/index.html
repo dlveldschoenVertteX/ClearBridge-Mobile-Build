@@ -264,13 +264,28 @@ body{
   ⚡ FIREBASE CONFIG — Edit ONLY this block to go live
 ════════════════════════════════════════════════════ -->
 <script>
+// REAL CONFIG NOTE (2026-08-23): no Firebase Web App registration exists
+// anywhere in this codebase yet -- lib/firebase_options.dart's own `web`
+// block is ALSO placeholder data (confirmed by inspection: sequential
+// digits, not a real key), only its `android` block is real. apiKey and
+// messagingSenderId below are the real Android app's own values, reused
+// here deliberately: Firebase API keys are project-wide and not secret by
+// design (they're not the real security boundary -- Firestore/Storage
+// rules are), and messagingSenderId is a GCP-project-level ID shared
+// across every platform's app registration, not per-app. appId IS
+// genuinely per-platform-registration and has no accurate substitute --
+// left as a placeholder so DEMO mode can be told apart from a real
+// (if incomplete) attempt; a real Web App registration (Firebase Console
+// -> Project Settings -> Add app -> Web, or via the Management API) is
+// still the correct real fix, and will also unlock Analytics/Installations/
+// Messaging features this approximation can't provide.
 const FIREBASE_CONFIG = {
-  apiKey:            "YOUR_API_KEY",               // Firebase Console → Project Settings
+  apiKey:            "AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU", // real (Android app's own key, project-wide)
   authDomain:        "clearbridge-dc699.firebaseapp.com",
   projectId:         "clearbridge-dc699",
-  storageBucket:     "clearbridge-dc699.appspot.com",
-  messagingSenderId: "YOUR_SENDER_ID",
-  appId:             "YOUR_APP_ID"
+  storageBucket:     "clearbridge-dc699.firebasestorage.app",   // real (matches firebase_options.dart's android block)
+  messagingSenderId: "427514831103",                            // real (project-wide GCP sender ID)
+  appId:             "YOUR_APP_ID"                              // NOT real -- needs an actual Web App registration
 };
 
 // Firestore collection paths — adjust to match your schema
@@ -300,6 +315,18 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
 </script>
 
 <!-- ════════════════════════════════════════════════════
+  ⏳ SPLASH — brand loading beat shown before EITHER the
+  sign-in gate or the dashboard appears, on every load.
+  Purely a fixed-minimum-duration cosmetic beat (no real
+  work happens during it) -- see hideSplash() at the bottom.
+════════════════════════════════════════════════════ -->
+<div id="splash" style="position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:radial-gradient(ellipse at 60% 0%,#142346 0%,#0B0F1A 68%);transition:opacity .4s ease;">
+  <img src="assets/clearbridge-logo.png" alt="ClearBridge" style="width:64px;height:64px;border-radius:16px;box-shadow:0 0 40px rgba(0,191,255,.25);animation:pulse-c 2.2s ease-in-out infinite;">
+  <div style="font-size:13px;font-weight:800;color:var(--bright);letter-spacing:-.01em;">ClearBridge</div>
+  <div style="font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.16em;text-transform:uppercase;">Admin Console</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════
   🔒 ADMIN SIGN-IN GATE — real Firestore data is sensitive
   (user records, payment info); this must be authenticated
   and claim-checked BEFORE any listener starts. Skipped only
@@ -308,6 +335,16 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
   adminClaimProvider/router_service.dart already enforce --
   one source of truth for "who is an admin", not a second,
   independently-drifting check.
+
+  Two modes, toggled by loginMode (see doAuthAction()):
+  'signin' (default) and 'create' -- the latter is the real,
+  server-verified "first launch" bootstrap: it calls the
+  `bootstrapFirstAdmin` callable Cloud Function
+  (functions/index.js), which only ever succeeds for the
+  FIRST caller to ever request it (it hard-refuses once any
+  account already carries the admin claim) -- so this can't
+  be used to self-grant admin access a second time, or by
+  anyone after the real first admin exists.
 ════════════════════════════════════════════════════ -->
 <div id="login-gate" style="position:fixed;inset:0;z-index:500;display:none;align-items:center;justify-content:center;background:radial-gradient(ellipse at 60% 0%,#142346 0%,#0B0F1A 68%);">
   <div style="width:320px;padding:28px 26px;background:var(--card);border:1px solid var(--rim);border-radius:16px;backdrop-filter:blur(20px);">
@@ -315,19 +352,26 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
       <img src="assets/clearbridge-logo.png" alt="CB" style="width:32px;height:32px;border-radius:8px;">
       <div>
         <div style="font-size:13px;font-weight:800;color:var(--bright);">ClearBridge</div>
-        <div style="font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.14em;text-transform:uppercase;">Admin Console</div>
+        <div style="font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.14em;text-transform:uppercase;" id="login-eyebrow">Admin Console</div>
       </div>
     </div>
     <input id="login-email" type="email" autocomplete="username" placeholder="Admin email"
       style="width:100%;margin-bottom:9px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
     <input id="login-pass" type="password" autocomplete="current-password" placeholder="Password"
-      onkeydown="if(event.key==='Enter')doSignIn();"
-      style="width:100%;margin-bottom:14px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
-    <button id="login-btn" onclick="doSignIn()"
+      onkeydown="if(event.key==='Enter')doAuthAction();"
+      style="width:100%;margin-bottom:9px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
+    <input id="login-pass2" type="password" autocomplete="new-password" placeholder="Confirm password"
+      onkeydown="if(event.key==='Enter')doAuthAction();"
+      style="display:none;width:100%;margin-bottom:14px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
+    <button id="login-btn" onclick="doAuthAction()"
       style="width:100%;padding:10px;background:var(--cyan);border:none;border-radius:9px;color:#0B0F1A;font-weight:800;font-size:13px;cursor:pointer;font-family:inherit;">
       Sign in
     </button>
     <div id="login-error" style="margin-top:11px;font-size:11.5px;color:var(--red);min-height:14px;"></div>
+    <div style="margin-top:8px;text-align:center;">
+      <a href="#" id="login-toggle" onclick="toggleLoginMode();return false;"
+        style="font-size:11px;color:var(--dim);text-decoration:underline;">First time? Create the admin account</a>
+    </div>
   </div>
 </div>
 
@@ -652,6 +696,7 @@ const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-functions-compat.js"></script>
 
 <script>
 /* ════════════════════════════════════════════════════
@@ -724,15 +769,38 @@ const TITLES = {
    mechanism -- not something this page can grant itself). */
 let AUTH = null;
 
+/* ── Splash ──
+   A fixed-minimum-duration brand beat shown before either the sign-in
+   gate or the dashboard appears, on every load -- real device feedback
+   asked for this explicitly. No real work happens during it; reveal()
+   below just makes sure it's visible for at least MIN_SPLASH_MS even if
+   Firebase resolves auth state instantly, so it always reads as a
+   deliberate beat rather than a flash. */
+function hideSplash() {
+  const sp = document.getElementById('splash');
+  if (!sp) return;
+  sp.style.opacity = '0';
+  setTimeout(() => { sp.style.display = 'none'; }, 400);
+}
+
 function initFB() {
   const shell = document.getElementById('shell');
   const gate = document.getElementById('login-gate');
+  const MIN_SPLASH_MS = 1200;
+  const splashStart = Date.now();
+  const reveal = show => {
+    const wait = Math.max(0, MIN_SPLASH_MS - (Date.now() - splashStart));
+    setTimeout(() => { hideSplash(); show(); }, wait);
+  };
+
   if (DEMO) {
     // No real backend configured yet -- nothing to protect. Same
     // straight-to-dashboard behaviour this page already had, just made
     // explicit now that a gate exists for the non-demo path.
-    shell.style.display = '';
-    document.getElementById('demo-banner').style.display = 'flex';
+    reveal(() => {
+      shell.style.display = '';
+      document.getElementById('demo-banner').style.display = 'flex';
+    });
     return;
   }
   try {
@@ -741,12 +809,12 @@ function initFB() {
     AUTH = firebase.auth();
   } catch (e) {
     console.error('Firebase init:', e);
+    reveal(() => { gate.style.display = 'flex'; });
     return;
   }
   AUTH.onAuthStateChanged(async user => {
     if (!user) {
-      gate.style.display = 'flex';
-      shell.style.display = 'none';
+      reveal(() => { gate.style.display = 'flex'; shell.style.display = 'none'; });
       return;
     }
     let isAdmin = false;
@@ -757,16 +825,49 @@ function initFB() {
       console.error('Admin claim check failed:', e);
     }
     if (!isAdmin) {
-      document.getElementById('login-error').textContent =
-        'This account does not have admin access.';
+      reveal(() => {
+        gate.style.display = 'flex';
+        document.getElementById('login-error').textContent =
+          'This account does not have admin access.';
+      });
       AUTH.signOut();
       return;
     }
-    gate.style.display = 'none';
-    shell.style.display = '';
+    reveal(() => { gate.style.display = 'none'; shell.style.display = ''; });
     listenCaptures();
     listenUsers();
   });
+}
+
+/* ── Sign-in / first-launch admin creation ──
+   Two modes toggled by loginMode: 'signin' (default) and 'create'. The
+   create flow is a REAL, server-verified bootstrap, not a client-side
+   shortcut -- it makes a genuine Firebase Auth account, then calls the
+   `bootstrapFirstAdmin` callable Cloud Function (functions/index.js),
+   which grants the admin custom claim ONLY when no account anywhere
+   already carries it. That refusal is enforced server-side (the client
+   cannot grant itself a custom claim, a real Firebase security boundary,
+   not a policy this page could bypass even if it wanted to) -- so this
+   can only ever succeed once, for the genuine first admin, never as a
+   standing self-promotion hole. Requires functions/index.js to actually
+   be DEPLOYED (see that file's own header) -- until then this fails with
+   a clear, real "not found" error rather than silently doing nothing. */
+let loginMode = 'signin';
+
+function toggleLoginMode() {
+  loginMode = loginMode === 'signin' ? 'create' : 'signin';
+  const isCreate = loginMode === 'create';
+  document.getElementById('login-pass2').style.display = isCreate ? '' : 'none';
+  document.getElementById('login-btn').textContent = isCreate ? 'Create admin account' : 'Sign in';
+  document.getElementById('login-eyebrow').textContent = isCreate ? 'Create Admin Account' : 'Admin Console';
+  document.getElementById('login-toggle').textContent = isCreate
+    ? 'Already have an admin account? Sign in'
+    : 'First time? Create the admin account';
+  document.getElementById('login-error').textContent = '';
+}
+
+function doAuthAction() {
+  return loginMode === 'create' ? doCreateAdmin() : doSignIn();
 }
 
 function doSignIn() {
@@ -780,6 +881,39 @@ function doSignIn() {
   AUTH.signInWithEmailAndPassword(email, pass)
     .catch(e => { err.textContent = e.message || 'Sign-in failed.'; })
     .finally(() => { btn.disabled = false; btn.textContent = 'Sign in'; });
+}
+
+async function doCreateAdmin() {
+  const email = document.getElementById('login-email').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const pass2 = document.getElementById('login-pass2').value;
+  const btn = document.getElementById('login-btn');
+  const err = document.getElementById('login-error');
+  err.textContent = '';
+  if (!email || !pass) { err.textContent = 'Enter both email and password.'; return; }
+  if (pass !== pass2) { err.textContent = 'Passwords do not match.'; return; }
+  if (pass.length < 8) { err.textContent = 'Password must be at least 8 characters.'; return; }
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    const cred = await AUTH.createUserWithEmailAndPassword(email, pass);
+    const claim = firebase.app().functions('africa-south1').httpsCallable('bootstrapFirstAdmin');
+    await claim();
+    // Custom claims only take effect on a FRESH ID token -- force a
+    // refresh so onAuthStateChanged's own getIdTokenResult (already
+    // listening) sees admin:true immediately, instead of waiting up to an
+    // hour for the cached token to naturally expire.
+    await cred.user.getIdToken(true);
+    // onAuthStateChanged handles revealing the dashboard from here.
+  } catch (e) {
+    err.textContent = e.message || 'Could not create admin account.';
+    // Roll back the just-created auth account if claim-granting failed --
+    // otherwise a failed bootstrap (most likely: an admin already exists)
+    // leaves a real, permanent, non-admin account behind with no way back
+    // into this create flow.
+    try { await AUTH.currentUser?.delete(); } catch (_) {}
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create admin account';
+  }
 }
 
 function listenCaptures() {
