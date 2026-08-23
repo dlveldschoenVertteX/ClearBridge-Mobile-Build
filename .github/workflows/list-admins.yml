@@ -1,0 +1,33 @@
+name: List Admin Accounts (diagnostic)
+
+# Manually triggered only. Runs functions/scripts/list_admins.js once,
+# using the same real service-account credentials as the other deploy
+# workflows in this repo, to print which Firebase Auth account(s)
+# currently carry the `admin: true` custom claim. Output is visible only
+# in this workflow run's own Actions log (private to repo collaborators),
+# never exposed as a public/callable endpoint -- built specifically to
+# identify a real orphaned admin account (from the admin panel's earlier,
+# pre-rebuild incarnation) without granting any new privileged access.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  list-admins:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm install
+
+      - name: List accounts with the admin claim
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        working-directory: functions
+        run: |
+          echo "$FIREBASE_SA_KEY" > /tmp/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
+            GCLOUD_PROJECT=clearbridge-dc699 \
+            node scripts/list_admins.js
+          rm /tmp/sa.json
