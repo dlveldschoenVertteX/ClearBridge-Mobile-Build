@@ -264,28 +264,23 @@ body{
   ⚡ FIREBASE CONFIG — Edit ONLY this block to go live
 ════════════════════════════════════════════════════ -->
 <script>
-// REAL CONFIG NOTE (2026-08-23): no Firebase Web App registration exists
-// anywhere in this codebase yet -- lib/firebase_options.dart's own `web`
-// block is ALSO placeholder data (confirmed by inspection: sequential
-// digits, not a real key), only its `android` block is real. apiKey and
-// messagingSenderId below are the real Android app's own values, reused
-// here deliberately: Firebase API keys are project-wide and not secret by
-// design (they're not the real security boundary -- Firestore/Storage
-// rules are), and messagingSenderId is a GCP-project-level ID shared
-// across every platform's app registration, not per-app. appId IS
-// genuinely per-platform-registration and has no accurate substitute --
-// left as a placeholder so DEMO mode can be told apart from a real
-// (if incomplete) attempt; a real Web App registration (Firebase Console
-// -> Project Settings -> Add app -> Web, or via the Management API) is
-// still the correct real fix, and will also unlock Analytics/Installations/
-// Messaging features this approximation can't provide.
+// REAL CONFIG (2026-08-23): a genuine Firebase Web App registration now
+// exists for this project (Firebase Console -> Project Settings -> Add app
+// -> Web) -- every field below is that real registration's own config,
+// not a reused/approximated value. apiKey is this Web App's own key (was
+// previously the Android app's key, reused as a stopgap -- both are valid
+// since Firebase API keys are project-wide and not the real security
+// boundary; Firestore/Storage rules are). appId/measurementId are this
+// Web App's own genuine per-registration values, unlocking real Analytics/
+// Installations/Messaging support that the earlier placeholder couldn't.
 const FIREBASE_CONFIG = {
-  apiKey:            "AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU", // real (Android app's own key, project-wide)
+  apiKey:            "AIzaSyDli6txWMCjKDXy_8DpUw5qk4zfJ4UF804",
   authDomain:        "clearbridge-dc699.firebaseapp.com",
   projectId:         "clearbridge-dc699",
-  storageBucket:     "clearbridge-dc699.firebasestorage.app",   // real (matches firebase_options.dart's android block)
-  messagingSenderId: "427514831103",                            // real (project-wide GCP sender ID)
-  appId:             "YOUR_APP_ID"                              // NOT real -- needs an actual Web App registration
+  storageBucket:     "clearbridge-dc699.firebasestorage.app",
+  messagingSenderId: "427514831103",
+  appId:             "1:427514831103:web:945a0b1ba7f64bfd48acca",
+  measurementId:     "G-2BHREZH5L2"
 };
 
 // Firestore collection paths — adjust to match your schema
