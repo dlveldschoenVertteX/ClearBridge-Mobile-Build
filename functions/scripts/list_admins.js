@@ -22,7 +22,12 @@ async function main() {
     const page = await admin.auth().listUsers(1000, pageToken);
     for (const u of page.users) {
       if (u.customClaims && u.customClaims.admin === true) {
-        found.push({uid: u.uid, email: u.email || "(no email)", disabled: u.disabled});
+        found.push({
+          uid: u.uid,
+          email: u.email || "(no email)",
+          disabled: u.disabled,
+          providers: (u.providerData || []).map((p) => p.providerId),
+        });
       }
     }
     pageToken = page.pageToken;
@@ -33,7 +38,7 @@ async function main() {
   } else {
     console.log(`${found.length} account(s) carry the admin claim:`);
     for (const f of found) {
-      console.log(`  uid=${f.uid}  email=${f.email}  disabled=${f.disabled}`);
+      console.log(`  uid=${f.uid}  email=${f.email}  disabled=${f.disabled}  providers=${f.providers.join(",") || "(none)"}`);
     }
   }
 }
