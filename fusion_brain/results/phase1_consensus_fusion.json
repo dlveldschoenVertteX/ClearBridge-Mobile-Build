@@ -1,0 +1,52 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "phase0c": {
+    "sources_registered": [
+      "tilt_left",
+      "tilt_tip",
+      "tilt_right",
+      "sweep_left",
+      "sweep_center",
+      "sweep_right"
+    ],
+    "registration_rate": "6/6",
+    "sweep_center_flagged": "visually incoherent raw frame (thumb out of frame/motion blur), lowest inlier fraction (14%), only large registered rotation (39deg)"
+  },
+  "phase1": {
+    "reliability_gate_min_inlier_frac": 0.2,
+    "reliability_gate_min_inlier_count": 15,
+    "sources_passed": [
+      "tilt_left",
+      "tilt_tip",
+      "tilt_right",
+      "sweep_left",
+      "sweep_right"
+    ],
+    "sources_rejected": [
+      "sweep_center"
+    ],
+    "anchor_minutiae": 135,
+    "fused_minutiae": 220,
+    "added_by_source": {
+      "tilt_left": 12,
+      "tilt_tip": 3,
+      "tilt_right": 33,
+      "sweep_left": 11,
+      "sweep_center": 0,
+      "sweep_right": 26
+    },
+    "bozorth3_vs_ink_scan": {
+      "anchor": 5,
+      "fused": 5
+    },
+    "bozorth3_vs_macro_round32": {
+      "anchor": 34,
+      "fused": 28
+    },
+    "bozorth3_vs_macro_round35": {
+      "anchor": 29,
+      "fused": 25
+    },
+    "verdict": "fused does NOT beat anchor-alone on the two more decisive real references; ties on the noisy ink-scan reference"
+  }
+}

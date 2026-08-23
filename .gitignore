@@ -20,3 +20,45 @@ build/
 
 # macOS
 .DS_Store
+
+# Python (Cloud Functions local deploy analysis)
+functions/processEnhanceAndScore/venv/
+functions/processEnhanceAndScore/__pycache__/
+**/__pycache__/
+*.pyc
+
+# Firebase CLI deploy logs
+firebase-debug.log
+*firebase-debug*.log
+
+# ML local datasets/checkpoints -- never commit. This repo is PUBLIC; local
+# ml/*/dataset dirs can contain real user capture-derived images (e.g.
+# ml/thumb_seg/dataset/), and checkpoints/exports are large binaries this
+# project deploys via Cloud Storage, never git, same as every existing
+# *.onnx model already in the pipeline.
+ml/**/dataset/
+ml/**/runs/
+ml/**/*.onnx
+ml/**/*.pt
+# mosaic_register/data holds real user capture-derived print images (pulled
+# from Firestore/Storage as its training corpus), not named "dataset/" but
+# the exact same real-biometric-image risk the comment above describes.
+ml/mosaic_register/data/
+ml/mosaic_register/*.log
+ml/mosaic_register/manifest.json
+
+# ridge_restore_curriculum/data holds a real NIST SD302 sample pulled from
+# S3 (public research data, not privacy-sensitive like the real_prints
+# above, but still a large local dataset this project's own convention
+# keeps out of git -- reuploaded/redownloaded from S3 whenever needed, not
+# stored in the repo).
+ml/ridge_restore_curriculum/data/
+ml/ridge_restore_curriculum/*.log
+ml/ridge_restore_curriculum/*.png
+
+# Session scratchpad -- experiments, harness runs, raw design-tool exports,
+# any working files that shouldn't end up in the deployed repo. This project
+# has always used scratchpad/ this way (see harness.py, sourceafis/ etc.
+# from prior sessions) -- ignore it explicitly so untracked-file hooks
+# don't flag every drop.
+scratchpad/

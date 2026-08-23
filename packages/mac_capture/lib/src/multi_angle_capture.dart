@@ -4,11 +4,17 @@ import 'dart:typed_data';
 class CaptureAngles {
   static const List<String> keys = ['front', 'right', 'top', 'left'];
   static const List<String> keyList = keys;
+  // Not currently wired into any screen. Degrees intentionally left out of
+  // this copy -- the real fire angles live in ThumbAngleService._offAxisDeg /
+  // _topOffAxisDeg and are still being tuned; a previous version of this text
+  // hardcoded 45° here while the actual target was 15-20°, which is exactly
+  // the kind of instructed-vs-required mismatch that causes "won't fire"
+  // confusion.
   static const List<String> instructions = [
     'Point camera straight down at your thumb',
-    'Tilt phone 45° to the RIGHT — capture right edge',
+    'Tilt phone to the RIGHT — capture right edge',
     'Tilt toward THUMB TIP — capture top of thumbprint',
-    'Tilt phone 45° to the LEFT — capture left edge',
+    'Tilt phone to the LEFT — capture left edge',
   ];
   static const List<String> details = [
     'Place RIGHT thumb flat on dark surface. Hold phone 15-20cm above, straight down.',

@@ -1,0 +1,10 @@
+opencv-python-headless>=4.8
+onnxruntime>=1.16
+# Pinned <2, and torch deliberately NOT listed here: the SageMaker PyTorch
+# 2.3 DLC ships its own version-matched torch+numpy (numpy 1.x ABI).
+# Letting pip install an unbounded torch/numpy on top of that here would
+# either fight the DLC's own CUDA-matched torch build or reintroduce the
+# numpy 2.x/torch-1.x-ABI DataLoader-worker crash already found and fixed
+# on the multiview-fusion branch's own SageMaker launcher this same
+# session (RuntimeError: Numpy is not available, forked-worker only).
+numpy>=1.24,<2

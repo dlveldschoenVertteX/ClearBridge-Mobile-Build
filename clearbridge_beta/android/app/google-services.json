@@ -1,0 +1,126 @@
+{
+  "project_info": {
+    "project_number": "427514831103",
+    "project_id": "clearbridge-dc699",
+    "storage_bucket": "clearbridge-dc699.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427514831103:android:ad3f79916c25252848acca",
+        "android_client_info": {
+          "package_name": "com.clearbridge.app"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "427514831103-nck6enk45apc4oj4dupf24d3q46el1af.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.clearbridge.app",
+            "certificate_hash": "418b6455a1bae1cf1ab4f1e945f25a8c64ac3391"
+          }
+        },
+        {
+          "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "427514831103-qp3ti4papvor6ocjdih6ntm94t5qb3gd.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.clearbridge.clearbridgeHybrid"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427514831103:android:bc34b32903b6a9dd48acca",
+        "android_client_info": {
+          "package_name": "com.clearbridge.beta"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "427514831103-qp3ti4papvor6ocjdih6ntm94t5qb3gd.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.clearbridge.clearbridgeHybrid"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:427514831103:android:39c5c212efd647e948acca",
+        "android_client_info": {
+          "package_name": "com.clearbridge.bridge"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyAus1IsVAvF0Z_LUBQO5pK6C9VKtCb3tEU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "427514831103-8pvrq3353v3ta1v61uu22q44fnnvuhk5.apps.googleusercontent.com",
+              "client_type": 3
+            },
+            {
+              "client_id": "427514831103-qp3ti4papvor6ocjdih6ntm94t5qb3gd.apps.googleusercontent.com",
+              "client_type": 2,
+              "ios_info": {
+                "bundle_id": "com.clearbridge.clearbridgeHybrid"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

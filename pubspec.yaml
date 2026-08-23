@@ -41,7 +41,12 @@ dependencies:
   cupertino_icons: ^1.0.8
   flutter_riverpod: ^2.6.1
   go_router: ^17.1.0
-  firebase_core: ^4.5.0
+  # Upper-bounded: 4.12.0 broke compile compat with the coordinated
+  # firebase_auth/firestore/storage/functions bumps resolved alongside it
+  # (missing 'FirebasePlugin' type, 'pluginConstants' getter) -- confirmed via
+  # a real CI failure on clearbridge_beta (same constraint, same floating
+  # resolution since no pubspec.lock is committed anywhere in this repo).
+  firebase_core: '>=4.5.0 <4.12.0'
   firebase_auth: ^6.2.0
   cloud_firestore: ^6.1.3
   firebase_storage: ^13.1.0

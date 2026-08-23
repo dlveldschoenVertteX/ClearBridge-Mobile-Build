@@ -1,0 +1,110 @@
+[
+  {
+    "capture": "971c304d-3aa5-49b2-902f-0fd4f34d0029",
+    "rows": [
+      {
+        "source": "front_v1",
+        "total": 48,
+        "corroborated": 43,
+        "unique_in_overlap": 4,
+        "unique_new_coverage": 1
+      },
+      {
+        "source": "sweep_right",
+        "total": 94,
+        "corroborated": 32,
+        "unique_in_overlap": 48,
+        "unique_new_coverage": 14
+      },
+      {
+        "source": "sweep_left",
+        "total": 50,
+        "corroborated": 19,
+        "unique_in_overlap": 10,
+        "unique_new_coverage": 21
+      },
+      {
+        "source": "sweep_delta",
+        "total": 48,
+        "corroborated": 28,
+        "unique_in_overlap": 17,
+        "unique_new_coverage": 3
+      },
+      {
+        "source": "sweep_center",
+        "total": 64,
+        "corroborated": 31,
+        "unique_in_overlap": 27,
+        "unique_new_coverage": 6
+      },
+      {
+        "source": "sweep_tip",
+        "total": 110,
+        "corroborated": 41,
+        "unique_in_overlap": 28,
+        "unique_new_coverage": 41
+      }
+    ],
+    "registered": [
+      "sweep_center",
+      "sweep_delta",
+      "sweep_left",
+      "sweep_right",
+      "sweep_tip"
+    ]
+  },
+  {
+    "capture": "f222e1df-c812-432c-ba3a-aa5b0b74de1b",
+    "rows": [
+      {
+        "source": "front_v1",
+        "total": 122,
+        "corroborated": 111,
+        "unique_in_overlap": 9,
+        "unique_new_coverage": 2
+      },
+      {
+        "source": "sweep_right",
+        "total": 91,
+        "corroborated": 59,
+        "unique_in_overlap": 14,
+        "unique_new_coverage": 18
+      },
+      {
+        "source": "sweep_left",
+        "total": 88,
+        "corroborated": 54,
+        "unique_in_overlap": 6,
+        "unique_new_coverage": 28
+      },
+      {
+        "source": "sweep_delta",
+        "total": 123,
+        "corroborated": 89,
+        "unique_in_overlap": 24,
+        "unique_new_coverage": 10
+      },
+      {
+        "source": "sweep_center",
+        "total": 112,
+        "corroborated": 98,
+        "unique_in_overlap": 12,
+        "unique_new_coverage": 2
+      },
+      {
+        "source": "sweep_tip",
+        "total": 95,
+        "corroborated": 73,
+        "unique_in_overlap": 20,
+        "unique_new_coverage": 2
+      }
+    ],
+    "registered": [
+      "sweep_center",
+      "sweep_delta",
+      "sweep_left",
+      "sweep_right",
+      "sweep_tip"
+    ]
+  }
+]

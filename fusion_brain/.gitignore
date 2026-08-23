@@ -1,0 +1,6 @@
+# Real biometric data — NEVER commit. This repo is public, and these are
+# real users' fingerprint captures ("special personal information" under
+# POPIA). The cache is local scratch only; it is rebuilt on demand from
+# Storage by anyone with real credentials.
+results/cache/
+results/cache_fusion_v1/

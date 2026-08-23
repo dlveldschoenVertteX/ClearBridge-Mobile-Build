@@ -46,6 +46,14 @@ class TaggedFrame {
   /// thumb without re-running detection on compressed frames.
   final Rect? thumbRoi;
 
+  /// Raw Y-plane dimensions. The backend decodes [bytes] as:
+  ///   np.frombuffer(data, dtype=uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
+  /// [bytesPerRow] is the effective stride (capped to buffer capacity / height)
+  /// and may equal [imageWidth] on devices that don't pad the Y-plane.
+  final int imageWidth;
+  final int imageHeight;
+  final int bytesPerRow;
+
   const TaggedFrame({
     required this.bytes,
     required this.timestamp,
@@ -54,6 +62,9 @@ class TaggedFrame {
     required this.laplacianScore,
     required this.zoneId,
     required this.thumbAngleDegrees,
+    required this.imageWidth,
+    required this.imageHeight,
+    required this.bytesPerRow,
     this.targetAngleDegrees,
     this.angularError,
     this.thumbCoverageRatio = 0.0,
@@ -132,7 +143,17 @@ class HybridCaptureService {
       if (_window.length < _maxCandidates) {
         final bytes = _extractBytes(image);
         if (bytes != null) {
-          _window.add(_Candidate(bytes, weightedScore, DateTime.now(), thumbRoi: thumbRoi));
+          final h = image.height;
+          final effectiveStride = h > 0
+              ? math.min(image.planes[0].bytesPerRow, bytes.length ~/ h)
+              : image.planes[0].bytesPerRow;
+          _window.add(_Candidate(
+            bytes, weightedScore, DateTime.now(),
+            thumbRoi: thumbRoi,
+            width: image.width,
+            height: h,
+            bytesPerRow: effectiveStride,
+          ));
         }
       } else {
         var lowestIdx = 0;
@@ -142,7 +163,17 @@ class HybridCaptureService {
         if (weightedScore > _window[lowestIdx].score) {
           final bytes = _extractBytes(image);
           if (bytes != null) {
-            _window[lowestIdx] = _Candidate(bytes, weightedScore, DateTime.now(), thumbRoi: thumbRoi);
+            final h = image.height;
+            final effectiveStride = h > 0
+                ? math.min(image.planes[0].bytesPerRow, bytes.length ~/ h)
+                : image.planes[0].bytesPerRow;
+            _window[lowestIdx] = _Candidate(
+              bytes, weightedScore, DateTime.now(),
+              thumbRoi: thumbRoi,
+              width: image.width,
+              height: h,
+              bytesPerRow: effectiveStride,
+            );
           }
         }
       }
@@ -270,12 +301,25 @@ class HybridCaptureService {
       ..sort((a, b) => b.score.compareTo(a.score));
     _window.clear();
 
+    // Reject anything below the same "good" bar used for the early-exit
+    // check above -- previously the burst returned its top-scoring frames
+    // unconditionally, so an angle that's physically harder to hold steady
+    // (faster/awkward orbit -> motion blur) could still fire and upload a
+    // blurry capture as long as SOME frame scored better than the others in
+    // that window, even if none were actually sharp. _fireAngleCapture
+    // already treats an empty return as "nothing usable — reset and let the
+    // user re-hold"; this makes that path also cover "the whole burst was
+    // too blurry", not just "no candidates were collected at all".
+    final qualifying =
+        candidates.where((c) => c.score >= _minBurstQuality).toList();
+    if (qualifying.isEmpty) return const [];
+
     // Compute shortest-arc angular error once (same for all frames in burst).
     final double? angularError = targetAngleDegrees != null
         ? _shortestArc(thumbAngleDegrees, targetAngleDegrees)
         : null;
 
-    return candidates.take(keep).map((c) {
+    return qualifying.take(keep).map((c) {
       return TaggedFrame(
         bytes: c.bytes,
         timestamp: c.timestamp,
@@ -288,6 +332,9 @@ class HybridCaptureService {
         angularError: angularError,
         thumbCoverageRatio: thumbCoverageRatio,
         thumbRoi: c.thumbRoi,
+        imageWidth: c.width,
+        imageHeight: c.height,
+        bytesPerRow: c.bytesPerRow,
       );
     }).toList();
   }
@@ -352,9 +399,399 @@ class HybridCaptureService {
     return n > 1 ? m2 / (n - 1) : 0.0;
   }
 
+  /// Live, on-device estimate of the thumb's native ridge wavelength (in raw
+  /// preview pixels) over [roi]. Diagnostic-only for now -- the caller writes
+  /// it to Firestore alongside the capture for comparison against the
+  /// backend's own authoritative `afisWavelengthPx`; it does not yet drive
+  /// any user-facing hint (see FrontCaptureController's `distanceHint`).
+  ///
+  /// A deliberately coarser Dart port of `afis_print.py`'s
+  /// `_ridge_wavelength()`/`_orientation_field()` (autocorrelation-based, no
+  /// FFT needed -- no FFT/DSP package exists anywhere in this project's
+  /// pubspec.yaml files, and the backend's own trusted algorithm doesn't use
+  /// one either). Simplifications relative to the backend, and why each is
+  /// necessary rather than just cheaper:
+  ///   - No per-block affine rotation (the backend rotates each 32x32 block
+  ///     to its own local ridge orientation via Sobel + boxFilter). Instead,
+  ///     a single coarse whole-ROI orientation check picks ONE of two axes
+  ///     (row-bands vs column-bands) for every strip. This still has to be a
+  ///     real check, not an assumed "ridges are horizontal" default -- a
+  ///     tip-up thumb's ridge flow inside the guide crop varies by finger/
+  ///     core position, and projecting the wrong axis produces a
+  ///     confidently WRONG estimate, not just a noisier one.
+  ///   - Subpixel (parabolic) peak interpolation on the autocorrelation
+  ///     peak. Required, not polish: live-preview resolution is well below
+  ///     the still's 3200px decode width, so the same physical ridge
+  ///     spacing shows up as only a handful of raw preview pixels -- integer
+  ///     lag alone can't distinguish enough steps across the real 9-14px
+  ///     (still-space) sweet spot once rescaled.
+  ///
+  /// Returns null (never a fabricated fallback like the backend's default-
+  /// to-9.0) when fewer than 2 strips qualify -- a wrong-but-plausible
+  /// number would be worse than no signal for a value this is meant to
+  /// eventually be trusted more than the existing brightness/coverage proxy.
+  static RidgeWavelengthEstimate? estimateRidgeWavelengthPx(
+    CameraImage image, {
+    required Rect roi,
+    int stripCount = 5,
+    int stripThicknessPx = 4,
+    double minStripStd = 6.0,
+    int minLagPx = 2,
+    // Hard ceiling on the autocorrelation search window (raw preview pixels).
+    // Ridge periods > 40px live-preview correspond to > ~55px still-space via
+    // the ~1.4x scale factor -- well above any range that produces usable NFIQ2
+    // scores. Without this cap, low-frequency torch-gradient trends in the
+    // signal dominate the autocorrelation envelope at longer lags and cause
+    // a spurious "first local max" to be found at ~89px rather than the true
+    // ~12-14px ridge period.
+    int maxLagRawPx = 40,
+    int maxSignalSamples = 300,
+    RidgeWavelengthAttemptDebug? debug,
+  }) {
+    if (image.planes.isEmpty) return null;
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    final w = image.width;
+    final h = image.height;
+    if (w < 8 || h < 8) return null;
+    final stride =
+        h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+
+    final x0 = (roi.left * w).clamp(1, w - 2).toInt();
+    final y0 = (roi.top * h).clamp(1, h - 2).toInt();
+    final x1 = (roi.right * w).clamp(1, w - 2).toInt();
+    final y1 = (roi.bottom * h).clamp(1, h - 2).toInt();
+    final roiW = x1 - x0;
+    final roiH = y1 - y0;
+    if (roiW < 16 || roiH < 16) return null;
+
+    // Coarse whole-ROI orientation check -- ROI-granularity stand-in for the
+    // backend's per-pixel Sobel orientation field. sumAbsRowGrad is large
+    // when brightness changes fastest moving DOWN (detects horizontal
+    // ridges); sumAbsColGrad is large when it changes fastest moving RIGHT
+    // (detects vertical ridges). Subsampled by gradStep -- this only needs
+    // to pick the dominant axis, not measure it precisely.
+    const gradStep = 3;
+    var sumAbsRowGrad = 0.0;
+    var sumAbsColGrad = 0.0;
+    for (var yy = y0; yy < y1 - gradStep; yy += gradStep) {
+      final row = yy * stride;
+      final rowNext = (yy + gradStep) * stride;
+      for (var xx = x0; xx < x1 - gradStep; xx += gradStep) {
+        sumAbsRowGrad += (bytes[row + xx] - bytes[rowNext + xx]).abs();
+        sumAbsColGrad += (bytes[row + xx] - bytes[row + xx + gradStep]).abs();
+      }
+    }
+    // Column gradients dominant -> brightness changes fastest moving right
+    // -> ridges run vertically -> the periodic (ridge-perpendicular) axis
+    // is X, so strips are horizontal row-bands averaged down to a signal
+    // that varies along X. Otherwise strips are vertical column-bands
+    // averaged across to a signal that varies along Y.
+    final ridgesVertical = sumAbsColGrad >= sumAbsRowGrad;
+    debug?.axis = ridgesVertical ? 'rows' : 'cols';
+
+    final projectedLen = ridgesVertical ? roiW : roiH;
+    // Bound the O(L^2) autocorrelation cost regardless of live-preview
+    // resolution, same "subsample for cost control" convention already used
+    // by meanLuma (stride 8) and _computeThumbFocus (stride 2) above.
+    final sampleStride = math.max(1, projectedLen ~/ maxSignalSamples);
+    final sigLen = projectedLen ~/ sampleStride;
+    if (sigLen < 16) return null;
+
+    final lags = <double>[];
+    for (var s = 0; s < stripCount; s++) {
+      final sig = List<double>.filled(sigLen, 0.0);
+      if (ridgesVertical) {
+        final bandStart = y0 +
+            ((roiH - stripThicknessPx) * s / math.max(1, stripCount - 1))
+                .round();
+        final by0 = bandStart.clamp(y0, y1 - stripThicknessPx);
+        final by1 = math.min(y1, by0 + stripThicknessPx);
+        if (by1 <= by0) continue;
+        for (var yy = by0; yy < by1; yy++) {
+          final row = yy * stride;
+          for (var i = 0; i < sigLen; i++) {
+            sig[i] += bytes[row + x0 + i * sampleStride];
+          }
+        }
+        final n = by1 - by0;
+        for (var i = 0; i < sigLen; i++) sig[i] /= n;
+      } else {
+        final bandStart = x0 +
+            ((roiW - stripThicknessPx) * s / math.max(1, stripCount - 1))
+                .round();
+        final bx0 = bandStart.clamp(x0, x1 - stripThicknessPx);
+        final bx1 = math.min(x1, bx0 + stripThicknessPx);
+        if (bx1 <= bx0) continue;
+        for (var xx = bx0; xx < bx1; xx++) {
+          for (var i = 0; i < sigLen; i++) {
+            sig[i] += bytes[(y0 + i * sampleStride) * stride + xx];
+          }
+        }
+        final n = bx1 - bx0;
+        for (var i = 0; i < sigLen; i++) sig[i] /= n;
+      }
+
+      final mean = sig.reduce((a, b) => a + b) / sig.length;
+      var variance = 0.0;
+      for (final v in sig) {
+        variance += (v - mean) * (v - mean);
+      }
+      variance /= sig.length;
+      final stripStd = math.sqrt(variance);
+      debug?.stripsAttempted += 1;
+      if (stripStd > (debug?.maxStripStd ?? 0.0)) debug?.maxStripStd = stripStd;
+      if (stripStd < minStripStd) continue;
+      debug?.stripsClearedStd += 1;
+
+      // Mean-center then quadratic-detrend to suppress torch-gradient trends
+      // that would otherwise produce spurious autocorrelation peaks at long
+      // lags, or blur/suppress the true ridge-period peak entirely.
+      //
+      // Upgraded from a purely linear detrend, 2026-08-17 round 3 (real
+      // debugging pass, not a parameter guess): the torch is a near-point
+      // source, so its brightness falloff across a strip is genuinely
+      // closer to quadratic (radial, centred wherever the torch's own
+      // falloff peaks) than linear -- a linear fit only ever removes the
+      // AVERAGE slope across the strip and leaves the residual curvature
+      // in place, worst for strips that sit off to one side of the ROI
+      // (exactly where real telemetry showed the estimator falling short:
+      // stripsWithPeak landing at 1 of 2 needed on strips that had already
+      // cleared the contrast bar, i.e. real periodic content was present
+      // but the autocorrelation search still failed to find a clean local
+      // maximum for it). Quadratic strictly generalises linear (a linear
+      // trend is just the degenerate c=0 case), so this can only detrend
+      // at least as well as before on genuinely linear cases -- it cannot
+      // regress a strip that already worked.
+      //
+      // Closed-form least-squares fit of y = a + b*x + c*x^2 via the 3x3
+      // normal-equations system, solved with Cramer's rule -- O(sigLen),
+      // cheap enough for a per-strip, per-throttled-attempt computation.
+      final centered = List<double>.generate(sig.length, (i) => sig[i] - mean);
+      final n = centered.length;
+      if (n >= 3) {
+        var s1 = 0.0, s2 = 0.0, s3 = 0.0, s4 = 0.0;
+        var t0 = 0.0, t1 = 0.0, t2 = 0.0;
+        for (var i = 0; i < n; i++) {
+          final x = i.toDouble();
+          final x2 = x * x;
+          s1 += x;
+          s2 += x2;
+          s3 += x2 * x;
+          s4 += x2 * x2;
+          final y = centered[i];
+          t0 += y;
+          t1 += x * y;
+          t2 += x2 * y;
+        }
+        final s0 = n.toDouble();
+        final det = s0 * (s2 * s4 - s3 * s3) -
+            s1 * (s1 * s4 - s3 * s2) +
+            s2 * (s1 * s3 - s2 * s2);
+        if (det.abs() > 1e-9) {
+          final detA = t0 * (s2 * s4 - s3 * s3) -
+              s1 * (t1 * s4 - s3 * t2) +
+              s2 * (t1 * s3 - s2 * t2);
+          final detB = s0 * (t1 * s4 - s3 * t2) -
+              t0 * (s1 * s4 - s3 * s2) +
+              s2 * (s1 * t2 - t1 * s2);
+          final detC = s0 * (s2 * t2 - t1 * s3) -
+              s1 * (s1 * t2 - t1 * s2) +
+              t0 * (s1 * s3 - s2 * s2);
+          final a = detA / det, b = detB / det, c = detC / det;
+          for (var i = 0; i < n; i++) {
+            final x = i.toDouble();
+            centered[i] -= a + b * x + c * x * x;
+          }
+        } else {
+          // Degenerate normal-equations matrix (shouldn't happen for n>=3
+          // with distinct integer x's, but fall back to linear-only rather
+          // than leaving raw content undetrended).
+          final slope = (centered.last - centered.first) / math.max(1, n - 1);
+          for (var i = 0; i < n; i++) {
+            centered[i] -= slope * i;
+          }
+        }
+      } else if (n >= 2) {
+        final slope = (centered.last - centered.first) / math.max(1, n - 1);
+        for (var i = 0; i < n; i++) {
+          centered[i] -= slope * i;
+        }
+      }
+      // Only compute the autocorrelation up to the max-lag ceiling. Beyond
+      // ~40 raw px there is no plausible ridge period worth measuring; computing
+      // beyond it would be wasted O(L) work and risks finding spurious peaks.
+      final maxLagSubsampled =
+          math.min(centered.length - 1, (maxLagRawPx / sampleStride).ceil() + 1);
+      final ac = List<double>.filled(maxLagSubsampled + 1, 0.0);
+      for (var lag = 0; lag <= maxLagSubsampled; lag++) {
+        var sum = 0.0;
+        for (var i = 0; i < centered.length - lag; i++) {
+          sum += centered[i] * centered[i + lag];
+        }
+        ac[lag] = sum;
+      }
+
+      // ALL local maxima via sign-change in the discrete derivative,
+      // rejecting lag <= minLagPx (mirrors afis_print.py's peaks[peaks>3],
+      // scaled down since live-preview pixels are coarser than still pixels
+      // -- see class docs). The search is bounded to maxLagSubsampled to
+      // prevent spurious peaks from low-frequency lighting gradients.
+      //
+      // Real bug found + fixed 2026-08-06: trusting only the FIRST local
+      // maximum makes this whole estimate hinge on a single autocorrelation
+      // cycle -- one spurious/missed peak from sensor noise, JPEG-adjacent
+      // preview compression, or curvature near a whorl core silently
+      // determines the strip's entire contribution. A real user report
+      // ("wavelength system is not consistent" despite visually identical
+      // thumb placement) plus real Firestore data (single-sample reads
+      // 20.6px-123.1px across captures with similar backend
+      // afisWavelengthPx) traced partly to this. Standard fingerprint-
+      // literature fix (Hong/Wan/Jain-style x-signature ridge counting):
+      // detect every local maximum and average the spacing between
+      // consecutive ones, so one bad cycle gets diluted by the others
+      // instead of solely determining the result. Falls back to the old
+      // single-peak behaviour when only one maximum is found (a clean,
+      // low-noise signal), so this is a strict improvement, never a
+      // regression, on the cases the old code already handled well.
+      final peakLags = <int>[];
+      for (var lag = 1; lag < ac.length - 1; lag++) {
+        if (lag <= minLagPx) continue;
+        if (ac[lag] > ac[lag - 1] && ac[lag] >= ac[lag + 1]) {
+          peakLags.add(lag);
+        }
+      }
+      if (peakLags.isEmpty) continue;
+      debug?.stripsWithPeak += 1;
+
+      double refinedLag;
+      if (peakLags.length == 1) {
+        // Single peak: subpixel parabolic interpolation, same as before.
+        final peakLag = peakLags[0];
+        final yPrev = ac[peakLag - 1], yPeak = ac[peakLag], yNext = ac[peakLag + 1];
+        final denom = yPrev - 2 * yPeak + yNext;
+        refinedLag = denom.abs() > 1e-9
+            ? peakLag + 0.5 * (yPrev - yNext) / denom
+            : peakLag.toDouble();
+      } else {
+        // Multiple peaks: subpixel-refine each, then average the spacing
+        // between consecutive ones -- averages across cycles instead of
+        // trusting the first alone.
+        final refined = <double>[];
+        for (final peakLag in peakLags) {
+          final yPrev = ac[peakLag - 1], yPeak = ac[peakLag], yNext = ac[peakLag + 1];
+          final denom = yPrev - 2 * yPeak + yNext;
+          refined.add(denom.abs() > 1e-9
+              ? peakLag + 0.5 * (yPrev - yNext) / denom
+              : peakLag.toDouble());
+        }
+        var spacingSum = 0.0;
+        for (var i = 1; i < refined.length; i++) {
+          spacingSum += refined[i] - refined[i - 1];
+        }
+        refinedLag = spacingSum / (refined.length - 1);
+      }
+      // Convert the subsampled-signal lag back to raw preview pixels.
+      lags.add(refinedLag * sampleStride);
+    }
+
+    if (lags.length < 2) return null;
+    lags.sort();
+    final mid = lags.length ~/ 2;
+    final medianLagPx =
+        lags.length.isOdd ? lags[mid] : (lags[mid - 1] + lags[mid]) / 2;
+
+    return RidgeWavelengthEstimate(
+      medianLagPx: medianLagPx,
+      qualifyingStrips: lags.length,
+      // 'rows' = strips were horizontal row-bands (ridges run vertically);
+      // 'cols' = strips were vertical column-bands (ridges run horizontally).
+      axis: ridgesVertical ? 'rows' : 'cols',
+    );
+  }
+
   /// EMA smoothing helper (also used by the capture controller for the meters).
   static double ema(double previous, double incoming, {double alpha = 0.3}) =>
       alpha * incoming + (1 - alpha) * previous;
+
+  /// Intensity-weighted centroid of whatever's in [roi], along either the
+  /// raw buffer's column axis ([alongRows] false, the default) or its row
+  /// axis ([alongRows] true), for the guided left-right thumb-sweep capture
+  /// (diagnostic-first -- see FrontCaptureController's sweepPositioning/
+  /// sweepActive phases). No optical flow, no tracker state carried between
+  /// calls -- per the sweep spec's own explicit design choice, a simple
+  /// per-frame brightness-weighted centroid within the existing guide
+  /// bounds is sufficient, since under torch/ambient light the thumb pad
+  /// reads meaningfully brighter than the background it sweeps across. Same
+  /// stride-safe, subsampled-scan pattern as [meanLuma]/[_measureBrightness]
+  /// above.
+  ///
+  /// [alongRows] exists because this raw CameraImage buffer is delivered in
+  /// the sensor's native (unrotated) orientation -- unlike the still-JPEG
+  /// path (`decodeStillJpegToLuma`) or the live preview widget
+  /// (`CameraPreview`), which both apply their own rotation before this
+  /// buffer's axes would visually match on-screen left/right. For a typical
+  /// back camera with `sensorOrientation=90` (this project's real, already-
+  /// confirmed convention -- see `_computeGuideRegion`'s "90°-CW rotation"),
+  /// the raw buffer's ROW axis is the one that ends up mapped to on-screen
+  /// HORIZONTAL after that rotation, not its column axis. The caller is
+  /// responsible for both picking the right axis for what it's trying to
+  /// measure on screen, and for any sign flip the rotation direction
+  /// implies (see FrontCaptureController's `_sweepScreenXFraction`).
+  ///
+  /// Returns the brightness-weighted mean position along the selected axis
+  /// within [roi], normalized 0.0 (the axis's start edge) to 1.0 (its end
+  /// edge). Returns null when the ROI has no usable signal (zero total
+  /// brightness) rather than a fabricated fallback -- same "null over a
+  /// wrong-but-plausible number" discipline as [estimateRidgeWavelengthPx].
+  static double? estimateThumbCentroidX(
+    CameraImage image, {
+    required Rect roi,
+    bool alongRows = false,
+  }) {
+    if (image.planes.isEmpty) return null;
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    final w = image.width;
+    final h = image.height;
+    if (w < 8 || h < 8) return null;
+    final stride =
+        h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+
+    final x0 = (roi.left * w).clamp(0, w - 1).toInt();
+    final y0 = (roi.top * h).clamp(0, h - 1).toInt();
+    final x1 = (roi.right * w).clamp(0, w - 1).toInt();
+    final y1 = (roi.bottom * h).clamp(0, h - 1).toInt();
+    if (x1 <= x0 + 1 || y1 <= y0 + 1) return null;
+
+    const step = 4; // subsample -- same cost-control convention as meanLuma (step 8)
+    var weightedSum = 0.0;
+    var totalWeight = 0.0;
+    if (alongRows) {
+      for (var yy = y0; yy < y1; yy += step) {
+        final row = yy * stride;
+        for (var xx = x0; xx < x1; xx += step) {
+          final v = bytes[row + xx].toDouble();
+          weightedSum += v * yy;
+          totalWeight += v;
+        }
+      }
+      if (totalWeight <= 0) return null;
+      final centroidYPx = weightedSum / totalWeight;
+      return ((centroidYPx - y0) / (y1 - y0)).clamp(0.0, 1.0);
+    }
+    for (var yy = y0; yy < y1; yy += step) {
+      final row = yy * stride;
+      for (var xx = x0; xx < x1; xx += step) {
+        final v = bytes[row + xx].toDouble();
+        weightedSum += v * xx;
+        totalWeight += v;
+      }
+    }
+    if (totalWeight <= 0) return null;
+    final centroidXPx = weightedSum / totalWeight;
+    return ((centroidXPx - x0) / (x1 - x0)).clamp(0.0, 1.0);
+  }
 
   /// Mean luminance of the Y plane, optionally restricted to [roi] (normalized
   /// 0-1 Rect). Shared brightness helper for controllers without their own ROI
@@ -415,10 +852,89 @@ class HybridCaptureService {
   }
 }
 
+/// Optional diagnostic sink for [HybridCaptureService.estimateRidgeWavelengthPx],
+/// filled in unconditionally (success OR failure) when passed. Added
+/// 2026-08-17: real telemetry showed live attempts return null ~95% of the
+/// time with zero detail on why -- every failure looked identical from the
+/// outside (too little texture? wrong axis? ROI too small?), which is
+/// exactly why the long-standing sampleCount:0 problem was never root-
+/// caused from real device data before now. The caller logs this alongside
+/// each attempt so the NEXT real capture's telemetry shows the actual
+/// observed per-strip contrast distribution instead of just a bare null.
+class RidgeWavelengthAttemptDebug {
+  /// How many of the [stripCount] strips were actually sampled (can be
+  /// fewer than requested if a band clamps to zero height/width).
+  int stripsAttempted = 0;
+
+  /// How many strips cleared the [minStripStd] contrast bar (regardless of
+  /// whether a peak was then found in them).
+  int stripsClearedStd = 0;
+
+  /// Highest per-strip std observed, even if it didn't clear the bar --
+  /// the single most useful number for deciding whether minStripStd itself
+  /// is set too high for live-preview content.
+  double maxStripStd = 0.0;
+
+  /// How many of the strips that cleared [stripsClearedStd] then ALSO found
+  /// a real autocorrelation local maximum (i.e. contributed to `lags` and
+  /// would count toward the >=2 needed for a non-null result). Added
+  /// 2026-08-17 round 2: real telemetry from the first working round of
+  /// this debug sink showed 5/5 strips clearing the contrast bar on every
+  /// single attempt across multiple real captures (indoor AND sunlight)
+  /// while `estimateRidgeWavelengthPx` still returned null every time --
+  /// proving the contrast bar (minStripStd) was never the real bottleneck,
+  /// but leaving genuinely ambiguous whether strips are finding ZERO
+  /// autocorrelation peaks (no periodic signal survives in the live-preview
+  /// domain at all -- a structural ISP/resolution limit no amount of
+  /// threshold tuning fixes) or finding exactly ONE (a borderline case
+  /// where minLagPx/maxLagRawPx tuning could plausibly help). This field
+  /// is the direct answer: equals `lags.length` at the point
+  /// [estimateRidgeWavelengthPx] returns, so `stripsWithPeak < 2` on the
+  /// next real capture pinpoints exactly which of those two cases is
+  /// actually happening, instead of guessing.
+  int stripsWithPeak = 0;
+
+  /// 'rows' or 'cols' -- the axis picked before any strip was sampled.
+  String? axis;
+}
+
+/// Result of [HybridCaptureService.estimateRidgeWavelengthPx].
+class RidgeWavelengthEstimate {
+  /// Median autocorrelation-peak lag across qualifying strips, in raw
+  /// live-preview pixels (NOT yet scaled to the backend's still-space
+  /// `afisWavelengthPx` convention -- the caller applies that scale factor).
+  final double medianLagPx;
+
+  /// How many of the requested strips had enough texture (std >= minStripStd)
+  /// and a detectable autocorrelation peak to contribute to the median.
+  final int qualifyingStrips;
+
+  /// 'rows' or 'cols' -- which axis the strips were built along. See
+  /// [HybridCaptureService.estimateRidgeWavelengthPx]'s doc comment.
+  final String axis;
+
+  const RidgeWavelengthEstimate({
+    required this.medianLagPx,
+    required this.qualifyingStrips,
+    required this.axis,
+  });
+}
+
 class _Candidate {
   final Uint8List bytes;
   final double score;
   final DateTime timestamp;
   final Rect? thumbRoi;
-  const _Candidate(this.bytes, this.score, this.timestamp, {this.thumbRoi});
+  final int width;
+  final int height;
+  final int bytesPerRow;
+  const _Candidate(
+    this.bytes,
+    this.score,
+    this.timestamp, {
+    this.thumbRoi,
+    required this.width,
+    required this.height,
+    required this.bytesPerRow,
+  });
 }

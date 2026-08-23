@@ -1,0 +1,52 @@
+[
+  {
+    "capture": "353cb00b-a70f-4ce7-9005-6db8e70e3616",
+    "rows": [
+      {
+        "source": "CONTROL_faceon2",
+        "angle": 1.04,
+        "total": 116,
+        "corroborated": 82,
+        "unmatched_inside_anchor": 21,
+        "new_beyond_anchor_inner": 9,
+        "new_beyond_anchor_EDGE": 4
+      },
+      {
+        "source": "tiltMOD_neg",
+        "angle": -11.83,
+        "total": 279,
+        "corroborated": 56,
+        "unmatched_inside_anchor": 53,
+        "new_beyond_anchor_inner": 63,
+        "new_beyond_anchor_EDGE": 107
+      },
+      {
+        "source": "tiltEXT_neg",
+        "angle": -17.02,
+        "total": 264,
+        "corroborated": 59,
+        "unmatched_inside_anchor": 45,
+        "new_beyond_anchor_inner": 73,
+        "new_beyond_anchor_EDGE": 87
+      },
+      {
+        "source": "tiltMOD_pos",
+        "angle": 8.54,
+        "total": 31,
+        "corroborated": 15,
+        "unmatched_inside_anchor": 8,
+        "new_beyond_anchor_inner": 5,
+        "new_beyond_anchor_EDGE": 3
+      },
+      {
+        "source": "tiltEXT_pos",
+        "angle": 15.78,
+        "total": 380,
+        "corroborated": 57,
+        "unmatched_inside_anchor": 83,
+        "new_beyond_anchor_inner": 111,
+        "new_beyond_anchor_EDGE": 129
+      }
+    ]
+  }
+]

@@ -1,0 +1,54 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    // Admins (Firebase custom claim) get read access for review/ops tooling,
+    // mirroring firestore.rules. Cloud Functions use the Admin SDK and bypass
+    // these rules entirely, so server-side enhance/stitch/score is unaffected.
+    function isAdmin() {
+      return request.auth != null && request.auth.token.admin == true;
+    }
+
+    // MAC3D raw capture frames: uncompressed Y-plane camera bytes, uploaded as
+    // application/octet-stream (JPEG re-encoding would degrade the SFM
+    // reconstruction). Derived JPEGs in this same path (e.g. enhanced_flat.jpg
+    // written by the Cloud Function) still match the image-type check below.
+    //
+    // video/mp4 added 2026-08-03: the burst+video hybrid capture's sweep
+    // video (front_capture_controller.dart's _captureSweepVideo, uploaded as
+    // {basePath}/sweep_video.mp4) was being rejected here -- real device
+    // test confirmed via Firestore's own sweepVideoDebug.error:
+    // "[firebase_storage/unauthorized] User is not authorized to perform the
+    // desired action." on a real 13.8MB upload after recording succeeded.
+    // The feature was otherwise working end-to-end (record + read bytes both
+    // succeeded); only this content-type gate blocked it.
+    match /captures/{userId}/{allPaths=**} {
+      allow read: if isAdmin()
+        || (request.auth != null && request.auth.uid == userId);
+      allow write: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 50 * 1024 * 1024
+        && (request.resource.contentType.matches('image/(jpeg|png|webp)')
+            || request.resource.contentType.matches('video/mp4')
+            || request.resource.contentType == 'application/octet-stream');
+    }
+
+    // Every other upload path in the app follows the convention {type}/{userId}/...
+    // (fingerprints/, selfies/, id_documents/, and the dynamic fallback in
+    // image_upload_service.dart). Enforce that the second path segment is the
+    // caller's own uid: a user can only touch their own data.
+    match /{type}/{userId}/{allPaths=**} {
+      allow read: if isAdmin()
+        || (request.auth != null && request.auth.uid == userId);
+      allow write: if request.auth != null
+        && request.auth.uid == userId
+        && request.resource.size < 50 * 1024 * 1024
+        && request.resource.contentType.matches('image/(jpeg|png|webp)');
+    }
+
+    // Fail closed: anything not matching the per-user convention is denied.
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

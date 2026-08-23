@@ -20,6 +20,12 @@ android {
         isCoreLibraryDesugaringEnabled = true
     }
 
+    // AGP disables resValue generation by default; the flavors below rely on
+    // it for their per-flavor app_name.
+    buildFeatures {
+        resValues = true
+    }
+
     defaultConfig {
         // TODO: Specify your own unique Application ID (https://developer.android.com/studio/build/application-id.html).
         applicationId = "com.clearbridge.app"
@@ -36,6 +42,25 @@ android {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
             signingConfig = signingConfigs.getByName("debug")
+        }
+    }
+
+    // Two co-installable variants of the same codebase — one defaulting to
+    // 4-angle capture, one to arc-sweep. Which capture flow is actually used
+    // at runtime is selected by the CAPTURE_MODE dart-define passed to
+    // `flutter build apk --flavor <flavor> --dart-define=CAPTURE_MODE=<mode>`;
+    // these flavors only need to keep the two APKs distinct on-device
+    // (application ID + display name) so both can be installed side by side.
+    flavorDimensions += "captureMode"
+    productFlavors {
+        create("fourAngle") {
+            dimension = "captureMode"
+            resValue("string", "app_name", "ClearBridge")
+        }
+        create("arcSweep") {
+            dimension = "captureMode"
+            applicationIdSuffix = ".arcsweep"
+            resValue("string", "app_name", "ClearBridge Arc")
         }
     }
 }

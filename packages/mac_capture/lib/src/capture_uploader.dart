@@ -19,6 +19,9 @@ abstract class CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    // Full per-detect-cycle approach trajectory (ground truth angle vs. what
+    // the IMU/CV saw) -- see MultiAngleCaptureController._logTelemetry.
+    List<Map<String, dynamic>> debugTelemetry = const [],
   });
 }
 

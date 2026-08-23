@@ -131,17 +131,33 @@ class _BootstrapperAppState extends State<_BootstrapperApp> {
       NotificationService.init(),
     ]);
 
-    // App Check: Play Integrity on Android (attests the APK is a genuine signed
-    // build). Runs silently in the background; tokens are attached automatically
-    // to all Firebase SDK requests (Firestore, Storage, Cloud Functions callable).
-    // Enforcement is enabled per-service in the Firebase Console → App Check.
-    // Use AndroidProvider.debug for emulator/CI; playIntegrity for release builds.
+    // App Check: attests the APK is a genuine, unmodified build. Runs silently
+    // in the background; tokens are attached automatically to all Firebase SDK
+    // requests (Firestore, Storage, Cloud Functions callable). Enforcement is
+    // configured per-service in the Firebase Console → App Check.
+    //
+    // Play Integrity requires the app's signing certificate to match the one
+    // registered for this package with Firebase/Google Play. Release builds
+    // here (and every CI build) are signed with an ephemeral, machine-
+    // generated debug keystore — a different certificate every time — which
+    // can never satisfy Play Integrity attestation. Forcing playIntegrity for
+    // non-debug-mode builds made every sideloaded beta APK activate a
+    // provider that was guaranteed to fail its attestation handshake, which
+    // is a known cause of hard, uncatchable native crashes in this plugin on
+    // some devices — exactly the "app has stopped" crash seen on real
+    // devices, while a build with no App Check (capture_harness) launches
+    // fine. Use the debug provider until release builds are signed with a
+    // real, stable keystore registered with Firebase; also wrap activation in
+    // try/catch so any future App Check failure degrades gracefully instead
+    // of taking the whole app down.
     if (!kIsWeb) {
-      await FirebaseAppCheck.instance.activate(
-        androidProvider: kDebugMode // ignore: deprecated_member_use
-            ? AndroidProvider.debug
-            : AndroidProvider.playIntegrity,
-      );
+      try {
+        await FirebaseAppCheck.instance.activate(
+          androidProvider: AndroidProvider.debug,
+        );
+      } catch (error) {
+        debugPrint('App Check activation failed (non-fatal): $error');
+      }
     }
 
     // Enable Firestore offline persistence so dashboard/history serve cached

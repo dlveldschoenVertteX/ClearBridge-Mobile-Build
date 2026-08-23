@@ -13,6 +13,7 @@ import 'thumb_angle_service.dart';
 import 'angle_progress_circles.dart';
 import 'capture_guidance_overlay.dart';
 import 'capture_intro_animation.dart';
+import 'capture_vignette_overlay.dart';
 import 'distance_guidance_widget.dart';
 import 'focus_meter_widget.dart';
 import 'haptic_guidance_circle.dart';
@@ -40,6 +41,7 @@ class MacCaptureScreen extends ConsumerStatefulWidget {
     required this.onComplete,
     required this.onQueued,
     required this.onClose,
+    this.showDebugHud = false,
   });
 
   /// Backend that persists a finished capture (Firebase, or anything else).
@@ -62,6 +64,12 @@ class MacCaptureScreen extends ConsumerStatefulWidget {
 
   /// Called when the user backs out of the screen before/without capturing.
   final VoidCallback onClose;
+
+  /// Shows a live readout of the values behind the axis/CV gates (gyro
+  /// magnitude, CV confidence + prediction, distance to target, focus,
+  /// lighting) in the top-left corner. Off by default — for internal test
+  /// builds diagnosing capture-firing issues, not end users.
+  final bool showDebugHud;
 
   @override
   ConsumerState<MacCaptureScreen> createState() => _MacCaptureScreenState();
@@ -86,12 +94,13 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
     try {
       await _cameraService.initializeCamera(
         lensDirection: CameraLensDirection.back,
-        // 1920x1080 per the camera-system spec. ResolutionPreset.max requests
-        // the sensor's full resolution (4K+ on many devices), which means
-        // every frame's Laplacian scoring and TFLite hand detection runs on
-        // 4x+ the pixel count for no quality benefit -- the backend NFIQ
-        // pipeline works from the same-sized JPEGs regardless.
-        resolution: ResolutionPreset.veryHigh,
+        // Full sensor resolution: the backend SFM/NFIQ pipeline works from raw
+        // Y-plane frames (not downscaled JPEGs), so more source detail
+        // directly improves reconstruction and NFIQ score. This costs more
+        // per-frame CPU in the live preprocessing loop (Laplacian scoring,
+        // TFLite hand detection) than the previous 1080p cap -- if that
+        // becomes a smoothness problem worth trading back, revisit here.
+        resolution: ResolutionPreset.max,
       );
       if (!mounted) return;
       _sensorOrientation = _cameraService.selectedCamera?.sensorOrientation ?? 0;
@@ -213,6 +222,19 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
               Positioned.fill(
                 child: RepaintBoundary(child: _cameraLayer()),
               ),
+
+              // Layer 1a: vignette — smoothly fades the background to black
+              // so only the centred thumb region is visible, both as a
+              // framing cue for the user and to visually reinforce keeping
+              // busy backgrounds out of the shot. Shown whenever the guide
+              // circle itself would be shown.
+              if (phase == CapturePhase.capturing ||
+                  phase == CapturePhase.angleComplete ||
+                  phase == CapturePhase.awaitingStart ||
+                  phase == CapturePhase.calibrating)
+                const Positioned.fill(
+                  child: RepaintBoundary(child: CaptureVignetteOverlay()),
+                ),
 
               // Layer 1b: spatial anchors — Consumer subscribes per-frame during
               // active capture; RepaintBoundary isolates ripple animations.
@@ -336,6 +358,14 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                                 ),
                               ],
                             ),
+                            if (s.distanceToTarget < 180.0)
+                              Padding(
+                                padding: const EdgeInsets.only(top: 8),
+                                child: AngleDegreeText(
+                                  distanceToTarget: s.distanceToTarget,
+                                  isLocked: s.distanceToTarget <= 5,
+                                ),
+                              ),
                             const SizedBox(height: 12),
                             if (s.guidanceMessage.isNotEmpty)
                               Padding(
@@ -427,7 +457,8 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                     mainAxisSize: MainAxisSize.min,
                     children: [
                       Text(
-                        'Place your thumb in front of the camera',
+                        'Place your thumb in front of the camera. Keep your '
+                        'body still — move only the phone.',
                         textAlign: TextAlign.center,
                         style: CaptureTypography.body.copyWith(
                           fontSize: 14,
@@ -464,6 +495,21 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                         textAlign: TextAlign.center,
                         style: CaptureTypography.body
                             .copyWith(fontSize: 13),
+                      ),
+                      const SizedBox(height: 4),
+                      // This is the exact moment the orientation reference is
+                      // zeroed (DeviceOrientationService.captureReference()) —
+                      // if the user's body turns right now, every angle read
+                      // for the rest of the session is thrown off, since the
+                      // gyro can't tell "phone tilted relative to thumb" apart
+                      // from "phone and thumb both turned together with the body."
+                      Text(
+                        'Stay still — don\'t turn your body, only the phone moves',
+                        textAlign: TextAlign.center,
+                        style: CaptureTypography.body.copyWith(
+                          fontSize: 12,
+                          color: CaptureColors.silverDim,
+                        ),
                       ),
                     ],
                   ),
@@ -604,6 +650,21 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
                           .watch(multiAngleCaptureControllerProvider)
                           .state;
                       return _buildFlashPanel(s);
+                    },
+                  ),
+                ),
+
+              // Layer 10: debug HUD — internal test builds only.
+              if (widget.showDebugHud)
+                Positioned(
+                  top: 48,
+                  left: 48,
+                  child: Consumer(
+                    builder: (_, ref, __) {
+                      final s = ref
+                          .watch(multiAngleCaptureControllerProvider)
+                          .state;
+                      return _buildDebugHud(s);
                     },
                   ),
                 ),
@@ -749,6 +810,48 @@ class _MacCaptureScreenState extends ConsumerState<MacCaptureScreen> {
           ),
           const SizedBox(height: 4),
           pill,
+        ],
+      ),
+    );
+  }
+
+  /// Raw values behind the axis/CV gates — see [MacCaptureScreen.showDebugHud].
+  Widget _buildDebugHud(CaptureSessionState s) {
+    String row(String label, String value) => '$label: $value';
+    final lines = <String>[
+      row('angle', s.currentAngleIndex < ThumbAngleService.order.length
+          ? ThumbAngleService.order[s.currentAngleIndex]
+          : '?'),
+      row('dist°', s.distanceToTarget.toStringAsFixed(1)),
+      row('gyro', s.gyroMagnitude.toStringAsFixed(3)),
+      row('cv', s.cvPredictedAngle == null
+          ? '—'
+          : '${s.cvPredictedAngle} ${(s.cvConfidence ?? 0).toStringAsFixed(2)}'),
+      row('focus', s.focusValue.toStringAsFixed(2)),
+      row('light', s.lightingValue.toStringAsFixed(2)),
+      row('green', '${s.axisGreenFrames}/5'),
+    ];
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(6),
+        border: Border.all(color: Colors.white.withValues(alpha: 0.15)),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          for (final line in lines)
+            Text(
+              line,
+              style: const TextStyle(
+                color: Colors.greenAccent,
+                fontSize: 11,
+                fontFamily: 'monospace',
+                height: 1.4,
+              ),
+            ),
         ],
       ),
     );

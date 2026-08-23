@@ -17,7 +17,8 @@ const _uuid = Uuid();
 /// `processEnhanceAndScore` Cloud Function (africa-south1). Returns the
 /// captureId. This is the app's concrete [CaptureUploader] — the mac_capture
 /// package knows nothing about Firebase, only this interface.
-class FingerprintFrameUploadService implements CaptureUploader {
+class FingerprintFrameUploadService
+    implements CaptureUploader, ArcCaptureUploader {
   const FingerprintFrameUploadService();
 
   @override
@@ -31,6 +32,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    List<Map<String, dynamic>> debugTelemetry = const [],
   }) async {
     try {
       return await _uploadAndProcess(
@@ -43,6 +45,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
         burstStats: burstStats,
         axisGateAtCapture: axisGateAtCapture,
         orbitAngles: orbitAngles,
+        debugTelemetry: debugTelemetry,
       );
     } on FirebaseException catch (e) {
       final isNetwork = e.code == 'unavailable' ||
@@ -64,6 +67,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     List<Map<String, dynamic>> burstStats = const [],
     List<Map<String, dynamic>> axisGateAtCapture = const [],
     Map<String, double> orbitAngles = const {},
+    List<Map<String, dynamic>> debugTelemetry = const [],
   }) async {
     // Fail fast before touching Storage/Firestore — both require auth.
     final authUser = FirebaseAuth.instance.currentUser;
@@ -165,6 +169,113 @@ class FingerprintFrameUploadService implements CaptureUploader {
       }
     }();
 
+    // Debug telemetry (gyro/CV trajectory for retuning + CV retraining) is a
+    // separate collection/write on purpose -- it can be large enough to risk
+    // hitting Firestore's 1MB doc limit on a long/retried session, and it
+    // must never be able to fail the actual capture upload above.
+    if (debugTelemetry.isNotEmpty) {
+      () async {
+        try {
+          await db.collection('captureTelemetry').doc(id).set({
+            'captureId': id,
+            'userId': userId,
+            'createdAt': FieldValue.serverTimestamp(),
+            'telemetry': debugTelemetry,
+          });
+        } catch (e) {
+          debugPrint('[captureTelemetry] write failed (non-blocking): $e');
+        }
+      }();
+    }
+
+    return id;
+  }
+
+  /// Uploads an arc-sweep capture (continuous gyro-tracked sweep, one best
+  /// frame per angular bin) and triggers processing. The backend identifies
+  /// arc captures by the `frame_{N}_arc_{binIndex}.jpg` filename convention
+  /// and by `arcAngles` in the callable payload (main.py `_download_arc_frames`
+  /// / `is_arc`) — both must stay in sync with that contract.
+  ///
+  /// [frames] and [arcAngles] are parallel lists ordered by bin. Bin indices
+  /// are read from `frameMetadata[i]['binIndex']` when present so Storage
+  /// filenames carry the true bin even if some bins were skipped; falls back
+  /// to the list position otherwise.
+  @override
+  Future<String> uploadArcAndProcess(
+    List<Uint8List> frames, {
+    required List<double> arcAngles,
+    required String userId,
+    String? captureId,
+    void Function(double progress)? onProgress,
+    List<Map<String, dynamic>> frameMetadata = const [],
+  }) async {
+    final authUser = FirebaseAuth.instance.currentUser;
+    if (authUser == null) {
+      throw Exception('[unauthenticated] Session expired — sign in again before capture.');
+    }
+    if (frames.length != arcAngles.length) {
+      throw ArgumentError(
+          'frames (${frames.length}) and arcAngles (${arcAngles.length}) must be parallel');
+    }
+
+    final db = FirebaseFirestore.instance;
+    final id = captureId ?? _uuid.v4();
+    final basePath = 'captures/$userId/$id';
+
+    final uploadTasks = <(Uint8List, String)>[];
+    for (int i = 0; i < frames.length; i++) {
+      final binIndex = (i < frameMetadata.length
+              ? frameMetadata[i]['binIndex'] as int?
+              : null) ??
+          i;
+      uploadTasks.add(
+          (frames[i], '$basePath/frame_${i + 1}_arc_$binIndex.jpg'));
+    }
+
+    final firestoreFuture = db.collection('captures').doc(id).set({
+      'captureId': id,
+      'userId': userId,
+      'createdAt': FieldValue.serverTimestamp(),
+      'status': 'pending',
+      'source': 'flutter_apk',
+      'captureMethod': 'arc_sweep',
+      'captureMode': 'arc_sweep',
+      'frameCount': frames.length,
+      'arcAngles': arcAngles,
+      'frames': frameMetadata,
+    }, SetOptions(merge: true));
+
+    final tokenFuture = authUser.getIdToken(true);
+
+    var completed = 0;
+    for (var i = 0; i < uploadTasks.length; i += 6) {
+      final batchEnd = math.min(i + 6, uploadTasks.length);
+      await Future.wait([
+        for (var j = i; j < batchEnd; j++)
+          _uploadFrame(uploadTasks[j].$1, uploadTasks[j].$2)
+              .then((_) => onProgress?.call(++completed / frames.length)),
+      ]);
+    }
+
+    await Future.wait([firestoreFuture, tokenFuture]);
+
+    // Fire-and-forget, same rationale as the 4-angle path above.
+    () async {
+      try {
+        await FirebaseFunctions.instanceFor(region: 'africa-south1')
+            .httpsCallable('processEnhanceAndScore')
+            .call({
+          'captureId': id,
+          'userId': userId,
+          'basePath': basePath,
+          'arcAngles': arcAngles,
+        });
+      } catch (e) {
+        debugPrint('[processEnhanceAndScore] arc trigger failed (non-blocking): $e');
+      }
+    }();
+
     return id;
   }
 
@@ -180,7 +291,7 @@ class FingerprintFrameUploadService implements CaptureUploader {
     await FirebaseStorage.instance
         .ref()
         .child(path)
-        .putData(data, SettableMetadata(contentType: 'image/jpeg'));
+        .putData(data, SettableMetadata(contentType: 'application/octet-stream'));
   }
 }
 

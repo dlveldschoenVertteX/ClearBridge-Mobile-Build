@@ -5,11 +5,11 @@ import 'package:camera/camera.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
-import 'package:just_audio/just_audio.dart';
 import 'package:sensors_plus/sensors_plus.dart';
 import 'package:uuid/uuid.dart';
 
 import 'offline_capture_queue.dart';
+import 'capture_audio_service.dart';
 import 'capture_axis_controller.dart';
 import 'capture_uploader.dart';
 import 'multi_angle_capture.dart';
@@ -19,6 +19,7 @@ import 'frame_capture_service.dart';
 import 'hand_types.dart';
 import 'thumb_angle_service.dart';
 import 'thumb_landmarker_service.dart';
+import 'thumb_orientation_classifier.dart';
 
 const _uuid = Uuid();
 
@@ -70,6 +71,12 @@ class CaptureSessionState {
   final bool allCirclesGlow;
   // True for 1s after a failed capture burst — haptic circle shows amber "try again" state.
   final bool isRetrying;
+  // Debug-HUD fields (see MacCaptureScreen.showDebugHud) — raw values behind
+  // the axis/CV gates, not otherwise surfaced in the UI. Cheap to keep
+  // updated even when the HUD is off since they're plain doubles/strings.
+  final double gyroMagnitude; // rad/s, smoothed — see CaptureAxisController._gyroMax
+  final double? cvConfidence; // last orientation-classifier confidence, 0-1
+  final String? cvPredictedAngle; // last orientation-classifier prediction
 
   const CaptureSessionState({
     this.phase = CapturePhase.idle,
@@ -94,6 +101,9 @@ class CaptureSessionState {
     this.axisGreenFrames = 0,
     this.allCirclesGlow = false,
     this.isRetrying = false,
+    this.gyroMagnitude = 0.0,
+    this.cvConfidence,
+    this.cvPredictedAngle,
   });
 
   CaptureSessionState copyWith({
@@ -119,6 +129,9 @@ class CaptureSessionState {
     int? axisGreenFrames,
     bool? allCirclesGlow,
     bool? isRetrying,
+    double? gyroMagnitude,
+    double? cvConfidence,
+    String? cvPredictedAngle,
   }) {
     return CaptureSessionState(
       phase: phase ?? this.phase,
@@ -143,6 +156,9 @@ class CaptureSessionState {
       axisGreenFrames: axisGreenFrames ?? this.axisGreenFrames,
       allCirclesGlow: allCirclesGlow ?? this.allCirclesGlow,
       isRetrying: isRetrying ?? this.isRetrying,
+      gyroMagnitude: gyroMagnitude ?? this.gyroMagnitude,
+      cvConfidence: cvConfidence ?? this.cvConfidence,
+      cvPredictedAngle: cvPredictedAngle ?? this.cvPredictedAngle,
     );
   }
 }
@@ -161,7 +177,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   final _thumbAngle = ThumbAngleService.instance;
   final _hybrid = HybridCaptureService();
   final _axisController = CaptureAxisController();
-  final _successPlayer = AudioPlayer();
+  final _captureAudio = CaptureAudioService();
   final _orientation = DeviceOrientationService();
 
   /// Live device orientation relative to the front-pose reference. Step 1
@@ -173,6 +189,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   AdaptiveFlashController? _flash;
   CaptureUploader? _upload;
   ThumbLandmarkerService? _plugin;
+  ThumbOrientationClassifier? _orientationClassifier;
   String? _userId;
   int _sensorOrientation = 0;
 
@@ -185,6 +202,14 @@ class MultiAngleCaptureController extends ChangeNotifier {
   final List<int> _angleTimingsMs = [];
   final List<Map<String, dynamic>> _burstStatsList = [];
   final List<Map<String, dynamic>> _axisGateLogs = [];
+  // Per-detect-cycle trajectory (~90ms cadence): the full approach curve for
+  // every angle, not just the fire-moment snapshot in _axisGateLogs. This is
+  // the dataset for retuning CaptureAxisController/ThumbAngleService targets
+  // and for CV retraining (ground truth angle vs. what the classifier saw).
+  // Capped so a long/retried session can't blow past Firestore's 1MB
+  // document limit.
+  final List<Map<String, dynamic>> _debugTelemetry = [];
+  static const _debugTelemetryCap = 3000;
   DateTime? _angleStart;
 
   // Live detection state.
@@ -266,6 +291,22 @@ class MultiAngleCaptureController extends ChangeNotifier {
   static const _lockFireDeg = 12.0;
   static const _lockResetDeg = 18.0;
 
+  // Hybrid CV+IMU gate: when the orientation classifier's top prediction
+  // matches the current target angle at or above this confidence, treat the
+  // orientation as confirmed regardless of the IMU distance -- CV becomes the
+  // primary signal. Below this threshold (or on a different/no prediction),
+  // fall back to the IMU distance check exactly as before, so a low-confidence
+  // or wrong CV prediction never blocks a capture the IMU alone would allow.
+  //
+  // Lowered from 0.6: 'top' (roll axis) was firing inconsistently -- the roll
+  // target requires an awkward phone tilt to hit on IMU alone, and users were
+  // bending their thumb down to find a reachable pose instead of orbiting the
+  // phone. The classifier scores confidently (very high scores in practice)
+  // when it's actually looking at 'top', so trusting it at a lower bar lets
+  // capture fire correctly however the user is holding the phone (up or
+  // down), without needing the exact roll angle IMU alone would require.
+  static const _cvConfidenceThreshold = 0.45;
+
   static const _qualityOnlyRequired = 5;
   static const _qualityOnlyGyroMax = 0.10;
   // Raised from 0.45 → 0.58: quality-only path fires at close range where the
@@ -308,6 +349,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _angleTimingsMs.clear();
     _burstStatsList.clear();
     _axisGateLogs.clear();
+    _debugTelemetry.clear();
     _brightnessSum = 0.0;
     _brightnessCount = 0;
     _pitchDarkActivated = false;
@@ -325,16 +367,13 @@ class MultiAngleCaptureController extends ChangeNotifier {
     _latestBrightness = 0.0;
     _latestFocusNorm = 0.0;
     _axisController.reset();
+    _captureAudio.silence();
     _smoothedAngle = 0.0;
     _smoothAngleInitialized = false;
     _retryCount = 0;
     _focusPeak = 1.0;
 
-    unawaited(
-      _successPlayer
-          .setAsset('assets/audio/capture_success.wav')
-          .catchError((_) => null),
-    );
+    unawaited(_captureAudio.init());
 
     // Begin streaming device orientation; the reference is zeroed at the front
     // pose in _finalizeCalibration.
@@ -379,6 +418,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // stays not-ready (detect() returns []) until initialization completes,
     // which _detectAndDrive/_runCalibration already handle as "no hand yet".
     _plugin = ThumbLandmarkerService()..initialize();
+    // Same fire-and-forget init pattern; classify() returns null until ready,
+    // which cvConfirms already treats as "no CV signal, IMU decides alone".
+    _orientationClassifier = ThumbOrientationClassifier()..initialize();
   }
 
   // ── Stream processing ──────────────────────────────────────────────────────
@@ -730,9 +772,10 @@ class MultiAngleCaptureController extends ChangeNotifier {
           distanceToTarget: 180.0,
           landmarks: const <Landmark>[],
         );
+        _captureAudio.updateGuidanceTone(null);
         // Quality-only fallback: thumb may be too close for MediaPipe to see
         // the full hand. Fire on image quality alone when thumb fills the frame.
-        _checkQualityOnlyCapture();
+        _checkQualityOnlyCapture(image);
       }
       return;
     }
@@ -767,6 +810,17 @@ class MultiAngleCaptureController extends ChangeNotifier {
     }
     final distance = _thumbAngle.distanceToTarget(_smoothedAngle, target);
 
+    // Hybrid CV+IMU gate: a confident, correct CV prediction overrides the
+    // IMU distance to "locked" (0°) so orientation lock is CV-primary when
+    // the model is sure, and IMU-only (unchanged) otherwise. cvConfirms can
+    // only ever bring the thumb closer to firing, never block a capture the
+    // IMU alone would already have allowed -- see _cvConfidenceThreshold.
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvConfirms = cvPrediction != null &&
+        cvPrediction.angleName == name &&
+        cvPrediction.confidence >= _cvConfidenceThreshold;
+    final effectiveDistance = cvConfirms ? 0.0 : distance;
+
     // Hand height in frame (wrist→middle fingertip) as a distance proxy:
     // smaller value = farther away, larger value = too close.
     final wrist    = hands.first.landmarks[0];
@@ -789,21 +843,38 @@ class MultiAngleCaptureController extends ChangeNotifier {
     // Show rotation direction+magnitude while the thumb hasn't reached the fire
     // threshold. Quality-gate messages only matter once the angle is close enough
     // to capture — showing them while far just confuses the user about why nothing fires.
-    final guidanceMsg = distance > _lockFireDeg
-        ? _rotationMessage(name, distance)
+    final guidanceMsg = effectiveDistance > _lockFireDeg
+        ? _rotationMessage(name, effectiveDistance)
         : axisResult.message;
 
     _state = _state.copyWith(
       thumbAngleDegrees: _smoothedAngle,
-      distanceToTarget: distance,
+      distanceToTarget: effectiveDistance,
       thumbCoverageRatio: coverage,
       landmarks: hands.first.landmarks,
       guidanceMessage: guidanceMsg,
       axisGreenFrames: axisResult.consecutiveGreenFrames,
+      gyroMagnitude: _gyroMagnitude,
+      cvConfidence: cvPrediction?.confidence,
+      cvPredictedAngle: cvPrediction?.angleName,
+    );
+    _captureAudio.updateGuidanceTone(effectiveDistance);
+    _logTelemetry(
+      targetAngle: name,
+      rawDistance: distance,
+      effectiveDistance: effectiveDistance,
+      cvConfirms: cvConfirms,
+      cvPrediction: cvPrediction,
+      thumbCoverageRatio: coverage,
+      axisGreenFrames: axisResult.consecutiveGreenFrames,
+      source: 'landmark',
     );
 
+    // Transition detection is about genuine physical movement away from the
+    // last captured angle -- always IMU-driven (raw distance), independent
+    // of whether CV currently confirms the *new* target.
     _checkTransition(_smoothedAngle, distance);
-    _checkLock(distance, axisResult);
+    _checkLock(effectiveDistance, axisResult);
   }
 
   // ── Lock + transition logic ─────────────────────────────────────────────────
@@ -825,6 +896,43 @@ class MultiAngleCaptureController extends ChangeNotifier {
     }
   }
 
+  /// Appends one row of the approach trajectory — ground truth angle vs.
+  /// what the IMU/CV actually saw at that moment. Uploaded with the capture
+  /// (see _finishAndUpload) as the dataset for retuning axis targets/
+  /// thresholds and for CV retraining. [source] distinguishes the detection
+  /// path: 'landmark' (MediaPipe sees the hand) vs 'quality_only' (thumb too
+  /// close for MediaPipe, CV-only fallback) since their axisGreenFrames
+  /// counters aren't the same scheme.
+  void _logTelemetry({
+    required String targetAngle,
+    required double rawDistance,
+    required double effectiveDistance,
+    required bool cvConfirms,
+    required OrientationPrediction? cvPrediction,
+    required double thumbCoverageRatio,
+    required int axisGreenFrames,
+    required String source,
+  }) {
+    if (_debugTelemetry.length >= _debugTelemetryCap) return;
+    _debugTelemetry.add({
+      't':                 DateTime.now().millisecondsSinceEpoch,
+      'source':            source,
+      'targetAngle':       targetAngle,
+      'rawDistance':       double.parse(rawDistance.toStringAsFixed(2)),
+      'effectiveDistance': double.parse(effectiveDistance.toStringAsFixed(2)),
+      'cvConfirms':        cvConfirms,
+      'cvPredictedAngle':  cvPrediction?.angleName,
+      'cvConfidence':      cvPrediction == null
+          ? null
+          : double.parse(cvPrediction.confidence.toStringAsFixed(3)),
+      'gyroMagnitude':     double.parse(_gyroMagnitude.toStringAsFixed(4)),
+      'focusNorm':         double.parse(_latestFocusNorm.toStringAsFixed(3)),
+      'brightness':        double.parse(_latestBrightness.toStringAsFixed(1)),
+      'thumbCoverageRatio': double.parse(thumbCoverageRatio.toStringAsFixed(3)),
+      'axisGreenFrames':   axisGreenFrames,
+    });
+  }
+
   // Fires capture when MediaPipe cannot see the full hand (thumb fills the
   // frame at close range). Orbit angle is gated via a live IMU reading so the
   // user must physically orbit to each position — using _smoothedAngle here
@@ -832,7 +940,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   //   (a) _smoothedAngle retains the OLD axis value after an index advance
   //       (left=pitch−20° → top=roll−20°: stale pitch matches roll target → 0°)
   //   (b) the 30° window was wide enough to fire on natural device tilt alone.
-  void _checkQualityOnlyCapture() {
+  void _checkQualityOnlyCapture(CameraImage image) {
     if (_busy) return;
 
     // Gate on the live orbit reading for the current angle's axis. This is the
@@ -843,11 +951,40 @@ class MultiAngleCaptureController extends ChangeNotifier {
     final orbitLive     = _orbitAngle(orient, ThumbAngleService.axis[name]!);
     final orbitDistance = _thumbAngle.distanceToTarget(orbitLive, target);
 
-    if (orbitDistance > _lockFireDeg) {
-      _state = _state.copyWith(guidanceMessage: _rotationMessage(name, orbitDistance));
+    // Hybrid CV+IMU gate, same rationale as _detectAndDrive: this path only
+    // runs when MediaPipe can't see a full hand (thumb too close), which is
+    // exactly the range the orientation classifier was trained for and the
+    // hand-landmark angle extraction can't handle. Without this, quality-only
+    // captures were purely IMU-driven with zero visual orientation check.
+    final cvPrediction = _orientationClassifier?.classify(image, _sensorOrientation);
+    final cvConfirms = cvPrediction != null &&
+        cvPrediction.angleName == name &&
+        cvPrediction.confidence >= _cvConfidenceThreshold;
+    final effectiveOrbitDistance = cvConfirms ? 0.0 : orbitDistance;
+    _logTelemetry(
+      targetAngle: name,
+      rawDistance: orbitDistance,
+      effectiveDistance: effectiveOrbitDistance,
+      cvConfirms: cvConfirms,
+      cvPrediction: cvPrediction,
+      thumbCoverageRatio: _state.thumbCoverageRatio,
+      axisGreenFrames: _qualityOnlyStreak,
+      source: 'quality_only',
+    );
+
+    if (effectiveOrbitDistance > _lockFireDeg) {
+      _state = _state.copyWith(
+        guidanceMessage: _rotationMessage(name, effectiveOrbitDistance),
+        distanceToTarget: effectiveOrbitDistance,
+        gyroMagnitude: _gyroMagnitude,
+        cvConfidence: cvPrediction?.confidence,
+        cvPredictedAngle: cvPrediction?.angleName,
+      );
+      _captureAudio.updateGuidanceTone(effectiveOrbitDistance);
       _qualityOnlyStreak = 0;
       return;
     }
+    _captureAudio.updateGuidanceTone(effectiveOrbitDistance);
 
     final flashOn = _state.flashOn;
     final qualityOk = _gyroMagnitude <= _qualityOnlyGyroMax &&
@@ -867,7 +1004,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
       guidanceMessage: _qualityOnlyStreak >= _qualityOnlyRequired
           ? 'Capturing...'
           : 'Perfect — hold still',
+      distanceToTarget: effectiveOrbitDistance,
       axisGreenFrames: _qualityOnlyStreak,
+      gyroMagnitude: _gyroMagnitude,
+      cvConfidence: cvPrediction?.confidence,
+      cvPredictedAngle: cvPrediction?.angleName,
     );
 
     if (_qualityOnlyStreak >= _qualityOnlyRequired) {
@@ -923,6 +1064,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
   Future<void> _fireAngleCapture() async {
     if (_busy) return;
     _busy = true;
+    _captureAudio.silence();
     final index = _state.currentAngleIndex;
     final name = ThumbAngleService.order[index];
     debugPrint('AXIS_GATE[$name]: focus=${_latestFocusNorm.toStringAsFixed(2)} '
@@ -930,11 +1072,18 @@ class MultiAngleCaptureController extends ChangeNotifier {
         'gyro=${_gyroMagnitude.toStringAsFixed(3)} '
         'greenFrames=${_state.axisGreenFrames}');
     _axisGateLogs.add({
-      'angle':         name,
-      'focusNorm':     double.parse(_latestFocusNorm.toStringAsFixed(3)),
-      'brightness':    double.parse(_latestBrightness.toStringAsFixed(1)),
-      'gyroMagnitude': double.parse(_gyroMagnitude.toStringAsFixed(4)),
-      'greenFrames':   _state.axisGreenFrames,
+      'angle':            name,
+      'focusNorm':        double.parse(_latestFocusNorm.toStringAsFixed(3)),
+      'brightness':       double.parse(_latestBrightness.toStringAsFixed(1)),
+      'gyroMagnitude':    double.parse(_gyroMagnitude.toStringAsFixed(4)),
+      'greenFrames':      _state.axisGreenFrames,
+      // CV confirmation snapshot at the fire moment — data for retuning
+      // _cvConfidenceThreshold / ThumbAngleService's per-angle targets once
+      // enough beta sessions have logged real confidence distributions.
+      'cvConfidence':     _state.cvConfidence == null
+          ? null
+          : double.parse(_state.cvConfidence!.toStringAsFixed(3)),
+      'cvPredictedAngle': _state.cvPredictedAngle,
     });
     try {
       // 0. Refocus at current thumb distance before the burst window.
@@ -1029,7 +1178,9 @@ class MultiAngleCaptureController extends ChangeNotifier {
         await Future<void>.delayed(const Duration(milliseconds: 120));
         HapticFeedback.heavyImpact();
       }
-      unawaited(_playSuccessSound());
+      unawaited(_captureAudio.playAngleSuccess(
+        isFinal: index == ThumbAngleService.order.length - 1,
+      ));
       _retryCount = 0;
 
       _set(_state.copyWith(
@@ -1171,6 +1322,11 @@ class MultiAngleCaptureController extends ChangeNotifier {
             'bottom': f.thumbRoi!.bottom,
           },
           'timestamp': f.timestamp.toIso8601String(),
+          // Raw Y-plane geometry. Backend decodes as:
+          //   np.frombuffer(data, uint8).reshape((imageHeight, bytesPerRow))[:, :imageWidth]
+          'imageWidth':   f.imageWidth,
+          'imageHeight':  f.imageHeight,
+          'bytesPerRow':  f.bytesPerRow,
         },
     ];
 
@@ -1198,6 +1354,7 @@ class MultiAngleCaptureController extends ChangeNotifier {
         burstStats: List.unmodifiable(_burstStatsList),
         axisGateAtCapture: List.unmodifiable(_axisGateLogs),
         orbitAngles: orbitAngles,
+        debugTelemetry: List.unmodifiable(_debugTelemetry),
         onProgress: (p) =>
             _set(_state.copyWith(uploadProgress: p), notify: true),
       );
@@ -1289,13 +1446,6 @@ class MultiAngleCaptureController extends ChangeNotifier {
     } catch (_) {}
   }
 
-  Future<void> _playSuccessSound() async {
-    try {
-      await _successPlayer.seek(Duration.zero);
-      await _successPlayer.play();
-    } catch (_) {}
-  }
-
   void _fail(String message) {
     unawaited(_flash?.deactivate());
     unawaited(_stopStream());
@@ -1341,7 +1491,8 @@ class MultiAngleCaptureController extends ChangeNotifier {
     unawaited(_stopStream());
     _hybrid.reset();
     _plugin?.dispose();
-    unawaited(_successPlayer.dispose());
+    _orientationClassifier?.dispose();
+    _captureAudio.dispose();
     _orientation.dispose();
     super.dispose();
   }

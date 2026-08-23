@@ -26,10 +26,99 @@ class CameraService {
 
   /// Initializes the camera with the given [lensDirection].
   /// Default is [CameraLensDirection.back].
+  ///
+  /// [fps]/[videoBitrate] (burst+video hybrid capture, Phase 0, 2026-08-02):
+  /// real, plugin-supported `CameraController` constructor params (confirmed
+  /// against the `camera` package's own changelog -- "Adds support to
+  /// control video fps and bitrate", v0.10.6+) for whoever later calls
+  /// [startVideoRecording]. Unlike manual exposure control (see
+  /// docs/LOCKED_SHUTTER_SPEED_SCOPE.md), this is NOT a Camera2Interop gap --
+  /// it's a supported public API, just never previously wired up since
+  /// nothing in this app called startVideoRecording until now. Harmless to
+  /// pass even when the caller never records video (photo-only capture
+  /// ignores them). Codec (H.264 vs H.265/HEVC) and true constant-bitrate
+  /// enforcement are NOT controllable through this plugin -- the platform
+  /// picks the codec; [videoBitrate] is a target, not a hard guarantee.
+  // Real bug found 2026-08-17 (CTO real-device report, first-ever app
+  // launch: "Camera error: CameraException(CameraPermissionsRequestOngoing,
+  // Another request is ongoing and multiple requests cannot be handled at
+  // once.)"). This class already tracked `_pendingInitialization` as a
+  // field, but `initializeCamera()` never actually CHECKED it on entry --
+  // a second concurrent call (same instance) would just overwrite the
+  // field and start its own independent `CameraController(...).initialize()`
+  // call, racing the first one's own internal Android runtime permission
+  // request. That race can only ever matter on the very first launch
+  // (permission not yet granted -- once granted, initialize() never needs
+  // to prompt again), which is exactly what was reported. This lock makes
+  // a second concurrent call on the SAME CameraService instance await the
+  // first one's result instead of starting its own, closing that race
+  // regardless of which caller fires the second time.
+  Future<void>? _initializeCameraCall;
+
   Future<void> initializeCamera({
     CameraLensDirection lensDirection = CameraLensDirection.back,
     ResolutionPreset resolution = ResolutionPreset.max,
     CameraDescription? cameraDescription,
+    int? fps,
+    int? videoBitrate,
+  }) {
+    final existing = _initializeCameraCall;
+    if (existing != null) return existing;
+    final call = _initializeCameraUnguarded(
+      lensDirection: lensDirection,
+      resolution: resolution,
+      cameraDescription: cameraDescription,
+      fps: fps,
+      videoBitrate: videoBitrate,
+    );
+    _initializeCameraCall = call;
+    return call.whenComplete(() => _initializeCameraCall = null);
+  }
+
+  Future<void> _initializeCameraUnguarded({
+    required CameraLensDirection lensDirection,
+    required ResolutionPreset resolution,
+    required CameraDescription? cameraDescription,
+    int? fps,
+    int? videoBitrate,
+  }) async {
+    // Budget devices (e.g. CameraX capability negotiation at
+    // ResolutionPreset.max on a cold HAL start) occasionally exceed a single
+    // 10s attempt without the hardware actually being unavailable -- retry
+    // once with a longer budget before surfacing a hard failure to the user.
+    try {
+      await _initializeCameraAttempt(
+        lensDirection: lensDirection,
+        resolution: resolution,
+        cameraDescription: cameraDescription,
+        fps: fps,
+        videoBitrate: videoBitrate,
+        timeout: const Duration(seconds: 12),
+      );
+    } on TimeoutException {
+      debugPrint('CameraService: First init attempt timed out, retrying once');
+      try {
+        await _initializeCameraAttempt(
+          lensDirection: lensDirection,
+          resolution: resolution,
+          cameraDescription: cameraDescription,
+          fps: fps,
+          videoBitrate: videoBitrate,
+          timeout: const Duration(seconds: 20),
+        );
+      } on TimeoutException {
+        throw Exception('Camera initialization timed out');
+      }
+    }
+  }
+
+  Future<void> _initializeCameraAttempt({
+    required CameraLensDirection lensDirection,
+    required ResolutionPreset resolution,
+    required CameraDescription? cameraDescription,
+    required Duration timeout,
+    int? fps,
+    int? videoBitrate,
   }) async {
     try {
       // Get available cameras if not already fetched
@@ -48,6 +137,8 @@ class CameraService {
         camera,
         resolution,
         enableAudio: false,
+        fps: fps,
+        videoBitrate: videoBitrate,
       );
       _pendingController = controller;
       debugPrint(
@@ -55,9 +146,7 @@ class CameraService {
         '(direction=${camera.lensDirection}, type=${camera.lensType})',
       );
 
-      _pendingInitialization = controller.initialize().timeout(
-        const Duration(seconds: 10),
-      );
+      _pendingInitialization = controller.initialize().timeout(timeout);
 
       await _pendingInitialization;
 
@@ -84,9 +173,6 @@ class CameraService {
         await _disposeController(pendingController);
       }
       debugPrint('CameraService: Error initializing camera: $e');
-      if (e is TimeoutException) {
-        throw Exception('Camera initialization timed out');
-      }
       rethrow;
     }
   }
@@ -393,20 +479,40 @@ class CameraService {
     return matching.first;
   }
 
+  // Real ANR reported 2026-08-11: "ClearBridge Beta isn't responding" on the
+  // static BetaThankYouScreen, right after a successful capture -- a screen
+  // with no polling/listeners of its own (StatelessWidget, plain
+  // buttons), so the hang had to be residual background work from the
+  // capture flow it navigated away from. front_capture_screen.dart's own
+  // dispose() calls disposeCamera() fire-and-forget (State.dispose() can't
+  // be async), which was fine -- but the two native platform-channel calls
+  // this eventually reaches, controller.stopImageStream() and
+  // controller.dispose(), were both RAW unbounded awaits with zero timeout
+  // protection -- the exact same risk category this project has already
+  // found and fixed repeatedly elsewhere (secondary-camera capture,
+  // distance-sweep bursts, the sweep-burst zone sequence), just never
+  // applied to the disposal path itself. If the native Camera2 teardown
+  // genuinely hangs or is slow under contention right after a multi-shot
+  // burst + uploads (plausible, matching this project's own documented
+  // history of camera-session-teardown ANRs), nothing here could ever
+  // recover -- the await just never returns. Bounded the same way every
+  // other unbounded native camera call in this codebase already is.
+  static const Duration _disposeCallTimeout = Duration(seconds: 5);
+
   Future<void> _disposeController(CameraController controller) async {
     try {
       if (controller.value.isStreamingImages) {
         try {
-          await controller.stopImageStream();
+          await controller.stopImageStream().timeout(_disposeCallTimeout);
         } catch (error) {
-          debugPrint('CameraService: Error stopping image stream: $error');
+          debugPrint('CameraService: Error/timeout stopping image stream: $error');
         }
       }
 
-      await controller.dispose();
+      await controller.dispose().timeout(_disposeCallTimeout);
       debugPrint('CameraService: Camera disposed');
     } catch (error) {
-      debugPrint('CameraService: Error disposing controller: $error');
+      debugPrint('CameraService: Error/timeout disposing controller: $error');
     }
   }
 }

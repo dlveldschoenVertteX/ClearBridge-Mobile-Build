@@ -446,7 +446,7 @@ class _CaptureGuideScreenState extends State<CaptureGuideScreen>
                           width: double.infinity,
                           child: FilledButton.icon(
                             onPressed: () =>
-                                context.go(AppConstants.continuousCaptureRoute),
+                                context.go(AppConstants.activeCaptureRoute),
                             style: FilledButton.styleFrom(
                               backgroundColor: ClearBridgeColors.cyan,
                               foregroundColor: ClearBridgeColors.void_,
@@ -458,6 +458,31 @@ class _CaptureGuideScreenState extends State<CaptureGuideScreen>
                               'Start Capture',
                               style: TextStyle(
                                 fontSize: 15,
+                                fontWeight: FontWeight.w700,
+                                letterSpacing: -0.01,
+                              ),
+                            ),
+                          ),
+                        ),
+                        const SizedBox(height: 10),
+                        SizedBox(
+                          width: double.infinity,
+                          child: OutlinedButton.icon(
+                            onPressed: () =>
+                                context.go(AppConstants.arcSweepCaptureRoute),
+                            style: OutlinedButton.styleFrom(
+                              foregroundColor: ClearBridgeColors.cyan,
+                              side: BorderSide(
+                                  color:
+                                      ClearBridgeColors.cyan.withValues(alpha: 0.5)),
+                              padding: const EdgeInsets.symmetric(vertical: 14),
+                              shape: const StadiumBorder(),
+                            ),
+                            icon: const Icon(Icons.threesixty, size: 18),
+                            label: const Text(
+                              'Sweep Capture (beta)',
+                              style: TextStyle(
+                                fontSize: 14,
                                 fontWeight: FontWeight.w700,
                                 letterSpacing: -0.01,
                               ),

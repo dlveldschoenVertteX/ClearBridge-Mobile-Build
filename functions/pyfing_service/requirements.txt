@@ -1,0 +1,24 @@
+flask>=3.0,<4.0
+gunicorn>=21.0,<23.0
+Pillow>=10.0,<13.0
+numpy>=1.24,<2.0
+pyfing==0.6
+keras>=3.0,<4.0
+tensorflow-cpu>=2.18,<2.22
+# REAL BUILD FAILURE, 2026-08-12 (first time this service was ever actually
+# built -- it was written 2026-07-15 and never deployed, so this had never
+# been exercised): pyfing imports cv2 at package import time
+# (pyfing/segmentation.py line 6) but does NOT declare opencv as a
+# dependency of its own, so `pip install pyfing` leaves it missing and the
+# Dockerfile's own import sanity-check died with
+# "ModuleNotFoundError: No module named 'cv2'". Undeclared transitive
+# dependency in the upstream package, not a mistake in the pin above.
+#
+# HEADLESS specifically: plain opencv-python links against libGL.so.1,
+# which python:3.11-slim does not ship -- it would swap this import error
+# for a shared-library one at the same build step. The headless wheel drops
+# the GUI/highgui bindings this service never uses (it only ever calls
+# pyfing's own array-in/array-out functions behind an HTTP endpoint), so it
+# needs no apt layer at all and keeps the "no build toolchain" property
+# this Dockerfile's header calls out as the reason it stays simple.
+opencv-python-headless>=4.8,<5.0

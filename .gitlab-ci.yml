@@ -1,0 +1,86 @@
+# Stopgap CI for clearbridge_beta while GitHub Actions' included minutes are
+# exhausted for the current billing cycle (resets 2026-08-01). Mirrors the
+# "build-clearbridge-beta" job from .github/workflows/build.yml: same build
+# command, same signing-config fallback, same Firebase Storage destination
+# (clearbridge-beta-latest.apk) so the existing download link keeps working
+# without any landing-page changes.
+#
+# Not a full replacement for build.yml -- only the beta app is mirrored here,
+# to stay well inside GitLab.com's free-tier 400 CI minutes/month. The other
+# three jobs (four-angle/arc-sweep, capture-harness, deploy-web) stay on
+# GitHub Actions and will resume automatically once minutes reset or a
+# spending limit is added there.
+
+image: ghcr.io/cirruslabs/flutter:stable
+
+stages:
+  - build
+
+cache:
+  key: flutter-beta-pub-cache
+  paths:
+    - clearbridge_beta/.dart_tool
+    - .pub-cache
+
+build-clearbridge-beta:
+  stage: build
+  script:
+    - cd clearbridge_beta
+    - flutter pub get
+    # Same fallback as clearbridge_beta/android/app/build.gradle.kts: if
+    # KEYSTORE_BASE64 isn't set as a CI/CD variable yet, KEYSTORE_PATH points
+    # at a file that never gets created and Gradle falls back to the debug
+    # keystore automatically (see build.gradle.kts's `.takeIf { it.exists() }`).
+    - |
+      if [ -n "$KEYSTORE_BASE64" ]; then
+        echo "$KEYSTORE_BASE64" | base64 -d > /tmp/release.keystore
+        export KEYSTORE_PATH=/tmp/release.keystore
+      fi
+    - flutter build apk --release --target-platform android-arm64
+  artifacts:
+    paths:
+      - clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk
+    expire_in: 7 days
+
+  after_script:
+    # Best-effort: only runs if FIREBASE_SA_KEY is configured as a CI/CD
+    # variable. Publishes to the same Storage path the landing page and
+    # previous download links already point at, so nothing else changes.
+    - |
+      if [ -n "$FIREBASE_SA_KEY" ]; then
+        # This image's python3 has no working `ensurepip` (confirmed via CI
+        # log: "No module named pip" even after `python3 -m ensurepip`) --
+        # its bundled wheel must be stripped from this image. apt has a real
+        # python3-pip package, so use that as the primary path and keep
+        # ensurepip only as a fallback in case apt is ever unavailable.
+        (apt-get update -qq && apt-get install -y -qq --no-install-recommends python3-pip) >/dev/null 2>&1 || true
+        python3 -m pip --version >/dev/null 2>&1 || python3 -m ensurepip --upgrade >/dev/null 2>&1 || true
+        python3 -m pip install --quiet google-auth requests --break-system-packages 2>/dev/null \
+          || python3 -m pip install --quiet google-auth requests
+        python3 - <<'PYEOF'
+      import json, os, requests, google.auth.transport.requests as gtr
+      from google.oauth2 import service_account
+
+      sa = json.loads(os.environ['FIREBASE_SA_KEY'])
+      creds = service_account.Credentials.from_service_account_info(
+          sa, scopes=['https://www.googleapis.com/auth/cloud-platform'])
+      creds.refresh(gtr.Request())
+      token = creds.token
+      bucket = 'clearbridge-dc699.firebasestorage.app'
+      name = 'clearbridge-beta-latest.apk'
+      path = 'clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk'
+
+      with open(path, 'rb') as f:
+          data = f.read()
+      r = requests.post(
+          f'https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o'
+          f'?uploadType=media&name=apk-builds/{name}&predefinedAcl=publicRead',
+          headers={'Authorization': f'Bearer {token}',
+                   'Content-Type': 'application/vnd.android.package-archive'},
+          data=data, timeout=120)
+      if r.status_code in (200, 201):
+          print(f'✓ Download: https://storage.googleapis.com/{bucket}/apk-builds/{name}')
+      else:
+          print(f'✗ Upload failed: {r.status_code} {r.text[:200]}')
+      PYEOF
+      fi

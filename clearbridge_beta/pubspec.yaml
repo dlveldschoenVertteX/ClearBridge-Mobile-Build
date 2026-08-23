@@ -1,0 +1,61 @@
+name: clearbridge_beta
+description: >
+  Standalone "ClearBridge Beta" app: 8-phase orientation-guided oscillating
+  MAC3D fingerprint capture for beta testers. Splash -> user details & POPIA
+  consent -> oscillating arc-sweep capture -> ClearCoin reward -> thank you.
+  Anonymous Firebase auth against the real ClearBridge backend (Storage/
+  Firestore/processEnhanceAndScore) -- no four-angle flavor-based capture
+  code, no Paystack, no dashboard, no login flow. Deliberately decoupled
+  from capture_harness and the main app so none of the three ever need to
+  change in lockstep, even though the capture controller/screen originated
+  in capture_harness and is kept in sync by copying, not sharing code.
+publish_to: "none"
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.5.0
+
+dependencies:
+  flutter:
+    sdk: flutter
+  mac_capture:
+    path: ../packages/mac_capture
+  path_provider: ^2.1.5
+  uuid: ^4.5.3
+  image: ^4.2.0
+  google_fonts: ^6.2.1
+  # Upper-bounded: 4.12.0 broke compile compat with the coordinated
+  # firebase_auth/firestore/storage/functions bumps resolved alongside it
+  # (missing 'FirebasePlugin' type, 'pluginConstants' getter) -- confirmed via
+  # a real CI failure; 4.11.0 (paired with the same-day leaf versions) built
+  # successfully. No pubspec.lock is committed, so CI floats to newest-
+  # compatible on every run; this cap is a stopgap until a lockfile is added.
+  firebase_core: '>=4.5.0 <4.12.0'
+  firebase_auth: ^6.2.0
+  cloud_firestore: ^6.1.3
+  firebase_storage: ^13.1.0
+  cloud_functions: ^6.0.7
+  # Real crash reporting, added 2026-08-15 -- this app had none, so a real
+  # device crash (CTO report: "crashing on upload step") could only be
+  # investigated by inference from Firestore data, never a stack trace.
+  # NOTE: the Dart-side init below is safe on its own, but Crashlytics also
+  # needs android/app/google-services.json (download from Firebase Console
+  # -> Project Settings -> the Android app) + the com.google.gms.google-
+  # services and com.google.firebase.crashlytics Gradle plugins to actually
+  # register crashes -- NOT added here, since applying either Gradle plugin
+  # without that real file present fails the build at configuration time,
+  # breaking every future CI run. See main.dart's own init comment.
+  firebase_crashlytics: ^5.0.4
+  shared_preferences: ^2.3.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/models/
+    - assets/audio/
+    - assets/images/

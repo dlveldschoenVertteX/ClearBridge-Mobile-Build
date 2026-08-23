@@ -1,4 +1,5 @@
 import 'package:go_router/go_router.dart';
+import 'package:flutter_web_plugins/url_strategy.dart' show urlStrategy;
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:riverpod_annotation/riverpod_annotation.dart';
 import 'package:flutter/foundation.dart';
@@ -46,6 +47,7 @@ import 'package:clearbridge/admin_login_screen.dart';
 import 'package:clearbridge/captures_screen.dart';
 import 'package:clearbridge/pipeline_health_screen.dart';
 import 'package:clearbridge/clearcoin_reward_screen.dart';
+import 'package:clearbridge/beta_thank_you_screen.dart';
 import 'package:clearbridge/email_action_screen.dart';
 part 'router_service.g.dart';
 
@@ -81,7 +83,26 @@ GoRouter router(Ref ref) {
   // works correctly. Without this, GoRouter starts at initialLocation (/splash)
   // because the _BootstrapperApp loading phase delays router creation, and the
   // SplashScreen then redirects unauthenticated users to /login.
-  final browserPath = kIsWeb ? Uri.base.path : '';
+  //
+  // REAL BUG FIXED: this used to read `Uri.base.path` directly -- the raw
+  // browser window.location.pathname, with no awareness of the page's own
+  // <base href>. That is only correct when the app is deployed at the site
+  // ROOT (base href "/"). This app is also deployed under a subpath (the
+  // admin panel, at /admin_panel/ -- see deploy-web in
+  // .github/workflows/build.yml), where a URL like
+  // /admin_panel/admin would read as browserPath "/admin_panel/admin", which
+  // matches none of this router's own routes (all declared relative to the
+  // app's base, e.g. "/admin", "/admin/login") -- GoRouter would fail to
+  // match it and fall through to its default not-found handling instead of
+  // ever reaching AdminLoginScreen/AdminDashboardScreen. `urlStrategy` (set
+  // by usePathUrlStrategy() in main.dart, already running by the time this
+  // provider is first read) exposes `getPath()`, the SAME base-href-aware
+  // accessor GoRouter's own Router widget uses internally to reconcile
+  // subsequent browser navigation -- using it here instead makes the FIRST
+  // (cold-start) read consistent with every later one.
+  final browserPath = kIsWeb
+      ? (urlStrategy?.getPath() ?? Uri.base.path)
+      : '';
   final initialLocation = (browserPath.isEmpty || browserPath == '/')
       ? AppConstants.splashRoute
       : browserPath;
@@ -204,6 +225,7 @@ GoRouter router(Ref ref) {
       const captureRoutes = {
         AppConstants.fingerprintRoute,
         AppConstants.continuousCaptureRoute,
+        AppConstants.arcSweepCaptureRoute,
       };
       if (captureRoutes.contains(path)) {
         final consentState = ref.read(captureConsentProvider);
@@ -314,6 +336,24 @@ GoRouter router(Ref ref) {
         builder: (context, state) => _macCaptureScreen(context),
       ),
       GoRoute(
+        path: AppConstants.arcSweepCaptureRoute,
+        name: 'arcSweepCapture',
+        builder: (context, state) => ArcSweepCaptureScreen(
+          uploader: const FingerprintFrameUploadService(),
+          getUserId: () => FirebaseAuth.instance.currentUser?.uid,
+          onRequireLogin: () => context.go(AppConstants.loginRoute),
+          onComplete: (captureId) =>
+              context.go('/capture/result', extra: captureId),
+          onClose: () {
+            if (context.canPop()) {
+              context.pop();
+            } else {
+              context.go(AppConstants.dashboardRoute);
+            }
+          },
+        ),
+      ),
+      GoRoute(
         path: '/capture/result',
         name: 'captureResult',
         builder: (context, state) {
@@ -362,6 +402,11 @@ GoRouter router(Ref ref) {
         path: AppConstants.clearCoinRewardRoute,
         name: 'clearCoinReward',
         builder: (context, state) => const ClearCoinRewardScreen(),
+      ),
+      GoRoute(
+        path: AppConstants.betaThankYouRoute,
+        name: 'betaThankYou',
+        builder: (context, state) => const BetaThankYouScreen(),
       ),
       // Firebase Auth email action URL — Android App Links cold-start +
       // Flutter web. iOS cold-start is handled by DeepLinkService.getInitialLink.

@@ -23,14 +23,38 @@ class ThumbAngleService {
   ThumbAngleService._();
   static final ThumbAngleService instance = ThumbAngleService._();
 
+  /// Degrees off front (0°) for the left/right capture positions (pitch
+  /// axis -- orbiting the phone around the thumb).
+  ///
+  /// PROVISIONAL VALUE. 45° was the first proposal (also widens SfM angular
+  /// coverage and the CV classifier's class separation -- see the capture
+  /// audit) but was rejected as too physically demanding to reach one-handed
+  /// while orbiting the phone around a stationary thumb. 32° is a
+  /// placeholder pending hands-on UX testing to find the real ceiling --
+  /// update this one constant once that number is known. Changing it
+  /// invalidates the current CV model's training data (captures only fire
+  /// near whatever this value is, so old sessions reflect the old value) --
+  /// a retrain needs a fresh batch of sessions captured at the new angle.
+  static const double _offAxisDeg = 32.0;
+
+  /// Degrees off front for 'top' (roll axis -- tilting the phone forward).
+  /// Split out from [_offAxisDeg]: beta feedback found the shared 32° too
+  /// steep specifically for top -- tilting the phone forward that far is a
+  /// different, more awkward motion than orbiting it left/right, and testers
+  /// were bending their thumb to compensate instead of tilting the phone.
+  /// 20° roughly matches the pre-unification split mentioned above, which
+  /// happened to already have top around this figure before both were
+  /// merged into one number. Also provisional -- same CV-retrain caveat.
+  static const double _topOffAxisDeg = 20.0;
+
   /// Target device-orientation angle for each capture position, in degrees.
   /// Values are relative to the zeroed front pose and depend on the active axis
   /// (see [axis] below). Measured on Samsung A16 via the Step 1 HUD.
   static const Map<String, double> targets = {
-    'front': 0.0,    // magnitude ≈ 0 immediately after calibration zeros the ref
-    'left': -20.0,   // pitch ≈ -20° (orbit phone left around thumb)
-    'top': -20.0,    // roll ≈ -20° (tip top of phone forward → camera looks down)
-    'right': 15.0,   // pitch ≈ +15° (orbit phone right around thumb)
+    'front': 0.0,              // magnitude ≈ 0 immediately after calibration zeros the ref
+    'left': -_offAxisDeg,      // pitch (orbit phone left around thumb)
+    'top': -_topOffAxisDeg,    // roll (tip top of phone forward → camera looks down)
+    'right': _offAxisDeg,      // pitch (orbit phone right around thumb)
   };
 
   /// Which DeviceOrientationService component drives each capture position.

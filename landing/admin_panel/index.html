@@ -1,0 +1,1552 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=1280">
+<title>ClearBridge · Admin Dashboard</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Material+Symbols+Rounded:opsz,wght,FILL,GRAD@24,400,1,0">
+<style>
+/* ════════════════════════════════════════════════════
+   CLEARBRIDGE DESIGN TOKENS
+════════════════════════════════════════════════════ */
+:root {
+  --void:   #0B0F1A;
+  --navy:   #111827;
+  --steel:  #172340;
+  --rim:    #1E2D45;
+  --cyan:   #00BFFF;
+  --cyan-s: rgba(0,191,255,.10);
+  --cyan-b: rgba(0,191,255,.28);
+  --gold:   #C9A84C;
+  --gold-l: #E8C96A;
+  --blue:   #1E88E5;
+  --silver: #B5BCC4;
+  --dim:    #7a8089;
+  --bright: #E2E8F0;
+  --green:  #22C55E;
+  --orange: #F97316;
+  --red:    #EF4444;
+  --card:   rgba(23,35,64,.65);
+  --cb:     rgba(181,188,196,.12);
+}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{
+  background: radial-gradient(ellipse at 60% 0%,#142346 0%,#0B0F1A 68%);
+  font-family:'Manrope',sans-serif;
+  color:var(--bright);
+  min-height:100vh;
+}
+::-webkit-scrollbar{width:5px;height:5px;}
+::-webkit-scrollbar-track{background:transparent;}
+::-webkit-scrollbar-thumb{background:rgba(181,188,196,.15);border-radius:3px;}
+
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+@keyframes fadein{from{opacity:0;transform:translateY(5px)}to{opacity:1;transform:translateY(0)}}
+@keyframes pulse-c{0%,100%{box-shadow:0 0 18px rgba(0,191,255,.12)}50%{box-shadow:0 0 38px rgba(0,191,255,.35)}}
+@keyframes pulse-g{0%,100%{box-shadow:0 0 18px rgba(201,168,76,.15)}50%{box-shadow:0 0 48px rgba(201,168,76,.45)}}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+
+/* ── Layout ── */
+.shell{display:flex;height:100vh;overflow:hidden;}
+
+/* ── Sidebar ── */
+.sidebar{
+  width:228px;flex-shrink:0;
+  background:rgba(11,15,26,.97);
+  border-right:1px solid var(--cb);
+  display:flex;flex-direction:column;
+  height:100vh;overflow:hidden;
+}
+.sb-logo{
+  padding:18px 16px 16px;
+  border-bottom:1px solid var(--cb);
+  display:flex;align-items:center;gap:10px;
+}
+.sb-logo img{width:32px;height:32px;border-radius:8px;}
+.sb-logo .n{font-size:13px;font-weight:800;color:var(--bright);}
+.sb-logo .r{font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.14em;text-transform:uppercase;}
+
+.sb-nav{flex:1;padding:10px 8px;overflow-y:auto;display:flex;flex-direction:column;gap:1px;}
+.grp{font-size:9px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--dim);padding:9px 8px 3px;}
+
+.ni{
+  display:flex;align-items:center;gap:8px;
+  padding:8px 10px;border-radius:9px;
+  cursor:pointer;border:1px solid transparent;
+  text-decoration:none;transition:background .12s;
+  user-select:none;
+}
+.ni:hover{background:rgba(255,255,255,.04);}
+.ni.active{background:var(--cyan-s);border-color:var(--cyan-b);}
+.ni .ic{font-family:'Material Symbols Rounded';font-size:16px;color:var(--dim);}
+.ni .lb{font-size:12px;font-weight:600;color:var(--dim);}
+.ni.active .ic,.ni.active .lb{color:var(--cyan);}
+.ni .badge{
+  margin-left:auto;font-size:9.5px;font-weight:700;
+  padding:1.5px 6px;border-radius:100px;
+}
+.badge-r{background:rgba(239,68,68,.18);color:var(--red);}
+.badge-o{background:rgba(249,115,22,.18);color:var(--orange);}
+.badge-d{background:rgba(181,188,196,.08);color:var(--dim);}
+
+.sb-foot{
+  padding:12px 14px;
+  border-top:1px solid var(--cb);
+}
+.dot{
+  width:7px;height:7px;border-radius:50%;
+  animation:blink 2.5s infinite;display:inline-block;
+}
+.dot-g{background:var(--green);}
+.dot-o{background:var(--orange);}
+
+/* ── Main ── */
+.main{flex:1;display:flex;flex-direction:column;min-width:0;overflow:hidden;}
+
+.topbar{
+  padding:14px 26px;
+  border-bottom:1px solid var(--cb);
+  background:rgba(11,15,26,.6);
+  backdrop-filter:blur(20px);
+  display:flex;align-items:center;gap:10px;
+  flex-shrink:0;
+}
+.topbar .bc-eye{font-size:9.5px;font-weight:700;letter-spacing:.16em;text-transform:uppercase;color:var(--cyan);}
+.topbar .bc-title{font-size:15px;font-weight:800;letter-spacing:-.01em;color:var(--bright);}
+
+.alert-pill{
+  display:flex;align-items:center;gap:6px;
+  padding:6px 11px;border-radius:100px;
+  font-size:11px;font-weight:600;cursor:pointer;
+  border:1px solid transparent;
+}
+.ap-r{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.3);color:var(--red);}
+.ap-o{background:rgba(249,115,22,.1);border-color:rgba(249,115,22,.3);color:var(--orange);}
+.alert-pill .ic{font-family:'Material Symbols Rounded';font-size:14px;}
+
+.tb-btn{
+  display:flex;align-items:center;gap:5px;
+  padding:6px 11px;
+  background:rgba(255,255,255,.05);
+  border:1px solid var(--cb);
+  border-radius:9px;cursor:pointer;
+  font-size:11px;font-weight:600;color:var(--dim);
+  transition:background .12s;font-family:'Manrope',sans-serif;
+}
+.tb-btn:hover{background:rgba(255,255,255,.09);color:var(--silver);}
+.tb-btn .ic{font-family:'Material Symbols Rounded';font-size:14px;}
+
+.content{flex:1;overflow-y:auto;padding:22px 26px 44px;}
+
+/* ── Cards ── */
+.card{
+  background:var(--card);
+  border:1px solid var(--cb);
+  border-radius:18px;
+  backdrop-filter:blur(18px);
+}
+.card-click{cursor:pointer;transition:border-color .14s,transform .1s;}
+.card-click:hover{border-color:rgba(0,191,255,.3);transform:translateY(-1px);}
+.card-click:active{transform:scale(.99);}
+
+/* ── Type ── */
+.eye{font-size:9.5px;font-weight:700;letter-spacing:.18em;text-transform:uppercase;color:var(--cyan);}
+.mono{font-family:'JetBrains Mono',monospace;}
+.ic{font-family:'Material Symbols Rounded';font-style:normal;user-select:none;line-height:1;}
+
+/* ── Pages ── */
+.page{display:none;}
+.page.active{display:block;animation:fadein .25s ease;}
+
+/* ── Grids ── */
+.g4{display:grid;grid-template-columns:repeat(4,1fr);gap:13px;}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:13px;}
+.g3{display:grid;grid-template-columns:repeat(3,1fr);gap:13px;}
+.g21{display:grid;grid-template-columns:2fr 1fr;gap:13px;}
+
+/* ── Progress ── */
+.pb-t{background:rgba(255,255,255,.06);border-radius:4px;height:5px;overflow:hidden;}
+.pb-f{height:100%;border-radius:4px;}
+
+/* ── Firebase banner ── */
+.fb-banner{
+  display:flex;align-items:flex-start;gap:10px;
+  background:rgba(201,168,76,.07);
+  border:1px solid rgba(201,168,76,.2);
+  border-radius:12px;padding:12px 15px;
+  margin-bottom:18px;
+}
+.fb-banner .ic{color:var(--gold);font-size:17px;margin-top:1px;flex-shrink:0;}
+.fb-banner p{font-size:11.5px;color:var(--dim);line-height:1.55;}
+.fb-banner strong{color:var(--gold);}
+.fb-banner a{color:var(--cyan);text-decoration:none;}
+.fb-banner a:hover{text-decoration:underline;}
+.fb-banner code{
+  background:rgba(255,255,255,.07);
+  border-radius:4px;padding:1px 5px;
+  font-family:'JetBrains Mono',monospace;font-size:10.5px;
+  color:var(--bright);
+}
+
+/* ── Gate timeline ── */
+.gate-item{display:flex;gap:13px;cursor:pointer;}
+.gate-item:hover .gate-body{background:rgba(255,255,255,.02);border-radius:10px;}
+.gate-conn{display:flex;flex-direction:column;align-items:center;}
+.gate-dot{
+  width:28px;height:28px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;
+  flex-shrink:0;
+  font-family:'Material Symbols Rounded';font-size:14px;
+}
+.gate-line{width:2px;flex:1;background:rgba(255,255,255,.07);min-height:18px;}
+.gate-body{flex:1;padding-bottom:16px;padding:6px 8px 16px;}
+
+/* ── Funnel ── */
+.fn-row{margin-bottom:13px;}
+.fn-label{display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;}
+.fn-track{height:6px;background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden;}
+.fn-fill{height:100%;border-radius:3px;transition:width .7s ease;}
+
+/* ── Modal ── */
+.modal-bg{
+  position:fixed;inset:0;
+  background:rgba(11,15,26,.82);
+  backdrop-filter:blur(10px);
+  display:flex;align-items:center;justify-content:center;
+  z-index:900;
+  opacity:0;pointer-events:none;
+  transition:opacity .18s;
+}
+.modal-bg.open{opacity:1;pointer-events:all;}
+.modal-box{
+  background:#111827;
+  border:1px solid rgba(181,188,196,.18);
+  border-radius:20px;
+  padding:26px;
+  width:540px;max-width:92vw;
+  max-height:78vh;overflow-y:auto;
+  transform:translateY(10px);
+  transition:transform .2s;
+}
+.modal-bg.open .modal-box{transform:translateY(0);}
+.modal-hdr{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:18px;}
+.modal-close{
+  width:30px;height:30px;border-radius:8px;
+  background:rgba(255,255,255,.06);
+  border:none;cursor:pointer;
+  color:var(--dim);
+  font-family:'Material Symbols Rounded';font-size:17px;
+  display:flex;align-items:center;justify-content:center;
+  transition:background .12s;
+}
+.modal-close:hover{background:rgba(255,255,255,.11);}
+
+/* ── Status row ── */
+.svc-row{
+  display:flex;align-items:center;justify-content:space-between;
+  padding:11px 0;
+  border-bottom:1px solid var(--cb);
+}
+.svc-row:last-child{border-bottom:none;}
+
+/* ── Section header ── */
+.sec-hdr{margin-bottom:16px;}
+.sec-hdr .eye{margin-bottom:3px;}
+.sec-hdr h2{font-size:17px;font-weight:800;letter-spacing:-.02em;}
+</style>
+</head>
+<body>
+
+<!-- ════════════════════════════════════════════════════
+  ⚡ FIREBASE CONFIG — Edit ONLY this block to go live
+════════════════════════════════════════════════════ -->
+<script>
+// REAL CONFIG (2026-08-23): a genuine Firebase Web App registration now
+// exists for this project (Firebase Console -> Project Settings -> Add app
+// -> Web) -- every field below is that real registration's own config,
+// not a reused/approximated value. apiKey is this Web App's own key (was
+// previously the Android app's key, reused as a stopgap -- both are valid
+// since Firebase API keys are project-wide and not the real security
+// boundary; Firestore/Storage rules are). appId/measurementId are this
+// Web App's own genuine per-registration values, unlocking real Analytics/
+// Installations/Messaging support that the earlier placeholder couldn't.
+const FIREBASE_CONFIG = {
+  apiKey:            "AIzaSyDli6txWMCjKDXy_8DpUw5qk4zfJ4UF804",
+  authDomain:        "clearbridge-dc699.firebaseapp.com",
+  projectId:         "clearbridge-dc699",
+  storageBucket:     "clearbridge-dc699.firebasestorage.app",
+  messagingSenderId: "427514831103",
+  appId:             "1:427514831103:web:945a0b1ba7f64bfd48acca",
+  measurementId:     "G-2BHREZH5L2"
+};
+
+// Firestore collection paths — adjust to match your schema
+//
+// REAL SCHEMA NOTE (2026-08-23): the original comments here described the
+// four-angle/SfM architecture's own fields (angles[], angleType, sfmSuccess)
+// -- that architecture was discontinued 2026-07-15. The live schema
+// (captureMode: 'front_only_v1', the only active capture flow) writes
+// {userId, createdAt, status, captureMode, nfiq2Score (0-100 int, the real
+// NIST NFIQ2 sidecar score), nfiqPass (bool), henryClass, guideRegion,
+// afisSource (which internal variant won selection), processingStartedAt,
+// scoredAt}. listenCaptures() below has been updated to match; the
+// four-angle-era UI copy elsewhere on this page ("4-Angle Completion",
+// "SFM Success Rate", Gate 1's "300 unique 4-angle captures" target, the
+// funnel's "Completed 4-Angle Set" stage) still describes the OLD
+// architecture and needs a real decision on what the current equivalents
+// should be -- not guessed here.
+const COL = {
+  captures:  "captures",    // {userId, createdAt, status, captureMode, nfiq2Score, nfiqPass, henryClass, guideRegion, afisSource}
+  users:     "users",       // {createdAt, lastActive, consentedAt, downloadedAt, referredBy}
+  gates:     "gates",       // {id, status, count, target, notes, updatedAt}
+  referrals: "referrals",   // {sharerId, redeemerId, createdAt}
+  payments:  "transactions",// {amount, type, status, createdAt, paystackRef}
+};
+
+const DEMO = FIREBASE_CONFIG.apiKey === "YOUR_API_KEY";
+</script>
+
+<!-- ════════════════════════════════════════════════════
+  ⏳ SPLASH — brand loading beat shown before EITHER the
+  sign-in gate or the dashboard appears, on every load.
+  Purely a fixed-minimum-duration cosmetic beat (no real
+  work happens during it) -- see hideSplash() at the bottom.
+════════════════════════════════════════════════════ -->
+<div id="splash" style="position:fixed;inset:0;z-index:900;display:flex;align-items:center;justify-content:center;flex-direction:column;gap:16px;background:radial-gradient(ellipse at 60% 0%,#142346 0%,#0B0F1A 68%);transition:opacity .4s ease;">
+  <img src="assets/clearbridge-logo.png" alt="ClearBridge" style="width:64px;height:64px;border-radius:16px;box-shadow:0 0 40px rgba(0,191,255,.25);animation:pulse-c 2.2s ease-in-out infinite;">
+  <div style="font-size:13px;font-weight:800;color:var(--bright);letter-spacing:-.01em;">ClearBridge</div>
+  <div style="font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.16em;text-transform:uppercase;">Admin Console</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════
+  🔒 ADMIN SIGN-IN GATE — real Firestore data is sensitive
+  (user records, payment info); this must be authenticated
+  and claim-checked BEFORE any listener starts. Skipped only
+  in DEMO mode (no real backend to protect yet). Checks the
+  SAME `admin` custom claim the Flutter app's own
+  adminClaimProvider/router_service.dart already enforce --
+  one source of truth for "who is an admin", not a second,
+  independently-drifting check.
+
+  Two modes, toggled by loginMode (see doAuthAction()):
+  'signin' (default) and 'create' -- the latter is the real,
+  server-verified "first launch" bootstrap: it calls the
+  `bootstrapFirstAdmin` callable Cloud Function
+  (functions/index.js), which only ever succeeds for the
+  FIRST caller to ever request it (it hard-refuses once any
+  account already carries the admin claim) -- so this can't
+  be used to self-grant admin access a second time, or by
+  anyone after the real first admin exists.
+════════════════════════════════════════════════════ -->
+<div id="login-gate" style="position:fixed;inset:0;z-index:500;display:none;align-items:center;justify-content:center;background:radial-gradient(ellipse at 60% 0%,#142346 0%,#0B0F1A 68%);">
+  <div style="width:320px;padding:28px 26px;background:var(--card);border:1px solid var(--rim);border-radius:16px;backdrop-filter:blur(20px);">
+    <div style="display:flex;align-items:center;gap:10px;margin-bottom:20px;">
+      <img src="assets/clearbridge-logo.png" alt="CB" style="width:32px;height:32px;border-radius:8px;">
+      <div>
+        <div style="font-size:13px;font-weight:800;color:var(--bright);">ClearBridge</div>
+        <div style="font-size:9.5px;font-weight:700;color:var(--cyan);letter-spacing:.14em;text-transform:uppercase;" id="login-eyebrow">Admin Console</div>
+      </div>
+    </div>
+    <input id="login-email" type="email" autocomplete="username" placeholder="Admin email"
+      style="width:100%;margin-bottom:9px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
+    <input id="login-pass" type="password" autocomplete="current-password" placeholder="Password"
+      onkeydown="if(event.key==='Enter')doAuthAction();"
+      style="width:100%;margin-bottom:9px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
+    <input id="login-pass2" type="password" autocomplete="new-password" placeholder="Confirm password"
+      onkeydown="if(event.key==='Enter')doAuthAction();"
+      style="display:none;width:100%;margin-bottom:14px;padding:10px 12px;background:rgba(255,255,255,.04);border:1px solid var(--cb);border-radius:9px;color:var(--bright);font-size:13px;font-family:inherit;">
+    <button id="login-btn" onclick="doAuthAction()"
+      style="width:100%;padding:10px;background:var(--cyan);border:none;border-radius:9px;color:#0B0F1A;font-weight:800;font-size:13px;cursor:pointer;font-family:inherit;">
+      Sign in
+    </button>
+    <div id="login-error" style="margin-top:11px;font-size:11.5px;color:var(--red);min-height:14px;"></div>
+    <div style="margin-top:8px;text-align:center;">
+      <a href="#" id="login-toggle" onclick="toggleLoginMode();return false;"
+        style="font-size:11px;color:var(--dim);text-decoration:underline;">First time? Create the admin account</a>
+    </div>
+  </div>
+</div>
+
+<div class="shell" id="shell" style="display:none;">
+
+<!-- ════ SIDEBAR ════ -->
+<aside class="sidebar">
+  <div class="sb-logo">
+    <img src="assets/clearbridge-logo.png" alt="CB">
+    <div><div class="n">ClearBridge</div><div class="r">Admin Console</div></div>
+  </div>
+
+  <nav class="sb-nav">
+    <div class="grp">Overview</div>
+    <div class="ni active" data-sec="overview" onclick="go('overview',this)">
+      <span class="ic">dashboard</span><span class="lb">Dashboard</span>
+    </div>
+
+    <div class="grp">Quality</div>
+    <div class="ni" data-sec="pipeline" onclick="go('pipeline',this)">
+      <span class="ic">analytics</span><span class="lb">Pipeline Health</span>
+    </div>
+    <div class="ni" data-sec="gates" onclick="go('gates',this)">
+      <span class="ic">flag</span><span class="lb">Gate Milestones</span>
+      <span class="badge badge-o">2</span>
+    </div>
+
+    <div class="grp">Growth</div>
+    <div class="ni" data-sec="funnel" onclick="go('funnel',this)">
+      <span class="ic">filter_alt</span><span class="lb">User Funnel</span>
+    </div>
+    <div class="ni" data-sec="retention" onclick="go('retention',this)">
+      <span class="ic">repeat</span><span class="lb">Retention</span>
+    </div>
+
+    <div class="grp">Finance</div>
+    <div class="ni" data-sec="payments" onclick="go('payments',this)">
+      <span class="ic">payments</span><span class="lb">Payments</span>
+      <span class="badge badge-d">Gate 4</span>
+    </div>
+
+    <div class="grp">System</div>
+    <div class="ni" data-sec="infra" onclick="go('infra',this)">
+      <span class="ic">dns</span><span class="lb">Infrastructure</span>
+      <span class="badge badge-o">1</span>
+    </div>
+    <div class="ni" data-sec="rhythm" onclick="go('rhythm',this)">
+      <span class="ic">calendar_today</span><span class="lb">Weekly Rhythm</span>
+    </div>
+  </nav>
+
+  <div class="sb-foot">
+    <div style="display:flex;align-items:center;gap:7px;margin-bottom:6px;">
+      <span class="dot dot-g"></span>
+      <span style="font-size:11px;color:var(--dim);">Beta · Live</span>
+    </div>
+    <div style="font-size:10px;color:var(--dim);line-height:1.6;" id="sb-updated">—</div>
+    <div style="font-size:10px;color:var(--dim);">Firebase · africa-south1</div>
+  </div>
+</aside>
+
+<!-- ════ MAIN ════ -->
+<main class="main">
+
+  <!-- TOPBAR -->
+  <div class="topbar">
+    <div style="flex:1;">
+      <div class="bc-eye" id="tb-eye">ClearBridge</div>
+      <div class="bc-title" id="tb-title">Dashboard Overview</div>
+    </div>
+    <div id="tb-alert"></div>
+    <div style="font-size:11px;color:var(--dim);white-space:nowrap;" id="tb-date"></div>
+    <button class="tb-btn" onclick="refresh()">
+      <span class="ic" id="refresh-ic">refresh</span>Refresh
+    </button>
+  </div>
+
+  <!-- CONTENT -->
+  <div class="content">
+
+    <!-- Firebase demo banner -->
+    <div class="fb-banner" id="demo-banner" style="display:none;">
+      <span class="ic">info</span>
+      <p>
+        <strong>Demo mode</strong> — showing sample data.
+        To connect live data, open this file and set <code>FIREBASE_CONFIG</code> at the top.
+        <a href="https://console.firebase.google.com/project/clearbridge-dc699/firestore" target="_blank">Open Firestore →</a>
+        · <a href="https://console.firebase.google.com/project/clearbridge-dc699/settings/general" target="_blank">Get config →</a>
+      </p>
+    </div>
+
+    <!-- ══════════ OVERVIEW ══════════ -->
+    <div id="page-overview" class="page active">
+
+      <!-- KPI Row -->
+      <div class="g4" style="margin-bottom:20px;">
+
+        <div class="card card-click" style="padding:17px 18px;position:relative;overflow:hidden;animation:pulse-c 4s ease-in-out infinite;" onclick="go('funnel')">
+          <div style="position:absolute;top:-10px;right:-10px;width:80px;height:80px;background:radial-gradient(circle,rgba(0,191,255,.13),transparent 70%);pointer-events:none;"></div>
+          <div class="eye">Captures</div>
+          <div class="mono" style="font-size:34px;font-weight:700;color:var(--cyan);letter-spacing:-.03em;margin:5px 0 3px;" id="k-cap">—</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:11px;">of <span id="k-cap-tgt">300</span> Gate 1 target</div>
+          <div class="pb-t"><div class="pb-f" id="k-cap-bar" style="background:var(--cyan);"></div></div>
+          <div style="display:flex;justify-content:space-between;margin-top:5px;">
+            <span style="font-size:10px;color:var(--dim);" id="k-cap-pct">—</span>
+            <span style="font-size:10px;color:var(--green);" id="k-cap-trend">↑ —</span>
+          </div>
+        </div>
+
+        <div class="card card-click" style="padding:17px 18px;position:relative;overflow:hidden;" id="k-nfiq-card" onclick="go('pipeline')">
+          <div style="position:absolute;top:-10px;right:-10px;width:80px;height:80px;pointer-events:none;" id="k-nfiq-glow"></div>
+          <div class="eye" id="k-nfiq-eye">NFIQ Pass Rate</div>
+          <div class="mono" style="font-size:34px;font-weight:700;letter-spacing:-.03em;margin:5px 0 3px;" id="k-nfiq">—</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:10px;">Target ≥65% · Production ≥80%</div>
+          <div style="display:flex;align-items:flex-end;gap:3px;height:20px;" id="k-nfiq-spark"></div>
+          <div style="display:flex;justify-content:space-between;margin-top:5px;">
+            <span style="font-size:10px;color:var(--dim);">7-day trend</span>
+            <span style="font-size:10px;" id="k-nfiq-trend">—</span>
+          </div>
+        </div>
+
+        <div class="card card-click" style="padding:17px 18px;position:relative;overflow:hidden;" onclick="go('funnel')">
+          <div style="position:absolute;top:-10px;right:-10px;width:80px;height:80px;background:radial-gradient(circle,rgba(30,136,229,.15),transparent 70%);pointer-events:none;"></div>
+          <div class="eye" style="color:var(--blue);">Active Users</div>
+          <div class="mono" style="font-size:34px;font-weight:700;color:var(--blue);letter-spacing:-.03em;margin:5px 0 3px;" id="k-users">—</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:10px;">Total signups</div>
+          <div style="display:flex;gap:8px;">
+            <div style="flex:1;background:rgba(255,255,255,.04);border-radius:8px;padding:7px 9px;">
+              <div style="font-size:10px;color:var(--dim);">New (7d)</div>
+              <div class="mono" style="font-size:14px;font-weight:700;color:var(--bright);" id="k-users-7d">—</div>
+            </div>
+            <div style="flex:1;background:rgba(255,255,255,.04);border-radius:8px;padding:7px 9px;">
+              <div style="font-size:10px;color:var(--dim);">MAU</div>
+              <div class="mono" style="font-size:14px;font-weight:700;color:var(--bright);" id="k-mau">—</div>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-click" style="padding:17px 18px;position:relative;overflow:hidden;animation:pulse-g 4s ease-in-out infinite;border-color:rgba(201,168,76,.22);" onclick="go('payments')">
+          <div style="position:absolute;top:-10px;right:-10px;width:80px;height:80px;background:radial-gradient(circle,rgba(201,168,76,.15),transparent 70%);pointer-events:none;"></div>
+          <div class="eye" style="color:var(--gold);">Revenue</div>
+          <div class="mono" style="font-size:34px;font-weight:700;color:var(--gold);letter-spacing:-.03em;margin:5px 0 3px;" id="k-rev">R0</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:10px;">Payments inactive · Gate 4</div>
+          <div style="background:rgba(201,168,76,.09);border:1px solid rgba(201,168,76,.2);border-radius:8px;padding:7px 10px;">
+            <div style="font-size:10px;color:var(--gold);">Projected at Gate 4</div>
+            <div class="mono" style="font-size:13px;font-weight:700;color:var(--gold-l);">R91,070 / mo</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Gate 1 counter + Angle cards -->
+      <div class="g2" style="margin-bottom:18px;">
+        <div class="card card-click" style="padding:18px;" onclick="go('gates')">
+          <div class="eye" style="margin-bottom:4px;">Gate 1 Progress</div>
+          <div style="font-size:11px;color:var(--dim);margin-bottom:16px;">300 unique 4-angle captures · Jun 30</div>
+          <div style="text-align:center;padding:4px 0;">
+            <div class="mono" style="font-size:58px;font-weight:900;color:var(--cyan);letter-spacing:-.04em;line-height:1;text-shadow:0 0 40px rgba(0,191,255,.4);" id="g1-big">—</div>
+            <div style="font-size:13px;color:var(--dim);margin:3px 0 16px;">/ 300</div>
+            <div class="pb-t" style="height:9px;border-radius:6px;margin-bottom:8px;">
+              <div class="pb-f" id="g1-bar" style="background:linear-gradient(90deg,var(--cyan),rgba(0,191,255,.55));"></div>
+            </div>
+            <div style="display:flex;justify-content:space-between;font-size:11px;">
+              <span style="color:var(--dim);" id="g1-pct">—</span>
+              <span style="color:var(--orange);" id="g1-rem">—</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="card card-click" style="padding:18px;" onclick="go('pipeline')">
+          <div class="eye" style="margin-bottom:13px;">AFIS Source Mix</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;" id="angle-grid"></div>
+        </div>
+      </div>
+
+      <!-- Red flags -->
+      <div class="card" style="padding:16px;border-color:rgba(239,68,68,.2);background:rgba(239,68,68,.03);">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:11px;">
+          <span class="ic" style="color:var(--red);font-size:17px;">warning</span>
+          <div class="eye" style="color:var(--red);">Active Flags</div>
+        </div>
+        <div style="display:flex;gap:9px;flex-wrap:wrap;" id="flags-list"></div>
+      </div>
+    </div>
+
+    <!-- ══════════ PIPELINE HEALTH ══════════ -->
+    <div id="page-pipeline" class="page">
+      <div class="sec-hdr"><div class="eye">Section 1</div><h2>Pipeline Health</h2></div>
+      <div class="g2" style="margin-bottom:13px;">
+        <div class="card" style="padding:18px;">
+          <div class="eye" style="margin-bottom:11px;">Scoring Success Rate</div>
+          <div class="mono" style="font-size:36px;font-weight:700;color:var(--green);margin-bottom:13px;" id="sfm-rate">—</div>
+          <div id="sfm-bars"></div>
+        </div>
+        <div class="card" style="padding:18px;">
+          <div class="eye" style="margin-bottom:11px;">Avg Processing Time</div>
+          <div style="display:flex;align-items:baseline;gap:7px;margin-bottom:13px;">
+            <div class="mono" style="font-size:36px;font-weight:700;color:var(--cyan);" id="proc-avg">—</div>
+            <div style="font-size:13px;color:var(--dim);">ms / capture</div>
+          </div>
+          <canvas id="proc-chart" style="width:100%;height:60px;display:block;margin-bottom:7px;"></canvas>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:11px;">
+            <span>200ms</span><span>600ms</span><span id="proc-avg-lbl" style="color:var(--cyan);">avg</span><span>1.4s</span><span>2s+</span>
+          </div>
+          <div style="display:flex;gap:9px;">
+            <div style="flex:1;background:rgba(255,255,255,.04);border-radius:8px;padding:8px;text-align:center;">
+              <div style="font-size:10px;color:var(--dim);">P50</div>
+              <div class="mono" style="font-size:14px;font-weight:700;color:var(--bright);" id="proc-p50">—</div>
+            </div>
+            <div style="flex:1;background:rgba(255,255,255,.04);border-radius:8px;padding:8px;text-align:center;">
+              <div style="font-size:10px;color:var(--dim);">P99</div>
+              <div class="mono" style="font-size:14px;font-weight:700;color:var(--orange);" id="proc-p99">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="g2">
+        <div class="card" style="padding:18px;">
+          <div class="eye" style="margin-bottom:12px;">Henry Class Distribution</div>
+          <div style="display:flex;gap:14px;align-items:center;">
+            <canvas id="henry-chart" width="90" height="90" style="flex-shrink:0;"></canvas>
+            <div style="flex:1;" id="henry-legend"></div>
+          </div>
+        </div>
+        <div class="card" style="padding:18px;">
+          <div class="eye" style="margin-bottom:12px;">NFIQ Score Distribution</div>
+          <canvas id="nfiq-dist" style="width:100%;height:72px;display:block;margin-bottom:7px;"></canvas>
+          <div style="display:flex;justify-content:space-between;font-size:10px;color:var(--dim);margin-bottom:11px;">
+            <span>0.0</span><span>0.2</span><span>0.4</span><span style="color:var(--orange);">0.60</span><span>0.8</span><span>1.0</span>
+          </div>
+          <div style="display:flex;gap:8px;">
+            <div style="flex:1;background:rgba(239,68,68,.09);border:1px solid rgba(239,68,68,.2);border-radius:8px;padding:8px;text-align:center;">
+              <div style="font-size:10px;color:var(--red);">Fail (&lt;0.60)</div>
+              <div class="mono" style="font-size:16px;font-weight:700;color:var(--red);" id="nfiq-fail">—</div>
+            </div>
+            <div style="flex:1;background:rgba(34,197,94,.09);border:1px solid rgba(34,197,94,.2);border-radius:8px;padding:8px;text-align:center;">
+              <div style="font-size:10px;color:var(--green);">Pass (≥0.60)</div>
+              <div class="mono" style="font-size:16px;font-weight:700;color:var(--green);" id="nfiq-pass">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ GATE MILESTONES ══════════ -->
+    <div id="page-gates" class="page">
+      <div class="sec-hdr"><div class="eye">Section 2</div><h2>Gate Milestones</h2></div>
+      <div class="g21">
+        <div class="card" style="padding:20px;" id="gates-tl"></div>
+        <div style="display:flex;flex-direction:column;gap:11px;" id="gates-side"></div>
+      </div>
+    </div>
+
+    <!-- ══════════ USER FUNNEL ══════════ -->
+    <div id="page-funnel" class="page">
+      <div class="sec-hdr"><div class="eye">Section 3</div><h2>User Funnel &amp; GTM</h2></div>
+      <div class="g21">
+        <div class="card" style="padding:20px;">
+          <div class="eye" style="margin-bottom:15px;">Beta Conversion Funnel</div>
+          <div id="funnel-rows"></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:11px;" id="funnel-ch"></div>
+      </div>
+    </div>
+
+    <!-- ══════════ RETENTION ══════════ -->
+    <div id="page-retention" class="page">
+      <div class="sec-hdr"><div class="eye">Section 4</div><h2>Retention &amp; ClearCoin</h2></div>
+      <div class="g2" id="ret-grid"></div>
+    </div>
+
+    <!-- ══════════ PAYMENTS ══════════ -->
+    <div id="page-payments" class="page">
+      <div class="sec-hdr"><div class="eye">Section 5</div><h2>Payments &amp; Financial</h2></div>
+      <div class="card" style="padding:22px;margin-bottom:14px;border-color:rgba(201,168,76,.22);text-align:center;">
+        <span class="ic" style="font-size:28px;color:var(--gold);display:block;margin-bottom:7px;">lock</span>
+        <div style="font-size:14px;font-weight:700;color:var(--gold);margin-bottom:4px;">Payments Inactive · Beta Phase</div>
+        <div style="font-size:12px;color:var(--dim);">Activates at Gate 4 · Target Oct 1, 2026. No payments, certificates, or AFIS submission until Gate 4.</div>
+      </div>
+      <div class="g3" style="opacity:.42;" id="pay-grid"></div>
+    </div>
+
+    <!-- ══════════ INFRASTRUCTURE ══════════ -->
+    <div id="page-infra" class="page">
+      <div class="sec-hdr"><div class="eye">Section 6</div><h2>Infrastructure &amp; Technical Health</h2></div>
+      <div class="g2">
+        <div class="card" style="padding:18px;">
+          <div class="eye" style="margin-bottom:13px;">Service Status</div>
+          <div id="svc-list"></div>
+        </div>
+        <div style="display:flex;flex-direction:column;gap:11px;">
+          <div class="card" style="padding:16px;" id="perf-card"></div>
+          <div class="card" style="padding:16px;" id="crash-card"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ══════════ WEEKLY RHYTHM ══════════ -->
+    <div id="page-rhythm" class="page">
+      <div class="sec-hdr"><div class="eye">Section 7</div><h2>Weekly Rhythm &amp; Actions</h2></div>
+      <div class="g2" id="rhythm-grid"></div>
+    </div>
+
+  </div><!-- .content -->
+</main>
+</div><!-- .shell -->
+
+<!-- ── MODAL ── -->
+<div class="modal-bg" id="modal" onclick="modalClose(event)">
+  <div class="modal-box">
+    <div class="modal-hdr">
+      <div>
+        <div class="eye" id="m-eye"></div>
+        <div style="font-size:17px;font-weight:800;letter-spacing:-.02em;margin-top:3px;" id="m-title"></div>
+      </div>
+      <button class="modal-close" onclick="modalClose()">close</button>
+    </div>
+    <div id="m-body"></div>
+  </div>
+</div>
+
+<!-- Firebase 10 compat SDK -->
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-functions-compat.js"></script>
+
+<script>
+/* ════════════════════════════════════════════════════
+   MOCK DATA — replaced by Firestore when config is set
+════════════════════════════════════════════════════ */
+const MOCK = {
+  captures:   { total:187, week:14, target:300 },
+  angles:     { FRONT:219, LEFT:201, TOP:188, RIGHT:193 },
+  nfiq: {
+    pass:58.4, fail:41.6, target:65,
+    trend:[45,52,48,55,60,55,58.4],
+    dist:[8,12,14,18,22,12,9,7,4,2],
+  },
+  sfm: {
+    success:74.3,
+    fails:{ ORB:12.0, RANSAC:7.0, Triangulation:3.2, PCA:1.5, Unwrap:2.0 }
+  },
+  proc: { avg:847, p50:780, p99:2100, hist:[5,12,22,40,48,38,25,14,6,3] },
+  henry:    { Loop:43, Whorl:40, Arch:13, Unknown:4 },
+  users:    { total:243, week:31, mau:89 },
+  funnel: [
+    { stage:"Forum Attendees",       n:412, cv:null,  hi:false },
+    { stage:"Consented to POPIA",    n:243, cv:59.0,  hi:false },
+    { stage:"Downloaded APK",        n:200, cv:82.3,  hi:false },
+    { stage:"Started Capture",       n:189, cv:94.5,  hi:false },
+    { stage:"Completed 4-Angle Set", n:187, cv:98.9,  hi:true  },
+    { stage:"Claimed R50 Voucher",   n:0,   cv:null,  hi:false, locked:true },
+  ],
+  channels: [
+    { name:"Forum Sessions", sub:"Secunda · Witbank · Middelburg", att:312, done:141 },
+    { name:"Eduardo Labour Broker", sub:"Direct partner track",    att:100, done:46  },
+  ],
+  gates: [
+    { id:0, label:"Angle-gate bug fix",               st:"done",    eta:null,       note:"",              cnt:null, tgt:null },
+    { id:1, label:"300 unique 4-angle captures",       st:"active",  eta:"Jun 30",   note:"",              cnt:187,  tgt:300  },
+    { id:2, label:"80%+ NFIQ pass rate (field data)",  st:"active",  eta:"Jul 15",   note:"Current 58.4%", cnt:null, tgt:null },
+    { id:3, label:"AFISwitch demo · 80%+ proof",       st:"blocked", eta:"Sep 1",    note:"Awaits Gate 2", cnt:null, tgt:null },
+    { id:4, label:"Production launch (Payments+AFIS)", st:"blocked", eta:"Oct 1",    note:"Awaits Gate 3", cnt:null, tgt:null },
+    { id:5, label:"5K users → WorkBridge launch",      st:"vision",  eta:"Jan 2027", note:"Awaits Gate 4", cnt:null, tgt:null },
+  ],
+  ret: { d7:31.4, d7n:76, rep:41.2, coins_avg:31.4, coins_max:38, kfac:0.36, ref_sent:67, ref_red:24 },
+  infra: [
+    { name:"Firebase Firestore",  sub:"clearbridge-dc699 · africa-south1", st:"up"      },
+    { name:"Cloud Storage",       sub:"Fingerprint storage",               st:"up"      },
+    { name:"Cloud Functions",     sub:"Paystack webhook Gen 2",            st:"up"      },
+    { name:"ONNX Model (Run 5)",  sub:"80.19% recall · Live in app",       st:"up"      },
+    { name:"SageMaker (Run 6)",   sub:"Awaits ECR resolution",             st:"pending" },
+  ],
+  perf: { lat_avg:124, lat_p99:847, cr7:3, cr_crit:0, cr_high:1, cr_low:2 },
+};
+
+/* ════ State ════ */
+let D = JSON.parse(JSON.stringify(MOCK));
+let DB = null;
+let drawn = {};
+let cur = 'overview';
+const TITLES = {
+  overview:"Dashboard Overview", pipeline:"Pipeline Health",
+  gates:"Gate Milestones",       funnel:"User Funnel & GTM",
+  retention:"Retention & ClearCoin", payments:"Payments & Financial",
+  infra:"Infrastructure",        rhythm:"Weekly Rhythm",
+};
+
+/* ════ Firebase + admin sign-in gate ════
+   Real Firestore data here is sensitive (user records, payment info) --
+   this app never queries it until a signed-in user's own ID token carries
+   `admin: true`, the SAME custom claim the Flutter app's own
+   adminClaimProvider/router_service.dart already enforce (one source of
+   truth for "who is an admin", set via the backend's admin-claim-granting
+   mechanism -- not something this page can grant itself). */
+let AUTH = null;
+
+/* ── Splash ──
+   A fixed-minimum-duration brand beat shown before either the sign-in
+   gate or the dashboard appears, on every load -- real device feedback
+   asked for this explicitly. No real work happens during it; reveal()
+   below just makes sure it's visible for at least MIN_SPLASH_MS even if
+   Firebase resolves auth state instantly, so it always reads as a
+   deliberate beat rather than a flash. */
+function hideSplash() {
+  const sp = document.getElementById('splash');
+  if (!sp) return;
+  sp.style.opacity = '0';
+  setTimeout(() => { sp.style.display = 'none'; }, 400);
+}
+
+function initFB() {
+  const shell = document.getElementById('shell');
+  const gate = document.getElementById('login-gate');
+  const MIN_SPLASH_MS = 1200;
+  const splashStart = Date.now();
+  const reveal = show => {
+    const wait = Math.max(0, MIN_SPLASH_MS - (Date.now() - splashStart));
+    setTimeout(() => { hideSplash(); show(); }, wait);
+  };
+
+  if (DEMO) {
+    // No real backend configured yet -- nothing to protect. Same
+    // straight-to-dashboard behaviour this page already had, just made
+    // explicit now that a gate exists for the non-demo path.
+    reveal(() => {
+      shell.style.display = '';
+      document.getElementById('demo-banner').style.display = 'flex';
+    });
+    return;
+  }
+  try {
+    firebase.initializeApp(FIREBASE_CONFIG);
+    DB = firebase.firestore();
+    AUTH = firebase.auth();
+  } catch (e) {
+    console.error('Firebase init:', e);
+    reveal(() => { gate.style.display = 'flex'; });
+    return;
+  }
+  AUTH.onAuthStateChanged(async user => {
+    if (!user) {
+      reveal(() => { gate.style.display = 'flex'; shell.style.display = 'none'; });
+      return;
+    }
+    let isAdmin = false;
+    try {
+      const token = await user.getIdTokenResult();
+      isAdmin = token.claims && token.claims.admin === true;
+    } catch (e) {
+      console.error('Admin claim check failed:', e);
+    }
+    if (!isAdmin) {
+      reveal(() => {
+        gate.style.display = 'flex';
+        document.getElementById('login-error').textContent =
+          'This account does not have admin access.';
+      });
+      AUTH.signOut();
+      return;
+    }
+    reveal(() => { gate.style.display = 'none'; shell.style.display = ''; });
+    listenCaptures();
+    listenUsers();
+  });
+}
+
+/* ── Sign-in / first-launch admin creation ──
+   Two modes toggled by loginMode: 'signin' (default) and 'create'. The
+   create flow is a REAL, server-verified bootstrap, not a client-side
+   shortcut -- it makes a genuine Firebase Auth account, then calls the
+   `bootstrapFirstAdmin` callable Cloud Function (functions/index.js),
+   which grants the admin custom claim ONLY when no account anywhere
+   already carries it. That refusal is enforced server-side (the client
+   cannot grant itself a custom claim, a real Firebase security boundary,
+   not a policy this page could bypass even if it wanted to) -- so this
+   can only ever succeed once, for the genuine first admin, never as a
+   standing self-promotion hole. Requires functions/index.js to actually
+   be DEPLOYED (see that file's own header) -- until then this fails with
+   a clear, real "not found" error rather than silently doing nothing. */
+let loginMode = 'signin';
+
+function toggleLoginMode() {
+  loginMode = loginMode === 'signin' ? 'create' : 'signin';
+  const isCreate = loginMode === 'create';
+  document.getElementById('login-pass2').style.display = isCreate ? '' : 'none';
+  document.getElementById('login-btn').textContent = isCreate ? 'Create admin account' : 'Sign in';
+  document.getElementById('login-eyebrow').textContent = isCreate ? 'Create Admin Account' : 'Admin Console';
+  document.getElementById('login-toggle').textContent = isCreate
+    ? 'Already have an admin account? Sign in'
+    : 'First time? Create the admin account';
+  document.getElementById('login-error').textContent = '';
+}
+
+function doAuthAction() {
+  return loginMode === 'create' ? doCreateAdmin() : doSignIn();
+}
+
+function doSignIn() {
+  const email = document.getElementById('login-email').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const btn = document.getElementById('login-btn');
+  const err = document.getElementById('login-error');
+  err.textContent = '';
+  if (!email || !pass) { err.textContent = 'Enter both email and password.'; return; }
+  btn.disabled = true; btn.textContent = 'Signing in…';
+  AUTH.signInWithEmailAndPassword(email, pass)
+    .catch(e => { err.textContent = e.message || 'Sign-in failed.'; })
+    .finally(() => { btn.disabled = false; btn.textContent = 'Sign in'; });
+}
+
+async function doCreateAdmin() {
+  const email = document.getElementById('login-email').value.trim();
+  const pass = document.getElementById('login-pass').value;
+  const pass2 = document.getElementById('login-pass2').value;
+  const btn = document.getElementById('login-btn');
+  const err = document.getElementById('login-error');
+  err.textContent = '';
+  if (!email || !pass) { err.textContent = 'Enter both email and password.'; return; }
+  if (pass !== pass2) { err.textContent = 'Passwords do not match.'; return; }
+  if (pass.length < 8) { err.textContent = 'Password must be at least 8 characters.'; return; }
+  btn.disabled = true; btn.textContent = 'Creating…';
+  try {
+    const cred = await AUTH.createUserWithEmailAndPassword(email, pass);
+    const claim = firebase.app().functions('africa-south1').httpsCallable('bootstrapFirstAdmin');
+    await claim();
+    // Custom claims only take effect on a FRESH ID token -- force a
+    // refresh so onAuthStateChanged's own getIdTokenResult (already
+    // listening) sees admin:true immediately, instead of waiting up to an
+    // hour for the cached token to naturally expire.
+    await cred.user.getIdToken(true);
+    // onAuthStateChanged handles revealing the dashboard from here.
+  } catch (e) {
+    err.textContent = e.message || 'Could not create admin account.';
+    // Roll back the just-created auth account if claim-granting failed --
+    // otherwise a failed bootstrap (most likely: an admin already exists)
+    // leaves a real, permanent, non-admin account behind with no way back
+    // into this create flow.
+    try { await AUTH.currentUser?.delete(); } catch (_) {}
+  } finally {
+    btn.disabled = false; btn.textContent = 'Create admin account';
+  }
+}
+
+function listenCaptures() {
+  DB.collection(COL.captures).onSnapshot(snap => {
+    const docs = snap.docs.map(d => ({id:d.id,...d.data()}));
+
+    // "Complete" = the pipeline actually finished scoring it. The
+    // four-angle architecture's own completeness signal (angles[].length
+    // === 4) no longer applies -- that architecture was discontinued
+    // 2026-07-15, and captureMode: 'front_only_v1' (a single capture, no
+    // per-angle array) is the only one active today.
+    const complete = docs.filter(d => d.status === 'scored');
+    D.captures.total = complete.length;
+    const w = new Date(); w.setDate(w.getDate()-7);
+    D.captures.week = complete.filter(d => d.createdAt?.toDate?.() > w).length;
+
+    // Repurposed from the old per-ANGLE breakdown (FRONT/LEFT/TOP/RIGHT,
+    // which doesn't exist for front_only_v1) to which internal AFIS
+    // candidate/variant actually won selection on each capture --
+    // superprintParams.afisSource -- the real dimension of variation this
+    // architecture now has. Checked defensively (top-level fallback) since
+    // this field has moved once before; only replaces the mock shape if
+    // real data with this field is actually present.
+    const srcCounts = {};
+    complete.forEach(d => {
+      const src = (d.superprintParams && d.superprintParams.afisSource) || d.afisSource;
+      if (src) srcCounts[src] = (srcCounts[src]||0) + 1;
+    });
+    if (Object.keys(srcCounts).length) D.angles = srcCounts;
+
+    // Real NIST NFIQ2 sidecar score (nfiq2Score, 0-100 int) and the
+    // backend's own pass/fail verdict (nfiqPass) -- NOT nfiqScore, the
+    // legacy 0-1 internal ResNet18 proxy this used to read (see this
+    // project's own history: the internal proxy is foolable and was
+    // explicitly replaced by the real sidecar as the trustworthy signal).
+    const wn = docs.filter(d => typeof d.nfiq2Score === 'number');
+    if (wn.length) {
+      const p = docs.filter(d => d.nfiqPass === true);
+      D.nfiq.pass = Math.round(p.length/wn.length*1000)/10;
+      D.nfiq.fail = Math.round((100-D.nfiq.pass)*10)/10;
+      const bins = new Array(10).fill(0);
+      wn.forEach(d => bins[Math.min(9, Math.floor(d.nfiq2Score/10))]++);
+      D.nfiq.dist = bins;
+    }
+
+    // Repurposed from "SFM success rate" (SfM/oscillating reconstruction
+    // was discontinued 2026-07-15 -- front_only_v1 never runs it, so that
+    // signal no longer exists) to overall scoring-completion rate: of
+    // every capture attempted, what fraction actually reached a scored
+    // result rather than getting stuck at pending/enhancing/error.
+    if (docs.length) D.sfm.success = Math.round(complete.length/docs.length*1000)/10;
+
+    // Real backend timestamps.
+    const wp = docs.filter(d => d.processingStartedAt?.toDate && d.scoredAt?.toDate);
+    if (wp.length) {
+      const totalMs = wp.reduce(
+        (a,b) => a + (b.scoredAt.toDate() - b.processingStartedAt.toDate()), 0);
+      D.proc.avg = Math.round(totalMs/wp.length);
+    }
+
+    // Henry classification is real (e.g. 'AW'), but the full set of real
+    // class-code strings this backend writes wasn't confirmed against a
+    // fixed 4-category list, so this is built dynamically from whatever
+    // distinct values actually appear rather than assuming
+    // Loop/Whorl/Arch/Unknown -- see renderPipeline's own donut-colour
+    // handling, made robust to any real category count.
+    const withHenry = complete.filter(d => d.henryClass);
+    if (withHenry.length) {
+      const counts = {};
+      withHenry.forEach(d => { counts[d.henryClass] = (counts[d.henryClass]||0) + 1; });
+      const dist = {};
+      Object.entries(counts).forEach(([k,v]) => { dist[k] = Math.round(v/withHenry.length*100); });
+      D.henry = dist;
+    }
+
+    drawn = {};
+    renderAll();
+  });
+}
+
+function listenUsers() {
+  DB.collection(COL.users).onSnapshot(snap => {
+    D.users.total = snap.size;
+    const w = new Date(); w.setDate(w.getDate()-7);
+    const m = new Date(); m.setDate(m.getDate()-30);
+    D.users.week = snap.docs.filter(d=>d.data().createdAt?.toDate?.()>w).length;
+    D.users.mau  = snap.docs.filter(d=>d.data().lastActive?.toDate?.()>m).length;
+    drawn = {};
+    renderAll();
+  });
+}
+
+/* ════ Navigation ════ */
+function go(sec, el) {
+  cur = sec;
+  document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
+  const pg = document.getElementById('page-'+sec);
+  if (pg) pg.classList.add('active');
+  document.querySelectorAll('.ni').forEach(n => n.classList.remove('active'));
+  const ni = el || document.querySelector(`.ni[data-sec="${sec}"]`);
+  if (ni) ni.classList.add('active');
+  document.getElementById('tb-title').textContent = TITLES[sec] || sec;
+  history.replaceState(null,'','#'+sec);
+  renderSection(sec);
+  return false;
+}
+
+/* ════ Render ════ */
+function renderAll() { renderSection('overview'); drawn={}; renderSection(cur); }
+
+function renderSection(s) {
+  switch(s) {
+    case 'overview':   renderOverview();   break;
+    case 'pipeline':   renderPipeline();   break;
+    case 'gates':      renderGates();      break;
+    case 'funnel':     renderFunnel();     break;
+    case 'retention':  renderRetention();  break;
+    case 'payments':   renderPayments();   break;
+    case 'infra':      renderInfra();      break;
+    case 'rhythm':     renderRhythm();     break;
+  }
+}
+
+/* ─── Overview ─── */
+function renderOverview() {
+  const pct = Math.round(D.captures.total/D.captures.target*1000)/10;
+  set('k-cap',   D.captures.total);
+  set('k-cap-tgt', D.captures.target);
+  css('k-cap-bar','width', pct+'%');
+  set('k-cap-pct', pct+'% to target');
+  set('k-cap-trend','↑ +'+D.captures.week+' this week');
+
+  // NFIQ card colour
+  const ok = D.nfiq.pass >= D.nfiq.target;
+  const nc = ok ? 'var(--green)' : 'var(--red)';
+  const el = document.getElementById('k-nfiq');
+  if (el) el.style.color = nc;
+  const card = document.getElementById('k-nfiq-card');
+  if (card) card.style.borderColor = ok ? 'rgba(34,197,94,.22)' : 'rgba(239,68,68,.3)';
+  const glow = document.getElementById('k-nfiq-glow');
+  if (glow) glow.style.background = ok
+    ? 'radial-gradient(circle,rgba(34,197,94,.13),transparent 70%)'
+    : 'radial-gradient(circle,rgba(239,68,68,.1),transparent 70%)';
+  const eye = document.getElementById('k-nfiq-eye');
+  if (eye) eye.style.color = nc;
+  set('k-nfiq', D.nfiq.pass+'%');
+
+  // Sparkline
+  const sp = document.getElementById('k-nfiq-spark');
+  if (sp) sp.innerHTML = D.nfiq.trend.map((v,i)=>{
+    const c = v>=D.nfiq.target ? 'var(--green)' : v>=50 ? 'var(--orange)' : 'var(--red)';
+    const last = i===D.nfiq.trend.length-1;
+    return `<div style="flex:1;background:${c};opacity:${last?1:.5};border-radius:2px 2px 0 0;height:${Math.round(v)}%;"></div>`;
+  }).join('');
+
+  const delta = D.nfiq.trend[6]-D.nfiq.trend[0];
+  const tl = document.getElementById('k-nfiq-trend');
+  if (tl) { tl.textContent=(delta>=0?'↑ +':'↓ ')+Math.abs(delta).toFixed(1)+'% vs 7d ago'; tl.style.color=delta>=0?'var(--green)':'var(--red)'; }
+
+  set('k-users',   D.users.total);
+  set('k-users-7d',D.users.week);
+  set('k-mau',     D.users.mau);
+
+  // Gate 1
+  set('g1-big', D.captures.total);
+  css('g1-bar','width', pct+'%');
+  set('g1-pct', pct+'% complete');
+  set('g1-rem', (D.captures.target-D.captures.total)+' remaining');
+
+  // Angle grid
+  const ag = document.getElementById('angle-grid');
+  if (ag) {
+    const vals = Object.values(D.angles);
+    const mx = Math.max(...vals), mn = Math.min(...vals);
+    ag.innerHTML = Object.entries(D.angles).map(([k,v])=>{
+      const weak = v===mn, strong = v===mx;
+      const c = weak ? 'var(--orange)' : 'var(--cyan)';
+      const sub = weak ? '↓ Weakest' : strong ? '✓ Strongest' : Math.round(v/mx*1000)/10+'%';
+      const sc = weak ? 'var(--orange)' : strong ? 'var(--green)' : 'var(--dim)';
+      return `<div style="background:rgba(0,191,255,.07);border:1px solid var(--cyan-b);border-radius:11px;padding:11px 13px;">
+        <div style="font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.1em;margin-bottom:3px;">${k}</div>
+        <div class="mono" style="font-size:24px;font-weight:700;color:${c};">${v}</div>
+        <div style="font-size:10px;color:${sc};margin-top:2px;">${sub}</div>
+      </div>`;
+    }).join('');
+  }
+
+  // Flags
+  const flags = [];
+  const daysBelow = D.nfiq.trend.filter(v=>v<65).length;
+  if (D.nfiq.pass < 65) flags.push({c:'red', t:`NFIQ pass rate <65% for <strong>${daysBelow} days</strong>`});
+  const rem = D.captures.target-D.captures.total;
+  if (rem>0) flags.push({c:'orange', t:`Gate 1: ${rem} captures needed`});
+  if ((100-D.sfm.success)>25) flags.push({c:'red', t:`Scoring failure rate ${(100-D.sfm.success).toFixed(1)}% — above 25% threshold`});
+  flags.push({c:'blue', t:'SageMaker Run 6: ECR resolution pending'});
+
+  const fl = document.getElementById('flags-list');
+  if (fl) fl.innerHTML = flags.map(f=>{
+    const map = {red:['rgba(239,68,68,.1)','rgba(239,68,68,.25)','var(--red)'], orange:['rgba(249,115,22,.1)','rgba(249,115,22,.25)','var(--orange)'], blue:['rgba(30,136,229,.1)','rgba(30,136,229,.25)','var(--blue)']};
+    const [bg,bd,dc] = map[f.c];
+    const anim = f.c!=='blue'?'animation:blink 1.5s infinite;':'';
+    return `<div style="display:flex;align-items:center;gap:7px;background:${bg};border:1px solid ${bd};border-radius:9px;padding:8px 12px;">
+      <span style="width:6px;height:6px;border-radius:50%;background:${dc};${anim}display:block;flex-shrink:0;"></span>
+      <span style="font-size:11.5px;color:var(--bright);">${f.t}</span>
+    </div>`;
+  }).join('');
+
+  // Topbar alert
+  const ta = document.getElementById('tb-alert');
+  if (ta) ta.innerHTML = D.nfiq.pass<65
+    ? `<div class="alert-pill ap-r" onclick="go('pipeline')"><span class="ic">warning</span>NFIQ below threshold</div>`
+    : `<div class="alert-pill ap-o"><span class="ic">info</span>Gate 1 in progress</div>`;
+}
+
+/* ─── Pipeline ─── */
+function renderPipeline() {
+  set('sfm-rate', D.sfm.success+'%');
+  set('proc-avg', D.proc.avg);
+  set('proc-avg-lbl', D.proc.avg+'ms avg');
+  set('proc-p50', D.proc.p50+'ms');
+  set('proc-p99', (D.proc.p99/1000).toFixed(1)+'s');
+  set('nfiq-fail', D.nfiq.fail+'%');
+  set('nfiq-pass', D.nfiq.pass+'%');
+
+  const sb = document.getElementById('sfm-bars');
+  if (sb) {
+    // Real success/fail split only -- the old per-reason breakdown
+    // (ORB/RANSAC/Triangulation/PCA/Unwrap) was specific to SfM
+    // reconstruction, discontinued 2026-07-15; front_only_v1's own
+    // pipeline doesn't have an analogous fixed set of failure reasons to
+    // report here without fabricating categories that aren't real.
+    const rows = [
+      ['Scored', D.sfm.success, 'var(--green)'],
+      ['Not scored', Math.round((100-D.sfm.success)*10)/10, 'var(--red)'],
+    ];
+    sb.innerHTML = rows.map(([l,v,c])=>`
+      <div style="display:flex;align-items:center;margin-bottom:9px;">
+        <span style="font-size:11.5px;color:var(--dim);width:130px;flex-shrink:0;">${l}</span>
+        <div style="flex:1;height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin:0 9px;">
+          <div style="height:100%;width:${v}%;background:${c};border-radius:3px;"></div>
+        </div>
+        <span class="mono" style="font-size:11px;color:${c};width:36px;text-align:right;">${v}%</span>
+      </div>`).join('');
+  }
+
+  if (!drawn.pipeline) {
+    drawn.pipeline = true;
+    setTimeout(()=>{
+      drawHisto('proc-chart', D.proc.hist, 'rgba(0,191,255,.55)', 'var(--cyan)');
+      // Real henryClass values may not be exactly 4 distinct codes (see
+      // listenCaptures' own note) -- cycle the palette via modulo instead
+      // of a fixed 4-slot array so a 5th+ real category gets a real
+      // colour instead of `undefined`.
+      const henryCols = ['#00BFFF','#1E88E5','#C9A84C','#7a8089','#22C55E','#F97316','#EF4444'];
+      const henryColAt = i => henryCols[i % henryCols.length];
+      drawDonut('henry-chart', Object.values(D.henry), Object.keys(D.henry).map((_,i)=>henryColAt(i)));
+      drawHisto('nfiq-dist', D.nfiq.dist, 'rgba(239,68,68,.5)', 'var(--red)', 'rgba(34,197,94,.55)', 'var(--green)', 6);
+      const hl = document.getElementById('henry-legend');
+      if (hl) {
+        const colsVar = ['var(--cyan)','var(--blue)','var(--gold)','var(--dim)','var(--green)','var(--orange)','var(--red)'];
+        hl.innerHTML = Object.entries(D.henry).map(([k,v],i)=>`
+          <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:9px;">
+            <div style="display:flex;align-items:center;gap:6px;">
+              <div style="width:7px;height:7px;border-radius:2px;background:${colsVar[i % colsVar.length]};"></div>
+              <span style="font-size:12px;color:var(--silver);">${k}</span>
+            </div>
+            <span class="mono" style="font-size:12px;color:${colsVar[i % colsVar.length]};font-weight:700;">${v}%</span>
+          </div>`).join('');
+      }
+    },50);
+  }
+}
+
+/* ─── Gates ─── */
+function renderGates() {
+  const tl = document.getElementById('gates-tl');
+  if (!tl) return;
+  const SC = {
+    done:   {dot:'background:var(--green);',               ic:'check',   bc:['rgba(34,197,94,.12)','rgba(34,197,94,.28)','var(--green)', '✓ Done'],    ec:'var(--green)'},
+    active: {dot:'background:var(--orange);',              ic:'sync',    bc:['rgba(249,115,22,.12)','rgba(249,115,22,.3)','var(--orange)','🟡 Active'],  ec:'var(--orange)'},
+    blocked:{dot:'background:rgba(239,68,68,.18);border:2px solid rgba(239,68,68,.4);',ic:'block',bc:['rgba(239,68,68,.1)','rgba(239,68,68,.28)','var(--red)','🔴 Blocked'],ec:'var(--red)'},
+    vision: {dot:'background:rgba(201,168,76,.15);border:2px solid rgba(201,168,76,.3);',ic:'star',bc:['rgba(201,168,76,.1)','rgba(201,168,76,.25)','var(--gold)','🔴 Blocked'],ec:'var(--gold)'},
+  };
+  tl.innerHTML = `<div class="eye" style="margin-bottom:16px;">Campaign Timeline</div>`+
+    D.gates.map((g,i)=>{
+      const s = SC[g.st];
+      const last = i===D.gates.length-1;
+      const prog = g.cnt!==null?`
+        <div style="background:rgba(255,255,255,.04);border-radius:8px;padding:9px 11px;margin-top:7px;">
+          <div style="display:flex;justify-content:space-between;margin-bottom:5px;">
+            <span class="mono" style="font-size:17px;font-weight:700;color:var(--cyan);">${g.cnt}<span style="font-size:11px;color:var(--dim);"> / ${g.tgt}</span></span>
+            <span style="font-size:11px;color:var(--orange);">${Math.round(g.cnt/g.tgt*1000)/10}%</span>
+          </div>
+          <div class="pb-t"><div class="pb-f" style="width:${g.cnt/g.tgt*100}%;background:var(--orange);"></div></div>
+        </div>`:'';
+      return `<div class="gate-item" onclick="modalOpen('Gate ${g.id}','${g.label}',${JSON.stringify({...g})})">
+        <div class="gate-conn">
+          <div class="gate-dot" style="${s.dot}color:#fff;">${s.ic}</div>
+          ${!last?'<div class="gate-line"></div>':''}
+        </div>
+        <div class="gate-body">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:8px;">
+            <div>
+              <div style="font-size:9.5px;color:${s.bc[2]};font-weight:700;text-transform:uppercase;letter-spacing:.1em;">Gate ${g.id}</div>
+              <div style="font-size:13px;font-weight:700;color:var(--bright);margin-top:2px;">${g.label}</div>
+              ${g.eta?`<div style="font-size:11px;color:${g.st==='active'?'var(--orange)':'var(--dim)'};margin-top:2px;">${g.note?g.note+' · ':''}Target: ${g.eta}</div>`:''}
+            </div>
+            <div style="background:${s.bc[0]};border:1px solid ${s.bc[1]};border-radius:7px;padding:3px 9px;font-size:11px;color:${s.bc[2]};font-weight:700;white-space:nowrap;">${s.bc[3]}</div>
+          </div>
+          ${prog}
+        </div>
+      </div>`;
+    }).join('');
+
+  const sd = document.getElementById('gates-side');
+  if (sd && !sd.innerHTML) sd.innerHTML = `
+    <div class="card" style="padding:15px;border-color:var(--cyan-b);background:var(--cyan-s);">
+      <div class="eye" style="margin-bottom:6px;">Critical Path</div>
+      <div style="font-size:12px;color:var(--bright);line-height:1.6;">Gate 2 unlocks Gate 3 (AFISwitch). NFIQ must reach 80%+ before any submission or demo.</div>
+    </div>
+    <div class="card" style="padding:15px;">
+      <div class="eye" style="margin-bottom:6px;color:var(--dim);">Beta Rule</div>
+      <div style="font-size:12px;color:var(--silver);line-height:1.6;">Data collection only. No payments, no certificates, no AFIS until Gate 4.</div>
+    </div>
+    <div class="card" style="padding:15px;border-color:rgba(201,168,76,.2);">
+      <div class="eye" style="margin-bottom:8px;color:var(--gold);">NFIQ Thresholds</div>
+      ${[['Beta (messy prints)','≥ 40%','var(--orange)'],['Gate B target','≥ 65%','var(--orange)'],['Production','≥ 80%','var(--green)']].map(([l,v,c])=>`
+        <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;">
+          <span style="color:var(--dim);">${l}</span><span style="color:${c};font-weight:700;">${v}</span>
+        </div>`).join('')}
+    </div>
+    <div class="card" style="padding:15px;">
+      <div class="eye" style="margin-bottom:8px;color:var(--dim);">Competitor Context</div>
+      <div style="font-size:12px;color:var(--silver);line-height:1.6;">PortalWuru = 2–5hr at R550/R395.<br>ClearBridge wedge = convenience + price.</div>
+    </div>`;
+}
+
+/* ─── Funnel ─── */
+function renderFunnel() {
+  const fr = document.getElementById('funnel-rows');
+  if (fr) {
+    const max = D.funnel[0].n;
+    fr.innerHTML = D.funnel.map(r=>{
+      const w = r.locked ? 0 : Math.round(r.n/max*100);
+      const bc = r.hi ? 'var(--cyan)' : 'var(--blue)';
+      const cc = r.locked ? 'var(--dim)' : r.hi ? 'var(--cyan)' : 'var(--bright)';
+      const cv = r.cv ? (r.cv>80?'var(--green)':'var(--orange)') : 'var(--dim)';
+      const wrap = r.hi ? 'background:var(--cyan-s);border:1px solid var(--cyan-b);border-radius:11px;padding:9px 11px;margin-bottom:6px;' : 'margin-bottom:12px;';
+      return `<div style="${wrap}">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px;">
+          <span style="font-size:${r.hi?'13px':'12px'};font-weight:${r.hi?'700':'500'};color:${r.hi?'var(--cyan)':'var(--silver)'};">${r.stage}</span>
+          <div style="display:flex;gap:11px;align-items:center;">
+            <span style="font-size:10px;color:${cv};">${r.cv?r.cv+'%':r.locked?'Post-launch':'—'}</span>
+            <span class="mono" style="font-size:${r.hi?'19px':'13.5px'};font-weight:700;color:${cc};min-width:30px;text-align:right;">${r.locked?'—':r.n}</span>
+          </div>
+        </div>
+        <div style="height:${r.hi?'6px':'5px'};background:rgba(255,255,255,.05);border-radius:3px;overflow:hidden;">
+          <div style="height:100%;width:${w}%;background:${bc};border-radius:3px;"></div>
+        </div>
+        ${r.hi?'<div style="font-size:10px;color:var(--cyan);margin-top:4px;">← Gate 1 primary metric</div>':''}
+      </div>`;
+    }).join('');
+  }
+
+  const ch = document.getElementById('funnel-ch');
+  if (ch && !ch.innerHTML) ch.innerHTML = `<div style="display:flex;flex-direction:column;gap:10px;">
+    ${D.channels.map(c=>`
+      <div class="card" style="padding:15px;">
+        <div style="font-size:12.5px;font-weight:700;color:var(--bright);margin-bottom:2px;">${c.name}</div>
+        <div style="font-size:11px;color:var(--dim);margin-bottom:10px;">${c.sub}</div>
+        ${[['Attended',c.att,'var(--bright)'],['Completed',c.done,'var(--cyan)'],['Conv. rate',Math.round(c.done/c.att*1000)/10+'%','var(--green)']].map(([l,v,col])=>`
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+            <span style="color:var(--dim);">${l}</span>
+            <span class="mono" style="color:${col};font-weight:700;">${v}</span>
+          </div>`).join('')}
+      </div>`).join('')}
+  </div>`;
+}
+
+/* ─── Retention ─── */
+function renderRetention() {
+  const g = document.getElementById('ret-grid');
+  if (!g||g.innerHTML) return;
+  const r = D.ret;
+  g.innerHTML = `
+    <div class="card" style="padding:18px;">
+      <div class="eye" style="margin-bottom:11px;color:var(--gold);">ClearCoin Awards</div>
+      <div class="mono" style="font-size:34px;font-weight:700;color:var(--gold);margin-bottom:4px;">${r.coins_max}</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:11px;">users at 50 coins (max) · +10 per capture</div>
+      <div style="background:rgba(201,168,76,.08);border:1px solid rgba(201,168,76,.18);border-radius:9px;padding:10px;">
+        ${[['Avg coins / user',r.coins_avg,'var(--gold)'],['At max (50)',r.coins_max+' users','var(--gold-l)']].map(([l,v,c])=>`
+          <div style="display:flex;justify-content:space-between;font-size:12px;margin-bottom:4px;">
+            <span style="color:var(--dim);">${l}</span><span class="mono" style="color:${c};font-weight:700;">${v}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+    <div class="card" style="padding:18px;">
+      <div class="eye" style="margin-bottom:11px;">Referral Codes</div>
+      <div style="display:flex;gap:9px;margin-bottom:11px;">
+        ${[['Shares',r.ref_sent,'var(--bright)'],['Redeemed',r.ref_red,'var(--green)'],['k-factor',r.kfac,r.kfac>=0.4?'var(--green)':'var(--orange)']].map(([l,v,c])=>`
+          <div style="flex:1;background:rgba(255,255,255,.04);border-radius:8px;padding:10px;text-align:center;">
+            <div style="font-size:10px;color:var(--dim);">${l}</div>
+            <div class="mono" style="font-size:21px;font-weight:700;color:${c};margin-top:3px;">${v}</div>
+          </div>`).join('')}
+      </div>
+      <div style="font-size:11px;color:var(--dim);">Production target: k-factor 0.4–0.6</div>
+    </div>
+    <div class="card" style="padding:18px;">
+      <div class="eye" style="margin-bottom:11px;">Day-7 Retention</div>
+      <div class="mono" style="font-size:34px;font-weight:700;color:var(--blue);margin-bottom:4px;">${r.d7}%</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:11px;">${r.d7n} / ${D.users.total} returned for 2nd capture</div>
+      <div class="pb-t" style="height:7px;border-radius:5px;"><div class="pb-f" style="width:${r.d7}%;background:var(--blue);"></div></div>
+    </div>
+    <div class="card" style="padding:18px;">
+      <div class="eye" style="margin-bottom:11px;">Repeat Capture Rate</div>
+      <div class="mono" style="font-size:34px;font-weight:700;color:var(--cyan);margin-bottom:4px;">${r.rep}%</div>
+      <div style="font-size:11px;color:var(--dim);margin-bottom:11px;">Users attempting 2+ captures</div>
+      <div class="pb-t" style="height:7px;border-radius:5px;"><div class="pb-f" style="width:${r.rep}%;background:var(--cyan);"></div></div>
+    </div>`;
+}
+
+/* ─── Payments ─── */
+function renderPayments() {
+  const g = document.getElementById('pay-grid');
+  if (!g||g.innerHTML) return;
+  [['Priority @ R530','R0','0 clearances'],['Premium @ R380','R0','0 clearances'],['Gross Margin','56%','Blended target'],
+   ['CAC Target','<R60','Blended'],['Paystack Webhooks','100%','Target health'],['Failed Txns','<5%','Target ceiling']].forEach(([l,v,s])=>{
+    const d = document.createElement('div');
+    d.className='card'; d.style.cssText='padding:16px;';
+    d.innerHTML=`<div class="eye" style="margin-bottom:8px;color:var(--dim);">${l}</div><div class="mono" style="font-size:22px;color:var(--dim);font-weight:700;">${v}</div><div style="font-size:11px;color:var(--dim);margin-top:3px;">${s}</div>`;
+    g.appendChild(d);
+  });
+}
+
+/* ─── Infra ─── */
+function renderInfra() {
+  const sl = document.getElementById('svc-list');
+  if (sl) sl.innerHTML = D.infra.map(s=>`
+    <div class="svc-row">
+      <div style="display:flex;align-items:center;gap:9px;">
+        <span class="dot ${s.st==='up'?'dot-g':'dot-o'}" style="${s.st==='up'?'animation-duration:3s':''}"></span>
+        <div>
+          <div style="font-size:12.5px;font-weight:600;color:var(--bright);">${s.name}</div>
+          <div style="font-size:10px;color:var(--dim);">${s.sub}</div>
+        </div>
+      </div>
+      <span style="font-size:11px;font-weight:700;color:${s.st==='up'?'var(--green)':'var(--orange)'};">${s.st==='up'?'UP':'PENDING'}</span>
+    </div>`).join('');
+
+  const pc = document.getElementById('perf-card');
+  if (pc&&!pc.innerHTML) {
+    pc.innerHTML=`<div class="eye" style="margin-bottom:11px;">App Performance</div>
+      ${[['API Latency (avg)',D.perf.lat_avg+'ms','var(--green)'],['API Latency (P99)',D.perf.lat_p99+'ms','var(--orange)'],['Crashes (7d)',D.perf.cr7,'var(--bright)']].map(([l,v,c])=>`
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+          <span style="font-size:12px;color:var(--dim);">${l}</span>
+          <span class="mono" style="font-size:13.5px;font-weight:700;color:${c};">${v}</span>
+        </div>`).join('')}`;
+  }
+  const cc = document.getElementById('crash-card');
+  if (cc&&!cc.innerHTML) {
+    const p = D.perf;
+    cc.innerHTML=`<div class="eye" style="margin-bottom:11px;">Crashlytics (7d)</div>
+      <div style="display:flex;gap:8px;">
+        ${[['Critical',p.cr_crit,'var(--red)','rgba(239,68,68,.08)','rgba(239,68,68,.2)'],
+           ['High',p.cr_high,'var(--orange)','rgba(249,115,22,.08)','rgba(249,115,22,.2)'],
+           ['Low',p.cr_low,'var(--silver)','rgba(181,188,196,.04)','var(--cb)']].map(([l,v,c,bg,bd])=>`
+          <div style="flex:1;background:${bg};border:1px solid ${bd};border-radius:8px;padding:9px;text-align:center;">
+            <div style="font-size:10px;color:${c};">${l}</div>
+            <div class="mono" style="font-size:22px;font-weight:700;color:${c};margin-top:3px;">${v}</div>
+          </div>`).join('')}
+      </div>`;
+  }
+}
+
+/* ─── Rhythm ─── */
+function renderRhythm() {
+  const g = document.getElementById('rhythm-grid');
+  if (!g||g.innerHTML) return;
+  g.innerHTML = `
+    <div style="display:flex;flex-direction:column;gap:11px;">
+      <div class="card" style="padding:18px;">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:11px;">
+          <span class="ic" style="color:var(--cyan);font-size:17px;">today</span>
+          <div class="eye" style="color:var(--cyan);">Monday 9AM · Check-in</div>
+        </div>
+        ${['Review NFIQ pass rate vs. target','Check capture count vs. Gate 1 (300)','Flag any stuck promises'].map(t=>`
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span class="ic" style="font-size:14px;color:var(--dim);">check_box_outline_blank</span>
+            <span style="font-size:12.5px;color:var(--silver);">${t}</span>
+          </div>`).join('')}
+      </div>
+      <div class="card" style="padding:18px;">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:11px;">
+          <span class="ic" style="color:var(--dim);font-size:17px;">weekend</span>
+          <div class="eye" style="color:var(--dim);">Friday 6PM · Wrap</div>
+        </div>
+        ${['Update all gate milestones','Evaluate channel performance (Forum vs. Eduardo)','Decide cuts/pivots for underperforming tactics','Verify payment health (if live)'].map(t=>`
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span class="ic" style="font-size:14px;color:var(--dim);">check_box_outline_blank</span>
+            <span style="font-size:12.5px;color:var(--silver);">${t}</span>
+          </div>`).join('')}
+      </div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:11px;">
+      <div class="card" style="padding:18px;border-color:rgba(239,68,68,.2);background:rgba(239,68,68,.03);">
+        <div style="display:flex;align-items:center;gap:7px;margin-bottom:11px;">
+          <span class="ic" style="color:var(--red);font-size:17px;">warning</span>
+          <div class="eye" style="color:var(--red);">Red Flags · Auto-surface</div>
+        </div>
+        ${[['NFIQ pass rate <65% for 3+ days','var(--red)'],['SFM failure >25%','var(--red)'],['Gate 1 stalled >7 days','var(--orange)'],['Paystack webhook >2% failure','var(--orange)'],['Crashlytics critical errors >2/day','var(--red)']].map(([t,c])=>`
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px;">
+            <span style="width:6px;height:6px;border-radius:50%;background:${c};flex-shrink:0;display:block;"></span>
+            <span style="font-size:12px;color:var(--silver);">${t}</span>
+          </div>`).join('')}
+      </div>
+      <div class="card" style="padding:18px;">
+        <div class="eye" style="margin-bottom:10px;color:var(--dim);">Operational Notes</div>
+        <div style="font-size:12px;color:var(--silver);line-height:1.65;display:flex;flex-direction:column;gap:7px;">
+          <p>Beta rule: Data collection only. No payments, no certificates, no AFIS until Gate 4.</p>
+          <p>NFIQ: accept 40% in beta, target 65%+ at Gate B, 80%+ for production.</p>
+          <p>PortalWuru = 2–5hr at R550/R395. ClearBridge wedge = convenience + price.</p>
+        </div>
+      </div>
+    </div>`;
+}
+
+/* ════ Charts (Canvas) ════ */
+function drawHisto(id, data, colorA, strokeA, colorB, strokeB, splitAt) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio||1;
+  const W = canvas.offsetWidth, H = canvas.offsetHeight;
+  canvas.width = W*dpr; canvas.height = H*dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const max = Math.max(...data);
+  const bw = W/data.length*0.65;
+  const gap = W/data.length*0.35;
+  data.forEach((v,i) => {
+    const x = i*(W/data.length)+gap/2;
+    const bh = (v/max)*(H-2);
+    const y = H-bh;
+    ctx.fillStyle = (splitAt!==undefined && i>=splitAt) ? (colorB||colorA) : colorA;
+    ctx.globalAlpha = 0.9;
+    roundRect(ctx, x, y, bw, bh, 3);
+    ctx.fill();
+  });
+  ctx.globalAlpha = 1;
+}
+
+function drawDonut(id, data, colors) {
+  const canvas = document.getElementById(id);
+  if (!canvas) return;
+  const dpr = window.devicePixelRatio||1;
+  canvas.width = 90*dpr; canvas.height = 90*dpr;
+  const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
+  const cx=45,cy=45,r=40,inner=24;
+  const total = data.reduce((a,b)=>a+b,0);
+  let a = -Math.PI/2;
+  data.forEach((v,i)=>{
+    const slice = (v/total)*Math.PI*2;
+    ctx.beginPath();
+    ctx.moveTo(cx,cy);
+    ctx.arc(cx,cy,r,a,a+slice);
+    ctx.closePath();
+    ctx.fillStyle = colors[i];
+    ctx.fill();
+    a+=slice;
+  });
+  ctx.beginPath();
+  ctx.arc(cx,cy,inner,0,Math.PI*2);
+  ctx.fillStyle='#0B0F1A';
+  ctx.fill();
+}
+
+function roundRect(ctx,x,y,w,h,r) {
+  if (h<1) return;
+  r = Math.min(r, h/2, w/2);
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.lineTo(x+w-r, y);
+  ctx.arcTo(x+w,y,x+w,y+r,r);
+  ctx.lineTo(x+w,y+h);
+  ctx.lineTo(x,y+h);
+  ctx.arcTo(x,y+h,x,y+h-r,r);
+  ctx.lineTo(x,y+r);
+  ctx.arcTo(x,y,x+r,y,r);
+  ctx.closePath();
+}
+
+/* ════ Modal ════ */
+function modalOpen(eyebrow, title, data) {
+  document.getElementById('m-eye').textContent = eyebrow;
+  document.getElementById('m-title').textContent = title;
+  // Build detail body
+  let body = `<div style="font-size:12.5px;color:var(--silver);line-height:1.65;">`;
+  if (data && data.note) body += `<p style="margin-bottom:10px;">${data.note}</p>`;
+  if (data && data.eta) body += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--cb);"><span style="color:var(--dim);">Target ETA</span><span style="color:var(--bright);font-weight:700;">${data.eta}</span></div>`;
+  if (data && data.cnt!==null && data.tgt!==null) body += `<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--cb);"><span style="color:var(--dim);">Progress</span><span class="mono" style="color:var(--cyan);font-weight:700;">${data.cnt} / ${data.tgt}</span></div>`;
+  body += `<p style="margin-top:14px;color:var(--dim);">Connect Firebase to populate detailed drill-down data for this gate.</p></div>`;
+  document.getElementById('m-body').innerHTML = body;
+  document.getElementById('modal').classList.add('open');
+}
+
+function modalClose(e) {
+  if (!e||e.target===document.getElementById('modal')) {
+    document.getElementById('modal').classList.remove('open');
+  }
+}
+document.addEventListener('keydown', e => { if (e.key==='Escape') modalClose(); });
+
+/* ════ Helpers ════ */
+function set(id,val) { const el=document.getElementById(id); if (el) el.textContent=val; }
+function css(id,prop,val) { const el=document.getElementById(id); if (el) el.style[prop]=val; }
+
+function refresh() {
+  const ic = document.getElementById('refresh-ic');
+  if (ic) ic.style.animation='spin 1s linear infinite';
+  setTimeout(()=>{ if (ic) ic.style.animation=''; tick(); },1000);
+}
+
+function tick() {
+  const el = document.getElementById('sb-updated');
+  if (el) el.textContent='Updated '+new Date().toLocaleTimeString('en-ZA',{hour:'2-digit',minute:'2-digit'});
+}
+
+/* ════ Init ════ */
+document.getElementById('tb-date').textContent =
+  new Date().toLocaleDateString('en-ZA',{weekday:'short',day:'numeric',month:'short',year:'numeric'});
+
+// Hash routing
+const hash = window.location.hash.replace('#','');
+if (hash && TITLES[hash]) go(hash);
+else renderAll();
+
+tick();
+initFB();
+</script>
+</body>
+</html>

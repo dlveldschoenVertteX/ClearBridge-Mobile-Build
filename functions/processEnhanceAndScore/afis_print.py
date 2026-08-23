@@ -1,0 +1,3467 @@
+"""
+AFIS-style binary superprint from the best plain (face-on) capture frame.
+
+Why this exists: the cylindrical unwrap is the right tool for *coverage*
+metadata, but the human-recognisable "superprint" deliverable — the classic
+black-ridges-on-white rolled-print look — is produced far more faithfully by
+enhancing the single sharpest face-on frame directly:
+
+    sharpest near-0° frame
+      → U-Net thumb mask            (existing trained model, thumb_seg_unet.onnx)
+      → local normalisation + CLAHE
+      → block orientation field     (doubled-angle Sobel averaging)
+      → ridge-wavelength estimate   (block autocorrelation)
+      → oriented Gabor filter bank  (per-pixel orientation-selected response)
+      → sign binarisation           (ridges black / valleys white)
+      → mask + crop
+
+Validated against a real sunlight capture (2c31b594): produces a clean,
+reference-comparable binary loop pattern where the cylindrical unwrap of the
+same capture appears geometrically stretched. This runs *in addition to* the
+existing unwrap→NNS→NFIQ path, not instead of it — output is saved alongside
+enhanced_flat.jpg for the user/AFIS-facing artefact.
+
+No torch dependency; cv2 + numpy + the ONNX session already provisioned by
+main._ensure_models / sfm_pipeline._get_thumb_seg_session.
+"""
+from __future__ import annotations
+
+import logging
+from typing import List, Optional, Tuple
+
+import cv2
+import numpy as np
+
+logger = logging.getLogger('afis_print')
+
+_BLOCK = 16          # orientation/variance block size (px)
+_N_ORIENT = 16       # Gabor bank orientation count
+_FACE_ON_MAX_DEG = 12.0   # a frame counts as "plain impression" within this angle
+_TARGET_PERIOD = 9.0      # ridge period (px) to normalise to — ~500 DPI domain
+_STACK_MAX = 4            # max same-pose frames to align+average (denoise)
+_STACK_ANGLE_DEG = 5.0    # only stack frames within this angle of the sharpest
+
+# Reference gyro magnitude (deg/s) for the gentle per-frame down-weighting in
+# _focus_stack_face_on, added 2026-08-06. Mirrors the CLIENT's own
+# _maxSteadyDegPerSec (front_capture_controller.dart) -- the burst only ever
+# fires once the hold reads below this at completion, so individual in-burst
+# frames should mostly sit near or under it already. Not independently
+# calibrated backend-side; it's a reference point for differentiating among a
+# single burst's OWN frames, not an absolute severity scale.
+_GYRO_STEADY_REF_DEG_PER_SEC = 6.0
+
+# Gabor/CLAHE tuning (2026-07-15): swept against the local ResNet18 proxy on 5
+# real captures whose actual nfiq2Score is known (2 good/72, 2 bad/7, 1
+# worst-case/1 — see Notion session log), reproducing main.py's scoring
+# exactly enough to match its recorded proxy values to within ~0.1. Gamma and
+# sigma-ratio moves were broadly positive (or flat) on EVERY case tested,
+# good and bad alike, so they're low-risk. Not yet confirmed against real
+# NFIQ2 (the sidecar can't be reached from this sandbox) — validate on the
+# next real device captures before trusting the absolute gain.
+_GABOR_SIGMA_RATIO = 0.65   # was 0.56 -- slightly wider envelope, helped coarser-ridge (larger native wavelength) captures without hurting clean ones
+_GABOR_GAMMA = 0.85         # was 0.60 -- monotonically improved every one of the 5 real test cases as it rose toward 1.0; kept <1.0 to preserve some orientation-selectivity rather than going fully isotropic
+_FEATHER_SIGMA = 2.5        # was 4.0 -- small, uniformly-nonnegative gain across all 5 cases
+_AA_SIGMA = 0.0               # 2026-08-03: sub-pixel anti-alias on the hard-
+# binarized ridge edges themselves (not the mask boundary -- see
+# _FADE_INSET_PX above). OFF by default -- measured negative on real NFIQ2,
+# see the real sweep data at the call site below. 0.7 was the visually-best
+# value tested (removes stairstep jaggedness, keeps ridges clearly
+# separated) if this is ever turned on for a look-over-score trade-off.
+_FADE_INSET_PX = 25.0       # 2026-08-03: real visual-QA finding -- a hard mask
+# boundary (even with the thin _FEATHER_SIGMA anti-alias above) reads as an
+# artificial "clipped" thumb silhouette instead of a real scanner print's
+# natural ridge taper, and is also a known real source of spurious ridge-
+# ending minutiae exactly along the crop curve (every ridge simultaneously
+# "ends" on the same geometric boundary -- not how a real contact print
+# looks, and a plausible real hit against AFIS matching, not just cosmetics).
+# Value swept (15/25/35/45/60px) against REAL NFIQ2 (locally built nfiq2
+# binary) on 4 diverse real captures (nfiq2Score 46-95): 25px gave both the
+# best mean score (67.5, vs 60.5 for the old hard-boundary baseline) AND was
+# the only value with a positive real delta on EVERY capture (+10/+9/+8/+1,
+# zero regressions) -- 35-45px looked better on some individual captures but
+# cost real score on cb684c57 specifically (-4/-2). Not a blind guess.
+# Ridges now reach full black only this many px inside the mask and fade
+# toward white over the same distance as they approach the edge, so the
+# print visually thins out and terminates before the crop boundary rather
+# than being sliced by it -- see the distance-transform blend below.
+_FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
+# shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
+# native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
+# regardless of variant (722ae3b0: scale 0.5 -> real 7; d7dd0c68: scale 0.9 -> real 5),
+# while captures needing little/no rescale did well (c34911b5, 3e54236a: both real 72).
+# Capping how aggressive the resample is allowed to get also improved the LOCAL proxy
+# score substantially on the same real bad case (722ae3b0: 65.3 -> 72.6). Left as a
+# floor rather than disabling freq_normalize entirely -- a mild correction still helps
+# (d7dd0c68's 0.9 scale case, while bad, wasn't as bad as the 0.5/0.45 cases).
+
+_MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUTER
+# BOUND for coverage expansion: the flash-diff/U-Net-detected real pad is used as the
+# mask (covering more of the pad incl. the tip, which the tight guide oval cuts off --
+# CTO: "entire thumbpad should be covered"), then clipped to this dilated guide so it can
+# never wander onto background or the hand behind the pad. 1.0 == legacy behaviour
+# (intersect with the bare guide -> shrink only). Set to 1.3 rather than a larger value
+# from a local sweep on the 14-capture set: 1.3 adds real pad/tip coverage while a more
+# aggressive 1.6 measurably HURT a capture whose guide was already well-placed
+# (c34911b5: local NFIQ2 79->68) by reaching into poor-contact periphery. The metrics
+# available in-sandbox (real NFIQ2, foolable; bozorth vs a single weak ink scan,
+# noise-limited) cannot finely arbitrate a fidelity gain from coverage, so this is a
+# conservative choice honouring the explicit "cover the pad" ask with limited downside --
+# confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
+
+_FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0  # below this, treat the flash frame as
+# blown-out and don't trust it for flash-diff segmentation (2026-07-23: real capture
+# dadd4ef9 -- nfiq2Score 81, but a visibly jagged/notched superprint boundary with a
+# real hole in the ridge-bearing area -- had EVERY flash frame in its burst score
+# Laplacian 17-20 (vs ambient's 232-245), the same recurring torch-blowout pattern
+# documented throughout this project. A severely overexposed/clipped flash frame has
+# little local brightness gradient left in the near-camera region, which is exactly
+# the cue _segment_via_flash_diff's torch-falloff differencing depends on -- so it
+# produces a noisy, patchy diff mask instead of a clean pad-shaped blob. That noise
+# passed straight through the existing area-only accept-gate below and became a real,
+# literal hole in the final print (afis_print.py hard-masks everything outside the
+# mask to white -- see `binimg[mask == 0] = 255`), not just a cosmetic boundary
+# artifact. 50.0 sits comfortably above every confirmed-blown-out real flash score
+# seen this project (17-90 range) and comfortably below legitimately sharp captures
+# (hundreds+), so this can only skip pairs already known unreliable.
+
+# Ridge-continuity tuning (2026-07-15, round 2): CTO reported ridges not
+# connecting/flowing smoothly on real device captures. Tried morphological
+# closing/opening directly on the binarized print first -- REJECTED, actively
+# harmful: any kernel size large enough to visibly bridge a gap (>=5px) is
+# already comparable to the native ridge spacing itself and collapses
+# adjacent ridges together (proxy score craters from ~70 to ~38 on all 3 real
+# test cases). Orientation-field smoothing was the real fix: swept 5.0 (old
+# default) up to 28.0 against the same 3 real captures (nfiq2Score 72/63/0) --
+# monotonically positive up to ~15, peaking there, mild falloff beyond.
+# Visually confirmed: dramatically smoother, naturally-flowing ridge curves
+# vs. the old choppy/jagged pattern, on both the good and the bad case.
+_ORIENT_SMOOTH = 15.0       # was 5.0 -- fixes the actual "ridges don't flow
+# smoothly" complaint; do NOT try morphological close/open on the binary
+# print for this instead, it was tested and made things worse (see above).
+
+
+def _normalize(img: np.ndarray, m0: float = 100.0, v0: float = 100.0) -> np.ndarray:
+    img = img.astype(np.float32)
+    m, v = img.mean(), max(img.var(), 1e-6)
+    return m0 + np.sqrt(v0 * (img - m) ** 2 / v) * np.sign(img - m)
+
+
+def _orientation_field(img: np.ndarray, bsize: int = _BLOCK, smooth: float = _ORIENT_SMOOTH) -> np.ndarray:
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    vx = cv2.boxFilter(2 * gx * gy, -1, (bsize, bsize))
+    vy = cv2.boxFilter(gx * gx - gy * gy, -1, (bsize, bsize))
+    theta = 0.5 * np.arctan2(vx, vy)
+    cs = cv2.GaussianBlur(np.cos(2 * theta), (0, 0), smooth)
+    sn = cv2.GaussianBlur(np.sin(2 * theta), (0, 0), smooth)
+    return 0.5 * np.arctan2(sn, cs) + np.pi / 2  # ridge direction
+
+
+_FOMFE_ORDER = 4   # basis order in each axis (5x5 (p,q) grid x 4 sin/cos
+# combos - 3 duplicate DC terms = 97 real basis functions). Low on purpose:
+# the whole point is a GLOBAL model with too few degrees of freedom to chase
+# per-block noise, only the overall ridge-flow topology.
+#
+# MEASURED 2026-08-03, NOT WIRED INTO main.py's production variant list --
+# same "quality win, matchability loss" category as gaborPyfingField (see
+# that variant's own docstring above), and by the same discipline, not
+# shipped. Real NFIQ2 (locally built nfiq2 binary) on 8 diverse real
+# captures: 'fomfe' beat the tuned 'gabor' baseline on 7/8 (+2,+4,+1,-6,+10,
+# +7,+5,+6 -- mean +3.6), the first denoise/orientation-hybrid variant this
+# whole session to show a clean net NFIQ2 gain over the baseline (every
+# prior one -- pyfingHybrid, coherenceDiff, nnsHybrid -- was net negative
+# there). But real SourceAFIS matchability on the CTO's own 4 genuine
+# cross-session captures (6 pairs) went the other way: mean 74.2 -> 58.1,
+# driven mostly by one capture (382cc4b2) whose pairs fell sharply (e.g.
+# vs c34911b5: 37.9 -> 2.5). Swept order in {1,2,3,4,5,6,8} specifically
+# looking for a setting that keeps the NFIQ2 gain without the matchability
+# cost: NONE of them did -- lower order reduced the damage (order=2: that
+# same pair recovers to 20.6) but never reached the gabor baseline (37.9),
+# and order=2 also cost real score on a pair that was previously fine
+# (3e54236a vs 722ae3b0: 139.3 -> 127.5). The likely mechanism: a low-order
+# GLOBAL model can't represent the real, legitimately-tight local curvature
+# right at a whorl core/delta, so it warps genuine ridge geometry there
+# toward the smooth global trend precisely where real matching depends on
+# it most -- the model helps exactly where local noise was the problem and
+# actively hurts exactly where local complexity was real signal, not noise.
+# UPDATE 2026-08-04 -- CTO's own refinement, real improvement, STILL not a
+# net win: rather than replacing the field everywhere, confidence-weight a
+# per-pixel blend with the existing LOCAL field (see `blend=True` below) --
+# trust local where it's genuinely strong, fall back to the global fit only
+# where local signal is weak. This measurably helped: real SourceAFIS mean
+# went 58.1 (pure global) -> 66.1 (blend, percentile=70) -> 69.1 (blend,
+# percentile=90, more conservative -- now the shipped default) vs the 74.2
+# gabor baseline, and at percentile=90, 3 of the 6 genuine pairs actually
+# BEAT the baseline outright (only the 3 pairs involving 382cc4b2 stayed
+# below it). Real NFIQ2 held up throughout (mean +4.0 at percentile=70,
+# still positive at 90). This confirms the CTO's diagnosis was right --
+# targeted/confidence-based blending IS a real improvement over uniform
+# global replacement -- but the gap to the baseline never fully closed, and
+# the SAME single capture (382cc4b2) stayed the holdout at every setting
+# tried, suggesting something specific to that capture's own local
+# coherence calibration rather than a blend-strength problem alone. Left
+# here as an available, honestly-still-negative-on-mean scaffold (same
+# treatment as gaborVarFreq/fidelity/gaborPyfingField/deepFocus*) -- do not
+# wire into production without first understanding why 382cc4b2 resists
+# every setting tried.
+#
+# BROADER VALIDATION 2026-08-04 (CTO's explicit ask: don't trust a 4-
+# capture/6-pair sample, test wider) -- the "382cc4b2 is a special case"
+# theory above was ITSELF a small-sample artifact. Widened real NFIQ2 to
+# 22 real captures across 10 independent real users (every real cross-
+# session genuine-pair group found in Storage, not hand-picked): mean
+# +2.36 (was +4.0 on the original 8) -- still net positive, but a
+# meaningfully smaller effect once tested broadly, with 6/22 regressing
+# (was 1/8). Widened real SourceAFIS matchability to all 15 genuine pairs
+# across those same 10 users (was 6 pairs / 1 user): mean 55.65 -> 50.03,
+# a ~10% REAL LOSS, 8/15 pairs improved vs 7/15 regressed -- essentially a
+# coin flip with real variance in both directions, not a clean win.
+# Critically: a NEW pair not involving 382cc4b2 at all (367fb854 vs
+# de540624) showed the single BIGGEST regression of the whole set
+# (91.0 -> 27.5, -63.5) -- bigger than anything 382cc4b2 produced. So the
+# earlier "one specific capture is miscalibrated" theory doesn't hold up;
+# this is a real, broader property of the technique -- it helps some real
+# captures a lot (+19.5, +13.5, +10.9) and hurts others a lot (-63.5,
+# -32.3, -16.3), fairly unpredictably, netting slightly negative on
+# average. NOT wired into main.py's production variant list, and NOT
+# recommended even as an additive max-of-variants candidate: main.py's
+# variant selection runs on the NFIQ2 proxy/real score, and this technique
+# can win that internal quality race on a capture where it's real-
+# matchability-negative (the same "the proxy is foolable" failure mode
+# already documented elsewhere in this project, just for a new variant).
+# Left here as an available, honestly-negative-on-the-metric-that-matters
+# scaffold -- not a wasted effort, a real answer.
+
+
+_FOMFE_BLEND_CONF_SIGMA = 12.0  # Gaussian smoothing (px) on the raw per-pixel
+# coherence map before it's used as the local/global blend weight -- avoids a
+# blocky/patchwork blend boundary that would itself look like a segmentation
+# artifact (same rationale as _ORIENT_SMOOTH existing at all).
+_FOMFE_BLEND_PERCENTILE = 90.0  # coherence percentile (within the mask) that
+# maps to full trust-the-local-estimate weight. Swept 70 vs 90 against real
+# SourceAFIS matchability (see update above) -- 90 (more conservative, only
+# the weakest ~10% of local signal ever defers to the global fit) measurably
+# closed more of the gap to the gabor baseline than 70 without losing the
+# real NFIQ2 gain, so it's the default. Real captures have a wide,
+# capture-specific coherence range (contact pressure/lighting vary a lot),
+# so a PERCENTILE-relative threshold generalizes across captures where a
+# fixed absolute cutoff wouldn't.
+
+
+def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
+                              bsize: int = _BLOCK,
+                              order: int = _FOMFE_ORDER,
+                              blend: bool = True) -> Optional[np.ndarray]:
+    """
+    Global 2D-Fourier-series orientation field model (2026-08-03,
+    FOMFE-inspired -- Wang/Hu/Phillips, "A Fingerprint Orientation Model
+    Based on 2D Fourier Expansion", IEEE TPAMI 2007).
+
+    _orientation_field above already fixes noisy per-block orientation with
+    a Gaussian blur on the doubled-angle (cos 2theta, sin 2theta) field --
+    but that's a LOCAL smoother: it can only propagate information a few
+    sigma (_ORIENT_SMOOTH=15px) before falling back to whatever noisy signal
+    is locally present. A real fingerprint's ridge flow is a globally
+    coherent pattern (loops/whorls/deltas all constrain each other) -- CTO's
+    own observation: "points that clearly supposed to go together but
+    segmentation error or something else is distorting flow". A GLOBAL
+    low-order model uses every valid sample across the whole pad to
+    determine the field EVERYWHERE, so it can bridge much larger low-
+    contrast/creased gaps by following the surrounding flow topology,
+    instead of either trusting a locally-noisy estimate or leaving it
+    unconstrained beyond the blur radius.
+
+    Fits cos(2*theta)/sin(2*theta) independently via weighted least squares
+    (weight = local gradient-coherence energy, so noisy/background blocks
+    barely influence the fit) against a small tensor-product cos/sin basis
+    over normalized image coordinates, then evaluates the fitted model
+    densely over the whole image. Returns None (self-skip, same contract as
+    every other optional signal in this module) if too few valid samples
+    exist for a stable fit.
+
+    blend=True (default, 2026-08-04, CTO's own refinement): the pure global
+    replacement (blend=False) measured a real matchability loss concentrated
+    at whorl cores/deltas -- a low-order global model can't represent the
+    real, legitimately-tight local curvature there, so it was overwriting
+    genuine structure, not just noise. Instead of replacing the local field
+    everywhere, CONFIDENCE-WEIGHT a blend between the two per pixel: trust
+    the local estimate (_orientation_field's own smoothed field) where local
+    signal is genuinely strong -- a sharp core has strong gradient coherence
+    on its own, no reconstruction needed -- and fall back toward the global
+    fit only where local coherence is weak (creases, low contact pressure,
+    typically nearer the pad periphery, matching the CTO's own "outer edges"
+    framing, but driven by actual signal strength rather than a hardcoded
+    geometric ring, so it adapts per-capture instead of assuming where the
+    weak regions will be).
+    """
+    h, w = img.shape
+    gx = cv2.Sobel(img, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(img, cv2.CV_32F, 0, 1, ksize=3)
+    vx = cv2.boxFilter(2 * gx * gy, -1, (bsize, bsize))
+    vy = cv2.boxFilter(gx * gx - gy * gy, -1, (bsize, bsize))
+    coherence = np.sqrt(vx * vx + vy * vy)
+    theta_raw = 0.5 * np.arctan2(vx, vy)
+    cs_raw = np.cos(2 * theta_raw)
+    sn_raw = np.sin(2 * theta_raw)
+
+    ys = np.arange(bsize // 2, h, bsize)
+    xs = np.arange(bsize // 2, w, bsize)
+    yy, xx = np.meshgrid(ys, xs, indexing='ij')
+    valid = mask[yy, xx] > 0
+    if int(valid.sum()) < 20:
+        return None
+    yy, xx = yy[valid], xx[valid]
+    w_sample = coherence[yy, xx]
+    cs_sample = cs_raw[yy, xx]
+    sn_sample = sn_raw[yy, xx]
+
+    def _basis(xn: np.ndarray, yn: np.ndarray) -> List[np.ndarray]:
+        cols = [np.ones_like(xn)]
+        for p in range(order + 1):
+            for q in range(order + 1):
+                if p == 0 and q == 0:
+                    continue
+                cols.append(np.cos(p * np.pi * xn) * np.cos(q * np.pi * yn))
+                cols.append(np.cos(p * np.pi * xn) * np.sin(q * np.pi * yn))
+                cols.append(np.sin(p * np.pi * xn) * np.cos(q * np.pi * yn))
+                cols.append(np.sin(p * np.pi * xn) * np.sin(q * np.pi * yn))
+        return cols
+
+    xn_s = (xx.astype(np.float32) - w / 2.0) / (w / 2.0)
+    yn_s = (yy.astype(np.float32) - h / 2.0) / (h / 2.0)
+    A = np.stack(_basis(xn_s, yn_s), axis=1)
+    sw = np.sqrt(np.clip(w_sample, 1e-3, None))
+    Aw = A * sw[:, None]
+    try:
+        coef_cs, *_ = np.linalg.lstsq(Aw, cs_sample * sw, rcond=None)
+        coef_sn, *_ = np.linalg.lstsq(Aw, sn_sample * sw, rcond=None)
+    except np.linalg.LinAlgError:
+        return None
+
+    yg, xg = np.mgrid[0:h, 0:w].astype(np.float32)
+    xng = (xg - w / 2.0) / (w / 2.0)
+    yng = (yg - h / 2.0) / (h / 2.0)
+    basis_full = _basis(xng, yng)
+    cs_fit = sum(c * b for c, b in zip(coef_cs, basis_full))
+    sn_fit = sum(c * b for c, b in zip(coef_sn, basis_full))
+
+    if not blend:
+        return 0.5 * np.arctan2(sn_fit, cs_fit) + np.pi / 2
+
+    # LOCAL field: the existing, already-tuned smoother (Gaussian blur on
+    # the same raw doubled-angle signal) -- reusing it rather than
+    # re-deriving keeps this consistent with the field this pipeline
+    # already ships when fomfe isn't involved at all.
+    cs_local = cv2.GaussianBlur(cs_raw, (0, 0), _ORIENT_SMOOTH)
+    sn_local = cv2.GaussianBlur(sn_raw, (0, 0), _ORIENT_SMOOTH)
+
+    # Confidence weight: smooth the raw coherence map first (avoids a
+    # blocky/patchwork blend boundary), then scale relative to its own
+    # in-mask percentile so this adapts to each capture's own contrast/
+    # pressure range rather than assuming a fixed absolute cutoff.
+    coh_smooth = cv2.GaussianBlur(coherence, (0, 0), _FOMFE_BLEND_CONF_SIGMA)
+    in_mask = coh_smooth[mask > 0]
+    ref = float(np.percentile(in_mask, _FOMFE_BLEND_PERCENTILE)) if in_mask.size else 1.0
+    ref = max(ref, 1e-6)
+    alpha = np.clip(coh_smooth / ref, 0.0, 1.0).astype(np.float32)
+
+    cs_blend = alpha * cs_local + (1.0 - alpha) * cs_fit
+    sn_blend = alpha * sn_local + (1.0 - alpha) * sn_fit
+    return 0.5 * np.arctan2(sn_blend, cs_blend) + np.pi / 2
+
+
+def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> float:
+    h, w = img.shape
+    freqs = []
+    for y in range(0, h - bsize, bsize):
+        for x in range(0, w - bsize, bsize):
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            # Real bug found + fixed 2026-07-29: rotating by `ang` alone
+            # rotates ridges TO the orientation direction, not TO vertical --
+            # the opposite of what's needed before collapsing axis 0 (rows)
+            # into a profile over x. Confirmed by direct execution: a block
+            # of perfectly vertical stripes (orient == 90 deg, already
+            # correctly aligned, needing ZERO rotation) got rotated a full
+            # 90 degrees by the old `np.degrees(ang)` call, turning it into
+            # HORIZONTAL stripes -- averaging over rows then averages
+            # straight along the periodic direction, producing a dead-flat
+            # signal (std=0.0) and silently contributing no frequency sample
+            # at all. `_upright_rotate` (this same file) does the analogous
+            # "bring a computed direction to vertical" operation and already
+            # correctly subtracts 90 -- this and the two sibling functions
+            # below (_ridge_frequency_map, _ridge_texture_strength) had
+            # copy-pasted the idiom without it.
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks):
+                freqs.append(peaks[0])
+    if not freqs:
+        return 9.0
+    return float(np.clip(np.median(freqs), 5, 20))
+
+
+def _ridge_wavelength_robust(
+    img: np.ndarray, orient: np.ndarray, bsize: int = 32,
+) -> Tuple[float, int]:
+    """Diagnostic-only companion to `_ridge_wavelength` above -- same block
+    grid/rotation-to-vertical alignment, but two changes aimed specifically
+    at the two real, data-confirmed weaknesses of the production estimator
+    (found 2026-08-06 investigating a real-user report that the reported
+    wavelength "isn't consistent" across captures with visually identical
+    thumb placement):
+
+    1. **No [5, 20] clip.** `_ridge_wavelength`'s own hard clip means every
+       real capture whose native wavelength is actually 22px, 40px, or 90px
+       all get reported identically as 20.0 -- confirmed directly against
+       real Firestore data (2026-08-06): 12+ of the 40 most recent captures
+       share the exact literal value `afisWavelengthPx: 20.0`, while the
+       (separately measured, unclipped) live on-device estimate for a
+       handful of those same captures spans 20.6px to 123.1px -- a 6x real
+       spread the clipped number can't distinguish at all. The clip is left
+       untouched on `_ridge_wavelength` itself (still feeds `freq_normalize`
+       scale math this project has real-device-tuned `_FREQ_SCALE_MIN`
+       against -- changing that input distribution blind is exactly the
+       "measure one variable at a time" violation this project's whole
+       history warns against) -- this is a SEPARATE, diagnostic-only value.
+    2. **Average peak spacing, not first-peak-only.** `_ridge_wavelength`
+       trusts only `peaks[0]` -- the very first local autocorrelation
+       maximum -- which is the single most noise-sensitive statistic
+       available (one spurious/missed peak from JPEG blocking, torch
+       specular texture, or curvature near a whorl core silently changes
+       the whole block's contribution). The standard fingerprint-literature
+       fix (Hong/Wan/Jain-style x-signature ridge counting; corroborated by
+       a 2026-08-06 web search on ridge-frequency estimation) is to detect
+       ALL local maxima in a block and average the spacing between
+       consecutive ones -- errors in any single cycle get diluted across
+       the others instead of solely determining the estimate.
+
+    Returns (median_wavelength_px, contributing_block_count) -- the block
+    count is a real confidence signal (few contributing blocks = a mostly
+    flat/low-texture crop, e.g. thumb barely in frame), not a magic number.
+    """
+    h, w = img.shape
+    freqs = []
+    for y in range(0, h - bsize, bsize):
+        for x in range(0, w - bsize, bsize):
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks) >= 2:
+                # Average spacing across every consecutive peak pair, not
+                # just the first cycle -- see docstring point 2.
+                freqs.append(float(np.mean(np.diff(peaks))))
+            elif len(peaks) == 1:
+                freqs.append(float(peaks[0]))
+    if not freqs:
+        return 9.0, 0
+    return float(np.median(freqs)), len(freqs)
+
+
+def _gabor_enhance(
+    img: np.ndarray, orient: np.ndarray, wavelength: float,
+    *,
+    sigma_ratio: float = _GABOR_SIGMA_RATIO,
+    gamma: float = _GABOR_GAMMA,
+) -> np.ndarray:
+    h, w = img.shape
+    sigma = sigma_ratio * wavelength
+    ksize = int(2 * np.ceil(3 * sigma) + 1)
+    outs = np.zeros((_N_ORIENT, h, w), np.float32)
+    for i in range(_N_ORIENT):
+        th = np.pi * i / _N_ORIENT
+        k = cv2.getGaborKernel((ksize, ksize), sigma, th + np.pi / 2,
+                               wavelength, gamma, 0, cv2.CV_32F)
+        k -= k.mean()
+        outs[i] = cv2.filter2D(img, cv2.CV_32F, k)
+    idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
+    yy, xx = np.mgrid[0:h, 0:w]
+    return outs[idx, yy, xx]
+
+
+# Spatially-varying ridge frequency. The single-wavelength _gabor_enhance above
+# applies ONE ridge period across the whole print, but a real fingerprint's
+# ridge frequency varies across the pad (finer toward the tip, coarser toward
+# the base/joint) — the classic Hong/Wan/Jain (1998) observation. Filtering a
+# region with the wrong period smears or splits ridges there, which reads
+# exactly as the "ridge-continuity distortion" the prime directive targets.
+# The var-freq path below estimates a per-BLOCK period map, then runs a Gabor
+# bank over (orientation x a few discrete frequency levels) and selects each
+# pixel by its LOCAL orientation AND period. Kept as its own variant (max-of-
+# variants) so it can only ever add a candidate.
+_FREQ_LEVELS = 5          # discrete ridge-period levels spanning the map's range
+_FREQMAP_BLOCK = 24       # block size for the local-period estimate
+_FREQMAP_SMOOTH = 24.0    # Gaussian smoothing (px) of the interpolated map
+
+
+def _ridge_frequency_map(img: np.ndarray, orient: np.ndarray, mask: np.ndarray,
+                         bsize: int = _FREQMAP_BLOCK) -> Optional[np.ndarray]:
+    """Per-pixel ridge-period (wavelength) map, in px, over the masked pad.
+
+    Same per-block projected-autocorrelation estimate as _ridge_wavelength, but
+    keeps every reliable block value instead of collapsing to one median, fills
+    unreliable/void blocks by nearest-reliable interpolation, and smooths. None
+    if too few reliable blocks (caller falls back to the single-wavelength path).
+    """
+    h, w = img.shape
+    ys = np.arange(0, h - bsize, bsize // 2)
+    xs = np.arange(0, w - bsize, bsize // 2)
+    grid = np.full((len(ys), len(xs)), np.nan, np.float32)
+    for iy, y in enumerate(ys):
+        for ix, x in enumerate(xs):
+            if mask[y:y + bsize, x:x + bsize].mean() < 128:
+                continue
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.std() < 8:
+                continue
+            ang = orient[y + bsize // 2, x + bsize // 2]
+            # Same rotation-direction fix as _ridge_wavelength above (see its
+            # comment) -- must bring the block TO vertical (ang - 90), not
+            # rotate BY the orientation angle itself.
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]
+            if len(peaks):
+                grid[iy, ix] = float(np.clip(peaks[0], 5, 20))
+    if np.isnan(grid).all() or np.count_nonzero(~np.isnan(grid)) < 4:
+        return None
+    # Fill unreliable/void blocks by iterative dilation of known values
+    # (simple nearest-fill), then upscale to full res and smooth into a
+    # continuous period field.
+    valid = ~np.isnan(grid)
+    filled = grid.copy()
+    known = valid.copy()
+    while not known.all():
+        dil = cv2.dilate(np.nan_to_num(filled), np.ones((3, 3), np.uint8))
+        cnt = cv2.dilate(known.astype(np.uint8), np.ones((3, 3), np.uint8))
+        take = (~known) & (cnt > 0)
+        # average of dilated neighbourhood approximated by the dilation value
+        filled[take] = dil[take]
+        known = known | take
+        if not take.any():
+            break
+    fmap = cv2.resize(filled, (w, h), interpolation=cv2.INTER_LINEAR)
+    fmap = cv2.GaussianBlur(fmap, (0, 0), _FREQMAP_SMOOTH)
+    return fmap
+
+
+def _gabor_enhance_varfreq(img: np.ndarray, orient: np.ndarray,
+                           wl_map: np.ndarray, n_levels: int = _FREQ_LEVELS) -> np.ndarray:
+    """Gabor enhancement with a per-pixel ridge period (wl_map) instead of one
+    global wavelength. Builds a bank over (_N_ORIENT orientations x n_levels
+    discrete period levels) spanning the map's actual range, then selects each
+    pixel's response by its local orientation bin AND nearest period level."""
+    h, w = img.shape
+    lo, hi = float(np.percentile(wl_map, 5)), float(np.percentile(wl_map, 95))
+    lo = max(lo, 4.0)
+    hi = max(hi, lo + 1.0)
+    levels = np.linspace(lo, hi, n_levels)
+    # Response cube: [level, orient, h, w] is too big; instead compute the
+    # selected response incrementally to keep memory ~one image per level.
+    o_idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
+    l_idx = np.clip(np.round((wl_map - lo) / max(hi - lo, 1e-6) * (n_levels - 1)),
+                    0, n_levels - 1).astype(int)
+    yy, xx = np.mgrid[0:h, 0:w]
+    out = np.zeros((h, w), np.float32)
+    for li, wl in enumerate(levels):
+        sel_l = (l_idx == li)
+        if not sel_l.any():
+            continue
+        sigma = _GABOR_SIGMA_RATIO * wl
+        ksize = int(2 * np.ceil(3 * sigma) + 1)
+        bank = np.zeros((_N_ORIENT, h, w), np.float32)
+        for i in range(_N_ORIENT):
+            th = np.pi * i / _N_ORIENT
+            k = cv2.getGaborKernel((ksize, ksize), sigma, th + np.pi / 2,
+                                   wl, _GABOR_GAMMA, 0, cv2.CV_32F)
+            k -= k.mean()
+            bank[i] = cv2.filter2D(img, cv2.CV_32F, k)
+        resp = bank[o_idx, yy, xx]
+        out[sel_l] = resp[sel_l]
+    return out
+
+
+# Ridge-confidence gate — the fidelity lever (prime directive). The Gabor bank
+# synthesizes a ridge EVERYWHERE it runs, including low-signal regions where it
+# invents plausible-but-wrong ridges. Those hallucinated ridges become spurious
+# minutiae that (a) can false-match a DIFFERENT finger and (b) don't repeat
+# across genuine captures of the SAME finger — measured: aggressive synthesis
+# raises NFIQ2 but does NOT improve (and can hurt) SourceAFIS genuine-vs-
+# impostor separation. This gate BLANKS the binarized print to background where
+# the local ridge signal is unreliable (low orientation coherence AND/OR weak
+# in-band ridge energy), so only trustworthy ridges survive to be transcribed
+# into minutiae. Deliberately trades NFIQ2 texture for match fidelity — judged
+# by SourceAFIS separation, never NFIQ2. See docs/FIDELITY_WALL_SCOPE.md.
+_CONF_COH_MIN = 0.35        # below this orientation coherence => blank
+_CONF_SOFT = 0.12           # soft transition width around the threshold
+
+
+def _ridge_confidence(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Per-pixel ridge trustworthiness in [0,1]: orientation coherence gated by
+    presence of real ridge-band energy. High only where ridges genuinely flow
+    coherently — i.e. where extracted minutiae are likely to be REPEATABLE."""
+    coh = _block_coherence(gray)
+    # In-band ridge energy: bandpass around the ridge frequency (DoG) then local
+    # RMS. Distinguishes true ridges from flat/blurred skin the coherence of
+    # noise can otherwise score high on.
+    g = gray.astype(np.float32)
+    band = cv2.GaussianBlur(g, (0, 0), 1.2) - cv2.GaussianBlur(g, (0, 0), 3.5)
+    energy = cv2.GaussianBlur(np.abs(band), (0, 0), _BLOCK)
+    if mask is not None:
+        m = mask > 0
+        e_hi = np.percentile(energy[m], 75) if m.any() else 1.0
+    else:
+        e_hi = np.percentile(energy, 75)
+    energy_n = np.clip(energy / max(e_hi, 1e-6), 0, 1)
+    return np.clip(coh, 0, 1) * energy_n
+
+
+def _apply_confidence_gate(binimg_signed: np.ndarray, conf: np.ndarray) -> np.ndarray:
+    """Turn a signed Gabor response into a binarized print, but fade ridges
+    toward background (white) where confidence is low, via a soft threshold on
+    `conf`. Returns a uint8 ridges-black-on-white image."""
+    ridges = (binimg_signed < 0).astype(np.float32)   # 1 where ridge
+    w = np.clip((conf - _CONF_COH_MIN) / _CONF_SOFT + 0.5, 0.0, 1.0)
+    gated = ridges * w                                 # keep ridge only if confident
+    return (255 - (gated * 255)).astype(np.uint8)
+
+
+_COH_DIFF_SIGMA = 1.2        # across-ridge smoothing extent (px) -- narrow, preserves ridge/valley contrast
+_COH_DIFF_ORIENT_RATIO = 2.5  # along-ridge : across-ridge elongation of the smoothing kernel
+
+
+def _coherence_diffusion(img: np.ndarray, orient: np.ndarray) -> np.ndarray:
+    """Oriented smoothing along the local ridge direction -- a directional-
+    kernel approximation of coherence-enhancing diffusion (Weickert-style
+    structure-tensor anisotropic diffusion, well-established in the
+    fingerprint-enhancement literature as a technique complementary to
+    Gabor bandpass filtering: it repairs small ridge discontinuities by
+    smoothing LENGTHWISE along the ridge while barely touching the
+    across-ridge direction, rather than Gabor's frequency-selective
+    response). Not a full iterative PDE solve -- reuses this module's own
+    per-orientation-bank architecture (see _gabor_enhance) for efficiency:
+    precompute elongated anisotropic Gaussian kernels at _N_ORIENT
+    discretized angles, select per pixel by the same orientation index.
+
+    Intended as a denoise PRE-PASS feeding the existing Gabor+binarize
+    chain (same role as _pyfing_denoise in the pyfingHybrid path), not a
+    replacement for it -- see enhance='coherenceDiff' in generate()."""
+    h, w = img.shape
+    sigma_across = _COH_DIFF_SIGMA
+    sigma_along = _COH_DIFF_SIGMA * _COH_DIFF_ORIENT_RATIO
+    half = int(np.ceil(3 * sigma_along))
+    yy, xx = np.mgrid[-half:half + 1, -half:half + 1].astype(np.float32)
+    outs = np.zeros((_N_ORIENT, h, w), np.float32)
+    for i in range(_N_ORIENT):
+        th = np.pi * i / _N_ORIENT   # ridge direction for this bin
+        c, s = np.cos(th), np.sin(th)
+        xr = xx * c + yy * s   # along-ridge axis
+        yr = -xx * s + yy * c  # across-ridge axis
+        k = np.exp(-(xr ** 2) / (2 * sigma_along ** 2) - (yr ** 2) / (2 * sigma_across ** 2))
+        k /= k.sum()
+        outs[i] = cv2.filter2D(img, cv2.CV_32F, k.astype(np.float32))
+    idx = np.round((orient % np.pi) / (np.pi / _N_ORIENT)).astype(int) % _N_ORIENT
+    yy2, xx2 = np.mgrid[0:h, 0:w]
+    return outs[idx, yy2, xx2]
+
+
+_STACK_ALIGN_PX = 512     # ECC alignment resolution (warp scaled to full-res)
+
+
+def _align_face_on_stack(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
+) -> Optional[Tuple[List[np.ndarray], List[Optional[float]]]]:
+    """ECC-affine align near-identical same-pose frames to the sharpest
+    (cand[0]) reference and return the aligned float32 stack (reference first).
+
+    The alignment warp is estimated on downscaled (_STACK_ALIGN_PX) copies for
+    speed, then scaled up and applied at full resolution -- ECC on full-res
+    burst stills is far too slow for the Cloud Function budget. Returns None if
+    fewer than 2 usable frames survive the correlation guard, so the caller
+    keeps the single sharpest frame (stacking must never degrade the print).
+
+    `gyros`, if given, must be index-aligned to `cand` (per-frame device
+    rotation rate in deg/s at capture time -- added 2026-08-06, client now
+    writes this per shot). Returns (stack, stack_gyros): the second list is
+    re-aligned to the frames that actually survived alignment (reference
+    first, then each accepted frame in the order appended), so it stays
+    correct even though some candidates get dropped along the way. Callers
+    that don't need gyro weighting (_stack_face_on) simply discard it."""
+    # Optional caller-owned alignment cache (audit, 2026-08-20). ECC affine
+    # registration is the single most expensive step in this module -- the
+    # 2026-07-16 production outage (capture 9efb7d1e, one variant taking 15+
+    # minutes and blowing the Cloud Run timeout) was caused precisely by
+    # redoing it once per variant. `stack_cache` fixed that for the deep*
+    # family by caching the COMBINED result, but `stack` and `focusStack`
+    # were left out: they call _stack_face_on / _focus_stack_face_on on the
+    # SAME frame list and so each redo this identical alignment, then combine
+    # it differently (flat mean vs sharpness-weighted). Caching the combined
+    # result cannot help there because the two results legitimately differ --
+    # the shareable work is the alignment itself, which is what this caches.
+    #
+    # Those two variants only became live for front_only_v1 in round 11
+    # (before that they returned None on every real capture, so the
+    # redundancy was invisible), which is why it outlived the original fix.
+    # Safe to share the returned stack: both consumers only READ it
+    # (np.stack(...) / np.mean(...)), neither mutates it in place.
+    if align_cache is not None and align_key is not None and align_key in align_cache:
+        return align_cache[align_key]
+    pairs = list(zip(cand, gyros if gyros is not None else [None] * len(cand)))
+    grays = [
+        (c if c is None or c.ndim == 2 else cv2.cvtColor(c, cv2.COLOR_BGR2GRAY), gy)
+        for c, gy in pairs
+    ]
+    grays = [(g, gy) for g, gy in grays if g is not None]
+    if len(grays) < 2:
+        return None
+    ref, ref_gyro = grays[0]
+    h, w = ref.shape[:2]
+    s = _STACK_ALIGN_PX / max(h, w)
+    small = (max(1, int(w * s)), max(1, int(h * s)))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    ref_small = cl.apply(cv2.resize(ref, small))
+    # Scale matrix mapping small-space warp to full-res.
+    up = np.array([[1 / s, 0, 0], [0, 1 / s, 0]], dtype=np.float32)
+    dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 80, 1e-4)
+    stack = [ref.astype(np.float32)]
+    stack_gyros = [ref_gyro]
+    for g, gy in grays[1:]:
+        gg = g if g.shape[:2] == (h, w) else cv2.resize(g, (w, h))
+        try:
+            warp = np.eye(2, 3, dtype=np.float32)
+            _, warp = cv2.findTransformECC(
+                ref_small, cl.apply(cv2.resize(gg, small)), warp,
+                cv2.MOTION_AFFINE, crit, None, 5)
+            # full-res warp = up · [warp;0 0 1] · dn
+            warp_full = (up @ np.vstack([warp, [0, 0, 1]]) @ dn).astype(np.float32)
+            aligned = cv2.warpAffine(gg, warp_full, (w, h), flags=cv2.INTER_LINEAR)
+            if float(np.corrcoef(aligned.ravel(), ref.ravel())[0, 1]) > 0.5:
+                stack.append(aligned.astype(np.float32))
+                stack_gyros.append(gy)
+        except cv2.error:
+            continue
+    # Cache negative results too -- a burst that fails the correlation guard
+    # fails it identically for both consumers, and re-running the full ECC
+    # sweep just to rediscover that is the most expensive possible no-op.
+    _aligned = None if len(stack) < 2 else (stack, stack_gyros)
+    if align_cache is not None and align_key is not None:
+        align_cache[align_key] = _aligned
+    return _aligned
+
+
+def _stack_face_on(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
+) -> Optional[np.ndarray]:
+    """Align (ECC affine) and AVERAGE near-identical same-pose frames -> a
+    denoised full-resolution grayscale (pure noise reduction). Returns None if
+    fewer than 2 usable frames survive.
+
+    `gyros` accepted for call-site symmetry with `_focus_stack_face_on` (both
+    are invoked polymorphically via one `_stack_fn` variable elsewhere in this
+    module) but deliberately UNUSED here -- this project already measured
+    (2026-07-24, median/trimmed-mean combine-swap experiments) that outlier-
+    reweighting this specific flat-mean function is a net-negative on real
+    data: at this pipeline's small burst depth (2-4 frames), any per-pixel
+    reweighting trades away more noise-averaging benefit than it recovers on
+    the majority of captures that don't have a genuine outlier frame. Kept as
+    a plain, unweighted mean on purpose."""
+    result = _align_face_on_stack(
+        cand, align_cache=align_cache, align_key=align_key)
+    if result is None:
+        return None
+    stack, _stack_gyros = result
+    return np.mean(np.stack(stack), axis=0).astype(np.uint8)
+
+
+def _focus_stack_face_on(
+    cand: List[Optional[np.ndarray]],
+    gyros: Optional[List[Optional[float]]] = None,
+    align_cache: Optional[dict] = None,
+    align_key: Optional[str] = None,
+) -> Optional[np.ndarray]:
+    """Align (ECC affine) same-pose frames, then combine by LOCAL SHARPNESS
+    rather than a flat mean -- classic focus stacking. Each output pixel is a
+    sharpness-weighted blend across the aligned frames, so the region that was
+    best-focused in ANY frame dominates there. This targets the pad's curved
+    edges going soft under a single frame's shallow macro depth-of-field:
+    different frames (slightly different hand distance across the burst) hold
+    focus at different radii, and this keeps the sharpest of each.
+
+    Weighted blend (not hard per-pixel argmax) to avoid seam artifacts where
+    the sharpest-frame index would flip abruptly. Returns None if fewer than 2
+    frames align, so the caller falls back to the single sharpest frame.
+
+    `gyros`, if provided (index-aligned to `cand`), gently down-weights
+    frames captured during more device rotation -- added 2026-08-06, real
+    per-frame motion context the backend previously had no access to at all.
+    Deliberately GENTLE (caps at a 40% weight reduction, never fully zeroes a
+    frame's contribution): this function ALREADY does per-pixel reweighting
+    by design (unlike _stack_face_on, where the equivalent experiment
+    measured net-negative -- see that function's docstring), so adding a
+    second real quality factor into an existing weighted combine is a much
+    smaller, better-justified change than introducing weighting where none
+    existed. Missing/None gyro values default to full (1.0) weight, so
+    callers without gyro data see byte-identical behaviour to before this."""
+    result = _align_face_on_stack(
+        cand, gyros=gyros, align_cache=align_cache, align_key=align_key)
+    if result is None:
+        return None
+    stack, stack_gyros = result
+    # Local sharpness energy per frame: |Laplacian| smoothed to a small window
+    # so the weight reflects neighbourhood focus, not single-pixel noise.
+    weights = []
+    for g, gy in zip(stack, stack_gyros):
+        lap = np.abs(cv2.Laplacian(g, cv2.CV_32F, ksize=3))
+        w_map = cv2.GaussianBlur(lap, (0, 0), 4.0) + 1e-3
+        if gy is not None and gy > 0:
+            gyro_factor = 1.0 - min(gy / (2.0 * _GYRO_STEADY_REF_DEG_PER_SEC), 0.4)
+            w_map = w_map * gyro_factor
+        weights.append(w_map)
+    w = np.stack(weights)                      # (N, H, W)
+    w /= w.sum(axis=0, keepdims=True)
+    out = (w * np.stack(stack)).sum(axis=0)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+_FLASH_PAIR_MAX_SHARPNESS_RATIO = 2.0
+# Above this ambient:flash pad-crop sharpness ratio, an ambient+flash pair is
+# NOT worth fusing -- the flash frame is so much softer that blending it in
+# costs more ridge detail than its complementary illumination buys back.
+#
+# Real measurement, 2026-08-12, on the 3 sweep captures taken right after the
+# per-zone focus fix landed (the first real sweep data where every zone was
+# genuinely in focus, so zone quality was finally limited by illumination
+# rather than by focus). Every zone whose ambient+flash pair actually fused
+# scored LOWER than that same zone's plain ambient frame, and every mosaic
+# built from fused zones scored lower than the same mosaic built from ambient
+# frames -- 5/5 zone cases and 2/2 mosaic cases, zero counter-examples:
+#
+#   capture   zone    amb:fl ratio   fused   ambient-only
+#   4a1c4d89  left        3.7x         62         75   (+13)
+#   d1f3153a  left        2.8x         72         77   (+5)
+#   d1f3153a  center      4.9x         72         75   (+3)
+#   4a1c4d89  mosaic        -          64         73   (+9)
+#   d1f3153a  mosaic        -          67         79   (+12)
+#
+# (22a27f67's three pairs all failed _fuse_flash_ambient's own registration
+# gate, so its fused and ambient-only paths were byte-identical at 60/60 --
+# a useful null control confirming the difference above is real, not harness
+# variance.) Measured flash frames on these captures ran Laplacian 3.2-31.8
+# against ambient's 30.0-105.2, i.e. the same recurring torch-blowout pattern
+# _FLASH_DIFF_MIN_FLASH_LAPLACIAN above documents for the segmentation path.
+#
+# 2.0 rather than the main burst's own 4x guard: every real fused case here
+# lost at ratios of only 2.8-4.9x, so a 4x threshold would still have let the
+# two worst regressions (-13, -5) through. Deliberately kept as a ratio gate
+# (not an outright removal of zone fusion) so a genuinely comparable flash
+# frame -- the case the feature was designed for, and the case a future
+# adaptive-EV fix on the sweep's torch would produce -- still fuses.
+def flash_pair_sharpness_ratio(ambient: np.ndarray, flash: np.ndarray,
+                               guide_region: Optional[dict] = None) -> Optional[float]:
+    """ambient:flash sharpness ratio over the guide's own pad crop.
+
+    Deliberately measured on the PAD CROP, not the whole still: a sweep-zone
+    frame is mostly a large static in-focus room with the pad occupying a
+    small fraction of the frame (the same whole-frame-vs-pad distinction that
+    `_front_anchored_mosaic_zones` exists to handle), so a whole-frame
+    Laplacian is dominated by background texture and says almost nothing
+    about the ridge content the fusion actually operates on.
+
+    Returns None when the ratio can't be measured (missing input, no usable
+    guide region, or a degenerate crop) -- callers treat None as "no evidence
+    to withhold fusion" and proceed exactly as before."""
+    if ambient is None or flash is None:
+        return None
+    ga = ambient if ambient.ndim == 2 else cv2.cvtColor(ambient, cv2.COLOR_BGR2GRAY)
+    gf = flash if flash.ndim == 2 else cv2.cvtColor(flash, cv2.COLOR_BGR2GRAY)
+    if gf.shape[:2] != ga.shape[:2]:
+        gf = cv2.resize(gf, (ga.shape[1], ga.shape[0]))
+    h, w = ga.shape[:2]
+    if guide_region:
+        try:
+            cx = float(guide_region['cx']); cy = float(guide_region['cy'])
+            rx = float(guide_region['rx']); ry = float(guide_region['ry'])
+        except (KeyError, TypeError, ValueError):
+            return None
+        x0 = max(0, int((cx - rx) * w)); x1 = min(w, int((cx + rx) * w))
+        y0 = max(0, int((cy - ry) * h)); y1 = min(h, int((cy + ry) * h))
+    else:
+        x0, x1, y0, y1 = w // 4, 3 * w // 4, h // 4, 3 * h // 4
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    la = float(cv2.Laplacian(ga[y0:y1, x0:x1], cv2.CV_64F).var())
+    lf = float(cv2.Laplacian(gf[y0:y1, x0:x1], cv2.CV_64F).var())
+    if lf <= 1e-6:
+        return float('inf')     # flash carries no detail at all
+    return la / lf
+
+
+def _best_frame_by_sharpness(cand: List[Optional[np.ndarray]]) -> Optional[np.ndarray]:
+    """Pick the single sharpest frame from `cand` by whole-frame Laplacian
+    variance -- no averaging, no registration, just a selection. Used by
+    fuse='deepAmbBestFl' for the flash side specifically, where this
+    project's own data shows averaging risks pulling in blown-out frames
+    (see that call site's own comment). Returns None if `cand` is empty."""
+    usable = [g for g in cand if g is not None]
+    if not usable:
+        return None
+    if len(usable) == 1:
+        return usable[0]
+    scores = [float(cv2.Laplacian(g, cv2.CV_64F).var()) for g in usable]
+    return usable[int(np.argmax(scores))]
+
+
+def _fuse_flash_ambient(ambient: np.ndarray, flash: np.ndarray,
+                        mode: str = 'maxc') -> Optional[np.ndarray]:
+    """Fuse a SAME-POSE ambient+flash pair into one enhanced grayscale.
+
+    Flash and ambient stills of the same pose carry complementary ridge
+    signal: the flash exposure gives strong specular contrast where the pad is
+    in closest contact (ridge crests catch the light), while the ambient
+    exposure reads ridge/valley modulation across the whole pad without
+    blow-out. Because it's the same pose this is PURE signal fusion with no
+    geometric distortion (unlike multi-angle reconstruction, which warps
+    oblique views and hurts NFIQ).
+
+    Registers flash→ambient (ECC affine — the hand drifts slightly between the
+    two exposures) then combines:
+      'maxc' : per-_BLOCK-px block, take whichever source has higher ridge
+               coherence. Biggest, most consistent NFIQ gain in testing
+               (+5–7 on the two hardest real captures).
+      'avg'  : intensity average — cross-illumination denoise; wins on
+               already-clean captures.
+    Returns a fused uint8 gray, or None if the pair can't be registered (caller
+    then skips the fusion variant and keeps the single-source renderings)."""
+    if ambient is None or flash is None:
+        return None
+    ga = ambient if ambient.ndim == 2 else cv2.cvtColor(ambient, cv2.COLOR_BGR2GRAY)
+    gf = flash if flash.ndim == 2 else cv2.cvtColor(flash, cv2.COLOR_BGR2GRAY)
+    if gf.shape[:2] != ga.shape[:2]:
+        gf = cv2.resize(gf, (ga.shape[1], ga.shape[0]))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    warp = np.eye(2, 3, dtype=np.float32)
+    try:
+        _, warp = cv2.findTransformECC(
+            cl.apply(ga), cl.apply(gf), warp, cv2.MOTION_AFFINE,
+            (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 100, 1e-4), None, 5)
+        gf_reg = cv2.warpAffine(gf, warp, (ga.shape[1], ga.shape[0]),
+                                flags=cv2.INTER_LINEAR)
+    except cv2.error:
+        return None
+    if float(np.corrcoef(gf_reg.ravel(), ga.ravel())[0, 1]) < 0.3:
+        return None   # not actually the same view — don't blend
+    if mode == 'avg':
+        return ((ga.astype(np.float32) + gf_reg.astype(np.float32)) / 2).astype(np.uint8)
+
+    def _coh(gray: np.ndarray) -> np.ndarray:
+        gg = gray.astype(np.float32)
+        gx = cv2.Sobel(gg, cv2.CV_32F, 1, 0, ksize=3)
+        gy = cv2.Sobel(gg, cv2.CV_32F, 0, 1, ksize=3)
+        gxx = cv2.boxFilter(gx * gx, -1, (_BLOCK, _BLOCK))
+        gyy = cv2.boxFilter(gy * gy, -1, (_BLOCK, _BLOCK))
+        gxy = cv2.boxFilter(gx * gy, -1, (_BLOCK, _BLOCK))
+        return np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-6)
+
+    ca, cf = _coh(ga), _coh(gf_reg)
+    if mode == 'soft':
+        # Feathered coherence weighting: each pixel is a blend biased toward the
+        # locally higher-coherence exposure. Smoother than a hard per-block
+        # switch (which leaves seams the orientation field then trips on), while
+        # still favouring the exposure that resolves ridges best in each region.
+        w = cv2.GaussianBlur(ca / (ca + cf + 1e-6), (0, 0), _BLOCK)
+        return (w * ga.astype(np.float32) +
+                (1.0 - w) * gf_reg.astype(np.float32)).astype(np.uint8)
+    # 'maxc': hard per-block selection.
+    return np.where(ca >= cf, ga.astype(np.float32),
+                    gf_reg.astype(np.float32)).astype(np.uint8)
+
+
+_MOSAIC_YAW_DEG   = 12.0   # only borrow from THIS-lightly-yawed neighbours
+_MOSAIC_YAW_MIN   = 4.0    # ...but far enough to add genuine edge coverage
+_MOSAIC_MAX_SIDE  = 6      # cap side frames (registration cost)
+_MOSAIC_REG_PX    = 640    # ECC registration resolution (warp applied full-res)
+# Feathering of each side frame's contribution at its own warp boundary --
+# see the blend block in _front_anchored_mosaic for the real artifact this
+# fixes and the measurements behind these values.
+_MOSAIC_FEATHER_SIGMA = 64.0
+_MOSAIC_FEATHER_ERODE = 15
+# How much sharper than the anchor a side frame must be, at a given pixel,
+# before it fully takes that pixel over. 1.0 disables the gate (restoring
+# the old plain-average behaviour). See the block in _front_anchored_mosaic
+# for the measurements; 1.5 was the best of 1.2/1.5/2.0 on mean real-NFIQ2
+# delta across 6 real captures, and all three recovered essentially all of
+# the anchor sharpness the ungated average was destroying.
+_MOSAIC_ANCHOR_DOMINANT_T = 1.5
+_MOSAIC_ANCHOR_RAMP_BLUR = 24.0
+
+
+def _block_sharpness(gray: np.ndarray) -> np.ndarray:
+    """Local high-frequency energy, as a smooth per-pixel field.
+
+    Deliberately Laplacian ENERGY rather than _block_coherence: coherence
+    measures how consistently ORIENTED a neighbourhood is, which a blurred
+    ridge pattern still scores highly on -- that is precisely why the
+    coherence-only blend could not tell a sharp side frame from a soft one.
+    """
+    lap = cv2.Laplacian(gray.astype(np.float32), cv2.CV_32F, ksize=3)
+    return cv2.GaussianBlur(lap * lap, (0, 0), 8.0)
+
+
+def _block_coherence(gray: np.ndarray, blur: float = 8.0) -> np.ndarray:
+    gg = gray.astype(np.float32)
+    gx = cv2.Sobel(gg, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gg, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = cv2.boxFilter(gx * gx, -1, (_BLOCK, _BLOCK))
+    gyy = cv2.boxFilter(gy * gy, -1, (_BLOCK, _BLOCK))
+    gxy = cv2.boxFilter(gx * gy, -1, (_BLOCK, _BLOCK))
+    c = np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-6)
+    return cv2.GaussianBlur(c, (0, 0), blur)
+
+
+def _front_anchored_mosaic(front: np.ndarray,
+                           sides: List[np.ndarray]) -> Tuple[Optional[np.ndarray], int]:
+    """Distortion-free minimal-yaw reconstruction.
+
+    Keeps the sharp FACE-ON `front` frame as the undistorted geometric anchor
+    and only BORROWS ridge detail from lightly-yawed side frames in the regions
+    where they register well AND resolve ridges better than the front (the pad
+    edges that curve away from the camera). At the small yaw this is restricted
+    to (<=_MOSAIC_YAW_DEG) the ridge foreshortening is a few percent, so the
+    borrowed edge ridges land at near-true scale -- unlike a full cylindrical
+    unwrap of wide-baseline oblique views, which stretches ridges and lowers
+    NFIQ. Composite is a per-pixel coherence-weighted average anchored on the
+    front's own coherence, so the centre stays exactly the front frame.
+
+    Homographies are estimated on _MOSAIC_REG_PX copies and applied at full
+    resolution (ECC on full-res stills is too slow for the function budget).
+    Returns (mosaic uint8, n_sides_used); n_used==0 means it degenerates to the
+    front frame."""
+    fh, fw = front.shape[:2]
+    acc = front.astype(np.float32) * _block_coherence(front)
+    wsum = _block_coherence(front).copy()
+    s = _MOSAIC_REG_PX / max(fh, fw)
+    small = (max(1, int(fw * s)), max(1, int(fh * s)))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    ref_small = cl.apply(cv2.resize(front, small))
+    up = np.array([[1 / s, 0, 0], [0, 1 / s, 0], [0, 0, 1]], dtype=np.float32)
+    dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-4)
+    used = 0
+    for sd in sides:
+        g = sd if sd.ndim == 2 else cv2.cvtColor(sd, cv2.COLOR_BGR2GRAY)
+        if g.shape[:2] != (fh, fw):
+            g = cv2.resize(g, (fw, fh))
+        try:
+            warp = np.eye(3, 3, dtype=np.float32)
+            _, warp = cv2.findTransformECC(
+                ref_small, cl.apply(cv2.resize(g, small)), warp,
+                cv2.MOTION_HOMOGRAPHY, crit, None, 5)
+            warp_full = (up @ warp @ dn).astype(np.float32)
+            # REAL BUG, found 2026-08-11: findTransformECC's own documented
+            # convention is that `warp` maps TEMPLATE (ref) coordinates to
+            # INPUT (g) coordinates -- warping `g` to align with `ref`
+            # therefore requires the INVERSE of the solved warp, which
+            # OpenCV expects you to request via WARP_INVERSE_MAP rather than
+            # inverting the matrix yourself. That flag was missing here,
+            # so `reg` was always warped in the wrong direction. Confirmed
+            # directly: on a real sweep-burst capture (6cda7689/d471498f),
+            # the solved translation matched the real, independently-known
+            # zone-to-zone shift almost exactly, yet the post-warp
+            # correlation against the anchor was ~0.20 (correctly rejected
+            # by the 0.45 guard below) -- applying the SAME solved warp with
+            # WARP_INVERSE_MAP raised it to ~0.65-0.67 on the same data.
+            # This bug meant every zone pair with genuine, deliberate
+            # translation between them (i.e. every real sweep zone, the
+            # whole point of the feature) was structurally guaranteed to
+            # fail registration regardless of spacing -- likely also why
+            # the OLDER "near-duplicate framing" cases only ever looked
+            # like they "worked": a near-identity warp looks similar
+            # applied in either direction, so those cases weren't actually
+            # validating the direction convention at all.
+            reg = cv2.warpPerspective(
+                g, warp_full, (fw, fh),
+                flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+        except cv2.error:
+            continue
+        if float(np.corrcoef(reg.ravel(), front.ravel())[0, 1]) < 0.45:
+            continue
+        # Feathered blend weights. The old `valid = (reg > 0)` had two real
+        # defects, both visible as a hard line cutting across the finished
+        # print (CTO report 2026-08-12, "there is an oval line passing
+        # through the mosaic capture"):
+        #
+        # 1. It is a BINARY step. Where the warped side image's rectangular
+        #    boundary crosses the pad, the blend weight jumps discontinuously,
+        #    so the composite switches sources mid-ridge. Measured on the
+        #    real capture that produced that report: the weight field's
+        #    gradient spiked to 3.96 against a field mean of 0.04 -- a ~100x
+        #    step. Feathering drops the same measurement to 0.49 (8.5x
+        #    lower), i.e. the weights now vary only as fast as the coherence
+        #    field itself, which is what the blend was always meant to
+        #    follow.
+        # 2. It tested the WARPED PIXELS rather than the warp's own
+        #    footprint, so any genuinely black pixel inside the side image
+        #    was misread as "no data" -- punching weight holes in real
+        #    content. Warping an explicit all-ones mask asks the question
+        #    actually being asked ("did this pixel come from the source
+        #    image?").
+        #
+        # Erode before blurring so the ~1px interpolation fringe at the warp
+        # boundary is excluded rather than smeared inward. Real NFIQ2 on the
+        # capture above: 73 -> 74-75 across sigma 16-96, i.e. a small
+        # consistent gain on top of removing the artifact; sigma is not a
+        # sensitive parameter here, so 64 is chosen as the middle of the
+        # flat region rather than tuned to a single capture.
+        ones = np.full(g.shape[:2], 255, np.uint8)
+        vm = cv2.warpPerspective(ones, warp_full, (fw, fh),
+                                 flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP)
+        vb = (vm > 127).astype(np.uint8)
+        if _MOSAIC_FEATHER_ERODE > 0:
+            vb = cv2.erode(vb, np.ones((_MOSAIC_FEATHER_ERODE,
+                                        _MOSAIC_FEATHER_ERODE), np.uint8))
+        valid = cv2.GaussianBlur(vb.astype(np.float32), (0, 0),
+                                 _MOSAIC_FEATHER_SIGMA)
+        cs = _block_coherence(reg) * valid
+        # ANCHOR-DOMINANT gate (2026-08-12). This function's own docstring
+        # above has always promised it "only BORROWS ridge detail from
+        # lightly-yawed side frames in the regions where they register well
+        # AND resolve ridges better than the front" -- but the code did not
+        # implement the second half at all. A plain coherence-weighted
+        # average hands a side whose coherence merely MATCHES the anchor
+        # ~50% of every pixel, and on real sweep captures the side frames
+        # overlap 94-97% of the crop, so virtually the whole print was an
+        # average of warped frames. Averaging frames misregistered by even a
+        # fraction of a ridge period smears ridges: measured across 6 real
+        # captures, the mosaic retained a mean of only 58.6% of the anchor's
+        # own pad-crop Laplacian (as low as 37%).
+        #
+        # Scaling each side's weight by how much SHARPER it is than the
+        # anchor delivers the documented behaviour: zero contribution at
+        # parity (so the output IS the anchor wherever the anchor is as good
+        # or better), ramping to full where a side genuinely resolves better
+        # -- the pad edge that rotated into view for that zone, which is the
+        # entire reason the sweep exists. Same 6 captures: retention rises
+        # 58.6% -> 105.2% (>100% because borrowed edge detail is genuinely
+        # sharper than the anchor there), with mean real-NFIQ2 delta against
+        # the best single zone moving -1.50 -> +0.00.
+        #
+        # NOT the same as the sharpness gate tried and rejected earlier the
+        # same day: that one multiplied by clip(side/anchor, 0, 1), which
+        # still gives a side near-full weight at parity and only punishes
+        # badly-blurred sides -- it measured net negative. This gates at
+        # ratio > 1, so parity contributes nothing.
+        if _MOSAIC_ANCHOR_DOMINANT_T > 1.0:
+            _ratio = _block_sharpness(reg) / (_block_sharpness(front) + 1e-6)
+            _gain = np.clip((_ratio - 1.0) / (_MOSAIC_ANCHOR_DOMINANT_T - 1.0),
+                            0.0, 1.0)
+            # Smooth the gain field so the handover between anchor and side
+            # is gradual -- an abrupt gain edge would reintroduce exactly
+            # the kind of weight discontinuity the feathering above exists
+            # to remove.
+            _gain = cv2.GaussianBlur(_gain, (0, 0), _MOSAIC_ANCHOR_RAMP_BLUR)
+            cs = cs * _gain
+        acc += reg.astype(np.float32) * cs
+        wsum += cs
+        used += 1
+    if used == 0:
+        return None, 0
+    return (acc / np.maximum(wsum, 1e-6)).astype(np.uint8), used
+
+
+_ZONE_MOSAIC_MARGIN = 2.6   # x guide rx/ry -- real registration search room
+                            # around the union of all zones' own guide bounds
+
+
+def _front_anchored_mosaic_zones(
+    zone_grays: dict,
+) -> Tuple[Optional[np.ndarray], Optional[dict], int]:
+    """Zone-sweep variant of `_front_anchored_mosaic`.
+
+    `_front_anchored_mosaic` was built for the (discontinued) four-angle
+    flow, where the camera itself yaws around a frame-filling thumb -- the
+    whole frame IS pad-dominated, so whole-frame ECC registration finds the
+    real pad-to-pad relationship. The sweep-burst flow is different: the
+    guide asks the FINGER to translate across several zones while the
+    camera stays fixed and wide, so each zone's raw still is mostly a large,
+    static, in-focus ROOM (wall, desk, keyboard) with the pad occupying a
+    small fraction of the frame. Real measurement against 2 real captures
+    (2026-08-08): full-frame phase-correlation between adjacent zones gave
+    a weak/noisy response (0.003-0.15, where ~1.0 is a confident single
+    dominant shift) -- whole-frame ECC has no reliable pad-to-pad signal to
+    lock onto and is easily dominated by the huge static background instead,
+    which explains both the real 'mosaic registration failed' cases and why
+    even a "successful" registration didn't win selection (it was very
+    likely aligning the room, not the ridge content).
+
+    Fix: crop every zone to the SAME generous still-space region derived
+    from the real union of all zones' own guide masks (`_superellipse_mask`,
+    the same conversion `generate()` itself uses) before ECC ever runs, so
+    the registration signal is dominated by pad content. Also returns the
+    ADJUSTED guide_region (re-expressed in the crop's own coordinate frame)
+    that the caller must use for the final `generate()` call on the mosaic
+    result -- the original guide_region's cx/cy are fractions of the FULL
+    frame, meaningless once the image has been cropped.
+
+    zone_grays: {zone_name: (gray_image, guide_region_dict)}, must include
+    'center' (the anchor). Returns (mosaic, adjusted_center_guide, n_used);
+    (None, None, 0) if 'center' is missing, no zone mask is derivable, or
+    the mosaic itself fails (caller falls back to the single-zone results
+    exactly as before -- purely additive, cannot regress)."""
+    if 'center' not in zone_grays:
+        return None, None, 0
+    anchor, anchor_guide = zone_grays['center']
+    h, w = anchor.shape[:2]
+
+    boxes = []
+    for _zone, (_g, _region) in zone_grays.items():
+        m = _superellipse_mask((h, w), _region)
+        if m is None:
+            continue
+        ys, xs = np.where(m > 0)
+        rx_px = float(_region['rx']) * w
+        ry_px = float(_region['ry']) * h
+        pad_x = rx_px * (_ZONE_MOSAIC_MARGIN - 1.0)
+        pad_y = ry_px * (_ZONE_MOSAIC_MARGIN - 1.0)
+        boxes.append((xs.min() - pad_x, xs.max() + pad_x,
+                      ys.min() - pad_y, ys.max() + pad_y))
+    if not boxes:
+        return None, None, 0
+
+    x0 = max(0, int(min(b[0] for b in boxes)))
+    x1 = min(w, int(max(b[1] for b in boxes)))
+    y0 = max(0, int(min(b[2] for b in boxes)))
+    y1 = min(h, int(max(b[3] for b in boxes)))
+    if x1 - x0 < 64 or y1 - y0 < 64:
+        return None, None, 0
+
+    anchor_crop = anchor[y0:y1, x0:x1]
+    sides_crop = [g[y0:y1, x0:x1] for zone, (g, _r) in zone_grays.items()
+                  if zone != 'center' and g.shape[:2] == (h, w)]
+    if not sides_crop:
+        return None, None, 0
+
+    mos, used = _front_anchored_mosaic(anchor_crop, sides_crop)
+    if mos is None:
+        return None, None, 0
+
+    # Re-express the anchor's own guide region in the crop's coordinate
+    # frame -- same cx/cy/rx/ry SHAPE (the pad's own size/taper is a
+    # property of the pad, not the crop), just re-centred/re-scaled onto
+    # the new (smaller) image dimensions instead of the original full frame.
+    cw, ch = (x1 - x0), (y1 - y0)
+    adj_guide = dict(anchor_guide)
+    adj_guide['cx'] = float(anchor_guide['cx']) * w / cw - x0 / cw
+    adj_guide['cy'] = float(anchor_guide['cy']) * h / ch - y0 / ch
+    adj_guide['rx'] = float(anchor_guide['rx']) * w / cw
+    adj_guide['ry'] = float(anchor_guide['ry']) * h / ch
+    return mos, adj_guide, used
+
+
+def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
+    """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
+    try:
+        import sfm_pipeline
+        session = sfm_pipeline._get_thumb_seg_session()
+        if session is None:
+            return None
+        size = sfm_pipeline._THUMB_SEG_IMG_SIZE
+        small = cv2.resize(gray, (size, size)).astype(np.float32) / 255.0
+        logits = session.run(['logits'], {'input': small[None, None]})[0][0, 0]
+        probs = 1.0 / (1.0 + np.exp(-logits))
+        m = (probs > 0.5).astype(np.uint8) * 255
+        m = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((21, 21), np.uint8))
+        n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+        if n > 1:
+            big = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            m = (lab == big).astype(np.uint8) * 255
+        if (m > 0).mean() < 0.03:   # implausibly small — treat as failed
+            return None
+        return m
+    except Exception as e:              # noqa: BLE001 — mask is best-effort
+        logger.warning('U-Net mask unavailable for AFIS print: %s', e)
+        return None
+
+
+def _fill_mask_holes(mask: np.ndarray) -> np.ndarray:
+    """Fills fully-enclosed holes/notches in a binary 0/255 mask -- belt-and-
+    suspenders alongside the blown-out-flash-frame guard above: even a decent
+    flash frame can produce a small noisy gap in the diff mask, and a hole
+    anywhere in the mask becomes a literal hole in the final print (generate()
+    hard-masks outside the mask to white). Flood-fills the background from a
+    corner (the mask is always a roughly-centred blob well inside the frame,
+    so a corner is reliably background), then anything NOT reached by that
+    flood is either real foreground or an enclosed hole -- both get kept. Can
+    only ADD area back inside already-enclosed gaps, never remove real
+    foreground, so this can't regress an already-clean mask.
+
+    Pads with a guaranteed-background 1px ring before flooding, rather than
+    seeding from the bare (0,0) corner directly. If the mask's own
+    foreground happens to touch the frame edge (a tight/zoomed capture, or
+    a noisy detector that over-reaches to the border), a single bare-corner
+    seed can get walled off from a real background pocket on the far side
+    of the frame -- that pocket would then be indistinguishable from an
+    enclosed hole and get wrongly merged into the foreground. The padding
+    ring connects every edge of the frame to the (0,0) seed regardless of
+    what the foreground does inside it, so this can only ever correctly
+    identify MORE real background, never mistake foreground for a hole."""
+    padded = cv2.copyMakeBorder(mask, 1, 1, 1, 1, cv2.BORDER_CONSTANT, value=0)
+    h, w = padded.shape[:2]
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)
+    filled = padded.copy()
+    cv2.floodFill(filled, flood_mask, (0, 0), 255)
+    holes = cv2.bitwise_not(filled)
+    combined = cv2.bitwise_or(padded, holes)
+    return combined[1:-1, 1:-1]
+
+
+_CREASE_MIN_CIRCVAR = 0.40   # row is "crease-like" below this circular
+# variance of ridge orientation across x, measured on a SMOOTHED profile
+# (see _CREASE_SMOOTH_PX). Retuned 2026-08-17 round 2, real CTO feedback on
+# a real generated print: the first cut (raw per-row, threshold 0.30) left
+# a real residual crease band visible -- a real capture's row-wise circular
+# variance profile (scratchpad/ps/deltacheck) showed the true tail crease
+# (frac 0.82-1.0 of the mask's span) is separated from the genuine core
+# peak (frac ~0.50-0.55) by only a shallow, narrow dip (frac ~0.60-0.68,
+# smoothed value ~0.37) then a SECOND, narrower high-variance bump (frac
+# 0.73-0.80) that the original threshold treated as real ridge structure
+# and left untouched -- but which the CTO's own annotation marked as still
+# being crease. 0.40 on the smoothed profile crosses that middle dip
+# instead, trimming from just past the real core onward and folding the
+# second bump into the cut. Real, deliberate trade-off, stated plainly:
+# this is more aggressive and costs more real area than the first cut --
+# accepted because leaving visible crease in the print is the worse
+# failure mode per direct CTO instruction.
+_CREASE_SMOOTH_PX = 21  # box-smoothing window (rows) applied to the raw
+# per-row circular-variance profile before thresholding -- absorbs narrow
+# spurious bumps/dips (a few rows wide) without needing a much higher/lower
+# threshold to compensate, same motivation as _ORIENT_SMOOTH existing at
+# all for the orientation field itself.
+_CREASE_MIN_RUN_FRAC = 0.05  # a low-variance run must persist this long
+# (as a fraction of the mask's own vertical span) before it's trusted as a
+# real crease boundary, not one noisy row -- same "don't trust a single
+# sample" discipline as the live wavelength estimator's own multi-strip
+# averaging. Lowered alongside the smoothing change above (8% -> 5%): the
+# smoothed profile itself already absorbs short-run noise, so requiring a
+# long RAW run on top of that made the scan needlessly conservative.
+_CREASE_MAX_TRIM_FRAC = 0.55  # hard cap: never trim more than this fraction
+# of the mask's vertical span this way, regardless of what the scan finds --
+# a real safety bound against a false-positive run eating a legitimately
+# low-curvature (e.g. arch-pattern) pad. Raised alongside the more
+# aggressive threshold above (0.40 -> 0.55) so the cap doesn't silently
+# override the real, validated boundary found on the CTO's own test capture
+# (~0.61 of that print's span).
+
+
+def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
+                       min_circvar: float = _CREASE_MIN_CIRCVAR,
+                       min_run_frac: float = _CREASE_MIN_RUN_FRAC,
+                       max_trim_frac: float = _CREASE_MAX_TRIM_FRAC,
+                       smooth_px: int = _CREASE_SMOOTH_PX
+                       ) -> Tuple[np.ndarray, np.ndarray]:
+    """Trims print area toward the BASE half only (never the tip -- matches
+    the CTO's own annotated photo, which flagged only the bottom boundary as
+    wrong) wherever local ridge orientation is too uniform across a row to
+    plausibly be real pad structure. A flexion crease is characteristically
+    near-straight, near-parallel lines; true pad ridge flow (whorl/loop/
+    arch, especially near a core) has real local curvature -- ridge
+    direction genuinely varies across x. Measures that via the row-wise
+    CIRCULAR variance of `_orientation_field`'s own ridge-direction estimate
+    (1 - resultant-vector-length of the doubled angles, so it's insensitive
+    to the pi-periodicity of ridge direction), scanning from the mask's own
+    vertical centre toward its base edge for the first sufficiently-long run
+    of low-variance rows.
+
+    MUST be called AFTER `_upright_from_tip`/`_upright_rotate` (i.e. on the
+    already-rotated `binimg`/`mask`, not the pre-rotation working image) --
+    that is the one point in this pipeline where "larger row index" is
+    unambiguously "toward the base", by construction. Found the hard way,
+    2026-08-17: guide_region's own `cy`/`ry` keys (still-space, pre-
+    rotation) do NOT correspond to the pre-rotation image's row axis --
+    they're already rotated 90 deg from the on-screen shape's own tip/base
+    axis (a real consequence of `_stillSpaceRegionForShape`'s
+    `(u,v)->(1-v,u)` transform, confirmed by direct visual overlay: the
+    guide's own cy+-ry span traced along the pre-rotation image's COLUMN
+    axis, not its row axis, in a real downloaded capture). Operating post-
+    rotation instead sidesteps that whole class of axis confusion, same
+    lesson as every other rotation bug already documented in this project --
+    trust the one point in the pipeline with a guaranteed, deterministic
+    orientation contract, not an intermediate space's own field names.
+
+    Runs `_orientation_field` directly on the binarized ridge image --
+    already clean, high-contrast black/white content, which gives a
+    stronger edge signal for this purpose than the noisier pre-binarization
+    grayscale would.
+
+    Real, deliberate choice: scans from the CENTRE outward (not from the
+    base edge inward) and requires a sustained run (on a SMOOTHED profile,
+    see `smooth_px`) before accepting a trim boundary -- a single noisy row
+    right at the mask's own soft/feathered edge (inherently less reliable
+    for orientation estimation) shouldn't be enough to trigger a trim on
+    its own, and a narrow spurious bump of apparent curvature shouldn't be
+    able to hide real crease just past it either (see the module-level
+    constants' own history for the real capture that found this gap).
+
+    Can only ever REMOVE area from the base half (whitened in binimg,
+    cleared in mask), never add or touch the tip half -- cannot regress a
+    capture that had no real crease overlap, same "additive/bounded, can't
+    make things worse" discipline as every other mask refinement in this
+    pipeline. Returns both inputs unchanged if no qualifying run is found.
+    """
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return binimg, mask
+    y0, y1 = int(ys.min()), int(ys.max())
+    span = y1 - y0
+    if span < 40:
+        return binimg, mask
+    orient = _orientation_field(binimg.astype(np.float32))
+    mid_y = y0 + span // 2
+
+    raw = np.full(y1 - y0 + 1, np.nan, dtype=np.float32)
+    for y in range(y0, y1 + 1):
+        row = mask[y] > 0
+        if row.sum() < 5:
+            continue
+        th = orient[y, row]
+        c = float(np.mean(np.cos(2 * th)))
+        s = float(np.mean(np.sin(2 * th)))
+        raw[y - y0] = 1.0 - float(np.hypot(c, s))
+    valid = (~np.isnan(raw)).astype(np.float32)
+    filled = np.nan_to_num(raw, nan=0.0)
+    kernel = np.ones(max(1, smooth_px), dtype=np.float32)
+    num = np.convolve(filled, kernel, mode='same')
+    den = np.convolve(valid, kernel, mode='same')
+    smoothed = np.divide(num, den, out=np.ones_like(num), where=den > 0)
+
+    min_run = max(3, int(min_run_frac * span))
+    run = 0
+    trim_at: Optional[int] = None
+    for i in range(mid_y - y0, len(smoothed)):
+        run = (run + 1) if smoothed[i] < min_circvar else 0
+        if run >= min_run:
+            trim_at = y0 + i - min_run + 1
+            break
+    if trim_at is None:
+        return binimg, mask
+    min_trim_at = y1 - int(max_trim_frac * span)
+    trim_at = max(trim_at, min_trim_at)
+    if trim_at >= y1:
+        return binimg, mask
+    binimg = binimg.copy()
+    mask = mask.copy()
+    binimg[trim_at:, :] = 255
+    mask[trim_at:, :] = 0
+    return binimg, mask
+
+
+_VIGNETTE_FEATHER_FRAC = 0.14  # width of the fade ring, as a fraction of
+# the fitted ellipse's own radius -- e.g. 0.14 means the last 14% of the
+# radius (working outward) ramps 1.0 -> 0.0 rather than cutting hard at the
+# boundary. Matches the general softness of the existing distance-transform
+# feather elsewhere in this pipeline, just applied to a geometric shape
+# instead of the organic mask boundary.
+
+
+def _circular_vignette(binimg: np.ndarray, mask: np.ndarray,
+                        feather_frac: float = _VIGNETTE_FEATHER_FRAC
+                        ) -> np.ndarray:
+    """Replaces the print's organic, mask-shaped edge fade with a smooth
+    ELLIPTICAL vignette, mimicking the clean round/oval capture window of a
+    real optical/capacitive fingerprint scanner (CTO request, 2026-08-17:
+    "have the feathing be circular so it mimics real fingerprint scanner
+    prints"). The existing per-pixel distance-transform feather (see
+    `_FADE_INSET_PX`/`_FEATHER_SIGMA` above) still runs first and is left
+    untouched -- it does real work fading Gabor content out cleanly at the
+    true segmented boundary. This runs as a LATER, purely geometric pass on
+    top: fits an ellipse to the mask's own centroid + extent, then fades
+    `binimg` to white with a smooth radial falloff from 1.0 (well inside)
+    to 0.0 (at/beyond the ellipse boundary).
+
+    Can only ever fade MORE of the image toward white, never reveal
+    anything the earlier organic feather or the crease trim had already
+    removed -- multiplies into the same white background those steps
+    already produce, so this is strictly additive/bounded like every other
+    mask refinement in this pipeline.
+    """
+    ys, xs = np.where(mask > 0)
+    if ys.size == 0:
+        return binimg
+    y0, y1, x0, x1 = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    cy, cx = (y0 + y1) / 2.0, (x0 + x1) / 2.0
+    a = (x1 - x0) / 2.0
+    b = (y1 - y0) / 2.0
+    if a < 4 or b < 4:
+        return binimg
+    h, w = binimg.shape[:2]
+    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
+    r = np.sqrt(((xx - cx) / a) ** 2 + ((yy - cy) / b) ** 2)
+    alpha = np.clip((1.0 - r) / max(feather_frac, 1e-6), 0.0, 1.0)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=max(a, b) * feather_frac * 0.25)
+    return (binimg.astype(np.float32) * alpha + 255.0 * (1.0 - alpha)).astype(np.uint8)
+
+
+def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
+                      flash_burst: Optional[List[np.ndarray]],
+                      shape: Tuple[int, int],
+                      guide_region: Optional[dict] = None) -> Optional[np.ndarray]:
+    """Content-aware thumb mask via flash-minus-ambient differencing (see
+    sfm_pipeline._segment_via_flash_diff) — picks the first ambient/flash
+    pair whose shape matches the frame being processed. Used to refine the
+    guide_region mask in generate(): the guide silhouette is a static,
+    purely geometric region with zero awareness of what's actually in the
+    frame, so background bleeding in past its edges (real-world alignment
+    isn't pixel-perfect) still gets Gabor-enhanced as if it were ridge
+    content. This is the same tier that already proved itself against real
+    captures for the (currently unguided-only) segmentation fallback —
+    reused here rather than re-derived. Best-effort: returns None on any
+    failure, same contract as _unet_mask.
+
+    REAL BUG FOUND + FIXED, 2026-08-19: `_segment_via_flash_diff` internally
+    seeds its thumb-lobe search at the frame's bare geometric centre
+    (`_isolate_thumb_lobe(opened, w/2, h/2, ...)`) — correct ONLY when the
+    guided pad happens to sit at cx=0.5. front_only_v1's real guide_region
+    is cx=0.63 (confirmed against `_superellipse_mask`'s own docstring: its
+    region is "the SAME normalized coordinate space as the frame generate()
+    receives", i.e. no rotation adjustment needed here, unlike the client-
+    side screen/still-space split) — a real ~13%-of-width offset (555px on
+    a 4266px-wide raw frame). Confirmed visually on a real capture
+    (`14674391`, a `guide+flashdiff`-masked capture that scored badly on
+    real SourceAFIS matchability, see this session's mask-vs-matchability
+    sweep): the flash-diff mask landed almost exactly on the WRONG
+    (frame-centre) seed point, not the true guide centre, and turned out to
+    be a knuckle/flexion-crease region, not the fingertip pad — a real,
+    visually-unambiguous case of the exact "wrong-centre grabs knuckle
+    skin" failure this project has already diagnosed once for a sibling
+    bug (`_scoreRoi`, capture-side, 2026-08-14 fix notes: "cropping a real
+    capture by the OLD [uncorrected] rect yields knuckle skin plus
+    background with essentially no pad ridges at all"). This is the same
+    bug class recurring in a different code path that never got the fix.
+
+    Fixed by threading `guide_region` through and seeding the lobe search
+    at the guide's own real centre (pixel space) instead of the bare frame
+    centre, falling back to frame-centre only when no guide_region is
+    available (matches every other caller of `_segment_via_flash_diff`
+    outside this guided front_only_v1 path, e.g. arc_sweep/oscillating,
+    which is unaffected by this change). Not yet re-measured against the
+    real SourceAFIS-vs-ground-truth sweep -- the next run of that sweep
+    after this deploys is what confirms whether `guide+flashdiff` closes
+    the real matchability gap against `guide+unet` this found."""
+    try:
+        import sfm_pipeline
+        ab = [g for g in (ambient_burst or []) if g is not None]
+        fb = [g for g in (flash_burst or []) if g is not None]
+        seed_cx = seed_cy = None
+        if guide_region:
+            try:
+                seed_cx = float(guide_region['cx']) * shape[1]
+                seed_cy = float(guide_region['cy']) * shape[0]
+            except (KeyError, TypeError, ValueError):
+                seed_cx = seed_cy = None
+        for a, f in zip(ab, fb):
+            a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
+            f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            if a_gray.shape != shape or f_gray.shape != shape:
+                continue
+            # Blown-out flash frame guard -- see _FLASH_DIFF_MIN_FLASH_LAPLACIAN's
+            # own comment. A saturated/clipped flash frame has too little local
+            # gradient left for the torch-falloff cue to work, and produces a
+            # noisy mask rather than failing cleanly -- skip this pair (try the
+            # next burst pair, if any) rather than trust it.
+            f_lap = float(cv2.Laplacian(f_gray, cv2.CV_64F).var())
+            if f_lap < _FLASH_DIFF_MIN_FLASH_LAPLACIAN:
+                logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
+                            f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
+                continue
+            result = sfm_pipeline._segment_via_flash_diff(
+                a_gray, f_gray, ksize=7, seed_cx=seed_cx, seed_cy=seed_cy)
+            if result is not None:
+                mask, _tx, _ty = result
+                return mask
+        return None
+    except Exception as e:              # noqa: BLE001 — mask refinement is best-effort
+        logger.warning('flash-diff mask unavailable for AFIS print: %s', e)
+        return None
+
+
+def _coherence_hull_mask(g8: np.ndarray, bsize: int = _BLOCK) -> Optional[np.ndarray]:
+    """Fallback mask: convex hull of the high-ridge-coherence region."""
+    gf = g8.astype(np.float32)
+    gx = cv2.Sobel(gf, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(gf, cv2.CV_32F, 0, 1, ksize=3)
+    gxx = cv2.boxFilter(gx * gx, -1, (bsize, bsize))
+    gyy = cv2.boxFilter(gy * gy, -1, (bsize, bsize))
+    gxy = cv2.boxFilter(gx * gy, -1, (bsize, bsize))
+    coh = np.sqrt((gxx - gyy) ** 2 + 4 * gxy ** 2) / (gxx + gyy + 1e-6)
+    m = (coh > 0.30).astype(np.uint8) * 255
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((41, 41), np.uint8))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((21, 21), np.uint8))
+    cnts, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return None
+    hull = cv2.convexHull(max(cnts, key=cv2.contourArea))
+    out = np.zeros_like(m)
+    cv2.drawContours(out, [hull], -1, 255, cv2.FILLED)
+    return cv2.erode(out, np.ones((15, 15), np.uint8))
+
+
+def _ridge_texture_strength(img: np.ndarray, orient: np.ndarray, bsize: int = 48, stride: int = 16) -> np.ndarray:
+    """
+    Per-PIXEL continuous ridge-periodicity strength (not a thresholded
+    block mask). A crease has a strong local gradient just like a ridge
+    does -- gradient coherence alone can't tell them apart. A crease does
+    NOT repeat at a short, consistent period the way a bank of parallel
+    ridges does, though -- autocorrelating each window along its own local
+    orientation (same technique as _ridge_wavelength) and reading off the
+    first peak's strength is a specific "is this actually fingerprint
+    ridge" signal (checked against a real capture: true pad windows median
+    0.254, background median 0.023 -- real separation). Overlapping windows
+    (stride < bsize) rather than a coarser upsampled grid: each window has
+    enough samples for a stable estimate, and the dense overlap makes the
+    field smooth by construction.
+    """
+    h, w = img.shape
+    ys = list(range(0, max(1, h - bsize), stride)) or [0]
+    xs = list(range(0, max(1, w - bsize), stride)) or [0]
+    grid = np.zeros((len(ys), len(xs)), dtype=np.float32)
+    for iy, y in enumerate(ys):
+        for ix, x in enumerate(xs):
+            blk = img[y:y + bsize, x:x + bsize]
+            if blk.shape != (bsize, bsize) or blk.std() < 8:
+                continue
+            ang = orient[min(y + bsize // 2, h - 1), min(x + bsize // 2, w - 1)]
+            # Same rotation-direction fix as _ridge_wavelength (see its
+            # comment) -- must bring the block TO vertical (ang - 90).
+            M = cv2.getRotationMatrix2D((bsize / 2, bsize / 2), np.degrees(ang) - 90.0, 1.0)
+            rot = cv2.warpAffine(blk, M, (bsize, bsize))
+            sig = rot.mean(axis=0)
+            sig = sig - sig.mean()
+            if sig.std() < 1e-6:
+                continue
+            ac = np.correlate(sig, sig, 'full')[bsize - 1:]
+            ac = ac / max(ac[0], 1e-6)
+            d = np.diff(ac)
+            peaks = np.where((d[:-1] > 0) & (d[1:] <= 0))[0] + 1
+            peaks = peaks[peaks > 3]   # no upper bound -- native-res ridge period
+            # varies with capture distance/resolution (matches _ridge_wavelength,
+            # which clamps only its final aggregate, not each candidate peak)
+            if len(peaks):
+                grid[iy, ix] = max(0.0, float(ac[peaks[0]]))
+    return cv2.resize(grid, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
+def _crop_to_pad_mask(gray: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """
+    Tighten a thumb-silhouette mask down to just the ridge-bearing pad,
+    dropping the DIP crease and everything beyond it (lower thumb segment,
+    palm). The U-Net/hull masks segment "thumb-shaped skin" -- on a close,
+    wide-framed capture that's far more than the pad.
+
+    Earlier attempts classified individual 2D blocks/windows as ridge-like
+    or not (first by gradient coherence, then by ridge periodicity) and
+    tried to consolidate the result into one connected region. Both failed:
+    coherence can't tell a crease from a ridge (a crease's strong local
+    gradient reads as "coherent" too), and periodicity -- though a real,
+    measurably discriminating signal -- turned out too spatially sparse at
+    any single block scale to consolidate without either falling back to
+    the unchanged mask or fragmenting into unusable islands, even after
+    several rounds of tuning window size, stride, and threshold.
+
+    This instead collapses the problem to 1D: project every mask pixel
+    onto the mask's own principal (long) axis -- the same axis
+    _upright_rotate independently computes for tip-up orientation -- and
+    average ridge-texture strength across each thin cross-section
+    perpendicular to that axis. A whole cross-section's average is far
+    more stable than any single block (the pad's dense parallel ridges
+    keep the average high; the crease's one sparse line plus the flat skin
+    around it drag it down), so finding where the profile falls off from
+    the pad's core is a single robust threshold crossing in each
+    direction, not a fragile 2D consolidation problem.
+    """
+    orient = _orientation_field(_normalize(gray))
+    strength = _ridge_texture_strength(gray, orient)
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return mask
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    center = pts.mean(axis=0)
+    _, s, vt = np.linalg.svd(pts - center, full_matrices=False)
+    if s[1] < 1e-6 or (s[0] / s[1]) < 1.15:
+        return mask   # no clear long axis -- leave alone, same guard as _upright_rotate
+    axis = vt[0]
+
+    proj = (pts - center) @ axis   # every mask pixel's 1D position along the long axis
+    vals = strength[ys, xs]
+
+    lo, hi = float(proj.min()), float(proj.max())
+    if hi - lo < 20:
+        return mask
+    n_bins = max(10, int((hi - lo) / 8))
+    bin_idx = np.clip(((proj - lo) / (hi - lo) * (n_bins - 1)).astype(int), 0, n_bins - 1)
+    bin_sum = np.bincount(bin_idx, weights=vals, minlength=n_bins)
+    bin_cnt = np.bincount(bin_idx, minlength=n_bins)
+    profile = np.where(bin_cnt > 0, bin_sum / np.maximum(bin_cnt, 1), 0.0).astype(np.float32)
+    profile = cv2.GaussianBlur(profile.reshape(-1, 1), (0, 0), 1.5).flatten()
+
+    # Pick the widest sustained band of periodicity, not simply the single
+    # tallest bin. A narrow, spurious high-periodicity spot (a stray
+    # reflection, a sharp-edged object at the frame's border) can outscore
+    # the real ridge band on peak height alone while covering only a
+    # handful of bins -- verified on a real capture where a 4-bin edge
+    # spike (0.223) beat a genuine ~35-bin ridge plateau (peak 0.104) and
+    # collapsed the kept region to nothing. Scoring contiguous above-floor
+    # runs by total area (width x strength) favours the sustained plateau
+    # a real print pad produces over a thin artifact spike.
+    floor_val = 0.05
+    above = profile >= floor_val
+    runs = []
+    start = None
+    for i in range(n_bins):
+        if above[i] and start is None:
+            start = i
+        elif not above[i] and start is not None:
+            runs.append((start, i - 1))
+            start = None
+    if start is not None:
+        runs.append((start, n_bins - 1))
+
+    candidates = [(float(profile[a:b + 1].sum()), a, b)
+                  for a, b in runs if float(profile[a:b + 1].max()) >= 0.10]
+    if not candidates:
+        return mask   # no confident, sustained ridge core found -- keep the original mask
+    _, lo_bin, hi_bin = max(candidates, key=lambda c: c[0])
+
+    bin_width = (hi - lo) / (n_bins - 1)
+    keep_lo = lo - 0.5 * bin_width + lo_bin * bin_width
+    keep_hi = lo - 0.5 * bin_width + (hi_bin + 1) * bin_width
+    keep = (proj >= keep_lo) & (proj <= keep_hi)
+
+    pad_mask = np.zeros_like(mask)
+    pad_mask[ys[keep], xs[keep]] = 255
+    pad_mask = cv2.morphologyEx(pad_mask, cv2.MORPH_CLOSE, np.ones((15, 15), np.uint8))
+    # Fraction of the ORIGINAL mask kept, not of the whole frame -- the
+    # whole point of this function is to keep a genuine SUBSET of the mask
+    # (excluding the crease/hand), so a correct result is naturally a small
+    # fraction of the full image whenever the mask itself is. An earlier
+    # version checked (pad_mask > 0).mean() against the whole image, which
+    # rejected every real result as "too aggressive" purely because the
+    # mask itself was a minority of the frame -- not because the crop was
+    # actually wrong.
+    kept_frac_of_mask = (pad_mask > 0).sum() / max((mask > 0).sum(), 1)
+    if kept_frac_of_mask < 0.05:
+        return mask   # too aggressive -- keep the original rather than emit nothing
+    return pad_mask
+
+
+def _upright_rotate(binimg: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Rotate so the thumb pad's long axis is VERTICAL, tip-up.
+
+    The source frame's orientation depends on how the phone was held during
+    capture (the burst still is sensor-rotation-corrected on-device, but
+    nothing constrains portrait-vs-landscape hold or which way the thumb
+    points within frame) -- so the pad can land in the output at any angle.
+    A rolled/AFIS print is always presented upright, so this is a real
+    correction, not cosmetic.
+
+    Method: PCA on the mask's pixel coordinates gives the pad's principal
+    (long) axis; rotate that to vertical. Up/down is then resolved by mask
+    width profile -- the fingertip end is consistently the narrower, more
+    tightly-curved end (the pad's widest point is roughly at the DIP crease
+    it curves in from, the tip itself tapers), so the narrower half goes on
+    top. This is a heuristic (no true anatomical landmark available from a
+    single 2D silhouette) but is a firm improvement over a random angle.
+    """
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 50:
+        return binimg, mask
+    pts = np.column_stack([xs, ys]).astype(np.float64)
+    mean = pts.mean(axis=0)
+    _, s, vt = np.linalg.svd(pts - mean, full_matrices=False)
+    # Only rotate when the pad has a CLEAR long axis. A near-circular mask (or a
+    # failed whole-frame mask) has s[0]≈s[1] → the principal axis is noise, and
+    # rotating by it spun the square output into a diamond. Leave those upright.
+    if s[1] < 1e-6 or (s[0] / s[1]) < 1.25:
+        return binimg, mask
+    principal = vt[0]  # (dx, dy) of the long axis
+    angle_deg = np.degrees(np.arctan2(principal[1], principal[0])) - 90.0
+
+    h, w = mask.shape
+    center = (w / 2.0, h / 2.0)
+    # Expand canvas so rotation doesn't clip corners of an elongated mask.
+    diag = int(np.ceil(np.hypot(h, w)))
+    pad_y, pad_x = (diag - h) // 2 + 5, (diag - w) // 2 + 5
+    bin_p = cv2.copyMakeBorder(binimg, pad_y, pad_y, pad_x, pad_x,
+                               cv2.BORDER_CONSTANT, value=255)
+    mask_p = cv2.copyMakeBorder(mask, pad_y, pad_y, pad_x, pad_x,
+                                cv2.BORDER_CONSTANT, value=0)
+    center_p = (center[0] + pad_x, center[1] + pad_y)
+    M = cv2.getRotationMatrix2D(center_p, angle_deg, 1.0)
+    size_p = (bin_p.shape[1], bin_p.shape[0])
+    bin_r = cv2.warpAffine(bin_p, M, size_p, borderValue=255)
+    mask_r = cv2.warpAffine(mask_p, M, size_p, borderValue=0)
+
+    # Tip-up: compare mask width in the top vs bottom third; the narrower
+    # third is the tip and belongs on top.
+    ry, rx = np.where(mask_r > 0)
+    if len(ry):
+        y0, y1 = ry.min(), ry.max()
+        third = max(1, (y1 - y0) // 3)
+        def _width(y_lo, y_hi):
+            band = mask_r[y_lo:y_hi, :]
+            widths = [np.count_nonzero(row) for row in band if np.any(row)]
+            return float(np.mean(widths)) if widths else 0.0
+        top_w = _width(y0, y0 + third)
+        bot_w = _width(y1 - third, y1)
+        if top_w > bot_w:  # wider end currently on top -- flip 180
+            bin_r = cv2.rotate(bin_r, cv2.ROTATE_180)
+            mask_r = cv2.rotate(mask_r, cv2.ROTATE_180)
+    return bin_r, mask_r
+
+
+def _superellipse_mask(shape: Tuple[int, int], region: dict) -> Optional[np.ndarray]:
+    """
+    Rasterize the app's guide silhouette into a binary pad mask.
+
+    `region` is in the SAME normalized (0-1) coordinate space as the frame
+    `generate()` receives (the center-square-cropped frame — main.py does the
+    full-still → cropped-frame remap before calling us, so here we only scale
+    by the frame's own dimensions). Shape is a superellipse
+    |x/rx|^n + |y/ry|^n <= 1 (n≈2.5 reads as a rounded thumb pad, not a plain
+    oval), matching what capture_pad_silhouette_overlay.dart draws so the
+    region the user visually fills IS the mask.
+    """
+    h, w = shape
+    cx = float(region['cx']) * w
+    cy = float(region['cy']) * h
+    rx = max(1.0, float(region['rx']) * w)
+    ry = max(1.0, float(region['ry']) * h)
+    n = float(region.get('n', 2.5))
+    ys, xs = np.mgrid[0:h, 0:w]
+    d = (np.abs((xs - cx) / rx) ** n) + (np.abs((ys - cy) / ry) ** n)
+    mask = (d <= 1.0).astype(np.uint8) * 255
+    if (mask > 0).sum() < 200:
+        return None
+    return mask
+
+
+# Ridge-quality floor, as a fraction of the pad's own median, below which
+# the print is considered to have ended. See _distal_boundary_row.
+_DISTAL_QUALITY_DROP = 0.75
+_DISTAL_MIN_KEEP = 0.55      # never crop above this fraction of the height
+_DISTAL_RUN_FRAC = 0.03      # sustained run required, as a fraction of height
+
+
+# Percentile of the FINGER's own ridge-energy distribution used as the
+# pad/non-pad cut. See _pad_within_finger.
+_PAD_RIDGE_PERCENTILE = 45
+_PAD_RIDGE_WL_LO = 8      # px -- ridge band low end
+_PAD_RIDGE_WL_HI = 28     # px -- ridge band high end
+_PAD_MORPH_K = 31
+
+
+def _pad_within_finger(gray: np.ndarray,
+                       finger: np.ndarray) -> Optional[np.ndarray]:
+    """Refine a FINGER mask down to the friction-ridge PAD.
+
+    The existing U-Net (_unet_mask) segments the whole finger, joint
+    included -- it was trained for finger-vs-background and is good at it.
+    It has no notion of where the fingerprint ends, which is a real problem
+    for matching: ridges past the distal crease are not part of any
+    reference print, so including them can only add minutiae that cannot
+    match.
+
+    The pad has a physical definition the rest of the finger does not: it
+    carries friction ridges at a characteristic spatial frequency. Bandpass
+    energy in that band, gated by orientation coherence, separates the two.
+
+    CRITICAL -- the gating by `finger` is not an optimisation, it is what
+    makes this work at all. Run over the whole frame this metric segments
+    BACKGROUND: measured on real mosaics it selected 1.5-2.9% of the crop
+    with 0% overlap with the finger, latching onto wood grain and fabric,
+    which are also coherent and band-energetic. That is the same failure
+    this project already documented when cropping SD302 ("the rig's own
+    metal support rail has coherent, energetic oriented texture
+    indistinguishable from ridges"). Restricting to inside the U-Net's
+    finger removes it entirely -- the hard, learned part (finger vs
+    arbitrary background) stays with the model that was trained for it, and
+    only the easy, physical part (finger -> pad) is done here.
+
+    Threshold is a percentile of the FINGER'S OWN energy distribution, not
+    an absolute -- self-calibrating across devices, lighting and skin.
+
+    Measured on 4 real sweep mosaics: selects 44-64% of the finger, with
+    coherence inside the pad 1.5-2.1x that of the finger outside it (0.259-
+    0.454 vs 0.174-0.239) -- a real separation on every capture tried.
+
+    Returns None (caller keeps the unrefined mask) when the finger mask is
+    too small to characterise or nothing survives, so this can only ever
+    tighten a mask onto real ridge area, never invent one."""
+    if finger is None or gray is None:
+        return None
+    f = finger > 0
+    if f.sum() < 1000:
+        return None
+    g = gray.astype(np.float32)
+    band = (cv2.GaussianBlur(g, (0, 0), _PAD_RIDGE_WL_LO / 3.0)
+            - cv2.GaussianBlur(g, (0, 0), _PAD_RIDGE_WL_HI / 3.0))
+    energy = cv2.GaussianBlur(np.abs(band), (0, 0), _PAD_RIDGE_WL_HI)
+    score = energy * _block_coherence(gray)
+    thr = float(np.percentile(score[f], _PAD_RIDGE_PERCENTILE))
+    bw = ((score > thr) & f).astype(np.uint8) * 255
+    k = np.ones((_PAD_MORPH_K, _PAD_MORPH_K), np.uint8)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_CLOSE, k)
+    bw = cv2.morphologyEx(bw, cv2.MORPH_OPEN, k)
+    n, lab, st, _ = cv2.connectedComponentsWithStats(bw)
+    if n > 1:
+        big = 1 + int(np.argmax(st[1:, cv2.CC_STAT_AREA]))
+        bw = (lab == big).astype(np.uint8) * 255
+    if (bw > 0).sum() < f.sum() * 0.15:
+        return None      # implausibly small -- distrust it, keep the finger
+    return bw
+
+
+def _distal_boundary_row(upright: np.ndarray,
+                         mask: Optional[np.ndarray] = None) -> Optional[int]:
+    """Row at which an UPRIGHT print stops being a fingerprint.
+
+    A fingerprint is the distal phalanx pad only -- tip down to the distal
+    flexion crease. Ridges below that crease are real ridges but are NOT
+    part of the print, and no reference print in an AFIS gallery contains
+    them, so including them can only add minutiae that cannot match.
+
+    Deliberately NOT a crease-line detector, because the crease is not
+    reliably there to detect: profiled on real upright sweep mosaics, the
+    row-mean intensity falls smoothly from ~179 to ~90 top-to-bottom with no
+    step, and the strongest single dark row landed at 99.9% of the height --
+    illumination falloff as the finger curves away, not a fold. Chasing a
+    discrete edge would have fitted noise.
+
+    What IS reliably present is a collapse in ridge structure: block
+    coherence measured 0.34-0.38 through the pad and 0.17-0.20 across the
+    bottom 10-15% on the same prints, i.e. roughly half. So this finds where
+    ridge quality falls below a fraction of the pad's OWN median (self-
+    calibrating -- no absolute threshold to drift across devices or
+    lighting) and stays there, which is the boundary that actually matters
+    for matching whether or not an anatomical crease is visible.
+
+    Returns the cut row, or None to leave the print untouched -- when no
+    sustained collapse is found, or when the cut would fall above
+    _DISTAL_MIN_KEEP of the height (a guard against truncating a genuinely
+    good print on a noisy profile; better to keep a little joint skin than
+    to amputate real pad)."""
+    h, w = upright.shape[:2]
+    if h < 64 or w < 64:
+        return None
+    coh = _block_coherence(upright)
+    if mask is not None and mask.shape[:2] == upright.shape[:2]:
+        m = (mask > 0).astype(np.float32)
+        num = (coh * m).sum(axis=1)
+        den = np.maximum(m.sum(axis=1), 1.0)
+        prof = num / den
+        # rows with almost no mask are meaningless -- treat as absent
+        prof[m.sum(axis=1) < w * 0.15] = np.nan
+    else:
+        band = coh[:, int(w * 0.25):int(w * 0.75)]
+        prof = band.mean(axis=1)
+    # smooth over ~1 ridge period so a single dark ridge cannot trigger it
+    k = max(3, int(h * 0.01) | 1)
+    finite = np.isfinite(prof)
+    if finite.sum() < h * 0.5:
+        return None
+    filled = np.interp(np.arange(h), np.flatnonzero(finite), prof[finite])
+    prof_s = cv2.GaussianBlur(filled.reshape(-1, 1).astype(np.float32),
+                              (1, k), 0).ravel()
+    # the pad's own reference level: the upper half, which is always print
+    ref = float(np.median(prof_s[:h // 2]))
+    if not np.isfinite(ref) or ref <= 1e-6:
+        return None
+    floor = ref * _DISTAL_QUALITY_DROP
+    run = max(4, int(h * _DISTAL_RUN_FRAC))
+    below = prof_s < floor
+    start = int(h * _DISTAL_MIN_KEEP)
+    for y in range(start, h - run):
+        if below[y:y + run].all():
+            return y
+    return None
+
+
+def _upright_from_tip(binimg: np.ndarray, mask: np.ndarray,
+                      tip_angle_deg: float) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Deterministic tip-up rotation for guided captures.
+
+    The app draws the silhouette tip-up on the portrait screen, so it knows
+    exactly which way the tip points once the still is rotated into landscape.
+    `tip_angle_deg` is that direction in the frame's own pixel space (standard
+    math convention: 0° = +x/right, 90° = +y/up). We rotate the content so the
+    tip ends up pointing UP -- no PCA guess (which is unstable on a near-
+    symmetric pad) and no width heuristic. A rolled/AFIS print is always
+    presented upright, so this is a real correction.
+    """
+    # Image y runs downward, so "up" on screen is -y. To send a vector at
+    # math-angle `tip_angle_deg` to screen-up, rotate the image by this much
+    # (getRotationMatrix2D's positive angle is CCW in math space).
+    rot_deg = 90.0 - tip_angle_deg
+    h, w = mask.shape
+    center = (w / 2.0, h / 2.0)
+    diag = int(np.ceil(np.hypot(h, w)))
+    pad_y, pad_x = (diag - h) // 2 + 5, (diag - w) // 2 + 5
+    bin_p = cv2.copyMakeBorder(binimg, pad_y, pad_y, pad_x, pad_x,
+                               cv2.BORDER_CONSTANT, value=255)
+    mask_p = cv2.copyMakeBorder(mask, pad_y, pad_y, pad_x, pad_x,
+                                cv2.BORDER_CONSTANT, value=0)
+    center_p = (center[0] + pad_x, center[1] + pad_y)
+    M = cv2.getRotationMatrix2D(center_p, rot_deg, 1.0)
+    size_p = (bin_p.shape[1], bin_p.shape[0])
+    bin_r = cv2.warpAffine(bin_p, M, size_p, borderValue=255)
+    mask_r = cv2.warpAffine(mask_p, M, size_p, borderValue=0)
+    return bin_r, mask_r
+
+
+def _geom_correct(g8: np.ndarray, mask: np.ndarray, mode: str):
+    """Cross-domain geometry correction (C2CL-style) via geom_correct.py.
+
+    Kept as a thin lazy-import wrapper (same non-blocking contract as the
+    pyfing/nns hooks): returns (g8, mask) warped toward contact-print
+    geometry, or None to self-skip the variant. See geom_correct.py and
+    docs/FIDELITY_WALL_SCOPE.md for why this exists and how it's validated
+    (SourceAFIS separation, not NFIQ2)."""
+    try:
+        import geom_correct
+    except ImportError:
+        return None
+    try:
+        return geom_correct.correct(g8, mask, mode=mode)
+    except Exception as e:      # never let a geometry experiment break scoring
+        logger.warning('AFIS geom correction (%s) failed: %s', mode, e)
+        return None
+
+
+def _pyfing_denoise(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
+    """Runs the pyfing sidecar's SNFEN model as a denoising pre-pass and
+    returns a full-frame-shaped CONTINUOUS-TONE image in pyfing's OWN
+    convention (ridges bright, background dark) -- not yet inverted,
+    not yet binarized. Feeds `_pyfing_enhance` (pure-pyfing variant) and
+    `enhance='pyfingHybrid'` in generate() (pyfing-then-Gabor hybrid).
+
+    Crops to the mask's own bounding box and grey-fills outside it before
+    sending -- pyfing's own internal segmentation doesn't need to re-solve
+    backgrounds we've already excluded via guide+flashdiff/U-Net. Pre-
+    rescales the crop to the ~500 DPI domain itself (same convention as
+    mindtct_client._normalize_dpi -- resample toward _TARGET_PERIOD) and
+    always calls pyfing with dpi=500, rather than passing our own measured
+    dpi through: pyfing's own Snfen.run() has a real bug when dpi != its
+    dnn_input_dpi (500) -- it resizes image/mask/orientation to a scaled
+    size but resizes ridge_periods to the ORIGINAL unscaled size, raising
+    a numpy dstack shape-mismatch every time (reproduced standalone: a
+    465px crop at dpi=300 crashes). Pre-normalizing ourselves and always
+    passing dpi=500 sidesteps that internal rescale path entirely instead
+    of working around a third-party bug with try/except.
+
+    Returns None on any failure (sidecar not configured, network error,
+    degenerate crop) -- caller treats this exactly like a failed fuse
+    pair: skip this variant, single-source renderings still stand."""
+    try:
+        import pyfing_client
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+    y0, x0 = max(0, ys.min() - 10), max(0, xs.min() - 10)
+    y1, x1 = min(g8.shape[0], ys.max() + 10), min(g8.shape[1], xs.max() + 10)
+    crop = g8[y0:y1, x0:x1].copy()
+    crop_mask = mask[y0:y1, x0:x1]
+    crop[crop_mask == 0] = 128   # neutral grey outside the mask, not the raw
+    # background pixels -- avoids handing pyfing's own segmentation a real
+    # background texture to (mis)classify, same as the validated test crop.
+
+    scale = float(np.clip(_TARGET_PERIOD / max(wl, 1.0), 0.3, 3.0))
+    orig_shape = crop.shape
+    if abs(scale - 1.0) > 0.02:
+        new_w = max(32, int(round(crop.shape[1] * scale)))
+        new_h = max(32, int(round(crop.shape[0] * scale)))
+        interp = cv2.INTER_AREA if scale < 1.0 else cv2.INTER_CUBIC
+        crop_scaled = cv2.resize(crop, (new_w, new_h), interpolation=interp)
+    else:
+        crop_scaled = crop
+
+    enhanced_scaled = pyfing_client.enhance_fingerprint(crop_scaled, method='SNFEN', dpi=500)
+    if enhanced_scaled is None or enhanced_scaled.shape != crop_scaled.shape:
+        return None
+    enhanced = cv2.resize(enhanced_scaled, (orig_shape[1], orig_shape[0]),
+                           interpolation=cv2.INTER_CUBIC) if crop_scaled.shape != orig_shape else enhanced_scaled
+
+    # Paste back into a full-frame canvas (native g8 outside the crop) so
+    # the result can feed straight into _normalize/_orientation_field --
+    # both only look at content inside `mask`, which is re-applied after
+    # Gabor same as every other enhance path.
+    full = g8.copy()
+    full[y0:y1, x0:x1] = enhanced
+    return full
+
+
+def _pyfing_orientation_frequency(g8: np.ndarray, mask: np.ndarray):
+    """RESEARCH SCAFFOLD (docs/FIDELITY_WALL_SCOPE.md): swap this module's own
+    classical orientation (_orientation_field, gradient/structure-tensor) and
+    frequency (_ridge_frequency_map, block autocorrelation) estimators for
+    pyfing's neural equivalents (Snfoe/Snffe), while keeping the SAME
+    downstream Gabor bank (_gabor_enhance_varfreq) -- isolates whether the
+    FIELD ESTIMATE itself is the limiting factor, distinct from pyfing's
+    SNFEN *enhancer* (enhance='pyfing'/'pyfingHybrid'), which already lost to
+    the tuned Gabor pipeline.
+
+    Returns (orientation, freq_map) in this module's own conventions --
+    orientation in [0, pi) "ridge direction" (matching _orientation_field's
+    return convention), freq_map a full-resolution ridge-PERIOD-in-px map
+    (matching _ridge_frequency_map's return convention, so it drops straight
+    into _gabor_enhance_varfreq) -- or None on any failure/unavailability
+    (caller falls back to this module's own classical fields, same
+    non-blocking contract as every other optional signal here).
+
+    UNLIKE _pyfing_denoise, this does NOT internally rescale toward
+    _TARGET_PERIOD -- resizing a per-pixel ANGLE field (wraps at 0/pi) or a
+    per-pixel PERIOD-in-px field (values themselves change with scale) after
+    the fact is a real correctness trap, not just an implementation detail.
+    Callers MUST pass freq_normalize=True to generate() so g8/mask are
+    already close to the ~500dpi/_TARGET_PERIOD domain BEFORE this runs,
+    making dpi=500 a valid assumption for pyfing's calls without any
+    post-hoc resize of the returned fields.
+
+    PRODUCTION NOTE: this does a direct in-process `import pyfing` (NOT the
+    pyfing_client HTTP-sidecar pattern _pyfing_denoise uses). That isolation
+    exists for a real reason (pyfing_client.py's own docstring: keeps
+    Keras/TensorFlow out of this Cloud Function's deploy footprint). This
+    scaffold is safe today only because `pyfing` is not in this function's
+    requirements.txt, so it self-skips via ImportError in the real deployed
+    environment -- it is for LOCAL MEASUREMENT ONLY (scratchpad harness).
+    If this measurably wins, build proper pyfing_service endpoints before
+    ever wiring it into main.py's _afis_variants."""
+    try:
+        import pyfing
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+
+    try:
+        foe = _pyfing_orientation_frequency._foe
+        ffe = _pyfing_orientation_frequency._ffe
+    except AttributeError:
+        foe = pyfing.Snfoe(pyfing.SnfoeParameters())
+        ffe = pyfing.Snffe(pyfing.SnffeParameters())
+        _pyfing_orientation_frequency._foe = foe
+        _pyfing_orientation_frequency._ffe = ffe
+
+    try:
+        pyfing_orient, _confidence = foe.run(g8, mask=mask, dpi=500)
+        pyfing_freq = ffe.run(g8, mask, pyfing_orient, dpi=500)
+    except Exception as e:
+        logger.warning('pyfing orientation/frequency estimation failed: %s', e)
+        return None
+
+    # Convert pyfing's [-pi/2, pi/2] orientation convention to this module's
+    # own [0, pi) "ridge direction" convention (see _orientation_field) --
+    # both measure ridge angle mod pi (an undirected line, not a vector), so
+    # this is a phase shift, not a sign flip. NOT independently re-verified
+    # against a ground-truth angle beyond the sanity render this scaffold was
+    # built with -- re-check visually (e.g. overlay a few orientation arrows
+    # on a real print) before trusting downstream numbers.
+    orientation = np.mod(pyfing_orient + np.pi / 2, np.pi)
+
+    # pyfing marks low-confidence/background pixels with negative sentinel
+    # values in the frequency map (observed on real prints: valid ~5-20px,
+    # invalid negative) -- treat those as unreliable and reuse
+    # _ridge_frequency_map's own nearest-fill + smoothing tail so the output
+    # is a clean, full-resolution period-in-px map in the same units/shape
+    # _gabor_enhance_varfreq already expects.
+    grid = pyfing_freq.copy()
+    grid[grid <= 0] = np.nan
+    grid[mask == 0] = np.nan
+    if np.count_nonzero(~np.isnan(grid)) < 4:
+        return None
+    valid = ~np.isnan(grid)
+    filled = grid.copy()
+    known = valid.copy()
+    while not known.all():
+        dil = cv2.dilate(np.nan_to_num(filled), np.ones((3, 3), np.uint8))
+        cnt = cv2.dilate(known.astype(np.uint8), np.ones((3, 3), np.uint8))
+        take = (~known) & (cnt > 0)
+        filled[take] = dil[take]
+        known = known | take
+        if not take.any():
+            break
+    freq_map = cv2.GaussianBlur(filled, (0, 0), _FREQMAP_SMOOTH)
+    return orientation, freq_map
+
+
+def _pyfing_enhance(g8: np.ndarray, mask: np.ndarray, wl: float) -> Optional[np.ndarray]:
+    """Alternative to _gabor_enhance: routes the masked pad through pyfing's
+    SNFEN model and uses ITS output directly as the final print (inverted
+    from pyfing's ridges-bright convention to this project's ridges-black
+    convention). See CLAUDE.md "Pretrained fingerphoto-enhancement models"
+    -- first real test scored competitively with this module's own tuned
+    Gabor output (bozorth3 vs the CTO's ink scan: 7 vs 6), but measured
+    across all 14 real front_only_v1 captures, never beat the tuned Gabor
+    pipeline on real NFIQ2 (see CLAUDE.md's "pyfing wired in" section).
+    See `enhance='pyfingHybrid'` in generate() for a second way to use
+    pyfing (as a denoise pre-pass feeding this project's own Gabor+
+    binarize chain, rather than as a standalone final image) motivated by
+    the CTO's observation that pyfing's own image convention (continuous-
+    tone, ridges bright) differs from what this pipeline's Gabor tuning
+    (gamma/sigma/freq-scale/orient-smooth) has always been calibrated
+    against (hard-binarized, ridges black) -- a plain invert isn't the
+    same transformation as that binarization."""
+    full = _pyfing_denoise(g8, mask, wl)
+    if full is None:
+        return None
+    return 255 - full   # pyfing: ridges bright -> project: ridges dark (still continuous-tone)
+    # caller (generate()) applies `binimg[mask == 0] = 255` right after,
+    # same as every other enhance path -- no need to duplicate it here.
+
+
+def _nns_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    """Runs this project's OTHER, older enhancement model (`enhancement_pipeline.
+    enhance()` -- CLAHE -> multi-scale Gabor -> trained FingerprintUNet ("NNS")
+    -> unsharp post-process) as a denoise PRE-PASS, same role as
+    `_pyfing_denoise`/`_coherence_diffusion`: feeds `enhance='nnsHybrid'` in
+    generate(), which then runs the result through this module's own tuned
+    Gabor bank + hard binarization for the final black-ridge/white-background
+    conversion, rather than using the NNS output directly as the final image.
+
+    Motivation (CTO, 2026-07-16): the NNS pipeline's continuous-tone output is
+    visibly smoother/more continuous ridge-wise than the AFIS binarized
+    template, but scores far lower on real NFIQ2 (measured: 39 vs 76 on the
+    same real capture) -- almost certainly because NFIQ2 was calibrated
+    against, and this project's whole Gabor pipeline has been tuned against,
+    a hard-binarized image, not a soft continuous-tone one (the same class of
+    convention gap `pyfingHybrid` addressed for pyfing). Unlike pyfing, NNS's
+    own output convention already matches this project's (ridges dark,
+    background light -- confirmed via `enhancement_pipeline.ink_scanner_style`'s
+    docstring and `_postprocess`'s contrast-stretch, which assume the same
+    polarity `_gabor_enhance`'s binarization does) -- no invert needed here.
+
+    REAL BUG FOUND + FIXED 2026-08-07: this used to crop to the mask's bbox
+    and grey-fill OUTSIDE it (same pattern as `_pyfing_denoise`) BEFORE
+    calling `enhancement_pipeline.enhance()` -- but unlike pyfing's SNFEN,
+    this project's own trained FingerprintUNet was never trained on masked/
+    neutral-filled input, and feeding it a hard edge between real content
+    and a flat fill makes it ring on that edge (visible concentric halo
+    artefacts, confirmed both visually and numerically this session: 5/5
+    real captures scored WORSE masked-then-enhanced than left unmasked,
+    mean real NFIQ2 21.9 vs 32.5 -- this is likely the SAME root cause
+    behind `main.py`'s own already-documented "don't blank the background
+    before Gabor/NNS enhancement" lesson for the SfM single-frame fallback
+    path, just rediscovered independently here). Also confirmed this
+    session (5/5 real captures) that the RAW NNS output is essentially
+    unscoreable by real NFIQ2 regardless of masking -- every one was
+    rejected outright ("Fingerprint area is too small") -- while running
+    that SAME unmasked-enhanced output through this module's own Gabor+
+    hard-binarize chain (exactly what the `nnsHybrid` branch below already
+    does) produced a real, valid score on 5/5. So both halves of this
+    function's original design were subtly broken by one bug: enhance
+    the FULL unmasked image first (matches how the model was actually
+    exercised when it scored competitively, per the 2026-07-16 CTO
+    motivation above), THEN composite the mask onto the RESULT with a
+    feathered edge (never a hard cut) -- exact same
+    resize/GaussianBlur(31,31)/alpha-blend pattern main.py's own
+    fallback_mask compositing already uses for this exact problem.
+    Returns None on any failure (missing dependency, degenerate mask, or
+    the NNS weights not being resolvable) -- same non-blocking contract as
+    every other optional signal in this module."""
+    try:
+        import enhancement_pipeline
+    except ImportError:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+
+    # SCALE: enhancement_pipeline.enhance() hard-resizes whatever it is given
+    # to 512x512. Handed a full ~3200px frame whose pad occupies only ~900px,
+    # the pad lands small enough that the dominant periodicity the net locks
+    # onto is background / finger-edge structure rather than ridges -- measured
+    # on a real capture with the unclipped estimator: pad at native res 15.0px,
+    # but full-frame-resized-to-512 reads 29.0px, and the NNS OUTPUT from that
+    # input also reads 29.0px (which is exactly what thick, merged, blobby
+    # ridges look like). Cropping to the pad first restores it: the same
+    # capture reads 16.5px in, 16.0px out. So crop -- but crop RECTANGULARLY,
+    # to REAL surrounding image content, with NO neutral fill: the fill is
+    # what the original version of this function got wrong (a hard edge
+    # between content and flat grey, which this net -- never trained on
+    # masked input -- rings on, producing concentric halo artefacts; 5/5 real
+    # captures scored worse that way, mean real NFIQ2 21.9 vs 32.5). Margin is
+    # ~30% of the pad's own bbox: enough real context for the net's internal
+    # CLAHE/segmentation, while the pad still dominates the 512x512 budget.
+    y0r, y1r, x0r, x1r = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    mh = max(8, int(0.30 * (y1r - y0r)))
+    mw = max(8, int(0.30 * (x1r - x0r)))
+    y0, y1 = max(0, y0r - mh), min(g8.shape[0], y1r + mh)
+    x0, x1 = max(0, x0r - mw), min(g8.shape[1], x1r + mw)
+    crop = g8[y0:y1, x0:x1]
+    if crop.shape[0] < 32 or crop.shape[1] < 32:
+        return None
+
+    try:
+        enhanced_crop, _params = enhancement_pipeline.enhance(crop, sfm_coverage=1.0)
+    except Exception as e:   # noqa: BLE001 -- must never block the pipeline
+        logger.warning('NNS denoise pre-pass failed (non-critical): %s', e)
+        return None
+    if enhanced_crop is None:
+        return None
+    if enhanced_crop.shape != crop.shape:
+        enhanced_crop = cv2.resize(enhanced_crop, (crop.shape[1], crop.shape[0]),
+                                   interpolation=cv2.INTER_CUBIC)
+
+    enhanced_full = g8.copy()
+    enhanced_full[y0:y1, x0:x1] = enhanced_crop
+
+    mask_f = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    bg = np.full_like(enhanced_full, 245)
+    composited = (enhanced_full.astype(np.float32) * mask_f
+                 + bg.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+    return composited
+
+
+_RIDGE_RESTORE_CKPT_PATH = '/tmp/ridge_restore_curriculum_best.pt'
+_ridge_restore_model_cache: dict = {}
+
+
+def _get_ridge_restore_model():
+    """Lazy-loads the ml/ridge_restore_curriculum checkpoint via raw torch
+    (research/validation only -- unlike every other model this file loads,
+    this one has NOT been exported to ONNX or uploaded to Storage models/,
+    so it self-skips via a plain file-existence check, same non-blocking
+    contract as a missing sidecar). Caches in-process once loaded."""
+    if 'model' in _ridge_restore_model_cache:
+        return _ridge_restore_model_cache['model']
+    import os
+    if not os.path.exists(_RIDGE_RESTORE_CKPT_PATH):
+        _ridge_restore_model_cache['model'] = None
+        return None
+    try:
+        import torch
+        import sys
+        sys.path.insert(0, '/home/user/ClearBridge-Mobile-Build/ml/ridge_restore_curriculum')
+        from model import RidgeRestoreUNet
+        ckpt = torch.load(_RIDGE_RESTORE_CKPT_PATH, map_location='cpu')
+        model = RidgeRestoreUNet()
+        model.load_state_dict(ckpt['model'])
+        model.eval()
+        _ridge_restore_model_cache['model'] = model
+        return model
+    except Exception as e:   # noqa: BLE001
+        logger.warning('ridge_restore_curriculum model load failed (non-critical): %s', e)
+        _ridge_restore_model_cache['model'] = None
+        return None
+
+
+def _ridge_restore_denoise(g8: np.ndarray, mask: np.ndarray) -> Optional[np.ndarray]:
+    """Runs the CURRICULUM-DEGRADATION-TRAINED ridge restoration network
+    (ml/ridge_restore_curriculum, 2026-08-08 -- CTO's own idea: real NIST
+    SD302 prints, synthetic blur/specular-blowout/low-contrast/uneven-
+    illumination degradation ramped up over training, network learns to
+    reconstruct clean ridges) as a denoise PRE-PASS -- same role and same
+    "crop with real-content margin, no neutral fill, feathered composite
+    back" pattern as `_nns_denoise` (this project's own already-hard-won
+    lesson: hard-masked flat-fill input makes a net never trained on masked
+    content ring on the edge, 5/5 real captures scored worse that way).
+
+    Output convention already matches this project's own (ridges dark,
+    background light -- trained directly on SD302 grayscale scans, which
+    use that same polarity) -- no invert needed, same as `_nns_denoise`.
+
+    Research/validation status, not production-proven: trained ONLY on
+    clean NIST SD302 CONTACT-SCANNER prints (no real fingerphoto capture
+    content, no background/uneven-lighting/skin-texture domain), so a real
+    generalization gap to actual captures is expected and was directly
+    observed in this project's own real-capture spot check (visible
+    banding/background artefacts on a raw unbinarized test) -- this
+    function exists to let that gap be measured PROPERLY, through the same
+    real guideRegion + Gabor + binarize + real-NFIQ2 path every other
+    candidate goes through, not to assert it already works.
+
+    Returns None on any failure (checkpoint not present locally, degenerate
+    mask, torch not available) -- same non-blocking contract as every
+    other optional denoise pre-pass in this module."""
+    model = _get_ridge_restore_model()
+    if model is None:
+        return None
+
+    ys, xs = np.where(mask > 0)
+    if len(ys) < 200:
+        return None
+    y0r, y1r, x0r, x1r = int(ys.min()), int(ys.max()), int(xs.min()), int(xs.max())
+    mh = max(8, int(0.30 * (y1r - y0r)))
+    mw = max(8, int(0.30 * (x1r - x0r)))
+    y0, y1 = max(0, y0r - mh), min(g8.shape[0], y1r + mh)
+    x0, x1 = max(0, x0r - mw), min(g8.shape[1], x1r + mw)
+    crop = g8[y0:y1, x0:x1]
+    if crop.shape[0] < 32 or crop.shape[1] < 32:
+        return None
+
+    try:
+        import torch
+        # Pad to a multiple of 8 (three MaxPool2d(2) stages -> skip-
+        # connection concat requires exact dims) -- reflect padding, not a
+        # flat fill, same "no hard edge for a net that never saw one"
+        # discipline as the crop margin above.
+        ch, cw = crop.shape
+        ph = (8 - ch % 8) % 8
+        pw = (8 - cw % 8) % 8
+        padded = cv2.copyMakeBorder(crop, 0, ph, 0, pw, cv2.BORDER_REFLECT)
+        x = torch.from_numpy(padded.astype(np.float32) / 255.0)[None, None]
+        with torch.no_grad():
+            restored = model(x)[0, 0].numpy()
+        restored_u8 = np.clip(restored[:ch, :cw] * 255, 0, 255).astype(np.uint8)
+    except Exception as e:   # noqa: BLE001
+        logger.warning('ridge_restore denoise pre-pass failed (non-critical): %s', e)
+        return None
+
+    enhanced_full = g8.copy()
+    enhanced_full[y0:y1, x0:x1] = restored_u8
+
+    mask_f = cv2.GaussianBlur(mask, (31, 31), 0).astype(np.float32) / 255.0
+    bg = np.full_like(enhanced_full, 245)
+    composited = (enhanced_full.astype(np.float32) * mask_f
+                 + bg.astype(np.float32) * (1.0 - mask_f)).astype(np.uint8)
+    return composited
+
+
+# Narrower than the pad/background mask-edge fade (_FADE_INSET_PX=25) --
+# this seam sits INSIDE already-real pad content on both sides (the main
+# frame and the zone frame), not at a pad/background boundary, so a
+# narrower ramp is enough to avoid a visible seam without unnecessarily
+# discarding the zone frame's own better-focused detail near its own edges.
+_FOCUS_ZONE_FEATHER_PX = 18.0
+
+
+def _focus_zone_splice(g8: np.ndarray, mask: np.ndarray,
+                        focus_zones: Optional[dict]) -> np.ndarray:
+    """
+    2026-08-17: incorporates the per-zone focus-bracket stills (real per-
+    zone matchability comparison, CLAUDE.md -- sweep's own dedicated zone
+    shots beat front's sub-crops of one general frame on core/right) into
+    the actual delivered print, not just the diagnostic minutiae-patch
+    scores. Splices each zone's OWN dedicated-focus still into g8, hard-
+    replacing that zone's own sub-region with only a narrow feathered seam
+    -- deliberately NOT the cross-zone pixel-averaging/mosaic fusion this
+    project has already measured destructive multiple times (matchability
+    mosaic, field-domain fusion, zone_reduction_test -- a single un-fused
+    zone beat every fused configuration by 2x+ real bozorth3 separation in
+    every one of those tests).
+
+    Two real, structural differences from that already-failed technique are
+    the reason this is worth trying as a genuinely different mechanism, not
+    a repeat of the same mistake:
+      1. No cross-position registration is needed. Sweep's mosaic/fusion
+         failures traced to real ECC registration error between frames
+         captured at DIFFERENT camera positions/poses/exposures. The
+         focus-zone-bracket shots share the exact same framing as the main
+         frame -- only the AF/AE target moved, the camera never did -- so
+         `guide_region`'s own sub-guide coordinates already apply exactly,
+         with zero alignment step and zero interpolation-error risk.
+      2. This is a hard replace within a spatially bounded sub-region with
+         only a narrow feather at the seam, not a full-region average/
+         blend of two sources. Structurally closer to how this module
+         already feathers the pad mask's own edge (`_FADE_INSET_PX`) than
+         to a cross-zone pixel blend.
+
+    Still a real, UNPROVEN hypothesis, not a confirmed result -- wired in
+    as one more diagnostic-first `enhance` mode (see 'focusZoneSplice'
+    below), gated by the same real-bozorth3-before-production-selection
+    discipline as every other candidate in this pipeline.
+
+    `focus_zones` maps zone name -> {'frame': raw still array, 'region':
+    sub-guide region dict in the SAME guide_region-relative coordinate
+    convention `_superellipse_mask` already expects}. Returns g8 UNCHANGED
+    (never None) when there is nothing usable to splice -- this can only
+    ever add detail inside an already-real sub-region, never remove or
+    degrade the main frame's own content, since every pixel outside a
+    spliced zone is left untouched.
+    """
+    if not focus_zones:
+        return g8
+    h, w = g8.shape[:2]
+    composite = g8.astype(np.float32).copy()
+    any_spliced = False
+    for zone, entry in focus_zones.items():
+        zframe = entry.get('frame') if isinstance(entry, dict) else None
+        region = entry.get('region') if isinstance(entry, dict) else None
+        if zframe is None or region is None:
+            continue
+        if zframe.shape[:2] != g8.shape[:2]:
+            # Real safety net, not expected in practice -- the client's own
+            # decode pipeline uses the identical _stillDecodeTargetWidth +
+            # center-square crop for the zone shots as the main burst,
+            # specifically so these stay pixel-aligned. Skip rather than
+            # risk splicing a mis-scaled zone into the composite.
+            continue
+        zgray = zframe if zframe.ndim == 2 else cv2.cvtColor(zframe, cv2.COLOR_BGR2GRAY)
+        zg8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(zgray.astype(np.uint8))
+        zone_mask = _superellipse_mask((h, w), region)
+        if zone_mask is None:
+            continue
+        # Never splice outside the pad's own already-established mask.
+        zone_mask = cv2.bitwise_and(zone_mask, mask)
+        if (zone_mask > 0).sum() < 200:
+            continue
+        dist = cv2.distanceTransform((zone_mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+        alpha = np.clip(dist / _FOCUS_ZONE_FEATHER_PX, 0.0, 1.0).astype(np.float32)
+        alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
+        composite = composite * (1.0 - alpha) + zg8.astype(np.float32) * alpha
+        any_spliced = True
+    if not any_spliced:
+        return g8
+    return np.clip(composite, 0, 255).astype(np.uint8)
+
+
+def generate(
+    frames: List[np.ndarray],
+    angles_deg: List[float],
+    lap_scores: Optional[List[Optional[float]]] = None,
+    ambient_frames: Optional[List[Optional[np.ndarray]]] = None,
+    flash_frames: Optional[List[Optional[np.ndarray]]] = None,
+    ambient_burst: Optional[List[np.ndarray]] = None,
+    flash_burst: Optional[List[np.ndarray]] = None,
+    ambient_burst_gyros: Optional[List[Optional[float]]] = None,
+    flash_burst_gyros: Optional[List[Optional[float]]] = None,
+    freq_normalize: bool = False,
+    stack: bool = False,
+    focus_stack: bool = False,
+    fuse: Optional[str] = None,
+    mosaic: bool = False,
+    guide_region: Optional[dict] = None,
+    enhance: str = 'gabor',
+    stack_cache: Optional[dict] = None,
+    geom: Optional[str] = None,
+    gabor_sigma_ratio: Optional[float] = None,
+    gabor_gamma: Optional[float] = None,
+    mirror: bool = False,
+    pyfing_blend: float = 1.0,
+    freq_scale_min: Optional[float] = None,
+    pad_mask_override: Optional[np.ndarray] = None,
+    crease_trim: bool = True,
+    circular_vignette: bool = True,
+    focus_zone_frames: Optional[dict] = None,
+) -> Tuple[Optional[np.ndarray], dict]:
+    """
+    Build the AFIS-style binary print from the best face-on frame.
+
+    frames         : BGR or grayscale frames (the same binned list fed to SfM).
+    angles_deg     : per-frame sweep angle (0 = face-on plain impression).
+    lap_scores     : optional per-frame sharpness (client laplacianScore).
+    ambient_frames : optional per-index ambient exposure for each bin (or None).
+    flash_frames   : optional per-index flash exposure for each bin (or None).
+                     Same-pose ambient/flash pairs enable `fuse` (see below).
+    freq_normalize : resample so the ridge period → _TARGET_PERIOD before Gabor.
+    stack          : same-pose burst denoise (align+average).
+    mosaic         : front-anchored minimal-yaw reconstruction — borrow edge
+                     ridges from lightly-yawed side frames without distorting
+                     the front centre. Returns (None, params) if no side frame
+                     registers, so single-source renderings still stand.
+    ambient_burst  : optional flat list of RAW near-face-on ambient shots (the
+    flash_burst      preserved front burst, before binning) for each
+                     illumination. Enables fuse='deep'.
+    ambient_burst_gyros : optional per-frame device rotation rate (deg/s),
+    flash_burst_gyros     index-aligned to ambient_burst/flash_burst
+                     respectively -- added 2026-08-06. Gently down-weights
+                     individual frames in _focus_stack_face_on's combine
+                     (see that function's docstring); has no effect when
+                     omitted or when `focus_stack`/`fuse` doesn't route
+                     through that function.
+    fuse           : 'maxc' | 'avg' — fuse the sharpest face-on bin's ambient +
+                     flash exposures instead of using a single source (uses
+                     ambient_frames/flash_frames);
+                     'deep' — deep-stack ALL preserved raw front-burst shots per
+                     illumination (align+average = denoise) THEN fuse the two
+                     stacks (uses ambient_burst/flash_burst). Returns
+                     (None, params) when the required inputs are absent, so the
+                     max-variant caller keeps the single-source renderings.
+    enhance        : 'gabor' (default, this module's own tuned Gabor bank) or
+                     'pyfing' (routes the masked pad through the pyfing sidecar's
+                     SNFEN model instead -- see _pyfing_enhance). Returns
+                     (None, params) if the sidecar isn't configured/reachable,
+                     so the caller keeps the gabor-based renderings; this can
+                     only ever add a candidate, never remove one.
+                     FIDELITY SCAFFOLDS (opt-in, default off, NOT in main.py's
+                     production variant list, judged by SourceAFIS matchability
+                     not NFIQ2 -- see docs/FIDELITY_WALL_SCOPE.md):
+                       'gaborVarFreq'     -- local per-region ridge-frequency
+                                             Gabor (own classical field
+                                             estimators);
+                       'fidelity'         -- local-freq Gabor + ridge-
+                                             confidence gate that blanks
+                                             hallucinated ridges;
+                       'gaborPyfingField' -- same Gabor bank as gaborVarFreq,
+                                             but orientation+frequency come
+                                             from pyfing's Snfoe/Snffe neural
+                                             estimators instead -- LOCAL
+                                             MEASUREMENT ONLY, requires
+                                             freq_normalize=True, see
+                                             _pyfing_orientation_frequency.
+                     gaborVarFreq/fidelity measurably reduce impostor false-
+                     matches (the right direction) but over-prune genuine
+                     signal at their current first-guess thresholds; they need
+                     the paired dataset to tune before they can win, so they
+                     stay unwired for now. gaborPyfingField not yet measured.
+                       'focusZoneSplice'  -- splices each per-zone focus-
+                                             bracket still (see
+                                             focus_zone_frames below) into
+                                             its own sub-region of the main
+                                             frame, hard-replace + narrow
+                                             feathered seam, NOT the cross-
+                                             zone pixel-fusion already
+                                             measured destructive elsewhere
+                                             in this project -- see
+                                             _focus_zone_splice's own
+                                             docstring for why this is a
+                                             genuinely different mechanism.
+                                             Real, unproven hypothesis --
+                                             diagnostic-first like every
+                                             other fidelity scaffold above.
+    focus_zone_frames : optional {zone_name: {'frame': np.ndarray, 'region':
+                     dict}} -- only consumed by enhance='focusZoneSplice'.
+                     `region` must be in the same guide_region-relative
+                     coordinate convention _superellipse_mask expects (i.e.
+                     the same sub-guide dicts main.py's minutiae-patch loop
+                     already builds). Absent/empty is a no-op self-skip.
+    freq_scale_min : per-call override of _FREQ_SCALE_MIN (module default
+                     0.7 when None), same per-call-override pattern as
+                     gabor_sigma_ratio/gabor_gamma -- deliberately NOT a
+                     module-level change, since _FREQ_SCALE_MIN=0.7 is
+                     itself real-Firestore-validated for freqNorm/deepFuse/
+                     deepMaxc/mosaicFreq and this override must not touch
+                     those. Added 2026-08-07 specifically for
+                     pyfingHybridFreqNorm: real SourceAFIS gate (22
+                     captures, 15 genuine pairs) found 0.9 here roughly
+                     halves the worst-case false-match risk (150.58 ->
+                     76.11 on the specific pair that motivated this) for
+                     essentially no separation cost (39.33 -> 39.02) and
+                     the best genuine-beats-impostor-max rate of any
+                     variant tried all session (5/15). See main.py's
+                     pyfingHybridFreqNorm entry for the production config.
+    pyfing_blend   : enhance='pyfingHybrid' only -- alpha-blend pyfing's
+                     denoised output with the pre-denoise image before the
+                     Gabor bank runs (1.0 = pure pyfing output, the only
+                     behaviour this ever had before 2026-08-07; lower values
+                     retain more original fine detail). RESEARCH LEVER, not
+                     yet validated: pyfingHybrid+freq_normalize's real
+                     SourceAFIS gate (22 captures, 15 genuine pairs) found
+                     the best raw genuine-vs-impostor separation of any
+                     variant tried this session, but also the worst false-
+                     match spike (one impostor pair scored ~4x SourceAFIS's
+                     own recommended threshold) -- visually confirmed as
+                     generic, boundary-driven ridge structure shared between
+                     two different real users, the same over-synthesis
+                     failure this module's own gaborPyfingField finding
+                     already documented. Blending back toward the original
+                     is a plausible way to keep pyfing's continuity repair
+                     while diluting its tendency to invent generic structure
+                     where the true signal is weak -- untested until swept
+                     against the same gate.
+    stack_cache    : optional caller-owned dict, reused across repeated calls
+                     within ONE request (e.g. main.py's max-of-variants loop
+                     calling generate() once per fuse mode) to avoid redoing
+                     the expensive _stack_face_on ECC alignment for 'deep'/
+                     'deepMaxc'/'deepSoft', which share identical inputs.
+                     Pass a fresh {} per request -- never a module-level/
+                     global cache, which would risk stale reuse across
+                     different requests on a warm Cloud Run instance.
+
+    geom           : optional cross-domain geometry correction toward contact-
+                     print geometry (C2CL-style), applied to the masked pad
+                     before enhancement. None (default) = off. 'cyl' = single-
+                     image cylinder-curvature rectification; 'cylElastic' =
+                     cyl + (currently identity) elastic flatten. See
+                     geom_correct.py / docs/FIDELITY_WALL_SCOPE.md. SCAFFOLD:
+                     validated by SourceAFIS genuine-vs-impostor separation
+                     (NOT NFIQ2), not yet tuned/wired into production variants
+                     — needs the paired dataset (scope doc item A) first.
+
+    Returns (binary uint8 image or None, params dict for Firestore).
+    """
+    params: dict = {'afisSource': None, 'afisWavelengthPx': None, 'afisMask': None}
+    if not frames:
+        return None, params
+
+    # Rank face-on candidates by SERVER-computed ridge-band energy — the
+    # client's laplacianScore is a whole-preview-frame proxy captured before
+    # the still fired (observed identical across a burst), so it can't
+    # distinguish the sharp still from a soft one. A DoG band-energy probe on
+    # a centre crop is ~ms per frame and measures the actual ridge signal.
+    def _ridge_energy(frame: np.ndarray) -> float:
+        g = frame if frame.ndim == 2 else cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = g.shape
+        c = g[h // 4: 3 * h // 4, w // 4: 3 * w // 4].astype(np.float32)
+        lo = cv2.GaussianBlur(c, (0, 0), 1.2)
+        hi = cv2.GaussianBlur(c, (0, 0), 3.5)
+        return float(np.abs(lo - hi).mean())
+
+    face_on = [i for i in range(len(frames))
+               if abs(float(angles_deg[i])) <= _FACE_ON_MAX_DEG and frames[i] is not None]
+    candidates = face_on if face_on else [i for i in range(len(frames)) if frames[i] is not None]
+    if not candidates:
+        return None, params
+    order = sorted(candidates, key=lambda i: -_ridge_energy(frames[i]))
+    src = frames[order[0]]
+    params['afisSource'] = {
+        'frameIndex': int(order[0]),
+        'angleDeg': float(round(float(angles_deg[order[0]]), 1)),
+    }
+
+    gray = src if src.ndim == 2 else cv2.cvtColor(src, cv2.COLOR_BGR2GRAY)
+
+    # Flash + ambient fusion. Walk the ridge-energy-ranked face-on candidates
+    # and fuse the FIRST bin that has both an ambient and a flash exposure of
+    # the same pose (they are already per-bin aligned by the oscillating
+    # downloader). This is complementary-illumination signal fusion with no
+    # geometric distortion and is the single biggest superprint lever found:
+    # +5–7 NFIQ on the hardest captures. Emits None (variant skipped) when no
+    # fusable pair exists, so single-source renderings still stand.
+    if fuse in ('deep', 'deepMaxc', 'deepSoft', 'deepFocusAvg', 'deepFocusMaxc', 'deepFocusSoft',
+                'deepAmbBestFl'):
+        # Deep raw-burst fusion: denoise each illumination by aligning+averaging
+        # ALL its preserved near-face-on burst shots, THEN fuse the two clean
+        # stacks. Strengthens both fusion inputs before combining — worth
+        # +2.5–8.5 NFIQ over the single best shot in testing. Needs the raw
+        # front burst preserved past binning (main._download_front_burst).
+        #
+        # Fusion mode matters for the flash SPECULAR SMUDGE (CTO feedback:
+        # "shadows/dark smudges that cover ridge patterns because of too much
+        # flash reflection"). Flat 'avg' keeps a blown-out flash centre half-
+        # bright, washing out the ridges there; the coherence modes ('maxc'
+        # hard per-block, 'soft' feathered) instead take whichever exposure
+        # actually RESOLVES ridges in each region, so the ambient exposure
+        # wins back the specular-blown centre. Confirmed on a real capture
+        # (3e54236a): maxc-fused superprint is a clean, fully-covered whorl
+        # with the centre smudge gone, vs. avg's washed centre (real NFIQ2
+        # 57->81, bozorth 4->6). All three are scored as separate max-variants
+        # in main.py, so the coherence modes can only ever raise the result.
+        _deep_mode = {
+            'deep': 'avg', 'deepMaxc': 'maxc', 'deepSoft': 'soft',
+            'deepFocusAvg': 'avg', 'deepFocusMaxc': 'maxc', 'deepFocusSoft': 'soft',
+            'deepAmbBestFl': 'maxc',
+        }[fuse]
+        # deepFocus* variants (2026-07-24): combine two techniques already
+        # separately validated but never together -- per-illumination
+        # SHARPNESS-WEIGHTED stacking (_focus_stack_face_on, targets the
+        # pad's curved edges going soft under a single frame's shallow
+        # macro depth-of-field) feeding the SAME coherence-based ambient/
+        # flash fusion (maxc/soft, already proven to win back the flash
+        # specular-blown centre) that plain deep/deepMaxc/deepSoft use with
+        # a flat average instead. Max-of-variants, so this can only ever
+        # add a candidate.
+        # deepAmbBestFl (2026-08-16, CTO idea): flash frames are this
+        # project's own recurring source of blown-out/inconsistent exposure
+        # (torch-blowout pattern documented repeatedly elsewhere in this
+        # file) -- averaging the WHOLE flash burst, like plain deep*/
+        # deepFocus* do, risks diluting one genuinely good flash frame with
+        # several blown-out ones. This keeps deep*'s ambient-side averaging
+        # (ambient exposes consistently enough that averaging is a clean
+        # noise-reduction win) but swaps the flash side for a single BEST
+        # frame (highest pad-crop sharpness), never averaged. Unmeasured
+        # until this exact test -- see the harness in scratchpad/ps.
+        _use_best_flash = fuse == 'deepAmbBestFl'
+        _use_focus_stack = fuse.startswith('deepFocus')
+        _stack_fn = _focus_stack_face_on if _use_focus_stack else _stack_face_on
+        if _use_focus_stack:
+            _cache_key = ('da_focus', 'df_focus')
+        elif _use_best_flash:
+            _cache_key = ('da', 'df_bestfl')
+        else:
+            _cache_key = ('da', 'df')
+        # Paired filtering (image, gyro) so the gyro list stays index-aligned
+        # to `ab`/`fb` after dropping None entries -- see _focus_stack_face_on
+        # docstring for what the gyro values feed into (_stack_face_on itself
+        # ignores them).
+        _ab_pairs = [
+            (g, gy) for g, gy in
+            zip(ambient_burst or [], ambient_burst_gyros or [None] * len(ambient_burst or []))
+            if g is not None
+        ]
+        ab = [p[0] for p in _ab_pairs]
+        ab_gyros = [p[1] for p in _ab_pairs]
+        _fb_pairs = [
+            (g, gy) for g, gy in
+            zip(flash_burst or [], flash_burst_gyros or [None] * len(flash_burst or []))
+            if g is not None
+        ]
+        fb = [p[0] for p in _fb_pairs]
+        fb_gyros = [p[1] for p in _fb_pairs]
+        if not ab and not fb:
+            return None, params
+        # _stack_face_on/_focus_stack_face_on do ECC-affine registration
+        # across the WHOLE burst -- expensive, and identical within each
+        # family (deep/deepMaxc/deepSoft share one cache slot;
+        # deepFocusAvg/deepFocusMaxc/deepFocusSoft share a SEPARATE one,
+        # since they need the sharpness-weighted stack, not the flat-
+        # averaged one). Found 2026-07-16 (real device capture 9efb7d1e):
+        # on a burst with poorly-correlated flash frames, redoing this 3x
+        # (once per fuse-mode variant) took 15+ minutes for a single
+        # variant, blowing the Cloud Run request timeout and leaving the
+        # capture stuck forever. Cache across the family via the caller-
+        # supplied, request-scoped `stack_cache` dict (main.py creates one
+        # fresh dict per request and passes it to every variant call) --
+        # never a module-level/global cache, so there's no risk of stale
+        # reuse across different requests.
+        if stack_cache is not None and _cache_key[0] in stack_cache:
+            da = stack_cache[_cache_key[0]]
+        else:
+            da = _stack_fn(ab, gyros=ab_gyros) if len(ab) >= 2 else (ab[0] if ab else None)
+            if stack_cache is not None:
+                stack_cache[_cache_key[0]] = da
+        if stack_cache is not None and _cache_key[1] in stack_cache:
+            df = stack_cache[_cache_key[1]]
+        elif _use_best_flash:
+            df = _best_frame_by_sharpness(fb)
+            if stack_cache is not None:
+                stack_cache[_cache_key[1]] = df
+        else:
+            df = _stack_fn(fb, gyros=fb_gyros) if len(fb) >= 2 else (fb[0] if fb else None)
+            if stack_cache is not None:
+                stack_cache[_cache_key[1]] = df
+        if da is not None and da.ndim != 2:
+            da = cv2.cvtColor(da, cv2.COLOR_BGR2GRAY)
+        if df is not None and df.ndim != 2:
+            df = cv2.cvtColor(df, cv2.COLOR_BGR2GRAY)
+        if da is not None and df is not None:
+            fused = _fuse_flash_ambient(da, df, mode=_deep_mode)
+            gray = fused if fused is not None else da
+        elif da is not None or df is not None:
+            gray = da if da is not None else df
+        else:
+            return None, params
+        params['afisDeepFuse'] = {
+            'nAmb': len(ab), 'nFla': len(fb), 'mode': _deep_mode,
+            'stack': 'focus' if _use_focus_stack else 'mean',
+        }
+    elif fuse:
+        if ambient_frames is None or flash_frames is None:
+            return None, params
+        # Rank fusion candidates by MOST FACE-ON first (smallest |angle|), then
+        # by the weaker of the two exposures' ridge energy — a bin only fuses
+        # well if BOTH its ambient and flash are sharp, and an off-centre bin
+        # (even if one exposure is very sharp) reintroduces the oblique
+        # distortion fusion is meant to avoid. This is deliberately different
+        # from the single-source `order` (which maximises one frame's energy).
+        def _pair_key(i):
+            amb = ambient_frames[i] if i < len(ambient_frames) else None
+            fla = flash_frames[i] if i < len(flash_frames) else None
+            if amb is None or fla is None:
+                return None
+            return (abs(float(angles_deg[i])),
+                    -min(_ridge_energy(amb), _ridge_energy(fla)))
+        pair_cands = sorted((i for i in candidates if _pair_key(i) is not None),
+                            key=_pair_key)
+        fused = None
+        for i in pair_cands:
+            fused = _fuse_flash_ambient(ambient_frames[i], flash_frames[i], mode=fuse)
+            if fused is not None:
+                gray = fused
+                params['afisFused'] = fuse
+                params['afisFusedBin'] = int(i)
+                params['afisFusedAngle'] = float(round(float(angles_deg[i]), 1))
+                break
+        if fused is None:
+            # Real gap found 2026-07-24 (same root cause as stack/focusStack
+            # above): for front_only_v1, ambient_frames/flash_frames are
+            # each length 1 (the single pre-selected pair), so when THAT one
+            # pair fails to register/fuse (real captures observed: 847fa2d3,
+            # 5aa18155 -- all of fuseAvg/fuseMaxc/fuseSoft returned None),
+            # the variant has no other pair to fall back to and dies
+            # entirely. Try additional same-pose pairs from the raw
+            # preserved burst (ambient_burst/flash_burst, already
+            # downloaded for deepFuse) ONLY once the primary pair has
+            # already failed -- the primary pair is still tried FIRST and
+            # stops the loop on success exactly as before, so this can only
+            # ever promote an already-guaranteed-None result to a real one.
+            _burst_amb = [g for g in (ambient_burst or []) if g is not None]
+            _burst_fla = [g for g in (flash_burst or []) if g is not None]
+            _n = min(len(_burst_amb), len(_burst_fla))
+            _burst_pairs = sorted(
+                range(_n),
+                key=lambda i: -min(_ridge_energy(_burst_amb[i]), _ridge_energy(_burst_fla[i])))
+            for i in _burst_pairs:
+                fused = _fuse_flash_ambient(_burst_amb[i], _burst_fla[i], mode=fuse)
+                if fused is not None:
+                    gray = fused
+                    params['afisFused'] = fuse
+                    params['afisFusedBin'] = f'burst_{i}'
+                    break
+        if fused is None:
+            return None, params
+
+    # Front-anchored minimal-yaw reconstruction. Anchor on the sharpest face-on
+    # frame (order[0]) and borrow edge ridge detail from lightly-yawed
+    # neighbours. Distortion-free because the yaw is tiny and the front centre
+    # is preserved; adds genuine pad-edge coverage the single frame lacks.
+    if mosaic and not fuse:
+        front_g = gray
+        sides = [frames[i] for i in range(len(frames))
+                 if _MOSAIC_YAW_MIN < abs(float(angles_deg[i])) <= _MOSAIC_YAW_DEG
+                 and frames[i] is not None]
+        sides = sorted(sides, key=lambda f: -_ridge_energy(f))[:_MOSAIC_MAX_SIDE]
+        if not sides:
+            return None, params
+        mos, n_used = _front_anchored_mosaic(front_g, sides)
+        if mos is None:
+            return None, params
+        gray = mos
+        params['afisMosaicSides'] = int(n_used)
+
+    # Same-pose multi-shot stacking. Aligning and averaging near-identical
+    # views is PURE denoising with no geometric distortion -- unlike
+    # multi-ANGLE reconstruction, which unrolls oblique deformable-skin views
+    # and measurably HURTS NFIQ (tested: whole-print unwrap scored 15-18pts
+    # below the single frame). Restrict to a TIGHT window around the sharpest
+    # frame's angle (±_STACK_ANGLE_DEG) so only genuinely same-pose stills are
+    # averaged -- a wider set blends slightly-different views and blurs ridges.
+    # Lifts NFIQ ~+3 by cutting sensor/rolling-shutter noise; falls back to the
+    # single sharpest frame if <2 same-pose frames or alignment fails.
+    #
+    # Gated behind `stack` because it can REGRESS a good capture: when the
+    # binned frame list carries only ~2 near-face-on stills, or when the
+    # "same-pose" frames are actually mild-different views, averaging softens
+    # ridges (observed -3.3 NFIQ on the sunlight capture). main.py scores the
+    # stacked rendering as an ADDITIONAL max-variant alongside the unstacked
+    # ones and keeps the higher NFIQ, so stacking can only ever help.
+    if (stack or focus_stack) and not fuse and not mosaic:
+        src_ang = float(angles_deg[order[0]])
+        same_pose = [i for i in order
+                     if abs(float(angles_deg[i]) - src_ang) <= _STACK_ANGLE_DEG]
+        same_frames = [frames[i] for i in same_pose[:_STACK_MAX]]
+        # `frames` has no associated per-frame gyro source, so the primary
+        # path above has none available -- same_gyros stays None (neutral
+        # weighting) unless the starvation fallback below populates it from
+        # ambient_burst_gyros/flash_burst_gyros.
+        same_gyros: Optional[List[Optional[float]]] = None
+        # Real bug found 2026-07-24: for front_only_v1 (this project's own
+        # active capture mode), main.py's _download_front_only_frames hands
+        # this function exactly ONE pre-selected frame -- `frames` (and
+        # therefore `same_frames` above) is always length 1, so `stack`/
+        # `focusStack` were STRUCTURALLY GUARANTEED to return None on every
+        # single front_only_v1 request, despite being two of the variants
+        # main.py's _afis_variants runs every single time. Confirmed via a
+        # local sweep of the real capture library: with real multi-frame
+        # material, focusStack alone jumped from a no-op (tied with `native`,
+        # since it silently fell through) to real wins up to +17 real NFIQ2
+        # on some captures. Fall back to the raw preserved same-pose burst
+        # (ambient_burst/flash_burst -- already downloaded for every
+        # front_only_v1 request to feed deepFuse, all same face-on pose by
+        # construction) when the primary frame list can't supply the >=2
+        # frames needed to stack anything itself. This can only ever
+        # PROMOTE an already-guaranteed-None result to a real one -- it
+        # never touches same_frames when `frames` already had enough
+        # material (four-angle/oscillating capture modes, which don't hit
+        # this starvation), so it can't regress those.
+        if len(same_frames) < 2:
+            # Paired (image, gyro) so sorting by ridge energy below can't
+            # desynchronize the two lists -- see _focus_stack_face_on's
+            # docstring for what the gyro values feed into.
+            _burst_pool_pairs = [
+                (g, gy) for g, gy in
+                list(zip(ambient_burst or [],
+                         ambient_burst_gyros or [None] * len(ambient_burst or []))) +
+                list(zip(flash_burst or [],
+                         flash_burst_gyros or [None] * len(flash_burst or [])))
+                if g is not None
+            ]
+            if len(_burst_pool_pairs) >= 2:
+                _burst_pool_pairs.sort(key=lambda pair: -_ridge_energy(pair[0]))
+                _burst_pool_pairs = _burst_pool_pairs[:_STACK_MAX]
+                same_frames = [p[0] for p in _burst_pool_pairs]
+                same_gyros = [p[1] for p in _burst_pool_pairs]
+        # focus_stack: sharpness-weighted combine (keep the best-focused region
+        # of each frame -- targets soft pad edges); stack: flat average (denoise).
+        # Both branches align the SAME `same_frames` list and differ only in
+        # how they combine it, so they share one alignment via the caller's
+        # request-scoped stack_cache -- see _align_face_on_stack's own cache
+        # docs. Distinct key from the deep* family's 'da'/'df' slots, which
+        # cache a different frame set entirely.
+        stacked = (_focus_stack_face_on(same_frames, gyros=same_gyros,
+                                        align_cache=stack_cache,
+                                        align_key='align_same_pose')
+                   if focus_stack
+                   else _stack_face_on(same_frames,
+                                       align_cache=stack_cache,
+                                       align_key='align_same_pose'))
+        if stacked is not None:
+            gray = stacked
+            params['afisStacked'] = len(same_frames)
+            params['afisStackMode'] = 'focus' if focus_stack else 'mean'
+    g8 = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)).apply(gray.astype(np.uint8))
+
+    # Guided path: the user visually seated the pad inside the on-screen
+    # silhouette, so that region IS the mask -- no free-range segmentation to
+    # bleed onto creases/hand/background, and no fragile ridge-periodicity crop
+    # (which selected a crease-side sliver on real captures). See
+    # _superellipse_mask. Falls through to segmentation only if the region
+    # rasterizes to nothing (degenerate params).
+    guide_mask = _superellipse_mask(gray.shape[:2], guide_region) if guide_region else None
+    if guide_mask is not None:
+        mask = guide_mask
+        params['afisMask'] = 'guide'
+
+        # Content-aware refinement, with COVERAGE EXPANSION. The guide
+        # silhouette is only where the on-screen overlay sat -- the real
+        # ridge-bearing pad extends BEYOND the tight guide oval (notably the
+        # tip), so masking to the bare guide throws away real, matchable
+        # ridge area (CTO feedback: "entire thumbpad should be covered").
+        # But the guide is also purely geometric with zero awareness of what
+        # is actually in frame, so background past its edges would get
+        # Gabor-noised if we just grew it blindly.
+        #
+        # Resolve both with a real per-capture pad detector: flash-diff
+        # (torch falls off with distance^2, so flash-minus-ambient isolates
+        # the near-camera pad almost regardless of background -- see
+        # sfm_pipeline._segment_via_flash_diff), U-Net fallback. Then:
+        #   - use the DETECTED pad as the mask (covers the whole real pad,
+        #     tip included), but
+        #   - CLIP it to a generous dilation of the guide (bound), so we can
+        #     never wander onto far background or the hand/wrist behind the
+        #     pad even if the detector over-segments.
+        # Falls back to the bare guide mask if the detector is unavailable or
+        # the result looks degenerate/runaway, so this can't regress a
+        # capture where the guide alone was already right.
+        # An explicit PAD mask from the caller wins over both detectors.
+        # Added 2026-08-12 for the matchability mosaic: _unet_mask segments
+        # the whole FINGER (joint included) and _flash_diff_mask needs an
+        # ambient/flash pair the mosaic path does not have, so neither can
+        # express "friction-ridge pad only". _pad_within_finger can, and the
+        # caller supplies its result here. Everything downstream (hole fill,
+        # guide-dilation clip, the runaway-area accept gate) still applies
+        # unchanged, so an override is bounded exactly like a detected mask.
+        if pad_mask_override is not None and pad_mask_override.shape[:2] == gray.shape[:2]:
+            pad_mask = pad_mask_override
+            refine_tag = 'padrefined'
+        else:
+            pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2], guide_region)
+            refine_tag = 'flashdiff'
+            if pad_mask is None:
+                pad_mask = _unet_mask(gray)
+                refine_tag = 'unet'
+        if pad_mask is not None:
+            # Real bug found 2026-07-23 (capture dadd4ef9): a noisy detector
+            # can leave an enclosed hole/notch in an otherwise-plausible pad
+            # mask, which becomes a literal white hole in the final print
+            # (mask==0 is hard-forced to white below) even though the guide's
+            # own area-only accept-gate has no way to catch it. Fill enclosed
+            # holes before that gate runs -- can only recover area already
+            # inside the detected pad, never grow past it.
+            pad_mask = _fill_mask_holes(pad_mask)
+            if _MASK_COVER_DILATE > 1.0:
+                bound = _superellipse_mask(gray.shape[:2], {
+                    **guide_region,
+                    'rx': float(guide_region['rx']) * _MASK_COVER_DILATE,
+                    'ry': float(guide_region['ry']) * _MASK_COVER_DILATE,
+                })
+                cand = cv2.bitwise_and(pad_mask, bound) if bound is not None else None
+                bound_area = (bound > 0).sum() if bound is not None else 1
+            else:
+                cand = cv2.bitwise_and(mask, pad_mask)      # legacy shrink-only
+                bound_area = (guide_mask > 0).sum()
+            # Accept only a plausible mask: at least a third of the guide (not
+            # a sliver from a misfire) and not filling ~the entire generous
+            # bound (which would mean the detector grabbed everything ->
+            # untrustworthy). Otherwise keep the bare guide.
+            if cand is not None:
+                cov = (cand > 0).sum()
+                if 0.35 * (guide_mask > 0).sum() <= cov <= 0.92 * bound_area:
+                    mask = cand
+                    params['afisMask'] = f'guide+{refine_tag}'
+                    params['afisMaskCoverPx'] = int(cov)
+    else:
+        # Mask FIRST, at native resolution -- the U-Net was trained on native-res
+        # frames, so segmenting a resampled image degrades the mask.
+        mask = _unet_mask(gray)
+        params['afisMask'] = 'unet' if mask is not None else 'coherence_hull'
+        if mask is None:
+            mask = _coherence_hull_mask(g8)
+        if mask is None or (mask > 0).mean() < 0.03:
+            logger.warning('AFIS print: no usable thumb mask — skipping')
+            return None, params
+        # A mask covering most of the frame means segmentation failed to isolate
+        # the thumb (the whole photo, background included, would be Gabor-noised).
+        # Better to emit nothing than a full-frame ridge-noise field.
+        if (mask > 0).mean() > 0.55:
+            logger.warning('AFIS print: mask covers %.0f%% of frame — segmentation '
+                           'failed, skipping', 100 * (mask > 0).mean())
+            params['afisMask'] = params['afisMask'] + '_rejected'
+            return None, params
+
+        # Tighten to just the ridge-bearing pad -- the mask above segments the
+        # whole visible thumb (creases, lower segment, palm on a close/wide
+        # framing), not only the print-worthy area. See _crop_to_pad_mask. Uses
+        # g8 (CLAHE-boosted): raw contrast is too low across most of the frame
+        # for the block-std gate to pass at all.
+        mask = _crop_to_pad_mask(g8, mask)
+
+    # Cross-domain geometry correction (C2CL-style), OFF unless requested via
+    # `geom`. Undoes the contactless-vs-contact geometric mismatch (cylinder
+    # foreshortening + eventually elastic flatten) on the masked pad BEFORE
+    # enhancement, warping g8 and mask together so the rest of the pipeline
+    # (freq-normalise, Gabor, feather, upright) is unchanged. Wired as its own
+    # max-of-variants candidate in main.py — can only add a print, never
+    # regress the best. Success is SourceAFIS genuine-vs-impostor separation,
+    # NOT NFIQ2 (see geom_correct.py / docs/FIDELITY_WALL_SCOPE.md). Returns
+    # None to self-skip (kept the un-corrected image) if the pad is degenerate.
+    if geom:
+        _gc = _geom_correct(g8, mask, geom)
+        if _gc is None:
+            return None, params
+        g8, mask = _gc
+        params['afisGeom'] = geom
+
+    # Ridge-frequency normalisation. NFIQ (and every scanner-trained ridge
+    # model) is calibrated for 500 DPI prints, where the ridge period is ~9 px.
+    # Our macro captures land anywhere from 9–20 px depending on phone
+    # distance, so the model sees an out-of-domain frequency and scores low.
+    # Estimate the native ridge wavelength on the MASKED pad, then resample the
+    # image AND the mask together so the period becomes _TARGET_PERIOD before
+    # enhancement (mask stays at native res for the U-Net; only the Gabor stage
+    # sees the resampled version). Grid search over real captures: consistent
+    # NFIQ gain when the estimate is reliable.
+    norm0 = _normalize(g8)
+    orient0 = _orientation_field(norm0)
+    native_wl = _ridge_wavelength(norm0, orient0)
+    params['afisWavelengthPx'] = float(round(native_wl, 1))
+    # Diagnostic-only, unclipped, multi-peak-averaged companion measurement
+    # -- see _ridge_wavelength_robust's docstring. Does NOT feed the
+    # freq_normalize scale below; native_wl (clipped, first-peak) is the
+    # only value that ever drives enhancement, unchanged from before.
+    raw_wl, raw_wl_blocks = _ridge_wavelength_robust(norm0, orient0)
+    params['afisWavelengthPxRaw'] = float(round(raw_wl, 1))
+    params['afisWavelengthPxRawBlocks'] = raw_wl_blocks
+    wl = native_wl
+    if freq_normalize and native_wl > 1.0:
+        _scale_min = freq_scale_min if freq_scale_min is not None else _FREQ_SCALE_MIN
+        scale = float(np.clip(_TARGET_PERIOD / native_wl, _scale_min, 2.5))
+        if abs(scale - 1.0) > 0.05:
+            interp = cv2.INTER_CUBIC if scale > 1 else cv2.INTER_AREA
+            g8 = cv2.resize(g8, None, fx=scale, fy=scale, interpolation=interp)
+            mask = cv2.resize(mask, (g8.shape[1], g8.shape[0]),
+                              interpolation=cv2.INTER_NEAREST)
+            params['afisFreqScale'] = float(round(scale, 3))
+            wl = _TARGET_PERIOD
+
+    binimg = None
+    if enhance == 'gaborVarFreq':
+        # Spatially-varying ridge-frequency Gabor: fit each region with its own
+        # LOCAL ridge period instead of one global wavelength, so ridges stay
+        # continuous where the pad's frequency deviates from the median (tip vs
+        # base). Falls back to the single-wavelength Gabor if too few reliable
+        # period blocks. See _ridge_frequency_map / _gabor_enhance_varfreq.
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        fmap = _ridge_frequency_map(norm, orient, mask)
+        if fmap is not None:
+            enh = _gabor_enhance_varfreq(norm, orient, fmap)
+            params['afisEnhance'] = 'gaborVarFreq'
+        else:
+            enh = _gabor_enhance(norm, orient, wl)
+            params['afisEnhance'] = 'gaborVarFreq_fallback'
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+    elif enhance == 'gaborPyfingField':
+        # RESEARCH: same Gabor bank as gaborVarFreq, but the orientation +
+        # frequency FIELDS feeding it come from pyfing's neural estimators
+        # (Snfoe/Snffe) instead of this module's own classical ones -- isolates
+        # whether the field estimate is the limiting factor. See
+        # _pyfing_orientation_frequency's docstring for the freq_normalize=True
+        # requirement and the LOCAL-MEASUREMENT-ONLY caveat.
+        norm = _normalize(g8)
+        fields = _pyfing_orientation_frequency(g8, mask)
+        if fields is not None:
+            orient, fmap = fields
+            enh = _gabor_enhance_varfreq(norm, orient, fmap)
+            params['afisEnhance'] = 'gaborPyfingField'
+        else:
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            params['afisEnhance'] = 'gaborPyfingField_fallback'
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+    elif enhance == 'fidelity':
+        # FIDELITY-oriented enhancement (prime directive): local-frequency
+        # Gabor + a ridge-CONFIDENCE gate that blanks hallucinated ridges in
+        # low-signal regions, so only repeatable, matchable minutiae survive.
+        # Trades NFIQ2 texture for genuine-vs-impostor separation; judged by
+        # SourceAFIS, not NFIQ2. See _ridge_confidence / _apply_confidence_gate.
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        fmap = _ridge_frequency_map(norm, orient, mask)
+        enh = (_gabor_enhance_varfreq(norm, orient, fmap) if fmap is not None
+               else _gabor_enhance(norm, orient, wl))
+        conf = _ridge_confidence(g8, mask)
+        binimg = _apply_confidence_gate(enh, conf)
+        params['afisEnhance'] = 'fidelity'
+    elif enhance == 'pyfing':
+        binimg = _pyfing_enhance(g8, mask, wl)
+        params['afisEnhance'] = 'pyfing' if binimg is not None else 'pyfing_unavailable'
+    elif enhance == 'pyfingHybrid':
+        # pyfing as a denoise PRE-PASS, not a standalone final image: run
+        # SNFEN to clean up ridge continuity, then let this module's own
+        # Gabor bank + hard binarization (calibrated against these exact
+        # captures) do the final black-ridge/white-background conversion,
+        # instead of a plain intensity invert of pyfing's own continuous-
+        # tone output. See _pyfing_denoise's docstring for why the two
+        # conventions aren't interchangeable via a simple invert.
+        denoised = _pyfing_denoise(g8, mask, wl)
+        if denoised is not None:
+            if pyfing_blend < 1.0:
+                alpha = float(np.clip(pyfing_blend, 0.0, 1.0))
+                denoised = cv2.addWeighted(
+                    denoised.astype(np.float32), alpha,
+                    g8.astype(np.float32), 1.0 - alpha, 0.0
+                ).astype(np.uint8)
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'pyfingHybrid'
+        else:
+            params['afisEnhance'] = 'pyfingHybrid_unavailable'
+    elif enhance == 'coherenceDiff':
+        # Coherence-enhancing diffusion as a denoise PRE-PASS (same role as
+        # _pyfing_denoise in the hybrid path, but classical, local, and
+        # always available -- no sidecar dependency): smooth lengthwise
+        # along the ridge direction to repair small discontinuities, THEN
+        # run this module's own tuned Gabor bank + binarization on top for
+        # the final black-ridge/white-background conversion.
+        norm = _normalize(g8)
+        orient0 = _orientation_field(norm)
+        denoised = _coherence_diffusion(norm, orient0)
+        orient = _orientation_field(denoised)
+        enh = _gabor_enhance(denoised, orient, wl)
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+        params['afisEnhance'] = 'coherenceDiff'
+    elif enhance == 'nnsHybrid':
+        # This project's OTHER enhancement model (enhancement_pipeline.enhance(),
+        # CLAHE+Gabor+FingerprintUNet -- see "NNS Enhancement" in main.py) as a
+        # denoise pre-pass: its continuous-tone output is visibly smoother/more
+        # ridge-continuous than the AFIS binarized template but scores far
+        # lower on real NFIQ2 alone (39 vs 76 on the same real capture,
+        # 2026-07-16) -- feed it through this module's own tuned Gabor bank +
+        # binarization instead of using it as the final image, same
+        # denoise-then-Gabor pattern as pyfingHybrid/coherenceDiff. Unlike
+        # pyfing, NNS's own convention already matches this project's
+        # (ridges dark, background light) -- no invert needed.
+        denoised = _nns_denoise(g8, mask)
+        if denoised is not None:
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'nnsHybrid'
+        else:
+            params['afisEnhance'] = 'nnsHybrid_unavailable'
+    elif enhance == 'ridgeRestoreHybrid':
+        # ml/ridge_restore_curriculum's curriculum-degradation-trained net
+        # as a denoise pre-pass, same pattern as pyfingHybrid/nnsHybrid.
+        # Research/validation only -- see _ridge_restore_denoise's own
+        # docstring for the real, not-yet-closed domain-gap caveat.
+        denoised = _ridge_restore_denoise(g8, mask)
+        if denoised is not None:
+            norm = _normalize(denoised)
+            orient = _orientation_field(norm)
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'ridgeRestoreHybrid'
+        else:
+            params['afisEnhance'] = 'ridgeRestoreHybrid_unavailable'
+    elif enhance == 'focusZoneSplice':
+        # See _focus_zone_splice's own docstring for the full mechanism and
+        # why it's structurally different from the already-refuted cross-
+        # zone fusion techniques. Splices happen BEFORE _normalize/
+        # _orientation_field/_gabor_enhance run, so ridge orientation is
+        # computed once over the WHOLE composite -- stays locally coherent
+        # across each seam, unlike stitching together already-binarized
+        # crops (closer to the matchability mosaic's own failure mode).
+        spliced = _focus_zone_splice(g8, mask, focus_zone_frames)
+        norm = _normalize(spliced)
+        orient = _orientation_field(norm)
+        enh = _gabor_enhance(norm, orient, wl)
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255
+        params['afisEnhance'] = ('focusZoneSplice' if focus_zone_frames
+                                  else 'focusZoneSplice_unavailable')
+    elif enhance == 'fomfe':
+        # Global 2D-Fourier orientation-field model instead of a denoise
+        # pre-pass -- see _fomfe_orientation_field's own docstring. No
+        # separate denoise step: this replaces ONLY how the orientation
+        # field itself is estimated (the direction Gabor filters at each
+        # pixel), leaving the actual pixel content (g8/norm) untouched --
+        # a different axis of change than every other hybrid variant above,
+        # which all denoise the IMAGE then re-run the existing local
+        # orientation estimator on the cleaned image.
+        norm = _normalize(g8)
+        orient = _fomfe_orientation_field(norm, mask)
+        if orient is not None:
+            enh = _gabor_enhance(norm, orient, wl)
+            binimg = 255 - (enh < 0).astype(np.uint8) * 255
+            params['afisEnhance'] = 'fomfe'
+        else:
+            params['afisEnhance'] = 'fomfe_unavailable'
+    if binimg is None:
+        # Either enhance == 'gabor', or a pyfing path was requested but the
+        # sidecar wasn't configured/reachable -- same non-blocking contract
+        # as every other optional signal in this module (fall back, don't
+        # fail).
+        norm = _normalize(g8)
+        orient = _orientation_field(norm)
+        enh = _gabor_enhance(
+            norm, orient, wl,
+            sigma_ratio=(gabor_sigma_ratio if gabor_sigma_ratio is not None
+                         else _GABOR_SIGMA_RATIO),
+            gamma=(gabor_gamma if gabor_gamma is not None else _GABOR_GAMMA),
+        )
+        binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
+        params.setdefault('afisEnhance', 'gabor')
+
+    # Sub-pixel anti-alias pass (2026-08-03, visual-QA finding, MEASURED
+    # NEGATIVE on real NFIQ2 -- OFF by default, see below). The hard sign-
+    # threshold binarization above (`enh < 0`) quantizes a smooth Gabor
+    # response straight to 0/255, leaving a visible pixel "staircase" along
+    # every ridge edge -- clearly visible zoomed in, even in the print's
+    # interior, far from any mask boundary. A real scanner print's ridge
+    # edges are naturally anti-aliased, not stair-stepped, so a small
+    # Gaussian blur on binimg looks visually closer to a real print.
+    # Swept sigma 0.0/0.3/0.5/0.7/1.0/1.3/1.6 against REAL NFIQ2 (locally
+    # built nfiq2 binary, not the proxy) on 4 diverse real captures
+    # (nfiq2Score 46-95): mean score fell fairly consistently as sigma rose
+    # (0.0: 66.75 -> 0.7: 64.00 -> 1.6: 59.75) -- confirms this pipeline's
+    # own established finding that NFIQ2 specifically rewards high-frequency
+    # ridge-like texture, and any smoothing directly trades that away. This
+    # is a real look-vs-score conflict, not a bug: unlike the mask-taper fix
+    # above (a clean win on both axes), this one only helps the visual read.
+    # Left OFF (0.0) by default rather than unilaterally trading away score
+    # for looks -- flip _AA_SIGMA to e.g. 0.7 if visual naturalness should
+    # win this specific trade-off instead.
+    if _AA_SIGMA > 0.0:
+        binimg = cv2.GaussianBlur(binimg, (0, 0), sigmaX=_AA_SIGMA)
+
+    binimg[mask == 0] = 255   # hard mask FIRST -- background is genuinely
+    # pure white here, zero Gabor-noise content, before any blur touches it.
+    #
+    # Fade ridges out toward the mask edge instead of leaving a hard cutoff.
+    # A real digital scanner print has no thumb-silhouette outline -- ridges
+    # simply taper off at the contact edge, at slightly different points per
+    # ridge, not all at once along one geometric curve. cv2.distanceTransform
+    # gives each foreground pixel its distance (px) to the nearest background
+    # pixel; normalizing that by _FADE_INSET_PX and clamping to [0, 1] builds
+    # an alpha ramp that's 1.0 (full black ridges) once _FADE_INSET_PX inside
+    # the mask and drops to 0.0 (white) exactly AT the boundary -- so the
+    # print itself visually thins out and disappears before reaching the crop
+    # edge, rather than being sliced by it. This also removes the real
+    # spurious-ridge-ending-minutiae risk a hard boundary creates (every
+    # ridge terminating simultaneously on the same curve is not a real
+    # fingerprint feature). A small Gaussian pass on the alpha ramp itself
+    # (same _FEATHER_SIGMA as before) just keeps the ramp from banding: the
+    # underlying mask shape is already irregular (real segmentation, not a
+    # perfect ellipse), so this reads as an organic taper, not a blurred
+    # oval. Computed entirely from `binimg`/`mask` post-hard-crop, so it can
+    # never reveal the unmasked Gabor response outside the pad the way an
+    # earlier blur-the-mask-then-blend-against-unmasked-binimg version did
+    # (that leaked a faint ghosted second boundary past the real edge).
+    # `mask` itself stays hard-edged below (crop bounding box, _upright_
+    # rotate's PCA) -- only the pixel blend is softened.
+    dist = cv2.distanceTransform((mask > 0).astype(np.uint8), cv2.DIST_L2, 5)
+    alpha = np.clip(dist / _FADE_INSET_PX, 0.0, 1.0).astype(np.float32)
+    alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
+    binimg = (binimg.astype(np.float32) * alpha +
+              255.0 * (1.0 - alpha)).astype(np.uint8)
+    if guide_region is not None and guide_mask is not None and 'tipAngleDeg' in guide_region:
+        # Deterministic upright from the guide's known tip direction -- the pad
+        # silhouette is near-symmetric, so PCA (_upright_rotate) can pick the
+        # wrong axis; the app tells us exactly which way the tip points.
+        binimg, mask = _upright_from_tip(binimg, mask, float(guide_region['tipAngleDeg']))
+    else:
+        binimg, mask = _upright_rotate(binimg, mask)
+    params['afisRotated'] = True
+
+    # Base-crease trim (2026-08-17, CTO-directed: "pad isolation needs to be
+    # a backend configuration"). The guide/flash-diff/U-Net masking above
+    # all separate finger SKIN from non-finger BACKGROUND -- the DIP flexion
+    # crease is still finger skin, so none of them have any signal to
+    # exclude it. This trims by ridge CURVATURE instead, and MUST run here,
+    # after upright rotation -- see _trim_base_crease's own docstring for
+    # why an earlier attempt at this (pre-rotation, keyed off guide_region's
+    # own cy/ry) trimmed the wrong axis entirely.
+    if crease_trim:
+        pre_cov = int((mask > 0).sum())
+        binimg, mask = _trim_base_crease(binimg, mask)
+        trimmed_px = pre_cov - int((mask > 0).sum())
+        if trimmed_px > 0:
+            params['afisCreaseTrimPx'] = trimmed_px
+
+    # Circular/elliptical vignette (2026-08-17, CTO request: "have the
+    # feathing be circular so it mimics real fingerprint scanner prints").
+    # Purely cosmetic edge treatment, applied on top of the crease-trimmed
+    # mask -- see _circular_vignette's own docstring.
+    if circular_vignette:
+        binimg = _circular_vignette(binimg, mask)
+        params['afisVignette'] = 'elliptical'
+
+    # Mirror-correction SCAFFOLD (2026-08-03, CTO-reported): this capture
+    # flow requires the user to twist their thumb behind the phone to
+    # present the pad to the rear camera -- a real geometric mirror vs. a
+    # direct scan/ink impression (finger pressed straight down, never
+    # twisted), already root-caused in this project's history (see
+    # CLAUDE.md, "CTO capture-geometry explanation: thumb-twist mirroring",
+    # 2026-07-17). No flip has ever been applied anywhere in this pipeline
+    # (confirmed: this module has zero `cv2.flip`/mirror logic elsewhere) --
+    # so every AFIS print produced so far is in "as captured" orientation,
+    # not "as if pressed directly" orientation. An earlier SourceAFIS test
+    # that round found mirroring did NOT improve match score on average, but
+    # was run against a single low-quality ink-scan reference already known
+    # to sit at the matcher's noise floor -- inconclusive, not a refutation.
+    # Applied LAST (after upright rotation), so it composes cleanly with
+    # every other step. Default OFF -- gated the same as every other
+    # unvalidated lever in this pipeline (geom=, enhance='fidelity', etc.):
+    # needs a real matcher test against a trustworthy reference before this
+    # becomes the default, not just a visual guess this time either.
+    if mirror:
+        binimg = cv2.flip(binimg, 1)
+        mask = cv2.flip(mask, 1)
+        params['afisMirrored'] = True
+
+    ys, xs = np.where(mask > 0)
+    m = 30
+    y0, x0 = max(0, ys.min() - m), max(0, xs.min() - m)
+    y1 = min(binimg.shape[0], ys.max() + m)
+    x1 = min(binimg.shape[1], xs.max() + m)
+    return binimg[y0:y1, x0:x1], params

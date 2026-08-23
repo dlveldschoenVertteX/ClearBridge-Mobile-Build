@@ -448,7 +448,7 @@ class _ClearCoinRewardScreenState extends State<ClearCoinRewardScreen>
                   height: 52,
                   child: ElevatedButton.icon(
                     onPressed: () =>
-                        context.go(AppConstants.dashboardRoute),
+                        context.go(AppConstants.betaThankYouRoute),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: ClearBridgeColors.cyan,
                       foregroundColor: ClearBridgeColors.void_,
@@ -459,7 +459,7 @@ class _ClearCoinRewardScreenState extends State<ClearCoinRewardScreen>
                     ),
                     icon: const Icon(Icons.arrow_forward_rounded, size: 20),
                     label: Text(
-                      'Go to Dashboard',
+                      'Continue',
                       style: GoogleFonts.manrope(
                         fontSize: 15,
                         fontWeight: FontWeight.w800,
