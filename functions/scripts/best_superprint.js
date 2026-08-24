@@ -16,7 +16,12 @@
 
 const admin = require("firebase-admin");
 
-admin.initializeApp();
+// Explicit storageBucket -- admin.initializeApp() with no args could not
+// auto-infer a bucket in this CI environment ("Bucket name not specified
+// or invalid"), unlike the Firestore-only bootstrapFirstAdmin function.
+// Real bucket name, matching FIREBASE_CONFIG.storageBucket in the admin
+// panel and firebase_options.dart's own android block.
+admin.initializeApp({storageBucket: "clearbridge-dc699.firebasestorage.app"});
 
 const TOP_N = parseInt(process.argv[2], 10) || 8;
 const SIGNED_URL_EXPIRES_MIN = 30;
