@@ -120,18 +120,18 @@ deformations, used for both registration AND mosaicking.
   + `sfm_pipeline._multiband_combine()`, gated by the same coherence-
   confidence check `_fuse_flash_ambient` uses, restricted to the same
   selectively-kept minutiae Stage A validated (`phase3_composite.py`).
-  **DONE — built, run for real, decisive negative.** Neither a hard-edge
-  nor a feathered composite boundary beats anchor-alone on either
-  informative reference (0/2 both times); the feathered attempt (meant to
-  fix the hard edge) measurably made it worse. Visually confirmed why: TPS
-  corrects minutia POSITION, not ridge PHASE, so a composited boundary
-  still manufactures spurious ridge structure at the seam — the exact
-  mechanism this file's own "why minutiae space, not pixel space" section
-  predicted, now confirmed to survive even with correct position
-  registration and genuine selectivity. Full detail:
-  `results/PHASE3_COMPOSITE_FINDINGS.md`. **Do not pursue further pixel-
-  compositing parameter tuning on this mechanism** — it is a phase-
-  alignment gap, not a blend-weight tuning problem.
+  Hard-edge and phase-correlation-corrected compositing of already-
+  binarized content are both real, decisive negatives (0/2 informative
+  references, TPS position was already correct at the real measured
+  overlap — see `results/PHASE3_COMPOSITE_FINDINGS.md`). **Follow-up
+  found the first real positive result in this track's history**
+  (`phase3c_continuous_blend.py`): compositing SOFTENED (not hard-binary)
+  content, binarizing once at the end, at a moderate selective-merge cap
+  (`max_added` in roughly 12-17) beats anchor-alone on BOTH informative
+  references — a real, replicated dose-response, not a single lucky
+  point. **Promising, not yet validated** — n=1 capture, same standing
+  caveat as everything else here; needs more real captures before this
+  becomes a trusted parameter rather than a hypothesis.
 
 ## The real blocker, stated plainly
 

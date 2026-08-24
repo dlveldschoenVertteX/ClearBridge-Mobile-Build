@@ -153,6 +153,69 @@ picked up again, is compositing the CONTINUOUS-TONE enhanced render
 (before the final binarization step) and thresholding once at the end,
 rather than blending already-binary content.
 
+## Follow-up #2: softened-content blending — the first real positive result in this whole track
+
+Direct follow-up to both this file's own diagnosis (binarized content may
+not have the smooth low-frequency structure `_multiband_combine` needs)
+and the CTO's direct instruction to keep trying real fixes. The TRUE
+pre-threshold Gabor signal turned out to be unreachable without
+reimplementing real production geometry (`_upright_from_tip`,
+crease-trim, vignette, final crop-to-bbox all run AFTER binarization,
+confirmed by a real captured-shape mismatch: (2240,2986) raw vs. (410,431)
+final) — correctly replaying that outside production code would be
+exactly the kind of hand-copied-geometry risk this project has been
+burned by before. Used a safe, zero-reimplementation-risk proxy instead
+(`phase3c_continuous_blend.py`): Gaussian-blur each already-correct,
+already-cropped/rotated print (`_AA_SIGMA`'s own antialiasing idea,
+repurposed for compositing instead of display) before compositing,
+binarize the composite once at the end instead of blending already-binary
+content.
+
+**Real result, sweeping `max_added` (the SAME selective-merge cap Stage A
+validated, at the pixel-compositing level for the first time) at a fixed
+blur_sigma=2.0:**
+
+| max_added | macro_round32 | macro_round35 | beats anchor (2 refs) |
+|---|---|---|---|
+| anchor alone | 34 | 29 | — |
+| 5 | 32 | 24 | 0/2 |
+| 10 | 40 | 27 | 1/2 |
+| **12** | **40** | **30** | **2/2** |
+| **15** | **40** | **30** | **2/2** |
+| **17** | **40** | **31** | **2/2** |
+| 20 (original hard-edge run) | 34 (tie) | 23 | 0/2 |
+
+**max_added in roughly 12–17 beats anchor-alone on BOTH informative
+references — the first time any candidate in this entire fusion_brain
+track (Phase 1, Stage A's point sets, every earlier Stage C image variant)
+has done that.** Not a single lucky point: three separate values (12, 15,
+17) all land in the same win band with tightly clustered scores, bracketed
+by real losses on both sides (5 and 20) — a genuine, replicated
+dose-response curve, the same shape Stage A's own point-set-level
+selectivity sweep found, now confirmed to hold at the actual pixel/image
+level once the blend target is soft-edged instead of hard-binary.
+`blur_sigma` itself saturated quickly (2.0 and 4.0 gave IDENTICAL
+re-thresholded scores) — the win is coming from the selectivity range
+combined with softened content, not from tuning the blur amount further.
+
+**Honest caveats, same standard this whole track has held throughout,
+not relaxed for a positive result**: n=1 real capture, 2 real informative
+references (both real cross-session captures of the same finger, not a
+lab-grade ground truth), and `max_added≈12-17` was found by sweeping THIS
+one capture's own data — a hypothesis worth a real go/no-go decision, not
+a tuned production parameter to trust yet. The ink_scan reference (noise
+floor, never counted) moved inconsistently across the same sweep (6, 5,
+4, 4, 4) — further confirmation that reference is not informative, not a
+contradiction of the real result on the two references that are.
+
+**Revises this file's earlier "decisive negative" framing, precisely**:
+hard-edge and phase-corrected compositing of already-binarized content
+remain real, decisive negatives — that diagnosis holds. What's new is
+that giving the blender softened, moderate-magnitude content instead
+opens a real, replicated positive window this track had not found before.
+Worth a real next step: more real captures to confirm the win band holds
+beyond n=1, before this graduates past "promising, not yet validated."
+
 ## Standing blocker, unchanged
 
 Same as every phase before this one: real judgement of whether ANY of

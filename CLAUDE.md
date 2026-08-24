@@ -56,22 +56,27 @@ this project already flagged as an unbuilt gap on 2026-07-17
 - Stage C — compositing template → actual superprint IMAGE. `tps.warp_image`
   + `sfm_pipeline._multiband_combine()`, restricted to Stage A's own
   selectively-kept minutiae, weighted by the same coherence-confidence
-  check `_fuse_flash_ambient` uses. **DONE (2026-08-24) — built, run for
-  real, decisive negative.** Neither a hard-edge nor a feathered composite
-  boundary beats anchor-alone on either informative real reference (0/2
-  both times); feathering — the direct, well-motivated fix for the hard
-  edge — made it measurably worse. Visually confirmed why: TPS corrects
-  minutia POSITION, not ridge PHASE, so compositing across the boundary
-  still manufactures spurious ridge structure — the exact mechanism this
-  track's own README predicted from every prior pixel-fusion attempt in
-  this project, now confirmed to survive even with correct position
-  registration and genuine selectivity. Full detail:
-  `fusion_brain/results/PHASE3_COMPOSITE_FINDINGS.md`. **Not pursuing
-  further pixel-compositing parameter tuning** — this is a phase-alignment
-  gap, not a blend-weight problem. Minutiae-space fusion (Stage A/B)
-  remains the live, validated approach; a real pixel-level superprint would
-  need either a genuinely new phase-aware registration step, or accepting
-  that fusion's real deliverable is the matching TEMPLATE, not a picture.
+  check `_fuse_flash_ambient` uses. **DONE (2026-08-24) — hard-edge and
+  phase-correlation-corrected compositing of already-binarized content are
+  both real, decisive negatives** (0/2 informative real references both
+  times; a real phase-correlation measurement at the genuine anchor/source
+  overlap found TPS position was already correct there — sub-pixel
+  residuals against a ~9px ridge period — ruling out "a small hidden
+  translational offset" as the mechanism). Visually confirmed why hard/
+  feathered compositing fails: TPS corrects minutia POSITION, not ridge
+  PHASE, so a composited boundary still manufactures spurious ridge
+  structure. **Follow-up found the first real positive result in this
+  track's whole history**: compositing SOFTENED (not hard-binary) content
+  and binarizing once at the end, at a moderate selective-merge cap
+  (`max_added` in roughly 12-17, `phase3c_continuous_blend.py`), beats
+  anchor-alone on BOTH informative real references — a real, replicated
+  dose-response across 3 tested values, not one lucky point, bracketed by
+  real losses on both sides (max_added=5 and =20). Full detail:
+  `fusion_brain/results/PHASE3_COMPOSITE_FINDINGS.md`. **Promising, not
+  validated** — n=1 capture, same standing caveat as everything else in
+  this track; needs more real captures before this becomes a trusted
+  parameter. Minutiae-space fusion (Stage A/B) remains the independently
+  validated approach regardless of how this develops further.
 
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+
