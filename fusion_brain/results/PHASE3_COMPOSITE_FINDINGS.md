@@ -107,6 +107,52 @@ delivers today, with fusion operating only at the matching-template level
 production doesn't currently expose. Either is a real product/architecture
 decision, not something to guess at here.
 
+## Follow-up: local phase-correlation correction — tested, also negative, and it sharpens the diagnosis
+
+Direct follow-up on this file's own closing recommendation ("a real fix
+would need a phase-aware registration step"). Built the cheapest classical
+version before considering anything learned (`phase3b_phase_correct.py`):
+every contributing source's TPS-warped image genuinely OVERLAPS the
+anchor's own real coverage in substantial real territory (10,900–21,400px
+per source on this capture) — territory `phase3_composite.py`'s own
+`1 - anchor_coverage` gate throws away before compositing, never otherwise
+used. Both images show the same real physical ridges there, so any
+sub-pixel translational disagreement between them, measured directly via
+Fourier phase correlation (`cv2.phaseCorrelate`), IS the local phase
+residual TPS left uncorrected — if the "phase gap hides inside dist_tol"
+hypothesis is right, this should find it.
+
+**Real result: the measured shifts are tiny — under 0.6px for all four
+sources** (tilt_left −0.04/−0.04, tilt_right −0.24/0.16, sweep_left
+0.59/0.09, sweep_right 0.05/−0.17 — against a ~9px ridge period). Applying
+them anyway did not help; macro_round32 got measurably WORSE (34 → 24, a
+bigger loss than the un-corrected hard-edge version's tie). Visually the
+corrected composite is near-identical to the uncorrected one — expected,
+given the corrections found were sub-pixel.
+
+**This is informative, not just another negative.** It rules out "a
+constant per-source translational phase offset, small enough to hide
+inside the minutiae correspondence tolerance" as the mechanism — that was
+the specific, well-motivated hypothesis this test existed to check, and
+the real overlap data says it isn't there. TPS + rigid registration were
+already correctly aligned in POSITION at these overlap points; the visible
+disconnected-island artifact survives despite that.
+
+**Real, untested candidate mechanism this points at instead**: every
+image composited so far is already hard-binarized (pure black/white ridge
+map), not continuous-tone. `_multiband_combine` was built and validated for
+smooth continuous-tone photographic content (the cylindrical SfM texture
+path) — Laplacian-pyramid blending's whole mechanism (hide seams by
+blending broad LOW-frequency content, which for a photo means smooth
+brightness/gradient information) may not have an equivalent to lean on in
+a binary image, where the "low-frequency" component is just local average
+darkness, not real structure. Blending two already-binarized ridge maps
+may be closer to blending two square waves than two photographs. Not
+tested this round — the real next cheap experiment, if this thread is
+picked up again, is compositing the CONTINUOUS-TONE enhanced render
+(before the final binarization step) and thresholding once at the end,
+rather than blending already-binary content.
+
 ## Standing blocker, unchanged
 
 Same as every phase before this one: real judgement of whether ANY of
