@@ -1,0 +1,29 @@
+name: Best NFIQ Score (diagnostic)
+
+# Manually triggered only. Runs functions/scripts/best_nfiq.js once to
+# find the single highest real nfiq2Score across every scored capture in
+# the live `captures` collection. Read-only, no images involved. Output
+# is visible only in this workflow run's own private Actions log.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  best-nfiq:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm install
+
+      - name: Find the best real NFIQ2 score
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        working-directory: functions
+        run: |
+          echo "$FIREBASE_SA_KEY" > /tmp/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
+            GCLOUD_PROJECT=clearbridge-dc699 \
+            node scripts/best_nfiq.js
+          rm /tmp/sa.json
