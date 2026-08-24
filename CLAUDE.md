@@ -53,9 +53,25 @@ this project already flagged as an unbuilt gap on 2026-07-17
   pattern (`ml/mosaic_register`, `ridgeRestoreHybrid` v2). Live version:
   a **learned per-minutia reliability model** (which candidates are worth
   merging). Gated on real scanner references for labels.
-- Stage C — compositing template → actual superprint IMAGE.
-  `tps.warp_image` built; blend via `sfm_pipeline._multiband_combine()`
-  (already built, unused). Not started.
+- Stage C — compositing template → actual superprint IMAGE. `tps.warp_image`
+  + `sfm_pipeline._multiband_combine()`, restricted to Stage A's own
+  selectively-kept minutiae, weighted by the same coherence-confidence
+  check `_fuse_flash_ambient` uses. **DONE (2026-08-24) — built, run for
+  real, decisive negative.** Neither a hard-edge nor a feathered composite
+  boundary beats anchor-alone on either informative real reference (0/2
+  both times); feathering — the direct, well-motivated fix for the hard
+  edge — made it measurably worse. Visually confirmed why: TPS corrects
+  minutia POSITION, not ridge PHASE, so compositing across the boundary
+  still manufactures spurious ridge structure — the exact mechanism this
+  track's own README predicted from every prior pixel-fusion attempt in
+  this project, now confirmed to survive even with correct position
+  registration and genuine selectivity. Full detail:
+  `fusion_brain/results/PHASE3_COMPOSITE_FINDINGS.md`. **Not pursuing
+  further pixel-compositing parameter tuning** — this is a phase-alignment
+  gap, not a blend-weight problem. Minutiae-space fusion (Stage A/B)
+  remains the live, validated approach; a real pixel-level superprint would
+  need either a genuinely new phase-aware registration step, or accepting
+  that fusion's real deliverable is the matching TEMPLATE, not a picture.
 
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+

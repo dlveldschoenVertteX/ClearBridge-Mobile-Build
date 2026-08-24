@@ -116,15 +116,22 @@ deformations, used for both registration AND mosaicking.
   **learned per-minutia reliability model**: predict which candidate
   minutiae are worth merging, which is what the selectivity result says
   actually matters. Still gated on real scanner references for labels.
-- **Stage C — compositing into a real superprint image.** Phase 1/Stage A
-  produce a matching TEMPLATE (a point set), not a picture. `tps.warp_image`
-  is built for this. Once a source is elastic-warped into anchor space,
-  ridge PHASE should line up at the seams — the thing every prior
-  pixel-fusion attempt in this project lacked, since none corrected
-  non-rigid deformation first. Blend with
-  `sfm_pipeline._multiband_combine()` (Laplacian-pyramid seam blending,
-  already built and unused) gated by the coherence-confidence check
-  `_fuse_flash_ambient` already uses.
+- **Stage C — compositing into a real superprint image.** `tps.warp_image`
+  + `sfm_pipeline._multiband_combine()`, gated by the same coherence-
+  confidence check `_fuse_flash_ambient` uses, restricted to the same
+  selectively-kept minutiae Stage A validated (`phase3_composite.py`).
+  **DONE — built, run for real, decisive negative.** Neither a hard-edge
+  nor a feathered composite boundary beats anchor-alone on either
+  informative reference (0/2 both times); the feathered attempt (meant to
+  fix the hard edge) measurably made it worse. Visually confirmed why: TPS
+  corrects minutia POSITION, not ridge PHASE, so a composited boundary
+  still manufactures spurious ridge structure at the seam — the exact
+  mechanism this file's own "why minutiae space, not pixel space" section
+  predicted, now confirmed to survive even with correct position
+  registration and genuine selectivity. Full detail:
+  `results/PHASE3_COMPOSITE_FINDINGS.md`. **Do not pursue further pixel-
+  compositing parameter tuning on this mechanism** — it is a phase-
+  alignment gap, not a blend-weight tuning problem.
 
 ## The real blocker, stated plainly
 
