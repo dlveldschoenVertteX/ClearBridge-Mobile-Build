@@ -1,0 +1,33 @@
+name: Best Superprint Candidates (diagnostic)
+
+# Manually triggered only. Runs functions/scripts/best_superprint.js
+# once to list the top-N real scored captures by nfiq2Score, each with a
+# short-lived (30 min) signed read URL for its delivered
+# superprint_afis.png. Does not pick a final "best" image itself -- per
+# this project's own standing prime directive, NFIQ2 alone can't decide
+# that; the actual pick happens by inspecting the candidate images
+# directly. Output (URLs, no image bytes) is visible only in this
+# workflow run's own private Actions log.
+on:
+  workflow_dispatch: {}
+
+jobs:
+  best-superprint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install functions dependencies
+        working-directory: functions
+        run: npm install
+
+      - name: List top real superprint candidates
+        env:
+          FIREBASE_SA_KEY: ${{ secrets.FIREBASE_SA_KEY }}
+        working-directory: functions
+        run: |
+          echo "$FIREBASE_SA_KEY" > /tmp/sa.json
+          GOOGLE_APPLICATION_CREDENTIALS=/tmp/sa.json \
+            GCLOUD_PROJECT=clearbridge-dc699 \
+            node scripts/best_superprint.js 8
+          rm /tmp/sa.json
