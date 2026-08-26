@@ -168,7 +168,18 @@ def run(cap_id: str, stage1_max_added: int = 25, stage2_max_added: int = 15,
         fused, union, dbg = fuse_templates(
             {m: minu[m] for m in have}, {m: cov[m] for m in have},
             b_shape, b_anchor, stage1_max_added, label=br)
-        br_minu[f'{br}_sp'] = fused
+        # Re-tag every point with the BRACKET as its source. Stage 1's
+        # fused minutiae otherwise keep their original member tag
+        # (tilt_left, tilt_right, ...), and `fm.fuse`'s per-source recount
+        # keys off `m.source` -- so Stage 2 reported contributed=0 for
+        # both brackets while genuinely merging 15 points. The selection
+        # itself was correct (only the accounting was wrong), but a
+        # diagnostic that silently reads zero is exactly how this project
+        # has been burned before, and the bracket IS the source at this
+        # level of the hierarchy.
+        import dataclasses
+        br_minu[f'{br}_sp'] = [dataclasses.replace(m, source=f'{br}_sp')
+                               for m in fused]
         br_cov[f'{br}_sp'] = union
         stage1_dbg[br] = dbg
 
