@@ -1,0 +1,90 @@
+{
+  "macro_round32": {
+    "anchor_alone": {
+      "minutiae": 135,
+      "in_extent": 77,
+      "whole": 34,
+      "restricted": 33
+    },
+    "anchor_alone_stage3": {
+      "minutiae": 135,
+      "in_extent": 77,
+      "whole": 34,
+      "restricted": 33
+    },
+    "p6_CONTROL": {
+      "minutiae": 135,
+      "in_extent": 65,
+      "whole": 24,
+      "restricted": 19
+    },
+    "p6_ecc_avg": {
+      "minutiae": 91,
+      "in_extent": 46,
+      "whole": 25,
+      "restricted": 27
+    },
+    "p6_ecc_maxc": {
+      "minutiae": 88,
+      "in_extent": 46,
+      "whole": 15,
+      "restricted": 15
+    },
+    "p6_tps_avg": {
+      "minutiae": 90,
+      "in_extent": 45,
+      "whole": 16,
+      "restricted": 16
+    },
+    "p6_tps_maxc": {
+      "minutiae": 273,
+      "in_extent": 56,
+      "whole": 23,
+      "restricted": 18
+    }
+  },
+  "macro_round35": {
+    "anchor_alone": {
+      "minutiae": 135,
+      "in_extent": 127,
+      "whole": 29,
+      "restricted": 27
+    },
+    "anchor_alone_stage3": {
+      "minutiae": 135,
+      "in_extent": 127,
+      "whole": 29,
+      "restricted": 27
+    },
+    "p6_CONTROL": {
+      "minutiae": 135,
+      "in_extent": 115,
+      "whole": 27,
+      "restricted": 20
+    },
+    "p6_ecc_avg": {
+      "minutiae": 91,
+      "in_extent": 82,
+      "whole": 20,
+      "restricted": 20
+    },
+    "p6_ecc_maxc": {
+      "minutiae": 88,
+      "in_extent": 80,
+      "whole": 16,
+      "restricted": 16
+    },
+    "p6_tps_avg": {
+      "minutiae": 90,
+      "in_extent": 80,
+      "whole": 22,
+      "restricted": 21
+    },
+    "p6_tps_maxc": {
+      "minutiae": 273,
+      "in_extent": 145,
+      "whole": 21,
+      "restricted": 22
+    }
+  }
+}

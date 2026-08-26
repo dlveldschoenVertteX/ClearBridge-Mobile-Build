@@ -110,3 +110,86 @@ one imperfect print against another and cannot separate "fusion hurt the
 print" from "the reference cannot resolve the improvement". The real
 >=500-DPI full-pad scanner reference — this track's standing blocker
 since 2026-07-16 — is what would settle it.
+
+---
+
+# Addendum -- was the REFERENCE the thing limiting these scores? (round 40)
+
+CTO raised the right question: every score in this track is measured
+against `macro_round32`/`macro_round35`, which are camera-"2" prints, and
+round 40 established camera "2" is the weakest back camera. If the
+instrument is weak and narrower than what fusion produces, fusion could
+have been working all along and we would not have seen it.
+
+## The bias is real, and it is large
+
+Measured on the actual cached templates:
+
+| template | minutiae | bbox area |
+|---|---|---|
+| `ref_macro_round32` | 96 | **52,866** |
+| `ref_macro_round35` | 130 | 139,761 |
+| anchor (`6b43c255`) | 135 | 103,016 |
+| `p6_tps_maxc` | 273 | **268,650** |
+
+Against round32 only **56 of tps_maxc's 273 minutiae (20%) fall inside
+the reference's extent**. The other 79% cannot match anything -- there is
+nothing there to match -- yet they still enlarge the template, which
+Stage A separately measured costs real score independently of whether the
+added points carry signal. Fusion pays a measured density cost for
+coverage the reference structurally cannot reward. That is a genuine,
+directional bias against every fusion arm ever scored here.
+
+## Two tests, and they agree: the bias is real but it was NOT hiding a win
+
+**Test 1 -- restrict each probe to the reference's own extent**
+(`diag_reference_power.py`). Removes the out-of-extent density penalty
+entirely and asks only "within the measurable region, did fusion help?"
+
+Fusion arms moved 0 to +2; the CONTROL moved -5 and -7. If fusion were
+adding real signal in measurable territory, restriction should have
+favoured it. It did not.
+
+**Test 2 -- build a better instrument** (`build_main_refs.py`). Both
+source captures carry a full 8-frame MAIN-camera burst and their own
+guideRegion; the macro print was only ever the reference because those
+rounds were macro investigations. Rendering the main-camera print gives a
+same-finger cross-session reference from the higher-quality, wider camera:
+`ref_main_round32` has **161 minutiae over a 106,673 bbox** against
+macro's 96 over 52,866.
+
+| candidate | macro32 | **main32** | macro35 | main35 |
+|---|---|---|---|---|
+| **`anchor_alone`** (full frame, no crop, no fusion) | 34 | **44** | 29 | 31 |
+| `p6_CONTROL` (anchor crop) | 24 | 27 | 27 | **36** |
+| `p6_ecc_avg` | 25 | 17 | 20 | 27 |
+| `p6_ecc_maxc` | 15 | 18 | 16 | 20 |
+| `p6_tps_avg` | 16 | 12 | 22 | 21 |
+| `p6_tps_maxc` | 23 | 23 | 21 | 25 |
+
+**The better instrument raises the ANCHOR (34 -> 44) far more than any
+fusion arm, and every fusion arm still loses to both baselines.** That is
+the opposite of what the masked-gains hypothesis predicts.
+
+## What this does and does not settle
+
+It does NOT vindicate fusion. Measured better, fusion looks the same or
+slightly worse, and the negatives sharpen rather than reverse.
+
+It DOES surface a separate, larger problem that had been hiding behind
+the weak reference: **`anchor_alone` (44/31) beats `p6_CONTROL` (27/36)
+on round32 by 17 points with the same content** -- the raw-domain CROP
+path is costing far more than fusion could ever add. Phase 6's arms were
+all measured against that already-handicapped control. Recovering the
+crop path is a bigger and better-evidenced lever than any remaining
+fusion tweak.
+
+Caveat on `main_round35`: its sharpest main ambient frame measured
+Laplacian 9.8 -- round 35's main burst was genuinely weak, which is
+precisely why camera "2" won that capture. `main_round32` (lap 606) is
+the trustworthy new reference; `main_round35` should be treated as
+corroborating, not decisive.
+
+Both new references are ADDITIVE -- the macro ones are untouched, so every
+historical number stays reproducible and the two instruments can be
+compared on the same candidates.
