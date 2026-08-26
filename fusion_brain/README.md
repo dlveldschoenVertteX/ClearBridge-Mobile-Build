@@ -171,6 +171,26 @@ deformations, used for both registration AND mosaicking.
   lone source survives at any nonzero weight — measured: 1 pixel of
   176,710 changed).
 
+- **Phase 4 — hierarchical per-bracket fusion (CTO's proposal). Premise
+  SUPPORTED, architecture REFUTED.** Build a superprint per architecture
+  (front / tilt / sweep), then fuse those. Premise check across 126 real
+  registrations: intra-bracket pairs register measurably better than
+  cross-bracket (42.47 vs 40.69 mean inliers, 100% vs 96.7% gate pass) —
+  real, but only ~4%. Image-level hierarchy scored 0/2 (it compounds the
+  density penalty: Stage 1 injected 36 and 22 unvetted minutiae, which
+  Stage 2 then trusted). Template-level hierarchy — same architecture, no
+  intermediate picture, zero unvetted additions — recovered most of that
+  to 1/2 but still trailed the flat merge. Raising the Stage 1 budget
+  (25→50→100→999, saturating) never closed the gap: Stage 2 took exactly
+  15 points from `tilt_sp` and 0 from `sweep_sp` at every budget, best
+  case 34/30 vs flat's 40/30. Mechanism: hierarchy points take an extra
+  registration hop (member → bracket anchor → front) and each transform
+  adds positional error, which a 4% pose-family edge cannot pay for —
+  which is exactly why a true premise can still yield a losing
+  architecture. **Flat selection across all sources at once is already
+  near-optimal for this data.** Full detail:
+  `results/PHASE4_HIERARCHY_FINDINGS.md`.
+
 ## The real blocker, stated plainly
 
 Stage A's controls surfaced a measurement problem, not just a method

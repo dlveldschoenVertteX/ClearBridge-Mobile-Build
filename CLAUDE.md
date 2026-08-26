@@ -108,6 +108,36 @@ this project already flagged as an unbuilt gap on 2026-07-17
   34/29), consistent with this project's documented sunlight capture
   problems — a capture-side effect, not a fusion one.
 
+- **Round 39 (2026-08-26) — hierarchical per-bracket fusion (CTO's
+  proposal): premise SUPPORTED, architecture REFUTED.** Build a superprint
+  per architecture (front / tilt / sweep), then fuse those three. Premise
+  tested first per this track's own Phase 0 discipline, across 126 real
+  registrations on all 3 real captures: intra-bracket pairs DO register
+  better than cross-bracket (42.47 vs 40.69 mean inliers, 100% vs 96.7%
+  gate pass) -- real, but only ~4%. Image-level hierarchy scored 0/2: it
+  COMPOUNDS the template-density penalty, because compositing an image
+  always yields more extracted minutiae than the merge validated (Stage 1
+  injected 36 and 22 unvetted points, which Stage 2 then trusted as
+  sources). Template-level hierarchy -- same architecture, intermediate
+  changed from picture to minutiae template, zero unvetted additions --
+  recovered most of that (1/2, 35/28) but still trailed the flat merge.
+  Raising the Stage 1 budget 25->50->100->999 (saturating; 999 identical
+  to 100) never closed the gap: Stage 2 took exactly 15 points from
+  `tilt_sp` and 0 from `sweep_sp` at EVERY budget, best case 34/30 against
+  flat's 40/30. **Mechanism**: hierarchy points take an extra registration
+  hop (member -> bracket anchor -> front) vs flat's single hop, and every
+  transform adds positional error that a 4% pose-family edge cannot pay
+  for -- which is exactly why a genuinely true premise can still yield a
+  losing architecture. **Conclusion: flat selection across all sources at
+  once (`fm.fuse` picking the global top-N over all six raw sources) is
+  already near-optimal for this data**; not recommending the bracket
+  hierarchy. One real diagnostic bug fixed en route: Stage 1's fused
+  minutiae kept their original member tags, and `fm.fuse` recounts per
+  source by `m.source`, so Stage 2 reported `contributed=0` for both
+  brackets while genuinely merging 15 points (selection was always
+  correct; only the accounting read zero). Full detail:
+  `fusion_brain/results/PHASE4_HIERARCHY_FINDINGS.md`.
+
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+
 of added coverage is unmeasurable and a density penalty of comparable size
