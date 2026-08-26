@@ -1388,6 +1388,68 @@ class FusionCaptureController extends ChangeNotifier {
     const firstPassTimeout = Duration(seconds: 20);
     const retryBackoff = Duration(seconds: 3);
 
+    // REAL DATA-LOSS BUG (found 2026-08-26 by auditing capture ffb1682f's
+    // own bytes in Storage, not from the client's own logs -- which were
+    // the thing that turned out to be wrong).
+    //
+    // That capture recorded `frames: []` with an `uploadFailed_front_*`
+    // TimeoutException for all 8 front frames. Storage told a different
+    // story:
+    //
+    //   front_amb_0.jpg  2,097,152 bytes (exactly 2 MiB), NO JPEG EOI
+    //                    marker -> genuinely truncated at a buffer boundary
+    //   the other 7      valid EOI marker -> complete, perfectly usable
+    //
+    // So SEVEN uploads actually completed and were thrown away, because
+    // `putData(...).timeout(...)` only abandons the DART future -- it does
+    // not cancel the native upload, which carries on and finishes. The
+    // client sees a TimeoutException, records the frame as failed, and
+    // omits it from `frames`. Result: a capture 7/8 intact in Storage but
+    // entirely invisible to everything that reads the document, the
+    // production backend included. The two-pass restructure above reduces
+    // how OFTEN a timeout fires; it cannot help once one has, because the
+    // verdict itself is wrong.
+    //
+    // The eighth frame is the mirror-image failure: a partial object left
+    // behind by an abandoned upload, sitting in Storage looking like a real
+    // file. Nothing downstream checks -- cv2 decodes a truncated JPEG
+    // happily (it only warns), and the garbage in the missing region
+    // actually INFLATES sharpness metrics, so a corrupt frame can score as
+    // the SHARPEST and be picked as the fusion anchor. That is not
+    // hypothetical: it happened while analysing this exact capture.
+    //
+    // Both halves need the same missing mechanism -- ask Storage what
+    // actually landed instead of trusting (or distrusting) the timeout.
+    // Byte length is the check, since it catches both the abandoned-but-
+    // complete case and the truncated case, and needs no image decode.
+    Future<bool> storedObjectIsComplete(String path, int expectedBytes) async {
+      try {
+        final md = await _storage
+            .ref(path)
+            .getMetadata()
+            .timeout(const Duration(seconds: 10));
+        return md.size == expectedBytes;
+      } catch (_) {
+        // Object absent, or metadata unreachable -- either way we cannot
+        // claim it landed. Deliberately conservative: a false "incomplete"
+        // costs one retry, a false "complete" silently ships a corrupt
+        // frame into the pipeline.
+        return false;
+      }
+    }
+
+    Future<void> deletePartialObject(String path, String tag) async {
+      try {
+        await _storage.ref(path).delete().timeout(const Duration(seconds: 10));
+        _debug['deletedPartial_$tag'] = true;
+      } catch (_) {
+        // Nothing there to delete, or the delete failed -- not worth
+        // failing the capture over. Recorded rather than silently dropped
+        // so a partial object that survives is at least traceable.
+        _debug['deletePartialFailed_$tag'] = true;
+      }
+    }
+
     Future<bool> attemptUpload(_Shot shot, Duration timeout) async {
       // Normally already shrunk at its phase boundary; this only does real
       // work if a phase timed out before its shrink pass ran.
@@ -1396,17 +1458,36 @@ class FusionCaptureController extends ChangeNotifier {
         shot.shrunk = true;
       }
       final path = '$basePath/${shot.tag}.jpg';
+      final expected = shot.jpeg.length;
       try {
         await _storage
             .ref(path)
             .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
             .timeout(timeout);
-        return true;
       } catch (e) {
-        debugPrint('[fusion] upload failed ${shot.tag}: $e');
+        debugPrint('[fusion] upload threw ${shot.tag}: $e');
+        // The upload may well have finished anyway (see above). Ask.
+        if (await storedObjectIsComplete(path, expected)) {
+          debugPrint('[fusion] ${shot.tag} landed complete despite $e');
+          _debug['uploadRecovered_${shot.tag}'] = e.toString();
+          return true;
+        }
         _debug['uploadFailed_${shot.tag}'] = e.toString();
+        // Whatever partial bytes are up there must not masquerade as a
+        // real frame on a later pass, or to the backend.
+        await deletePartialObject(path, shot.tag);
         return false;
       }
+      // putData returning normally is not proof the stored object is whole
+      // -- verify the same way, so a truncated upload can never be reported
+      // as success.
+      if (await storedObjectIsComplete(path, expected)) {
+        return true;
+      }
+      debugPrint('[fusion] upload incomplete ${shot.tag} (expected $expected)');
+      _debug['uploadIncomplete_${shot.tag}'] = expected;
+      await deletePartialObject(path, shot.tag);
+      return false;
     }
 
     final uploadedTags = <String>{};
