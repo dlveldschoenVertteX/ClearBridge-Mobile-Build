@@ -128,10 +128,21 @@ deformations, used for both registration AND mosaicking.
   (`phase3c_continuous_blend.py`): compositing SOFTENED (not hard-binary)
   content, binarizing once at the end, at a moderate selective-merge cap
   (`max_added` in roughly 12-17) beats anchor-alone on BOTH informative
-  references — a real, replicated dose-response, not a single lucky
-  point. **Promising, not yet validated** — n=1 capture, same standing
-  caveat as everything else here; needs more real captures before this
-  becomes a trusted parameter rather than a hypothesis.
+  references on the first capture, partially replicated (1/2 references)
+  on a second. **Promising, not yet validated** — n=2 captures, same
+  standing caveat as everything else here; needs more real captures
+  before this becomes a trusted parameter rather than a hypothesis.
+  **Important caveat found on direct visual review, 2026-08-26**: the
+  composite is NOT a visually coherent single print in either version —
+  it's a clean core print with several small, disconnected circular
+  patches of ridge texture stuck around its edge (root cause:
+  `_keep_mask`'s 24px-radius discs, one per kept minutia, mostly don't
+  touch each other). The bozorth3 score genuinely improves (it scores
+  minutiae correspondence, which the patches do add), but "scores
+  better" and "looks fused" are two separate claims — only the first is
+  currently true. Full detail + a concrete unbuilt fix (merge/dilate
+  neighboring discs into contiguous regions):
+  `results/PHASE3_COMPOSITE_FINDINGS.md`.
 
 ## The real blocker, stated plainly
 

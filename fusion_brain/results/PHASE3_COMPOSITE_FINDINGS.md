@@ -275,3 +275,47 @@ cross-session captures of the same finger, not a lab-grade ground truth,
 and the ink scan is a known noise floor (kept for continuity, never
 counted toward the verdict). n=1 capture throughout, same caveat as every
 other real number in this track.
+
+## Real, important caveat found on visual review: the composite is NOT
+## visually a single coherent print, in either version — "scored better"
+## and "looks fused" are two different claims, and only the first is true
+
+Direct visual review of both `..._composite_maxadded20.png` (hard-edge)
+and `..._composite_softblend.png` (the bozorth3-winning version) for
+`6b43c255` shows the SAME structural pattern in both: a clean core print
+surrounded by several small, visibly DISCONNECTED patches of ridge
+texture scattered around its edge — scalloped/circular in shape, not
+blended into the core region at all. Softening the blend changed contrast
+and seam smoothness at each patch's own boundary; it did not change the
+patch SHAPE or connect them to each other or to the core.
+
+**Root cause, confirmed in code, not a rendering bug**: both
+`phase3_composite.py` and `phase3c_continuous_blend.py` call the same
+`_keep_mask(kept_pts, a_shape, radius=KEEP_RADIUS_PX=24.0, ...)` —
+compositing is restricted to a union of independent 24px-radius circles,
+one per individually-kept minutia, not to a smooth contiguous region.
+Kept minutiae are sparse and scattered by construction (`fm.fuse`'s own
+selective-merge cap picks the globally highest-quality candidates
+wherever they happen to fall), so their 24px discs mostly don't touch
+each other — hence "small blobs stuck onto the sides," exactly matching
+a real, independent visual report of this same pattern
+(2026-08-26, CTO screenshot of a fusion_v1 composite).
+
+**This does not contradict the bozorth3 result above** — bozorth3 scores
+minutiae correspondence, which the composited patches genuinely add (the
+whole reason the score moved). But it does mean the "first real positive
+result" recorded above should NOT be read as "produces a coherent single
+print" — it currently produces a core print with several small
+disconnected ridge patches around it, which is real, matchability-
+positive by the one metric tested, and visually nothing like a seamless
+scanner-style print. Whether that visual discontinuity itself costs
+something a real AFIS matcher would care about beyond what bozorth3
+already captured is untested — bozorth3 doesn't penalize disconnected
+regions the way a human eye (or possibly a different real matcher) might.
+
+**Not yet fixed. Real, concrete next step, not yet built**: grow/dilate
+each kept minutia's disc (or switch to a smooth alpha falloff sized to
+merge neighboring discs) so nearby kept points' regions actually join
+into one contiguous patch instead of leaving gaps between them — this is
+a compositing-shape change, independent of the blend-softening fix
+already validated above, and has not been tried.
