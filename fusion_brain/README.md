@@ -140,9 +140,18 @@ deformations, used for both registration AND mosaicking.
   touch each other). The bozorth3 score genuinely improves (it scores
   minutiae correspondence, which the patches do add), but "scores
   better" and "looks fused" are two separate claims — only the first is
-  currently true. Full detail + a concrete unbuilt fix (merge/dilate
-  neighboring discs into contiguous regions):
-  `results/PHASE3_COMPOSITE_FINDINGS.md`.
+  currently true. The proposed fix (merge/dilate neighboring discs into
+  contiguous regions) was then built and tested twice
+  (`phase3d_merged_regions.py`, superseded; `phase3e_angle_gated_merge.py`,
+  correct): merging DOES produce a visually coherent single shape, but
+  consistently COSTS real matchability on the stronger reference across
+  both real captures and five settings (40→31 and 29→20). The
+  orientation-gated refinement is measurably inert (targets <5% of
+  composited area; changes 0.03% of pixels, identical scores). Net: the
+  blobby version scores better, the merged version looks better, and no
+  tested setting gets both — a product call, not a tuning problem. Full
+  detail, including a correction to phase3d's own erroneous conclusion
+  (drawn from a conflated test): `results/PHASE3_COMPOSITE_FINDINGS.md`.
 
 ## The real blocker, stated plainly
 

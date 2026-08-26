@@ -375,3 +375,92 @@ region (only bridge two discs if their underlying ridge angle roughly
 agrees in the gap between them), rather than a blind geometric distance
 threshold — same standing discipline as everywhere else in this track:
 measure before trusting a plausible-sounding fix.
+
+## Angle-gated merge built + tested (2026-08-26) — and it first overturned
+## phase3d's own conclusion, which was drawn from a conflated test
+
+Built `phase3e_angle_gated_merge.py` to test the fix phase3d proposed
+(only bridge two regions where their local ridge ORIENTATION agrees,
+using production `afis_print._orientation_field`, read-only). Building it
+surfaced a **real flaw in phase3d's own test design that invalidates
+phase3d's stated conclusion**, and that is the more important finding of
+the two.
+
+**phase3d moved TWO variables at once, not one.** `phase3c` built the
+keep mask PER SOURCE (`[m for m in fused if m.source == name]`) — each
+source only ever contributed pixels near ITS OWN kept points. phase3d
+replaced that with ONE GLOBAL mask over every source's kept points,
+applied to every source — so each source additionally contributed
+wherever its coverage happened to overlap some OTHER source's points.
+That is a far larger change than "merge nearby discs," and it manufactures
+exactly the multi-source overlap phase3d then blamed the regression on.
+**phase3d's conclusion ("the isolated discs were protecting the composite
+from cross-source disagreement") is therefore not established by that
+test, and its solid-black-block artifact is substantially an artifact of
+the conflation, not of merging.** Recorded here rather than quietly
+corrected: the earlier entry stands as written, this supersedes it.
+
+**Control run (per-source masking restored, merging only, no angle
+gate)** on the same capture/settings phase3d failed at:
+
+| variant | macro_round32 (anchor 34) | macro_round35 (anchor 29) | beats |
+|---|---|---|---|
+| phase3d (conflated global mask) | 27 | 22 | **0/2** |
+| phase3e control (per-source, merged) | 31 | **31** | **1/2** |
+
+Visually confirmed too: the control image has **no solid black blocks and
+no crossing artifacts** — it is a single, substantially contiguous shape,
+by far the most visually coherent composite this track has produced.
+
+**The angle gate itself is inert.** Real measured diagnostics (the
+instrumentation added precisely because phase3d's mechanism was inferred
+rather than measured): multi-source overlap is only **1,055px of 23,870px
+(4.4%)** on capture 1 and **268px of 14,590px (1.8%)** on capture 2. The
+gate suppressed 499px and changed the output by **57 of 176,710 pixels
+(0.03%)**, with **identical scores**. So cross-source ridge disagreement
+is not a meaningful mechanism here at all — phase3d's diagnosis was wrong
+about the cause as well as the magnitude.
+
+## The real trade-off merging buys, measured across both captures
+
+Sweeping `max_added` on the (correct) per-source merged variant, against
+`phase3c`'s isolated-disc numbers on the same captures:
+
+**Capture `6b43c255`** (anchor 34 / 29):
+
+| max_added | isolated discs (phase3c) | merged (phase3e) |
+|---|---|---|
+| 10 | — | 34 tie / **31 win** → 1/2 |
+| 12 | **40 win / 30 win → 2/2** | 31 / **31 win** → 1/2 |
+| 15 | **40 win / 30 win → 2/2** | 31 / **31 win** → 1/2 |
+| 17 | **40 win / 31 win → 2/2** | 32 / **30 win** → 1/2 |
+| 20 | — | 32 / **30 win** → 1/2 |
+
+**Capture `43378ea7`** (anchor 26 / 18), `max_added=15`: isolated discs
+29 / 17 → 1/2; merged **20 / 17 → 0/2**.
+
+**Consistent, reproducible finding across both real captures and five
+settings: merging into contiguous regions costs real matchability on the
+stronger reference** (capture 1: 40 → 31-32; capture 2: 29 → 20), while
+holding or slightly improving the weaker one. The visual-coherence gain is
+real and the matchability cost is real; they pull in opposite directions.
+
+## Honest conclusion
+
+The specific fix asked for (angle-gated merging) **does nothing measurable
+here** — the mechanism it targets accounts for under 5% of composited
+area. What the exercise actually produced is (a) a correction to phase3d's
+own erroneous conclusion, and (b) a clean, quantified statement of the
+genuine trade-off: **the blobby isolated-disc composite scores better; the
+merged composite looks better.** Both are real; there is no setting tested
+that gets both.
+
+That is a product decision, not a tuning problem, and it should be made
+explicitly rather than by picking whichever number looks best: if the
+delivered artifact is judged by a matcher, isolated discs win; if it is
+ever shown to a human or judged by eye, merged wins. Nothing here changes
+the standing recommendation that Stage C's trustworthy deliverable remains
+the minutiae TEMPLATE (Stage A/B), not the picture — and that production's
+superprint image should stay the single best full-frame render it delivers
+today. n=2 captures throughout, same standing caveat as every number in
+this track.
