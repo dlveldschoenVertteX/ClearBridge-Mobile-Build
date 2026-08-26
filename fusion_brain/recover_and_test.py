@@ -1,29 +1,43 @@
-"""Recover a fusion_v1 capture whose front frames uploaded successfully but
-were recorded as FAILED, then run the flat validated-bridge merge on it.
+"""Recover a fusion_v1 capture whose front frames were recorded as FAILED
+but mostly landed in Storage, then run the flat validated-bridge merge.
 
-REAL CLIENT BUG this exists to work around, found 2026-08-26 on capture
+REAL DATA-LOSS BUG this exists to work around, found 2026-08-26 on capture
 `ffb1682f-ed0d-4ffc-bb00-c15f4ebc1225`:
 
   frames: []                                    <- Firestore
   fusionDebug.uploadFailed_front_amb_0: "TimeoutException after 0:00:45"
-  fusionDebug.uploadFailed_front_fl_1:  "TimeoutException after 0:00:45"
   ... all 8 front frames marked failed ...
 
-  Storage actually contains all 8: front_amb_{0,2,4,6}.jpg,
-                                   front_fl_{1,3,5,7}.jpg
+  Storage nonetheless contains all 8 files.
 
-So the uploads SUCCEEDED and the client's own 45s timeout fired anyway --
-each frame was then recorded as failed and omitted from `frames`, leaving a
-capture with complete data in Storage that is unusable by anything reading
-the document (production backend included). The tilt and sweep shots on the
-same capture recorded fine; only the front burst hit the timeout, which is
-consistent with the front burst being the largest upload batch.
+Verified byte-level rather than assumed, and the honest picture is more
+nuanced than "the timeout was spurious":
 
-This script reconstructs the missing `frames` list from what is really in
-Storage, computes a REAL Laplacian sharpness per ambient frame (so anchor
-selection matches what the client would have chosen rather than defaulting
-to whichever happened to be first), and runs the flat validated-bridge
-merge on the recovered capture.
+  front_amb_0.jpg  2,097,152 bytes (exactly 2 MiB), NO JPEG EOI marker
+                   -> genuinely truncated, cut at an exact buffer boundary
+  the other 7      valid EOI marker -> complete, usable files
+
+So ONE upload really did fail and 7 completed, yet the client marked all 8
+failed and emptied `frames` -- leaving a capture that is 7/8 intact in
+Storage but entirely invisible to anything reading the document, the
+production backend included. Both halves are worth fixing client-side: the
+timeout should confirm against Storage before declaring failure, and it
+should fail only the frame that actually failed rather than the whole
+batch. Tilt and sweep on the same capture recorded fine; only the front
+burst, the largest upload batch, hit the timeout.
+
+**Integrity gate, learned the hard way**: cv2 decodes a truncated JPEG
+anyway (emitting "Premature end of JPEG file"), and the garbage in the
+missing region INFLATES Laplacian variance -- so on this script's first
+run the single corrupt frame scored sharpest (56.6 vs 50-53) and was
+chosen as the fusion anchor, quietly invalidating that run. Every file is
+now checked for a real EOI marker before it is trusted. A file existing is
+not evidence it is complete.
+
+This script reconstructs the missing `frames` list from the files that
+pass that gate, computes a real Laplacian per ambient frame so anchor
+selection matches what the client would have chosen, and runs the flat
+validated-bridge merge on the recovered capture.
 
 Read-only: Firestore/Storage reads, no writes to Firestore or Storage.
 """
@@ -102,6 +116,24 @@ def recover_frames(cap_id: str) -> Optional[dict]:
     for path in sorted(front):
         img = p0c._download(path)
         if img is None:
+            continue
+        # INTEGRITY GATE -- do not trust a file just because it exists.
+        # front_amb_0.jpg on this capture is exactly 2,097,152 bytes (2 MiB)
+        # with no JPEG EOI marker: a genuinely truncated upload, cut at an
+        # exact buffer boundary. cv2 still decodes it (emitting "Premature
+        # end of JPEG file"), and the garbage in the missing region INFLATES
+        # Laplacian variance -- so without this check the most corrupt frame
+        # scores sharpest and gets chosen as the anchor, which is exactly
+        # what happened on the first run of this script.
+        local = os.path.join(p0c.CACHE, path.replace('/', '_'))
+        try:
+            with open(local, 'rb') as fh:
+                fh.seek(-2, os.SEEK_END)
+                if fh.read(2) != b'\xff\xd9':
+                    print(f'    {os.path.basename(path):20} TRUNCATED '
+                          f'({os.path.getsize(local)} bytes, no EOI) -- skipped')
+                    continue
+        except OSError:
             continue
         g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img
         lap = float(cv2.Laplacian(g, cv2.CV_64F).var())
