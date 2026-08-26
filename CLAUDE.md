@@ -77,6 +77,36 @@ this project already flagged as an unbuilt gap on 2026-07-17
   this track; needs more real captures before this becomes a trusted
   parameter. Minutiae-space fusion (Stage A/B) remains the independently
   validated approach regardless of how this develops further.
+- **Round 38 (2026-08-26) — resolved "why isn't it one coherent print",
+  with real numbers, and corrected one of my own earlier wrong
+  conclusions.** The composite never was visually coherent (a core print
+  plus disconnected blobs) because `_keep_mask` draws independent 24px
+  discs per kept minutia. Naive merging of those discs LOOKS right but
+  costs real matchability (40→31, 29→20 across two captures). Real
+  mechanism, measured: sources present **119-134 UNVALIDATED minutiae**
+  inside their contributing coverage against only **15 validated** ones,
+  so merging pastes ~38 unvetted feature points to gain 15 vetted ones,
+  and Stage A's already-documented template-density penalty does the
+  rest. Fix that works (`phase3f_validated_merge.py`): bridge two
+  validated points only when the corridor between them contains no
+  unvalidated minutia — **matchability-neutral on all 3 real captures**
+  (matches the best blob score exactly: 40/30, 29/17, 21/19) while adding
+  real contiguity, with a clean dose-response when the gate is relaxed
+  (6 extra bridges → 3 extra minutiae → −6 and −4 points). Honest limit:
+  the gate is strict enough that it barely changes the picture, because
+  the blobs are very nearly the entire region this data can support — a
+  seamless merged print is not reachable by compositing policy alone.
+  Two real errors of mine are recorded there rather than quietly fixed:
+  (1) `phase3d`'s conclusion came from a conflated test (it changed the
+  merge AND swapped per-source masks for one global mask, manufacturing
+  the very overlap it then blamed); (2) weight attenuation CANNOT remove
+  content from `_multiband_combine`, which normalizes by total weight, so
+  a lone source survives at any nonzero weight (measured: 1 px of 176,710
+  changed). The new deliberately-sunlit capture (`5181d451`) processed
+  cleanly with no sunlight-specific failure in registration, gating or
+  compositing; its anchor scores are lower across the board (16/21 vs
+  34/29), consistent with this project's documented sunlight capture
+  problems — a capture-side effect, not a fusion one.
 
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+
