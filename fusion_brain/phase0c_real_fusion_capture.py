@@ -89,6 +89,70 @@ def _coverage(print_img: np.ndarray) -> np.ndarray:
     return (print_img < 240).astype(np.uint8)
 
 
+# Morphological closing radius used to turn ink into a solid footprint.
+# Must exceed the widest ridge-to-ridge VALLEY so gaps close, while staying
+# far below the print's own scale so the outer boundary is not inflated.
+# Real ridge period on these renders is ~9px (this project's own
+# _TARGET_PERIOD), so a 25px kernel spans roughly 2.5 periods -- comfortably
+# more than any single valley, comfortably less than the print.
+_FOOTPRINT_CLOSE_PX = 25
+# Second, larger close applied to the single largest component only, to
+# seal the remaining concavities a ridge-scale kernel cannot reach.
+_FOOTPRINT_SEAL_PX = 45
+
+
+def _footprint(print_img: np.ndarray) -> np.ndarray:
+    """Region this source actually IMAGED -- ink AND the valleys between it.
+
+    REAL BUG this exists to fix, found 2026-08-26 by tracing a visible
+    artifact (thick/tangled "smudge" patches inside the anchor's own print
+    on capture 5181d451) back to its source, rather than guessing at it.
+
+    `_coverage()` above returns INK pixels only (`print < 240`). That is the
+    right question for "where are this print's ridges", and the WRONG
+    question for "what territory does this source cover" -- which is what
+    both real consumers of it actually ask:
+
+      1. `1 - anchor_coverage` gates where a source may composite. With
+         ink-based coverage, HALF the anchor's own print (measured: 58,459
+         of 117,015 footprint px, 50.0%) -- every white valley between its
+         ridges -- reads as "territory the anchor does not cover", so a
+         source is free to draw ITS ridges into the gaps between the
+         anchor's ridges. That is precisely the observed artifact:
+         locally doubled ridge density, reading as a thick tangled smudge.
+         Confirmed visually (diag_source_attribution.py's own contribution
+         map puts sweep_left's region squarely inside the anchor print).
+      2. `fuse_minutiae.classify()` uses the same masks to decide
+         `unique_new_coverage` vs `unique_in_overlap`. A candidate minutia
+         sitting in another source's VALLEY -- fully imaged territory --
+         is therefore mis-tagged as genuine NEW coverage, inflating the
+         candidate pool the selective merge draws from.
+
+    Fix: close ink into a solid footprint, keep the largest connected
+    component (a real print is one region; specks are segmentation noise),
+    then seal remaining concavities. Deliberately morphology rather than a
+    convex hull: a fingerprint's real outline is genuinely concave in
+    places, and a hull would claim un-imaged territory as covered -- the
+    opposite error, and a harder one to notice.
+    """
+    ink = (print_img < 240).astype(np.uint8) * 255
+    if not ink.any():
+        return np.zeros(print_img.shape[:2], dtype=np.uint8)
+    k1 = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_FOOTPRINT_CLOSE_PX, _FOOTPRINT_CLOSE_PX))
+    closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k1)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(
+        (closed > 0).astype(np.uint8), 8)
+    if n <= 1:
+        return (closed > 0).astype(np.uint8)
+    biggest = max(range(1, n), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    foot = np.where(lab == biggest, 255, 0).astype(np.uint8)
+    k2 = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_FOOTPRINT_SEAL_PX, _FOOTPRINT_SEAL_PX))
+    foot = cv2.morphologyEx(foot, cv2.MORPH_CLOSE, k2)
+    return (foot > 0).astype(np.uint8)
+
+
 def _warp_coverage(cov: np.ndarray, t: reg.Transform,
                    out_shape: Tuple[int, int]) -> np.ndarray:
     th = np.radians(t.theta_deg)
