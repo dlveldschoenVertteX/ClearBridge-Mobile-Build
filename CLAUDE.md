@@ -1,5 +1,97 @@
 # ClearBridge Mobile — persistent context
 
+## Camera "2" is NOT a macro lens -- real device specs settle a standing assumption (2026-08-26, round 40)
+CTO asked directly, before buying a test phone: "are you actually using
+camera_index_macro or just cropping the main sensor output? ... if macro is
+this far the best captures we have on matchability and NFIQ2, would the
+entire fusion architecture benefit from being macro based?" Both halves
+checked against real code and real data rather than answered from the
+project's own accumulated framing.
+
+**Half 1 -- yes, it is a real separate camera.** `fusion_capture_controller
+.dart`'s `_runMacroPhase()` calls `initializeCamera(cameraDescription:
+macroDesc)` where `macroDesc` is matched on `c.name == '2'` among
+`getAvailableCameras()`. That is a genuine hardware camera switch, not a
+crop of the main sensor's output. Production's `_captureMacroShot` does the
+same thing.
+
+**Half 2 -- but that camera is not optically a macro lens.** Real
+device-reported `cameraLensInfo` (capture `1d186afc`, all four cameras):
+
+| cam | focal | sensor | minFocusDistance | note |
+|---|---|---|---|---|
+| 0 (main) | 4.15mm | 5.98x4.49mm | **50mm** | |
+| 1 (front) | 3.81mm | 5.98x4.49mm | -- | |
+| 2 ("macro") | **2.37mm** (shortest) | **3.92x2.94mm** (smallest) | **50mm** | |
+| 3 | 3.96mm | **6.64x4.97mm** (largest) | 50mm | |
+
+**The defining property of a macro lens is a minimum focus distance closer
+than the main camera's. Camera "2" has exactly the same 50mm floor as
+cameras 0 and 3.** It cannot focus closer than the main camera; it is the
+ultrawide sensor (shortest focal length = widest FOV, smallest sensor)
+being driven closer by a 1.2x-enlarged guide -- which is precisely how
+budget phones implement a "Macro" mode tile. This CONFIRMS round 33's own
+flagged-but-unconfirmed hypothesis ("~54mm working distance ...
+uncomfortably close to camera 2's own real minFocusDistanceDiopters: 20.0,
+a hard 50mm minimum") and explains the softness complaint that round 33's
+AF-target fix never fully resolved: there was never a macro optical
+advantage to recover.
+
+**Half 3 -- "macro is by far the best" is not supported by the real data.**
+Across 136 real scored captures (real `nfiq2Score` + `superprintParams
+.afisSource`):
+
+| winning source | wins | mean | max |
+|---|---|---|---|
+| `frame` (main camera) | **91** | 48.2 | **99** |
+| `secondary_3` | 4 | 30.5 | 72 |
+| **`secondary_2` (macro)** | **2** | 72.0 | 75 |
+
+and as CANDIDATES regardless of whether they won (`secondaryCamScores`):
+camera "3" mean **71.4** / max 76 (n=10) vs camera "2" mean **60.5** /
+max 75 (n=8) -- **camera 3 beats camera 2 on both.** Camera "2" won 1.5% of
+real captures. Where the "macro is best" impression most plausibly comes
+from: (a) rounds 32/35 celebrated camera 2's first-ever wins (69, then 75)
+as genuinely notable milestones, which they were -- but they are 2 data
+points; (b) `fusion_brain` uses `macro_round32`/`macro_round35` as bozorth3
+REFERENCES, which makes them structurally central to every score table in
+that track without implying the macro CAMERA scores best.
+
+**One real nuance that cuts the other way, stated rather than buried**: on
+a real paired capture, camera 2's own pad crop measured a LARGER ridge
+period (89.7px vs main's 58.9px) and much higher local contrast (Laplacian
+156.2 vs 28.0) -- because the 1.2x guide really does pull the user closer
+than the main camera's own distance calibration does. So camera 2 does
+deliver physically bigger ridges in practice, just not because of macro
+optics. n=1, measured with a purpose-built radial-FFT estimator (afis_print's
+own clipped `_ridge_wavelength_robust` returns nan on raw unenhanced crops),
+so treat as suggestive, not settled.
+
+**Recommendation: do NOT rebase the fusion architecture on camera "2".**
+Three independent reasons: no optical macro advantage (same focus floor,
+lower magnification per unit distance, smallest sensor); it loses to both
+camera 3 and the main camera on real measured scores; and the tilt/sweep
+brackets exist specifically to resolve ridges at pad EDGES rotating into
+view, for which the widest-FOV/smallest-sensor camera is the worst
+available tool. Camera "2"'s real demonstrated value is DIVERSITY -- both
+its wins came on captures where the main burst was independently weak (round
+35: main variants scored 33/64/39) -- i.e. it rescues a bad capture rather
+than out-resolving a good one. **If camera diversity is worth adding to
+fusion, camera "3" is the better-evidenced candidate** (largest sensor of
+all four, best secondary mean), and it is currently unused by
+`fusion_capture` entirely.
+
+**For the phone-buying decision (A35/S21/etc.), the one spec that matters
+is already measurable in 30 seconds**: whether the candidate phone has a
+rear camera whose `minFocusDistanceDiopters` implies a CLOSER minimum focus
+distance than its own main camera. `getCameraLensInfo` (MainActivity.kt,
+already ported into `fusion_capture`) reports exactly that, and
+`fusion_capture` already writes it to Firestore as `cameraLensInfo` on
+every capture. This makes the CTO's own cell-phone-store idea considerably
+more valuable than first assessed: a single capture per handset yields the
+full four-camera table above and answers "does this phone have real macro
+hardware" definitively, before any money is spent.
+
 ## ACTIVE TRACK: fusion_brain — the "brain" that fuses all architectures into one superprint (2026-08-22, round 37)
 **Read `fusion_brain/README.md` first — it carries the full live roadmap and
 per-stage status.** This section is the short pointer so the track is not
