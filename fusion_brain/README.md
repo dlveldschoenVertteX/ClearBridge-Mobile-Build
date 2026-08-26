@@ -152,6 +152,24 @@ deformations, used for both registration AND mosaicking.
   tested setting gets both — a product call, not a tuning problem. Full
   detail, including a correction to phase3d's own erroneous conclusion
   (drawn from a conflated test): `results/PHASE3_COMPOSITE_FINDINGS.md`.
+  **Resolved 2026-08-26 (`phase3f_validated_merge.py`)**: the CTO's read —
+  the blobs beat the merge because they reconstruct ridges only where the
+  data supports it — is confirmed and quantified. Sources present 119-134
+  UNVALIDATED minutiae inside their contributing coverage against only 15
+  validated ones, so naive merging pastes ~38 unvetted feature points to
+  gain 15 vetted ones, and Stage A's density penalty does the rest.
+  Bridging two validated points only when the corridor between them
+  contains no unvalidated minutia is **matchability-neutral on all three
+  real captures** (matches the best blob score exactly: 40/30, 29/17,
+  21/19) while drawing real bridges — the first merge that costs nothing.
+  Relaxing that gate one step admits 6 bridges, adds 3 minutiae, and costs
+  6 and 4 points: a clean dose-response. Honest limitation: the gate is so
+  strict it barely changes the picture (±200-640px of area), because the
+  blobs are very nearly the entire region this data can support. Also
+  records a structural bug worth knowing: weight attenuation CANNOT remove
+  content from `_multiband_combine` (it normalizes by total weight, so a
+  lone source survives at any nonzero weight — measured: 1 pixel of
+  176,710 changed).
 
 ## The real blocker, stated plainly
 

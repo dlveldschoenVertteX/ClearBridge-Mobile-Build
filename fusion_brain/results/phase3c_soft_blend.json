@@ -1,18 +1,18 @@
 {
-  "capture": "43378ea7-9f08-4a44-abe1-8e420bc344d7",
-  "max_added": 20,
+  "capture": "5181d451-3031-4e60-8ef8-65d6ec2eac8c",
+  "max_added": 15,
   "blur_sigma": 2.0,
   "scores": {
     "anchor_alone": {
-      "ink_scan": 8,
-      "macro_round32": 26,
-      "macro_round35": 18
+      "ink_scan": 7,
+      "macro_round32": 16,
+      "macro_round35": 21
     },
     "soft_composite": {
-      "ink_scan": 6,
-      "macro_round32": 25,
-      "macro_round35": 18
+      "ink_scan": 7,
+      "macro_round32": 21,
+      "macro_round35": 19
     }
   },
-  "composite_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/43378ea7-9f0_composite_softblend.png"
+  "composite_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_composite_softblend.png"
 }

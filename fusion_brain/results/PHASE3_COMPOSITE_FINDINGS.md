@@ -464,3 +464,90 @@ the minutiae TEMPLATE (Stage A/B), not the picture — and that production's
 superprint image should stay the single best full-frame render it delivers
 today. n=2 captures throughout, same standing caveat as every number in
 this track.
+
+## Validated-bridge merging (2026-08-26) — the CTO's hypothesis was right,
+## is now quantified, and yields the first merge that costs nothing
+
+CTO's read of the phase3e trade-off: *"if the blob beats the merge, that
+means it more meaningfully reconstructs the ridges in the places it should
+be. there needs to be a merged where ridges are reconstructed better and
+according to the data given."* Tested directly. **Confirmed, with a
+number.**
+
+**The mechanism, measured.** Counting extracted minutiae on the two saved
+composites (`6b43c255`, max_added=15): blobs 171 minutiae / 56,582 ink px;
+naive merge 209 / 72,946. The selective merge validated exactly **15**
+added minutiae — merging introduced **38 extra**, sitting in corridor
+pixels no gate in this track ever checked (not `fm.gate_sources`, not
+`fm.fuse`'s quality cap, not the coherence weight, which is a soft
+multiplier rather than a veto). Stage A's own random-noise control already
+established that template DENSITY alone carries a penalty comparable to
+real added minutiae. So the naive merge pays for 38 unvetted points to
+gain 15 vetted ones. That is exactly why it looks better and scores worse.
+
+**Real bug found in the first fix attempt, worth recording.** The obvious
+remedy — attenuate the compositing weight around unvalidated minutiae —
+**cannot work**, and the reason is structural: `_multiband_combine`
+normalizes by total weight, so wherever a single source covers a pixel the
+weight cancels out entirely and the pixel survives at full value no matter
+how small the weight. Measured: the suppression changed **1 pixel of
+176,710** and left scores identical. Weight is not a veto; only a hard
+zero removes content. Recorded because this invalidates any future "just
+down-weight it" fix on this blender.
+
+**What actually works — `phase3f_validated_merge.py`.** Rather than
+filling corridors and then trying to remove what's bad (which also punches
+holes, manufacturing the ridge terminations this whole exercise is trying
+to avoid), never grow through unsupported territory in the first place:
+draw the same validated discs, then join a PAIR of validated points with a
+capsule **only if the corridor between them contains no unvalidated
+minutia** (point-to-segment distance ≤ clearance). Contiguity grows only
+along paths the data endorses; no interior holes, no unvetted fill.
+
+**Real result, all three real captures, `max_added=15`:**
+
+| capture | anchor | blobs (phase3c) | validated bridges | bridges drawn |
+|---|---|---|---|---|
+| `6b43c255` | 34 / 29 | **40 / 30 → 2/2** | **40 / 30 → 2/2** | 3 |
+| `43378ea7` | 26 / 18 | 29 / 17 → 1/2 | 29 / 17 → 1/2 | 1 |
+| `5181d451` (sunlight, new) | 16 / 21 | 21 / 19 → 1/2 | 21 / 19 → 1/2 | 12 |
+
+**Matchability-neutral on every capture — it matches the best-known blob
+score exactly while drawing real bridges**, unlike the naive merge which
+cost 40→31 and 29→20. Composite minutiae counts are unchanged too (171 vs
+171 on capture 1), confirming the bridges add no spurious features.
+
+**Dose-response confirms the mechanism is the gate, not luck**
+(`6b43c255`, varying corridor clearance):
+
+| clearance | bridges let through | composite minutiae | round32 (34) | round35 (29) | beats |
+|---|---|---|---|---|---|
+| 24 (strict) | 6 rejected | 171 | **40** | **30** | **2/2** |
+| 12 | 0 rejected | 174 | 34 tie | 26 | 0/2 |
+| 6 | 0 rejected | 174 | 34 tie | 26 | 0/2 |
+| no gate (phase3e) | all | 209 | 31 | 31 | 1/2 |
+
+Relaxing the gate one step admits 6 more bridges, adds only **3** extra
+minutiae — and costs **6 points** on one reference and **4** on the other.
+Unvetted corridor content is expensive out of all proportion to its
+volume. The strict gate is the correct operating point.
+
+**The honest limitation, stated plainly.** The gate is strict enough that
+it barely changes the picture: covered area moves by only +202px
+(sunlight) and −641px (capture 1) versus the blob version. The reason is
+itself the finding — sources present **119–134 unvalidated minutiae**
+inside their contributing coverage against only **15 validated** ones, so
+almost every candidate corridor is genuinely blocked. **The blobs are not
+an arbitrary shape: they are very nearly the entire region where this
+data is trustworthy.** A visually seamless merged print is not reachable
+by better compositing policy alone, because the supporting data mostly is
+not there — which is the same standing conclusion this track keeps
+arriving at from new directions.
+
+**Sunlight capture note**: `5181d451` (the new capture, deliberately shot
+in sunlight) processed cleanly with no sunlight-specific failure —
+registration, gating and compositing all behaved normally, and fusion
+still beat anchor on one reference (16→21). Its anchor scores are lower
+across the board (16/21 vs capture 1's 34/29), consistent with this
+project's long-documented sunlight capture-quality problems, but that is a
+capture-side effect, not a fusion one.
