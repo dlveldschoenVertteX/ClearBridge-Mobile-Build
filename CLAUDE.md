@@ -230,6 +230,70 @@ this project already flagged as an unbuilt gap on 2026-07-17
   correct; only the accounting read zero). Full detail:
   `fusion_brain/results/PHASE4_HIERARCHY_FINDINGS.md`.
 
+- **Rounds 40-41 (2026-08-26) — raw-domain fusion tested to exhaustion;
+  the INSTRUMENT was the real problem, and fixing it did not rescue
+  fusion.** Phase 5 built raw-domain fusion (composite grayscale BEFORE
+  enhancement, so one orientation field and one Gabor pass span the whole
+  print — continuity by construction). It produced the most coherent print
+  this track has made; the CTO's own read was "the closest to my print I
+  have ever seen". Its first negative verdict turned out to be a
+  **confound of mine**: it compared a mosaic-via-crop against an
+  anchor-via-full-frame. The missing control scored 24/27, so against the
+  correct baseline the mosaic actually WINS round32.
+  - **Phase 6 (2x2: ECC vs ECC+TPS x average vs max-coherence)**: no arm
+    beats the control on both references; `ecc_avg` stays best at 1/2.
+    **TPS answered: measurably worse**, though the residual it corrects is
+    real (median local misregistration 1.1-11.1px after ECC). **Max-
+    coherence REFUTED** — an interim positive was measured against
+    unregistered sides and did not survive the fix. `tps_maxc` doubles
+    extracted minutiae (273 vs 135) and still loses — the template-density
+    penalty again. Three real bugs of mine recorded in
+    `results/PHASE6_TPS_MAXC_FINDINGS.md`: the ECC arm did no registration
+    at all; the first TPS arm tested a print-space→crop-space coordinate
+    bridge rather than TPS; and `tps.py`'s `warp_image` OOM-killed the
+    process at raw-crop resolution (fixed by row-chunking, verified
+    byte-identical).
+  - **The CTO's own question — "cam 2 is weaker than main, does that not
+    give us an unbalanced result?" — was right, and is now measured.**
+    `ref_macro_round32` covers a 52,866 bbox against the anchor's 103,016;
+    only 56 of a wide composite's 273 minutiae (20%) fall where it can see
+    them, while the other 79% still pay the density penalty. Real,
+    directional bias against exactly what fusion does. **But two tests say
+    it was not hiding a win**: restricting probes to the reference's own
+    extent moved fusion 0 to +2 while moving the CONTROL −5/−7; and
+    building better main-camera references (`build_main_refs.py`,
+    `ref_main_round32` = 161 minutiae over 106,673) raised the ANCHOR most
+    (34→44) with every fusion arm still losing.
+  - **Phase 7-8 (`results/PHASE8_CROPPATH_FINDINGS.md`)**: chasing a
+    17-point gap that should not have existed found the crop RENDER path
+    costs real score. Mask-aware `_normalize` **refuted** (byte-identical:
+    it is a pure affine map and everything downstream is affine-invariant
+    — do not re-attempt). **CLAHE tile scale is the real mechanism** —
+    `tileGridSize=(8,8)` is relative to the IMAGE, so the same pad gets
+    533x400px tiles full-frame vs 308x320px cropped — but forcing a common
+    physical tile made both paths worse, so it is a real SENSITIVITY, not
+    a change to make. Worth knowing regardless: **pad contrast enhancement
+    currently scales with framing and camera resolution rather than with
+    the finger**, a genuine cross-session inconsistency source. The fix
+    that works (register in crop space, render full-frame) **beats the crop
+    render on 3/4 references but is 0/4 against the plain anchor** — right
+    order of fix, wrong order of magnitude (~3-4 points against a 23-point
+    gap).
+  - **Where this leaves it**: pixel-domain fusion is now tested across
+    registration (ECC, ECC+TPS), combine rule (average, max-coherence),
+    render framing (crop, full-frame) and reference quality (macro,
+    main-camera), against a correct control every time. **`anchor_fullframe`
+    — the plain single-frame anchor, no fusion at all — remains the best
+    print this pipeline produces** (44/31 on the main-camera references).
+  - **PAUSED by CTO decision pending a real scanner reference.** When it
+    arrives, do this FIRST, before any new fusion work: add it via
+    `MACRO_REFS`/`build_main_refs.py`'s pattern and re-run
+    `diag_reference_power.py` + `phase8_fullframe_render.py`. Every
+    negative in rounds 37-41 is measurement-bound, not method-bound — the
+    open question is not "which fusion technique" but "can any reference
+    we own actually resolve the difference", and only a real >=500-DPI
+    full-pad scan answers it.
+
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+
 of added coverage is unmeasurable and a density penalty of comparable size
