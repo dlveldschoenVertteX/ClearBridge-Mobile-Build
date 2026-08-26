@@ -319,3 +319,59 @@ merge neighboring discs) so nearby kept points' regions actually join
 into one contiguous patch instead of leaving gaps between them — this is
 a compositing-shape change, independent of the blend-softening fix
 already validated above, and has not been tried.
+
+## Disc-merging fix built + tested (2026-08-26) — real, decisive NEGATIVE
+
+Direct follow-up to the caveat above: built `phase3d_merged_regions.py`,
+identical to `phase3c_continuous_blend.py` (same registration, same
+`fm.fuse` selective-merge cap, same soften-then-binarize-once policy)
+except the keep-mask is now a morphological CLOSE over the union of all
+sources' kept-point discs (`_keep_mask_merged`, elliptical kernel,
+`CLOSE_RADIUS_PX`), so nearby discs bridge into one contiguous region
+instead of staying as separate 24px blobs — the fix proposed to close the
+visual-coherence gap.
+
+**Real test, same capture (`6b43c255`) and same `max_added=15` that
+previously won 2/2 informative references under the isolated-disc
+version**: merging REVERSES the win. `macro_round32` 34→27 (was a win,
+now a loss), `macro_round35` 29→22 (same). **0/2 informative references,
+down from 2/2.** Confirmed not a tuning-sensitivity fluke: reran at a much
+tighter bridging radius (`close_radius=12` vs. `30`) — the resulting image
+differs by only 151 of 176,710 pixels (0.09%) and scores identically
+(27/22 both times). The loss is structural, not a knob to nudge.
+
+**Visually, the merged composite is also worse, not better** — sent for
+direct review: two solid black rectangular blocks appear where the
+merged region now spans, plus visible criss-crossing ridge lines, in
+place of the previous clean (if disconnected) ridge texture in those same
+patches.
+
+**Real mechanism, not just "it got worse"**: the compositing weight for
+each non-anchor source already excludes anywhere the anchor itself has
+coverage (`inv_a_cov` term) — so the black blocks are NOT anchor/source
+disagreement. They appear because merging pulls in the CORRIDOR between
+two individually-validated kept points, and that corridor was never
+itself checked for phase/orientation agreement — only the two endpoints
+were. Where that newly-included corridor is covered by MORE THAN ONE
+non-anchor source at once (two different sources' regions, previously
+kept apart by the 24px discs, now both spanning the same merged area),
+their independently-registered ridge lines disagree at that overlap
+(residual non-rigid misalignment TPS didn't fully correct, or genuinely
+different local ridge content between two different capture geometries),
+and multiband-blending two sets of black ridge lines at conflicting
+orientations does not average cleanly — it darkens toward solid black
+rather than picking one.
+
+**Conclusion: the isolated-disc "blobs" were not merely cosmetic — they
+were incidentally protecting the composite from exactly this
+inter-source disagreement**, by keeping each source's contribution
+confined to a small, mostly-non-overlapping patch. Naively merging
+neighboring regions removes that protection without adding anything to
+replace it (no phase/orientation check on the newly-included corridor).
+**Not adopting this fix.** A real next step, not yet built, if visual
+coherence is revisited: gate the merge itself on real orientation
+agreement between whichever sources would end up sharing the merged
+region (only bridge two discs if their underlying ridge angle roughly
+agrees in the gap between them), rather than a blind geometric distance
+threshold — same standing discipline as everywhere else in this track:
+measure before trusting a plausible-sounding fix.

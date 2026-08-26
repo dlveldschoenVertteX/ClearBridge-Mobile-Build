@@ -1,0 +1,19 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "max_added": 15,
+  "blur_sigma": 2.0,
+  "close_radius": 30.0,
+  "scores": {
+    "anchor_alone": {
+      "ink_scan": 5,
+      "macro_round32": 34,
+      "macro_round35": 29
+    },
+    "merged_composite": {
+      "ink_scan": 4,
+      "macro_round32": 27,
+      "macro_round35": 22
+    }
+  },
+  "composite_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_composite_merged.png"
+}
