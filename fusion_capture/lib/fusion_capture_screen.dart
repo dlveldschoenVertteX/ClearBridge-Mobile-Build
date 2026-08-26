@@ -79,9 +79,11 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen>
         return 1;
       case FusionPhase.sweep:
         return 2;
+      case FusionPhase.macro:
+        return 3;
       case FusionPhase.uploading:
       case FusionPhase.complete:
-        return 3;
+        return 4;
       default:
         return -1;
     }
@@ -281,6 +283,19 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen>
                   ),
                 if (s.distanceHint != null && _showGuide(s.phase))
                   _distanceBanner(s.distanceHint!),
+                // Macro's own confirmation text ('Capturing close-up
+                // detail…' / '✓ Close-up captured') has nowhere else to
+                // render: the ring-based confirmation banner above is
+                // nested inside the front-phase-only block (it's
+                // positioned relative to the front ring, which macro
+                // doesn't show), and without this the whole phase would
+                // give zero visual feedback -- exactly the "silent gap
+                // reads as a freeze" failure class this project has been
+                // burned by more than once. Reuses the same generic pill
+                // widget the distance hint already uses rather than a new
+                // one.
+                if (s.phase == FusionPhase.macro && s.confirmationText != null)
+                  _distanceBanner(s.confirmationText!),
                 _instruction(s),
                 _bottomBar(s),
               ],
@@ -297,7 +312,8 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen>
       p == FusionPhase.frontHold ||
       p == FusionPhase.frontBurst ||
       p == FusionPhase.tilt ||
-      p == FusionPhase.sweep;
+      p == FusionPhase.sweep ||
+      p == FusionPhase.macro;
 
   Widget _cameraLayer(FusionState s) {
     final cam = _controller.cameraService.controller;
@@ -348,15 +364,15 @@ class _FusionCaptureScreenState extends State<FusionCaptureScreen>
   /// -- this flow is materially longer than the single-burst one, and hiding
   /// that reads as a hang rather than as progress.
   Widget _stepper() {
-    const labels = ['Main', 'Edges', 'Texture'];
+    const labels = ['Main', 'Edges', 'Texture', 'Detail'];
     final idx = _phaseIndex;
     return Row(
-      children: List.generate(3, (i) {
+      children: List.generate(4, (i) {
         final done = idx > i;
         final active = idx == i;
         return Expanded(
           child: Padding(
-            padding: EdgeInsets.only(right: i < 2 ? 8 : 0),
+            padding: EdgeInsets.only(right: i < 3 ? 8 : 0),
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
