@@ -63,6 +63,8 @@ def _bracket(name: str) -> str:
         return 'tilt'
     if name.startswith('sweep'):
         return 'sweep'
+    if name.startswith('macro'):
+        return 'macro'
     return 'front'
 
 
@@ -153,7 +155,7 @@ def run(cap_ids: List[str]) -> dict:
 
     # Per-bracket detail: which bracket, if any, is internally coherent.
     print('\n  intra-bracket detail (by bracket):')
-    for br in ('tilt', 'sweep', 'front'):
+    for br in ('tilt', 'sweep', 'macro', 'front'):
         sel = [r for r in rows if r['kind'] == 'intra' and _bracket(r['ref']) == br]
         if not sel:
             print(f'    {br:8} (no intra pairs -- bracket has <2 sources)')

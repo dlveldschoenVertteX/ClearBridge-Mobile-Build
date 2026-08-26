@@ -191,6 +191,43 @@ deformations, used for both registration AND mosaicking.
   near-optimal for this data.** Full detail:
   `results/PHASE4_HIERARCHY_FINDINGS.md`.
 
+## Macro (camera "2") wired into `collect_sources()`, premise untested
+
+`fusion_capture` gained a fourth capture phase (2026-08-26, client-side
+port of `clearbridge_beta`'s own already-validated `_captureMacroShot`) —
+a dedicated close-up ambient/flash pair on camera "2". `collect_sources()`
+(`phase0c_real_fusion_capture.py`) now recognises `macroShots` the same
+way it already does `tiltShots`/`sweepShots`, which every downstream
+script (`phase3f`'s flat validated-bridge merge, the Phase 4 premise
+check) inherits automatically since they all iterate whatever sources it
+returns.
+
+**Real, stated-not-hidden limitation**: the crop reuses the FRONT
+camera's own `guide_region` — defensible for tilt (same camera, same
+guide, only the phone angle changes) but not for macro, a physically
+different lens shown a differently-sized on-screen guide. Production's
+own real camera-"2" crop is derived from `cameraLensInfo` sensor/focal-
+length math specifically because the naive reuse is already known wrong
+(`front_capture_controller.dart`'s own round-31 finding: real pad offset
+cy≈0.34, not the naive 0.5). `fusion_capture` does not record
+`cameraLensInfo`, so that correction isn't available here — this source
+is unvalidated and may be cropped on the wrong content entirely. A
+runtime warning prints whenever it's collected; visually confirm the
+rendered print before trusting any minutiae count from it.
+
+**No premise check has been run on real macro data yet** — no fusion_v1
+capture with `macroShots` exists so far. Per this track's own Phase 0
+discipline, whether macro is worth fusing at all (does it register onto
+the front anchor and land in genuinely new territory, the way tilt/sweep
+were confirmed to) is unmeasured, not assumed positive. There is also a
+real, specific reason for caution distinct from tilt/sweep's own history:
+macro's guide is deliberately a *tighter, closer* crop of roughly the
+same region the front burst already sees, unlike tilt/sweep's off-axis
+framing built to reveal edge content the front guide can't — so it may
+mostly fail Stage A/`phase3f`'s own `1 - anchor_coverage` gate regardless
+of its intrinsic quality. Flagged as the first real thing to check once
+capture data exists, not built on top of yet.
+
 ## The real blocker, stated plainly
 
 Stage A's controls surfaced a measurement problem, not just a method

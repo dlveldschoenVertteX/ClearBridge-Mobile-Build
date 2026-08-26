@@ -158,6 +158,50 @@ def collect_sources(doc: dict) -> Dict[str, Tuple[np.ndarray, dict]]:
         if img is not None:
             sources[zone] = (img, fgr.get(zone, guide))
 
+    # Macro (camera "2"): fusion_capture_controller.dart's macro phase
+    # captures exactly ONE dedicated close-up position (not multiple
+    # stations like tilt/sweep), tagged macro_amb_0 / macro_fl_0 -- so this
+    # reuses front_v1's own prefer-ambient-fall-back-to-flash selection by
+    # the `flashOn` field already on each entry, rather than tilt/sweep's
+    # tag-parsing/station-grouping logic, which does not apply here (there
+    # is no station to group by).
+    #
+    # REAL, KNOWN-WEAKER APPROXIMATION, stated plainly rather than hidden:
+    # this reuses the FRONT camera's own `guide_region`, the same choice
+    # already made for tilt above -- but for tilt that is a defensible
+    # reuse (same camera, same on-screen guide position, only the phone
+    # angle changes). Macro is not that: it is a physically different
+    # lens (main.py's own real cameraLensInfo history: camera "2" has a
+    # shorter focal length and smaller sensor than the main camera) shown
+    # a DIFFERENTLY-SIZED on-screen guide (scaled 1.2x -- see
+    # fusion_capture_controller.dart's `_macroGuideScaleFactor`). Production's
+    # OWN real crop for camera "2" is never derived from the on-screen guide
+    # at all -- it is derived from `cameraLensInfo`'s sensor/focal-length-
+    # ratio math (main.py, ~line 1637) specifically because the naive
+    # front-guide reuse is known wrong: front_capture_controller.dart's own
+    # real round-31 finding measured camera "2"'s true pad offset at
+    # cy~=0.34, not the naive 0.5 a straight guide reuse would assume.
+    # `fusion_capture` does not record `cameraLensInfo` at all, so that
+    # correction is not available here -- this crop is UNVALIDATED for this
+    # source and may be centred on the wrong content entirely. Wired in
+    # anyway (rather than skipped) so the premise-check machinery can run
+    # end to end the moment real macro capture data exists, but any
+    # analysis using this source should visually confirm the rendered
+    # print before trusting its minutiae count -- a low/zero registration
+    # inlier count for 'macro' is expected and uninformative until this
+    # caveat is resolved, not evidence the premise is false.
+    macro = doc.get('macroShots') or []
+    if macro:
+        amb_m = [m for m in macro if not m.get('flashOn')]
+        pick = amb_m[0] if amb_m else macro[0]
+        img = _download(pick['path'])
+        if img is not None:
+            print('    [macro] WARNING: cropped with the FRONT camera\'s '
+                  'guide_region -- unvalidated for this lens, no '
+                  'cameraLensInfo correction available. Visually confirm '
+                  'the rendered print before trusting this source.')
+            sources['macro'] = (img, guide)
+
     return sources
 
 
