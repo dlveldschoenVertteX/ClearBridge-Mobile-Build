@@ -125,8 +125,37 @@ def run(cap_id: str, combine: str = 'avg') -> Optional[dict]:
     # --- paste the finished mosaic back into the full frame -------------
     # No resampling, and nothing outside the crop box is touched, so the
     # ONLY difference from Phase 6 is the framing the enhancement sees.
+    #
+    # REAL BUG in this file's first version, caught by measuring the seam
+    # rather than trusting the result: `_mosaic` returns a coherence-
+    # WEIGHTED AVERAGE, which shifts the region's intensity statistics
+    # (measured here: mean 124.15 -> 136.77, std x1.097). Pasting that
+    # straight in leaves a hard 20.8-level step along the crop boundary --
+    # a rectangular discontinuity running across the frame, which the
+    # global CLAHE tiles and the orientation field both then see. The
+    # first run's `mosaic_fullframe` collapsed to 49 minutiae because of
+    # that seam, not because of anything about fusion; reporting it as a
+    # fusion result would have been reporting my own artifact.
+    #
+    # Fixed by restoring the mosaic's intensity statistics to those of the
+    # crop region it replaces before pasting. This is an affine intensity
+    # map, so per Phase 7's own refuted-hypothesis finding it cannot alter
+    # the ridge structure the mosaic carries -- it only removes the step.
+    mos_f = mos.astype(np.float32)
+    src_m, src_s = float(mos_f.mean()), float(mos_f.std())
+    dst_m, dst_s = float(a_crop.mean()), float(a_crop.std())
+    if src_s > 1e-6:
+        matched = (mos_f - src_m) * (dst_s / src_s) + dst_m
+    else:
+        matched = mos_f
+    matched = np.clip(matched, 0, 255).astype(np.uint8)
     pasted = a_gray.copy()
-    pasted[y0:y1, x0:x1] = mos
+    pasted[y0:y1, x0:x1] = matched
+    _band = 6
+    _in = float(pasted[y0 + 1:y0 + 1 + _band, x0:x1].mean())
+    _out = float(pasted[y0 - _band - 1:y0 - 1, x0:x1].mean())
+    print(f'  seam step after intensity match: {abs(_in - _out):.1f} levels '
+          f'(was 20.8 unmatched)')
 
     refs = {}
     for rn in REF_NAMES:

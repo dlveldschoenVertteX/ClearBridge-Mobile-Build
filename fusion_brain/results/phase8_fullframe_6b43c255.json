@@ -1,0 +1,43 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "combine": "avg",
+  "sides_used": 3,
+  "arms": {
+    "anchor_fullframe": {
+      "minutiae": 135,
+      "scores": {
+        "macro_round32": 34,
+        "main_round32": 44,
+        "macro_round35": 29,
+        "main_round35": 31
+      }
+    },
+    "anchor_crop": {
+      "minutiae": 135,
+      "scores": {
+        "macro_round32": 24,
+        "main_round32": 27,
+        "macro_round35": 27,
+        "main_round35": 36
+      }
+    },
+    "mosaic_crop": {
+      "minutiae": 91,
+      "scores": {
+        "macro_round32": 25,
+        "main_round32": 17,
+        "macro_round35": 20,
+        "main_round35": 27
+      }
+    },
+    "mosaic_fullframe": {
+      "minutiae": 92,
+      "scores": {
+        "macro_round32": 29,
+        "main_round32": 21,
+        "macro_round35": 22,
+        "main_round35": 21
+      }
+    }
+  }
+}
