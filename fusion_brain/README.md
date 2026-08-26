@@ -202,18 +202,24 @@ script (`phase3f`'s flat validated-bridge merge, the Phase 4 premise
 check) inherits automatically since they all iterate whatever sources it
 returns.
 
-**Real, stated-not-hidden limitation**: the crop reuses the FRONT
-camera's own `guide_region` — defensible for tilt (same camera, same
-guide, only the phone angle changes) but not for macro, a physically
-different lens shown a differently-sized on-screen guide. Production's
-own real camera-"2" crop is derived from `cameraLensInfo` sensor/focal-
-length math specifically because the naive reuse is already known wrong
-(`front_capture_controller.dart`'s own round-31 finding: real pad offset
-cy≈0.34, not the naive 0.5). `fusion_capture` does not record
-`cameraLensInfo`, so that correction isn't available here — this source
-is unvalidated and may be cropped on the wrong content entirely. A
-runtime warning prints whenever it's collected; visually confirm the
-rendered print before trusting any minutiae count from it.
+**Updated same day**: `fusion_capture` now records `cameraLensInfo` too
+(ported native probe + Dart query, same shape as `clearbridge_beta`'s own
+already-validated version), and `collect_sources()` uses it when present
+— `_macro_guide()` applies the same general FOV-correction formula
+production's own secondary-camera loop uses (angular FOV ≈ sensor-size /
+focal-length, so `rx`/`ry` scale by the resulting ratio). Verified against
+this device's own real numbers: reproduces production's documented ratio
+exactly (0.871). **Deliberately does NOT port production's `cy=0.34`/
+`rx=0.11`/`ry=0.13` overrides for camera "2"** — those are real, but
+empirical calibration for one specific device's own physical lens
+mounting, not a portable formula; blindly reusing them on a different
+phone's different macro lens would silently introduce a new wrong
+assumption, the exact failure mode multi-device testing exists to catch.
+`cx`/`cy` stay at 0.5 (matching what production itself falls back to for
+any camera it has no per-device calibration for). Falls back to the old
+unmodified-front-guide approximation, with the same loud runtime warning,
+whenever `cameraLensInfo` is absent — every capture before this field
+existed, and any device/build that doesn't record it.
 
 **No premise check has been run on real macro data yet** — no fusion_v1
 capture with `macroShots` exists so far. Per this track's own Phase 0

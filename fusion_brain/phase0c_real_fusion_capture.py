@@ -165,44 +165,76 @@ def collect_sources(doc: dict) -> Dict[str, Tuple[np.ndarray, dict]]:
     # the `flashOn` field already on each entry, rather than tilt/sweep's
     # tag-parsing/station-grouping logic, which does not apply here (there
     # is no station to group by).
-    #
-    # REAL, KNOWN-WEAKER APPROXIMATION, stated plainly rather than hidden:
-    # this reuses the FRONT camera's own `guide_region`, the same choice
-    # already made for tilt above -- but for tilt that is a defensible
-    # reuse (same camera, same on-screen guide position, only the phone
-    # angle changes). Macro is not that: it is a physically different
-    # lens (main.py's own real cameraLensInfo history: camera "2" has a
-    # shorter focal length and smaller sensor than the main camera) shown
-    # a DIFFERENTLY-SIZED on-screen guide (scaled 1.2x -- see
-    # fusion_capture_controller.dart's `_macroGuideScaleFactor`). Production's
-    # OWN real crop for camera "2" is never derived from the on-screen guide
-    # at all -- it is derived from `cameraLensInfo`'s sensor/focal-length-
-    # ratio math (main.py, ~line 1637) specifically because the naive
-    # front-guide reuse is known wrong: front_capture_controller.dart's own
-    # real round-31 finding measured camera "2"'s true pad offset at
-    # cy~=0.34, not the naive 0.5 a straight guide reuse would assume.
-    # `fusion_capture` does not record `cameraLensInfo` at all, so that
-    # correction is not available here -- this crop is UNVALIDATED for this
-    # source and may be centred on the wrong content entirely. Wired in
-    # anyway (rather than skipped) so the premise-check machinery can run
-    # end to end the moment real macro capture data exists, but any
-    # analysis using this source should visually confirm the rendered
-    # print before trusting its minutiae count -- a low/zero registration
-    # inlier count for 'macro' is expected and uninformative until this
-    # caveat is resolved, not evidence the premise is false.
     macro = doc.get('macroShots') or []
     if macro:
         amb_m = [m for m in macro if not m.get('flashOn')]
         pick = amb_m[0] if amb_m else macro[0]
         img = _download(pick['path'])
         if img is not None:
-            print('    [macro] WARNING: cropped with the FRONT camera\'s '
-                  'guide_region -- unvalidated for this lens, no '
-                  'cameraLensInfo correction available. Visually confirm '
-                  'the rendered print before trusting this source.')
-            sources['macro'] = (img, guide)
+            sources['macro'] = (img, _macro_guide(doc, guide))
 
     return sources
+
+
+def _macro_guide(doc: dict, main_guide: dict) -> dict:
+    """Crop region for the macro source -- real per-device correction when
+    possible, a loudly-flagged approximation otherwise.
+
+    `fusion_capture` now records `cameraLensInfo` (real Camera2
+    characteristics per camera id, ported 2026-08-26) the same way
+    `main.py`'s own secondary-camera scoring loop already does. When it's
+    present for both the main camera ("0") and camera "2", this applies
+    the SAME general FOV-correction formula production uses (main.py,
+    ~line 1637): angular field of view ~= sensorSize/focalLength, so
+    scaling rx/ry by (fl_sec/sensor_sec)/(fl_main/sensor_main) extracts
+    the equivalent physical pad region from the differently-framed
+    secondary lens.
+
+    Deliberately DOES NOT port production's cy=0.34/rx=0.11/ry=0.13
+    overrides for camera "2" -- those are real, but they are empirical
+    calibration measured against ONE specific device's own camera "2"
+    physical mounting (front_capture_controller.dart's round-31/33
+    history), not a portable formula. Blindly applying a Doogee-specific
+    offset to a different phone's different macro/auxiliary lens would
+    silently introduce a NEW wrong assumption -- exactly the failure mode
+    multi-device testing exists to catch, not repeat. cx/cy stay at the
+    generic 0.5 centre (matching what production itself uses for every
+    camera it has no per-device calibration for, e.g. its own camera "3").
+
+    Falls back to the main camera's own guide_region, unchanged, with a
+    loud runtime warning, whenever cameraLensInfo is absent (e.g. every
+    capture before this field existed) or incomplete.
+    """
+    lens_info = doc.get('cameraLensInfo') or {}
+    main_lens = lens_info.get('0') or {}
+    macro_lens = lens_info.get('2') or {}
+    fl_main = main_lens.get('focalLengthMm')
+    fl_macro = macro_lens.get('focalLengthMm')
+    sw_main = main_lens.get('sensorWidthMm')
+    sh_main = main_lens.get('sensorHeightMm')
+    sw_macro = macro_lens.get('sensorWidthMm')
+    sh_macro = macro_lens.get('sensorHeightMm')
+    if (fl_main and fl_macro and sw_main and sh_main and sw_macro and sh_macro
+            and fl_main > 0 and sw_macro > 0 and sh_macro > 0):
+        rx_ratio = (fl_macro / sw_macro) / (fl_main / sw_main)
+        ry_ratio = (fl_macro / sh_macro) / (fl_main / sh_main)
+        print(f'    [macro] cameraLensInfo-corrected crop: '
+              f'rx_ratio={rx_ratio:.3f} ry_ratio={ry_ratio:.3f} '
+              f'(fl {fl_main:.2f}->{fl_macro:.2f}mm, '
+              f'sensor {sw_main:.2f}x{sh_main:.2f}->{sw_macro:.2f}x{sh_macro:.2f}mm)')
+        return {
+            'cx': 0.5,
+            'cy': 0.5,
+            'rx': main_guide['rx'] * rx_ratio,
+            'ry': main_guide['ry'] * ry_ratio,
+            'tipAngleDeg': main_guide.get('tipAngleDeg', 0.0),
+            'n': main_guide.get('n', 2.5),
+        }
+    print('    [macro] WARNING: no cameraLensInfo for this capture -- '
+          'cropped with the FRONT camera\'s unmodified guide_region, '
+          'unvalidated for this lens. Visually confirm the rendered '
+          'print before trusting this source.')
+    return main_guide
 
 
 def analyse(cap_id: str, doc: dict) -> Optional[dict]:

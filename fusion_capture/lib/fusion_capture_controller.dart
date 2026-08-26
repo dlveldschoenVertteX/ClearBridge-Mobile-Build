@@ -9,7 +9,7 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show HapticFeedback;
+import 'package:flutter/services.dart' show HapticFeedback, MethodChannel;
 import 'package:mac_capture/mac_capture.dart';
 // Taken transitively via mac_capture (pins ^4.0.2), same as
 // clearbridge_beta's own front_capture_controller.dart -- not declared
@@ -468,6 +468,56 @@ class FusionCaptureController extends ChangeNotifier {
   static const double _macroDriftAcceptRatio = 0.6;
   static const Duration _macroFocusCallTimeout = Duration(seconds: 3);
 
+  // ---- camera capability probes (ported from clearbridge_beta) ----
+  // Two real, direct uses: (1) cameraLensInfo lets fusion_brain's own
+  // collect_sources() apply a per-device FOV-corrected crop to the macro
+  // source instead of the current unvalidated front-guide reuse -- see
+  // that file's own loud warning about why this matters; (2)
+  // rawSensorSupport is free, real hardware-survey data for whatever
+  // device this session happens to run on -- directly useful the moment
+  // this app runs on more than the one device it was built against.
+  // Read-only, no-capture, queried once per app process (not per session
+  // -- these are hardware constants that cannot change between captures
+  // on the same physical device) and attached to the capture doc.
+  static const _cameraCapabilitiesChannel = MethodChannel('clearbridge/cameraCapabilities');
+  static Map<String, Map<String, dynamic>>? _cameraLensInfoCache;
+  static bool _cameraLensInfoQueried = false;
+  static Map<String, bool>? _rawSensorSupportCache;
+  static bool _rawSensorSupportQueried = false;
+
+  static Future<Map<String, Map<String, dynamic>>?> _queryCameraLensInfo() async {
+    if (_cameraLensInfoQueried) return _cameraLensInfoCache;
+    _cameraLensInfoQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getCameraLensInfo');
+      if (result != null) {
+        _cameraLensInfoCache = result.map((k, v) => MapEntry(
+              k,
+              (v as Map).map((k2, v2) => MapEntry(k2 as String, v2)),
+            ));
+      }
+    } catch (e) {
+      debugPrint('[fusion] camera lens-info query failed (non-fatal): $e');
+    }
+    return _cameraLensInfoCache;
+  }
+
+  static Future<Map<String, bool>?> _queryRawSensorSupport() async {
+    if (_rawSensorSupportQueried) return _rawSensorSupportCache;
+    _rawSensorSupportQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getRawSensorSupport');
+      if (result != null) {
+        _rawSensorSupportCache = result.map((k, v) => MapEntry(k, v as bool));
+      }
+    } catch (e) {
+      debugPrint('[fusion] raw-sensor-support query failed (non-fatal): $e');
+    }
+    return _rawSensorSupportCache;
+  }
+
   // ---- pre-shutter countdown (real device feedback, 2026-08-22): every
   // station/burst previously fired the instant positioning finished, with
   // no final beat for the user to settle -- "it just fires without me
@@ -515,6 +565,8 @@ class FusionCaptureController extends ChangeNotifier {
   Size? _screenSize;
   Size? _previewSize;
   int _sensorOrientation = 90;
+  Map<String, Map<String, dynamic>>? _cameraLensInfo;
+  Map<String, bool>? _rawSensorSupport;
   /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
   /// WAITING but does not cancel the work behind the future -- without this
   /// an abandoned station loop keeps driving takePicture() while the NEXT
@@ -619,6 +671,13 @@ class FusionCaptureController extends ChangeNotifier {
       if (pv != null) _previewSize = Size(pv.width, pv.height);
       _sensorOrientation = cam.description.sensorOrientation;
       _flash = AdaptiveFlashController(cam);
+      // Queried once, sequentially, right here -- not raced against any
+      // other call site -- so the static per-process cache in
+      // _queryCameraLensInfo/_queryRawSensorSupport can never be read
+      // while still mid-flight. Real hardware constants for this device,
+      // safe to await now and reuse at upload time.
+      _cameraLensInfo = await _queryCameraLensInfo();
+      _rawSensorSupport = await _queryRawSensorSupport();
       final mainRegion = _guideRegionFor(PadSilhouetteShape.defaultShape);
       if (mainRegion != null) {
         _guideRegions['main'] = mainRegion;
@@ -1860,6 +1919,8 @@ class FusionCaptureController extends ChangeNotifier {
         if (sweepShots.isNotEmpty) 'sweepShots': sweepShots,
         if (macroShots.isNotEmpty) 'macroShots': macroShots,
         'fusionGuideRegions': _guideRegions,
+        if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
+        if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,
         'fusionDebug': _debug,
       }, SetOptions(merge: true)).timeout(_networkTimeout);
 
