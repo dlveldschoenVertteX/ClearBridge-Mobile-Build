@@ -216,6 +216,55 @@ opens a real, replicated positive window this track had not found before.
 Worth a real next step: more real captures to confirm the win band holds
 beyond n=1, before this graduates past "promising, not yet validated."
 
+## Second real capture: partial replication, not a clean repeat — and why, confirmed not guessed
+
+CTO took a fresh real `fusion_v1` capture session specifically to test
+whether the max_added≈12-17 win band above holds on a second, independent
+capture (`43378ea7-9f08-4a44-abe1-8e420bc344d7`). Ran the identical sweep.
+
+| max_added | macro_round32 | macro_round35 | beats (2 refs) |
+|---|---|---|---|
+| anchor alone | 26 | 18 | — |
+| 5 | 34 (BEAT) | 17 (lose) | 1/2 |
+| 10 | 31 (BEAT) | 17 (lose) | 1/2 |
+| 12 | 31 (BEAT) | 17 (lose) | 1/2 |
+| 15 | 29 (BEAT) | 17 (lose) | 1/2 |
+| 17 | 29 (BEAT) | 18 (tie) | 1/2 |
+| 20 | 25 (lose) | 18 (tie) | 0/2 |
+
+**Real, partial replication — not the clean 2/2 the first capture showed.**
+A genuine, consistent win on macro_round32 across a WIDE range (5 through
+17, not just a narrow band), but macro_round35 never actually beats
+anchor on this capture (best case: ties at max_added=17). One reference
+corroborates the mechanism works; the other doesn't move enough to call it
+replicated in full.
+
+**Investigated why the contribution pattern looks so different from the
+first capture (only `sweep_right` contributes almost anything) rather than
+leaving it unexplained** — real, checkable answer, not a guess: on this
+capture, ALL THREE tilt sources failed the SAME reliability gate this
+track has used since Phase 1 (`fm.gate_sources`, min_inlier_frac=0.20 /
+min_inlier_count=15) — real registration inlier counts too low to trust,
+a genuine per-capture quality difference (plausibly softer/less-aligned
+tilt shots this session), not a bug in anything built for Stage C. Of the
+3 sweep sources that DID pass, `sweep_right` alone offered 57
+unique-new-coverage candidates (mean quality 46.2) against `sweep_left`'s
+5 and `sweep_center`'s 1 — the global quality-sorted cap naturally
+concentrates on whichever source actually has real material to contribute
+on a given capture, which on THIS capture was overwhelmingly one source
+instead of four.
+
+**Honest conclusion**: the mechanism (softened compositing + moderate
+selectivity) produces a REAL improvement again, but not uniformly across
+both references, and which sources even get a chance to contribute varies
+capture-to-capture based on real, already-validated quality gating this
+track already trusts. This is consistent with — not a contradiction of —
+everything upstream in this track: real capture-to-capture variance in
+which sources register well is expected, and n=2 real captures is still
+far short of enough to trust `max_added≈12-17` as a tuned setting. It
+does further support that this line of work is worth continuing, not that
+it is already validated.
+
 ## Standing blocker, unchanged
 
 Same as every phase before this one: real judgement of whether ANY of
