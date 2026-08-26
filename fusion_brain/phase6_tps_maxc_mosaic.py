@@ -60,6 +60,7 @@ Read-only: Firestore/Storage reads, no writes outside fusion_brain/results/.
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from typing import Dict, List, Optional, Tuple
@@ -175,6 +176,86 @@ def _ecc_register(anchor_crop: np.ndarray,
     vm = cv2.warpPerspective(ones, warp_full, (fw, fh),
                              flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP)
     return regd, (vm > 127).astype(np.float32)
+
+
+# ---- Elastic refinement, in CROP SPACE only (2026-08-26 rewrite) ----
+# The first version of the TPS arm fitted its warp on RENDERED-PRINT
+# minutiae and bridged print-space -> crop-space with a bare per-axis
+# rescale of the rigid translation. That was wrong, and measurably so:
+# the anchor crop is 2563x2464 while its print is 410x431, and the
+# relationship between them includes generate()'s upright-from-tip
+# ROTATION and trim, not just a uniform scale -- plus the rescaled
+# rigid part was applied about the image ORIGIN, which at a 6x scale
+# ratio throws distant pixels hundreds of px off. Measured directly:
+# the three sources ECC registers well (corr 0.540 / 0.549 / 0.613)
+# were exactly the ones the print-space TPS destroyed (0.266 / 0.164 /
+# -0.008), so every side then failed the 0.45 gate and both TPS arms
+# produced nothing. That run tested the coordinate bridge, not TPS.
+#
+# This replaces it with the formulation the Phase 6 hypothesis actually
+# describes -- elastic correction ON TOP OF the global registration --
+# without ever leaving crop space: ECC aligns globally, then a grid of
+# per-block phase correlations measures the LOCAL residual directly on
+# the registered crops, and those become the TPS control points. Phase
+# correlation is the right probe here because the hypothesised mechanism
+# is sub-ridge-period phase residual, which is precisely what it
+# measures. Direction convention verified empirically before use
+# (phaseCorrelate(a, b) returns b's displacement relative to a), same
+# standing discipline as the Cramer's-rule and chunking checks.
+
+_BLOCK_PX = 128          # block side for local phase correlation
+_BLOCK_STRIDE = 128      # non-overlapping -> independent measurements
+_BLOCK_MIN_STD = 6.0     # skip flat/dead blocks: no ridge signal to phase-match
+_BLOCK_MIN_RESP = 0.05   # phaseCorrelate confidence floor
+_MAX_LOCAL_SHIFT_PX = 40.0   # == tps.MAX_PLAUSIBLE_DISPLACEMENT_PX: beyond a
+                             # few ridge periods this is not skin deformation
+_MAX_CONTROLS = 120      # caps the TPS solve AND warp_image's O(M*N) cost
+
+
+def _elastic_refine(anchor_crop: np.ndarray, regd: np.ndarray,
+                    vmask: np.ndarray) -> Optional[np.ndarray]:
+    """TPS-refine an ALREADY-ECC-REGISTERED side using local phase residual.
+
+    Returns the elastically-warped side, or None when too few blocks yield
+    a confident, physically plausible local shift (in which case the caller
+    should keep the plain ECC result rather than force a bad warp).
+    """
+    h, w = anchor_crop.shape[:2]
+    a_f = anchor_crop.astype(np.float32)
+    s_f = regd.astype(np.float32)
+    win = cv2.createHanningWindow((_BLOCK_PX, _BLOCK_PX), cv2.CV_32F)
+
+    ctrl_src, ctrl_dst, resps = [], [], []
+    for y in range(0, h - _BLOCK_PX + 1, _BLOCK_STRIDE):
+        for x in range(0, w - _BLOCK_PX + 1, _BLOCK_STRIDE):
+            if vmask[y:y + _BLOCK_PX, x:x + _BLOCK_PX].mean() < 0.9:
+                continue
+            ab = a_f[y:y + _BLOCK_PX, x:x + _BLOCK_PX]
+            sb = s_f[y:y + _BLOCK_PX, x:x + _BLOCK_PX]
+            if ab.std() < _BLOCK_MIN_STD or sb.std() < _BLOCK_MIN_STD:
+                continue
+            try:
+                (dx, dy), resp = cv2.phaseCorrelate(ab * win, sb * win)
+            except cv2.error:
+                continue
+            if resp < _BLOCK_MIN_RESP or math.hypot(dx, dy) > _MAX_LOCAL_SHIFT_PX:
+                continue
+            cx, cy = x + _BLOCK_PX / 2.0, y + _BLOCK_PX / 2.0
+            # phaseCorrelate(a, b) -> b's content sits at a's position plus
+            # (dx, dy). So in SIDE space the feature is at centre+(dx,dy),
+            # and its ANCHOR-space home is the block centre itself.
+            ctrl_src.append((cx + dx, cy + dy))
+            ctrl_dst.append((cx, cy))
+            resps.append(resp)
+
+    if len(ctrl_src) < tps.MIN_CONTROL_POINTS:
+        return None
+    order = np.argsort(resps)[::-1][:_MAX_CONTROLS]
+    warp = tps.fit_tps(np.array(ctrl_src)[order], np.array(ctrl_dst)[order],
+                       regularization=1.0)
+    if warp is None or warp.max_displacement > _MAX_LOCAL_SHIFT_PX:
+        return None
+    return tps.warp_image(warp, regd, (h, w), max_grid_pts=60_000)
 
 
 def _tps_warp_crop(anchor_crop: np.ndarray, side_crop: np.ndarray,
@@ -341,28 +422,28 @@ def run(cap_id: str, use_tps: bool = False, combine: str = 'avg',
         if name == 'center' or g.shape[:2] != shape:
             continue
         s_crop = g[y0:y1, x0:x1]
-        if not use_tps:
-            # Real ECC registration -- production's own step, extracted
-            # into `_ecc_register` (see the correction note in this
-            # module's docstring: the original version of this arm did
-            # NOT register at all, and this is the fix).
-            reg_out = _ecc_register(a_crop, s_crop)
-            if reg_out is None:
-                print(f'    {name}: ECC registration failed, skipped')
-                continue
-            regd, vmask = reg_out
-            sides.append(regd)
-            valid_masks.append(vmask)
+        # BOTH arms start from the identical ECC step -- production's own,
+        # extracted into `_ecc_register` (see the docstring correction: the
+        # first version of the ecc arm did NOT register at all). Sharing it
+        # is what makes elastic refinement the ONLY variable between arms.
+        reg_out = _ecc_register(a_crop, s_crop)
+        if reg_out is None:
+            print(f'    {name}: ECC registration failed, skipped')
             continue
-        s_print = _render(srcs[name][0], guide, f'{cap_id[:12]}_{name}')
-        if s_print is None:
-            continue
-        w = _tps_warp_crop(a_crop, s_crop, a_print, s_print, box, shape)
-        if w is not None:
-            sides.append(w)
-            valid_masks.append(None)
-        else:
-            print(f'    {name}: TPS registration failed, skipped')
+        regd, vmask = reg_out
+        if use_tps:
+            ref = _elastic_refine(a_crop, regd, vmask)
+            if ref is None:
+                # Deliberately keep the plain ECC result rather than drop the
+                # source: "too few confident local measurements" is not a
+                # reason to discard a side the global step aligned fine, and
+                # silently dropping it would confound the arms by changing
+                # WHICH sources contribute, not just how they are registered.
+                print(f'    {name}: elastic refine declined, keeping ECC')
+            else:
+                regd = ref
+        sides.append(regd)
+        valid_masks.append(vmask)
 
     mos, used = _mosaic(a_crop, sides, combine, valid_masks)
     if mos is None:
