@@ -35,6 +35,21 @@ causes, each with its own lever, tested here independently:
 Both default OFF so `phase6 --arm ecc_avg` reproduces Phase 5 exactly,
 which is what makes the other arms attributable.
 
+CORRECTION, 2026-08-26 -- a real bug in THIS harness's first version,
+found by reading its own numbers against its own code rather than by a
+failing run. `_mosaic()` takes PRE-REGISTERED sides. In TPS mode the
+sides were warped first, but the non-TPS path cropped each side and
+passed it through with NO registration at all -- production does ECC
+inside `_front_anchored_mosaic`, and replacing that function dropped the
+registration with it. So the original `ecc_*` arms were not the Phase 5
+baseline they were labelled as (2/6 sides passed the correlation gate vs
+Phase 5's 3, and the scores differed). The avg-vs-maxc contrast was
+still internally valid -- both arms saw identical sides -- but the
+TPS-vs-ECC contrast was not, because one arm was registered and the
+other was not. `_ecc_register()` below now performs production's exact
+ECC step (small-scale estimate, WARP_INVERSE_MAP, warped ones-mask for
+validity), so `ecc_*` is a real baseline and the 2x2 is interpretable.
+
 CONTROL: every arm is scored against `generate()` on the ANCHOR CROP with
 the same adjusted guide and no mosaic -- the control Phase 5 was missing.
 Comparing against the full-frame anchor is what produced that confound;
@@ -120,6 +135,48 @@ def _adjust_guide(guide: dict, box: Tuple[int, int, int, int],
     return adj
 
 
+def _ecc_register(anchor_crop: np.ndarray,
+                  side_crop: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """Production's own ECC step, extracted so it can be swapped for TPS.
+
+    Byte-equivalent to the registration block inside
+    `_front_anchored_mosaic`: CLAHE-equalised copies downscaled to
+    `_MOSAIC_REG_PX` for the estimate (full-res ECC is far too slow),
+    MOTION_HOMOGRAPHY, and -- critically -- `WARP_INVERSE_MAP` on the
+    application, which is the direction convention a real 2026-08-11 bug
+    in production got wrong for months. Validity comes from warping an
+    explicit all-ones mask, not from testing warped pixel values, for the
+    same reason production does it that way (a genuinely black pixel
+    inside the source is not "no data").
+
+    Returns (registered, valid_mask float32 in 0..1) or None if ECC fails
+    to converge.
+    """
+    fh, fw = anchor_crop.shape[:2]
+    g = side_crop if side_crop.shape[:2] == (fh, fw) else cv2.resize(side_crop, (fw, fh))
+    s = ap._MOSAIC_REG_PX / max(fh, fw)
+    small = (max(1, int(fw * s)), max(1, int(fh * s)))
+    cl = cv2.createCLAHE(3.0, (8, 8))
+    ref_small = cl.apply(cv2.resize(anchor_crop, small))
+    up = np.array([[1 / s, 0, 0], [0, 1 / s, 0], [0, 0, 1]], dtype=np.float32)
+    dn = np.array([[s, 0, 0], [0, s, 0], [0, 0, 1]], dtype=np.float32)
+    crit = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 60, 1e-4)
+    try:
+        warp = np.eye(3, 3, dtype=np.float32)
+        _, warp = cv2.findTransformECC(
+            ref_small, cl.apply(cv2.resize(g, small)), warp,
+            cv2.MOTION_HOMOGRAPHY, crit, None, 5)
+    except cv2.error:
+        return None
+    warp_full = (up @ warp @ dn).astype(np.float32)
+    regd = cv2.warpPerspective(g, warp_full, (fw, fh),
+                               flags=cv2.INTER_LINEAR + cv2.WARP_INVERSE_MAP)
+    ones = np.full(g.shape[:2], 255, np.uint8)
+    vm = cv2.warpPerspective(ones, warp_full, (fw, fh),
+                             flags=cv2.INTER_NEAREST + cv2.WARP_INVERSE_MAP)
+    return regd, (vm > 127).astype(np.float32)
+
+
 def _tps_warp_crop(anchor_crop: np.ndarray, side_crop: np.ndarray,
                    a_print: np.ndarray, s_print: np.ndarray,
                    box: Tuple[int, int, int, int],
@@ -170,13 +227,22 @@ def _tps_warp_crop(anchor_crop: np.ndarray, side_crop: np.ndarray,
 
 
 def _mosaic(anchor_crop: np.ndarray, sides: List[np.ndarray],
-            combine: str) -> Tuple[Optional[np.ndarray], int]:
+            combine: str,
+            valid_masks: Optional[List[Optional[np.ndarray]]] = None
+            ) -> Tuple[Optional[np.ndarray], int]:
     """Composite pre-registered raw crops onto the anchor.
 
     `combine='avg'`  -- coherence-weighted average, production's own rule.
     `combine='maxc'` -- per-pixel winner-take-all on the same weight
                         field. Never sums two ridge patterns, so
                         destructive interference cannot occur.
+
+    `valid_masks[i]`, when given, is the REAL warped-footprint mask for
+    `sides[i]` (production's own validity mechanism -- see
+    `_ecc_register`'s docstring for why a warped ones-mask is used instead
+    of testing pixel values). `None` per-entry falls back to the old
+    `(sd > 0)` pixel test, which is what an un-registered crop (nothing to
+    warp) has to use.
 
     Both reuse production's `_block_coherence`/`_block_sharpness` and the
     same anchor-dominant gate, so the ONLY difference between arms is the
@@ -192,15 +258,16 @@ def _mosaic(anchor_crop: np.ndarray, sides: List[np.ndarray],
     best_px = anchor_crop.astype(np.float32).copy()
     used = 0
 
-    for sd in sides:
+    vm_list = valid_masks if valid_masks is not None else [None] * len(sides)
+    for sd, vm in zip(sides, vm_list):
         if sd is None or sd.shape[:2] != (fh, fw):
             continue
         if float(np.corrcoef(sd.ravel(), anchor_crop.ravel())[0, 1]) < 0.45:
             continue
-        valid = (sd > 0).astype(np.float32)
+        valid = vm if vm is not None else (sd > 0).astype(np.float32)
         if ap._MOSAIC_FEATHER_ERODE > 0:
-            valid = cv2.erode(valid, np.ones((ap._MOSAIC_FEATHER_ERODE,) * 2,
-                                             np.uint8))
+            valid = cv2.erode(valid.astype(np.uint8), np.ones(
+                (ap._MOSAIC_FEATHER_ERODE,) * 2, np.uint8)).astype(np.float32)
         valid = cv2.GaussianBlur(valid, (0, 0), ap._MOSAIC_FEATHER_SIGMA)
         cs = ap._block_coherence(sd) * valid
         # Same anchor-dominant gate production uses: zero contribution at
@@ -269,12 +336,23 @@ def run(cap_id: str, use_tps: bool = False, combine: str = 'avg',
         return None
 
     sides: List[np.ndarray] = []
+    valid_masks: List[Optional[np.ndarray]] = []
     for name, (g, guide) in zone_grays.items():
         if name == 'center' or g.shape[:2] != shape:
             continue
         s_crop = g[y0:y1, x0:x1]
         if not use_tps:
-            sides.append(s_crop)
+            # Real ECC registration -- production's own step, extracted
+            # into `_ecc_register` (see the correction note in this
+            # module's docstring: the original version of this arm did
+            # NOT register at all, and this is the fix).
+            reg_out = _ecc_register(a_crop, s_crop)
+            if reg_out is None:
+                print(f'    {name}: ECC registration failed, skipped')
+                continue
+            regd, vmask = reg_out
+            sides.append(regd)
+            valid_masks.append(vmask)
             continue
         s_print = _render(srcs[name][0], guide, f'{cap_id[:12]}_{name}')
         if s_print is None:
@@ -282,10 +360,11 @@ def run(cap_id: str, use_tps: bool = False, combine: str = 'avg',
         w = _tps_warp_crop(a_crop, s_crop, a_print, s_print, box, shape)
         if w is not None:
             sides.append(w)
+            valid_masks.append(None)
         else:
             print(f'    {name}: TPS registration failed, skipped')
 
-    mos, used = _mosaic(a_crop, sides, combine)
+    mos, used = _mosaic(a_crop, sides, combine, valid_masks)
     if mos is None:
         print('  mosaic produced nothing (no side passed the gates)')
         return {'capture': cap_id, 'arm': tag, 'mosaic': False}
