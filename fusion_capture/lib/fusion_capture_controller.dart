@@ -468,6 +468,35 @@ class FusionCaptureController extends ChangeNotifier {
   static const double _macroDriftAcceptRatio = 0.6;
   static const Duration _macroFocusCallTimeout = Duration(seconds: 3);
 
+  // ---- camera "3" diversity source (round 40) ----------------------
+  // Added on the strength of a real measurement, not symmetry with the
+  // macro port. Across 136 real scored captures, camera "3" beat camera
+  // "2" as a candidate on BOTH mean (71.4 vs 60.5) and max (76 vs 75)
+  // real NFIQ2, and real device-reported `cameraLensInfo` shows it has
+  // the LARGEST sensor of all four cameras (6.64x4.97mm -- bigger than
+  // the main camera's own 5.98x4.49mm). It was nonetheless the only back
+  // camera this app never captured from.
+  //
+  // Deliberately NOT given the macro guide's 1.2x growth. That growth
+  // exists to pull the thumb closer to camera "2", and round 40 also
+  // established camera "2" is not optically a macro lens at all (same
+  // 50mm minimum focus distance as every other back camera), so the
+  // growth is already doing less than intended there. Camera "3" has a
+  // WIDER field of view than the main camera (sensorW/focal 1.677 vs
+  // 1.441, i.e. ~16% wider), so the pad lands SMALLER in its frame at the
+  // same working distance -- growing the guide on top of that would push
+  // the user closer for no optical gain and risk the same softness camera
+  // "2" has a documented history of. Standard guide, standard distance.
+  static const bool _cam3Enabled = true;
+  static const String _cam3CameraName = '3';
+  static const double _cam3GuideScaleFactor = 1.0;
+  // Matches main.py's own `_sec_cy` for camera "3" (0.37), which is in
+  // turn the main guide's own default cy -- one measured value, not a
+  // second independently-drifting copy. Same lesson this project has been
+  // burned by more than once (_scoreRoi/_focusPointScreenSpace).
+  static const double _cam3FocusTargetCy = 0.37;
+
+
   // ---- camera capability probes (ported from clearbridge_beta) ----
   // Two real, direct uses: (1) cameraLensInfo lets fusion_brain's own
   // collect_sources() apply a per-device FOV-corrected crop to the macro
@@ -704,6 +733,9 @@ class FusionCaptureController extends ChangeNotifier {
       if (_macroEnabled) {
         await _runMacroPhase();
       }
+      if (_cam3Enabled) {
+        await _runCam3Phase();
+      }
       if (_state.phase == FusionPhase.error) return;
       await _finishAndUpload();
     } catch (e) {
@@ -718,7 +750,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _runFrontPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.frontHold,
-          statusText: 'Phase 1 of 3 — Main capture',
+          statusText: 'Phase 1 of 5 — Main capture',
           detailText: 'Place thumb in the guide and hold still',
           guideShape: PadSilhouetteShape.defaultShape,
           overallProgress: 0.0,
@@ -933,7 +965,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _runTiltPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.tilt,
-          statusText: 'Phase 2 of 3 — Edge detail',
+          statusText: 'Phase 2 of 5 — Edge detail',
           detailText: 'Small tilts reveal the sides of your print',
           silhouetteState: PadSilhouetteState.aligning,
           guideShape: PadSilhouetteShape.defaultShape,
@@ -1087,7 +1119,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _runSweepPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.sweep,
-          statusText: 'Phase 3 of 3 — Texture',
+          statusText: 'Phase 3 of 5 — Texture',
           // Sweep's own real cue text lives entirely in distanceHint (see
           // _runSweepStations) -- detailText is left at whatever the tilt
           // phase last set, harmlessly, since the screen suppresses the
@@ -1361,10 +1393,27 @@ class FusionCaptureController extends ChangeNotifier {
   /// already ran. Real, deliberate cost: one more camera open/close cycle,
   /// one focus convergence, two shutter presses (ambient + flash) on top
   /// of the three phases before it.
-  Future<void> _runMacroPhase() async {
+  /// Generalised in round 40 so camera "3" can reuse this exact,
+  /// already-device-validated sequence rather than get a second parallel
+  /// implementation that could drift from it. Every parameter below is a
+  /// value that genuinely differs BETWEEN the two lenses; everything else
+  /// (focus convergence, EV pulldown, ambient+flash pairing, self-skip
+  /// behaviour, the forced _apply after the camera swap) is shared by
+  /// construction. Calling it with the macro arguments is behaviourally
+  /// identical to the pre-refactor `_runMacroPhase()`.
+  Future<void> _runSecondaryCameraPhase({
+    required String cameraName,
+    required double guideScale,
+    required double focusTargetCy,
+    required String tagPrefix,
+    required String phaseLabel,
+    required String busyText,
+    required String confirmText,
+    required String debugKey,
+  }) async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.macro,
-          statusText: 'Phase 4 of 4 — Close-up detail',
+          statusText: phaseLabel,
           phaseProgress: 0.0,
           clearStationIndex: true,
           zoneCaptureFlash: false,
@@ -1375,21 +1424,23 @@ class FusionCaptureController extends ChangeNotifier {
         CameraDescription? macroDesc;
         for (final c in cams) {
           if (c.lensDirection == CameraLensDirection.back &&
-              c.name == _macroCameraName) {
+              c.name == cameraName) {
             macroDesc = c;
             break;
           }
         }
         if (macroDesc == null) {
-          debugPrint('[fusion] macro camera ($_macroCameraName) not present, skipping');
-          _debug['macroCameraAbsent'] = true;
+          debugPrint('[fusion] secondary camera ($cameraName) not present, skipping');
+          _debug['${debugKey}CameraAbsent'] = true;
           return;
         }
 
         _apply(
           (s) => s.copyWith(
-            confirmationText: 'Capturing close-up detail…',
-            guideShape: PadSilhouetteShape.defaultShape.scaled(_macroGuideScaleFactor),
+            confirmationText: busyText,
+            guideShape: guideScale == 1.0
+                ? PadSilhouetteShape.defaultShape
+                : PadSilhouetteShape.defaultShape.scaled(guideScale),
           ),
           force: true,
         );
@@ -1411,7 +1462,7 @@ class FusionCaptureController extends ChangeNotifier {
         // this is ported from: camera "2"'s pad sits at cy~0.34, and
         // autofocus/sharpness-ROI aimed at 0.5 was measurably tracking
         // background/crease content instead.
-        const macroRoi = Rect.fromLTWH(0.25, 0.15, 0.5, 0.4);
+        final macroRoi = Rect.fromLTWH(0.25, focusTargetCy - 0.19, 0.5, 0.4);
         void macroFrameListener(CameraImage image) {
           try {
             final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
@@ -1423,7 +1474,7 @@ class FusionCaptureController extends ChangeNotifier {
         final focusSw = Stopwatch()..start();
         try {
           await _retargetAndConvergeMacro(
-              macroCam, const Offset(0.5, _macroFocusTargetCy),
+              macroCam, Offset(0.5, focusTargetCy),
               debugOut: focusDebug);
         } finally {
           try {
@@ -1431,7 +1482,7 @@ class FusionCaptureController extends ChangeNotifier {
           } catch (_) {}
         }
         focusDebug['convergedMs'] = focusSw.elapsedMilliseconds;
-        _debug['macroDebug'] = focusDebug;
+        _debug['${debugKey}Debug'] = focusDebug;
 
         // Ambient+flash pair (not a single shot) so the backend's real
         // flash-diff segmentation can engage for this candidate -- same
@@ -1451,7 +1502,7 @@ class FusionCaptureController extends ChangeNotifier {
           final flXfile = await macroCam.takePicture();
           flashJpeg = await flXfile.readAsBytes();
         } catch (e) {
-          debugPrint('[fusion] macro flash shot failed (non-fatal, ambient-only): $e');
+          debugPrint('[fusion] $cameraName flash shot failed (non-fatal, ambient-only): $e');
         } finally {
           try {
             await macroCam.setFlashMode(FlashMode.off).timeout(_macroFocusCallTimeout);
@@ -1473,7 +1524,7 @@ class FusionCaptureController extends ChangeNotifier {
         // and marked already-shrunk so the shared pass skips them.
         final ambShot = _Shot(
           jpeg: await _shrinkForUpload(ambJpeg, macroDesc.sensorOrientation),
-          tag: 'macro_amb_0',
+          tag: '${tagPrefix}_amb_0',
           flashOn: false,
           exif: ambExif,
         )..shrunk = true;
@@ -1483,21 +1534,56 @@ class FusionCaptureController extends ChangeNotifier {
           final flExif = parseJpegExposureExif(flashJpeg);
           final flShot = _Shot(
             jpeg: await _shrinkForUpload(flashJpeg, macroDesc.sensorOrientation),
-            tag: 'macro_fl_0',
+            tag: '${tagPrefix}_fl_0',
             flashOn: true,
             exif: flExif,
           )..shrunk = true;
           _shots.add(flShot);
         }
 
-        _apply((s) => s.copyWith(confirmationText: '✓ Close-up captured'), force: true);
+        _apply((s) => s.copyWith(confirmationText: confirmText), force: true);
       }())
           .timeout(const Duration(milliseconds: _macroCaptureTimeoutMs));
     } catch (e) {
-      debugPrint('[fusion] macro phase failed (non-fatal): $e');
-      _debug['macroPhaseFailed'] = e.toString();
+      debugPrint('[fusion] $cameraName phase failed (non-fatal): $e');
+      _debug['${debugKey}PhaseFailed'] = e.toString();
     }
   }
+
+  /// Camera "2" close-up. Arguments reproduce the pre-refactor behaviour
+  /// exactly, so this remains the same already-device-tested capture.
+  Future<void> _runMacroPhase() => _runSecondaryCameraPhase(
+        cameraName: _macroCameraName,
+        guideScale: _macroGuideScaleFactor,
+        focusTargetCy: _macroFocusTargetCy,
+        tagPrefix: 'macro',
+        phaseLabel: 'Phase 4 of 5 — Close-up detail',
+        busyText: 'Capturing close-up detail…',
+        confirmText: '✓ Close-up captured',
+        debugKey: 'macro',
+      );
+
+  /// Camera "3" diversity source. Same sequence, standard guide/distance
+  /// -- see the `_cam3*` constants for why the macro guide growth is
+  /// deliberately NOT applied here.
+  ///
+  /// Real caveat worth knowing when the first capture lands: this device
+  /// reports `hasOwnFlash: false` for camera "3", yet every real camera-3
+  /// frame this project has captured is clearly torch-lit (median
+  /// brightness 117-128/255) -- the torch is a system-level LED not gated
+  /// by the active camera's own reported flash capability. The flash half
+  /// of the pair is already inside its own try/catch and self-skips to
+  /// ambient-only if that turns out not to hold on some other device.
+  Future<void> _runCam3Phase() => _runSecondaryCameraPhase(
+        cameraName: _cam3CameraName,
+        guideScale: _cam3GuideScaleFactor,
+        focusTargetCy: _cam3FocusTargetCy,
+        tagPrefix: 'cam3',
+        phaseLabel: 'Phase 5 of 5 — Wide detail',
+        busyText: 'Capturing wide detail…',
+        confirmText: '✓ Wide detail captured',
+        debugKey: 'cam3',
+      );
 
   /// Called ONCE, from `_finishAndUpload`, after all three phases are done
   /// -- not per-phase. It used to run at each phase boundary specifically
@@ -1686,6 +1772,7 @@ class FusionCaptureController extends ChangeNotifier {
     final tiltShots = <Map<String, dynamic>>[];
     final sweepShots = <Map<String, dynamic>>[];
     final macroShots = <Map<String, dynamic>>[];
+    final cam3Shots = <Map<String, dynamic>>[];
 
     final sensorOrientation = _sensorOrientation;
 
@@ -1875,6 +1962,11 @@ class FusionCaptureController extends ChangeNotifier {
         // the mistake. Macro gets its own explicit branch and its own
         // Firestore field for the same reason tilt/sweep each already do.
         macroShots.add(meta);
+      } else if (shot.tag.startsWith('cam3_')) {
+        // Own explicit branch for exactly the reason documented above --
+        // the catch-all below is sweepShots, so a missing branch here
+        // would silently file camera-3 frames as sweep zones.
+        cam3Shots.add(meta);
       } else {
         sweepShots.add(meta);
       }
@@ -1908,6 +2000,7 @@ class FusionCaptureController extends ChangeNotifier {
           'tilt': _tiltEnabled,
           'sweep': _sweepEnabled,
           'macro': _macroEnabled,
+          'cam3': _cam3Enabled,
         },
         'status': 'pending',
         'nfiqScore': 0,
@@ -1918,6 +2011,7 @@ class FusionCaptureController extends ChangeNotifier {
         if (tiltShots.isNotEmpty) 'tiltShots': tiltShots,
         if (sweepShots.isNotEmpty) 'sweepShots': sweepShots,
         if (macroShots.isNotEmpty) 'macroShots': macroShots,
+        if (cam3Shots.isNotEmpty) 'cam3Shots': cam3Shots,
         'fusionGuideRegions': _guideRegions,
         if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
         if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,

@@ -235,12 +235,28 @@ def collect_sources(doc: dict) -> Dict[str, Tuple[np.ndarray, dict]]:
         pick = amb_m[0] if amb_m else macro[0]
         img = _download(pick['path'])
         if img is not None:
-            sources['macro'] = (img, _macro_guide(doc, guide))
+            sources['macro'] = (img, _secondary_guide(doc, guide, '2', 'macro'))
+
+    # Camera "3" diversity source (round 40). Added because real data said
+    # so, not for symmetry: across 136 real scored captures camera "3" beat
+    # camera "2" as a candidate on both mean (71.4 vs 60.5) and max
+    # (76 vs 75) real NFIQ2, and it has the largest sensor of all four
+    # cameras. Same FOV-correction formula, same self-skip contract -- a
+    # capture without `cam3Shots` (i.e. every capture before this landed)
+    # is unaffected.
+    cam3 = doc.get('cam3Shots') or []
+    if cam3:
+        amb_3 = [m for m in cam3 if not m.get('flashOn')]
+        pick3 = amb_3[0] if amb_3 else cam3[0]
+        img3 = _download(pick3['path'])
+        if img3 is not None:
+            sources['cam3'] = (img3, _secondary_guide(doc, guide, '3', 'cam3'))
 
     return sources
 
 
-def _macro_guide(doc: dict, main_guide: dict) -> dict:
+def _secondary_guide(doc: dict, main_guide: dict, cam_id: str = '2',
+                     label: str = 'macro') -> dict:
     """Crop region for the macro source -- real per-device correction when
     possible, a loudly-flagged approximation otherwise.
 
@@ -271,7 +287,7 @@ def _macro_guide(doc: dict, main_guide: dict) -> dict:
     """
     lens_info = doc.get('cameraLensInfo') or {}
     main_lens = lens_info.get('0') or {}
-    macro_lens = lens_info.get('2') or {}
+    macro_lens = lens_info.get(cam_id) or {}
     fl_main = main_lens.get('focalLengthMm')
     fl_macro = macro_lens.get('focalLengthMm')
     sw_main = main_lens.get('sensorWidthMm')
@@ -282,7 +298,7 @@ def _macro_guide(doc: dict, main_guide: dict) -> dict:
             and fl_main > 0 and sw_macro > 0 and sh_macro > 0):
         rx_ratio = (fl_macro / sw_macro) / (fl_main / sw_main)
         ry_ratio = (fl_macro / sh_macro) / (fl_main / sh_main)
-        print(f'    [macro] cameraLensInfo-corrected crop: '
+        print(f'    [{label}] cameraLensInfo-corrected crop: '
               f'rx_ratio={rx_ratio:.3f} ry_ratio={ry_ratio:.3f} '
               f'(fl {fl_main:.2f}->{fl_macro:.2f}mm, '
               f'sensor {sw_main:.2f}x{sh_main:.2f}->{sw_macro:.2f}x{sh_macro:.2f}mm)')
@@ -294,7 +310,7 @@ def _macro_guide(doc: dict, main_guide: dict) -> dict:
             'tipAngleDeg': main_guide.get('tipAngleDeg', 0.0),
             'n': main_guide.get('n', 2.5),
         }
-    print('    [macro] WARNING: no cameraLensInfo for this capture -- '
+    print(f'    [{label}] WARNING: no cameraLensInfo for this capture -- '
           'cropped with the FRONT camera\'s unmodified guide_region, '
           'unvalidated for this lens. Visually confirm the rendered '
           'print before trusting this source.')

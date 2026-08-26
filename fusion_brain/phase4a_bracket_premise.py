@@ -65,6 +65,12 @@ def _bracket(name: str) -> str:
         return 'sweep'
     if name.startswith('macro'):
         return 'macro'
+    # Same bug class the 'macro' line above exists to prevent: the catch-all
+    # is 'front', so a new secondary camera without its own branch would be
+    # silently classified as a front-bracket member and pollute the very
+    # intra-vs-cross-bracket comparison this file measures.
+    if name.startswith('cam3'):
+        return 'cam3'
     return 'front'
 
 
