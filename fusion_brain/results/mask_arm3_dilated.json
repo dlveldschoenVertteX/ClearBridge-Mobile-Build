@@ -1,0 +1,30 @@
+[
+ {
+  "id": "e33d618e",
+  "prod": 70.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 71.0,
+  "dilated": 61.0
+ },
+ {
+  "id": "a262d2b3",
+  "prod": 73.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 68.0,
+  "dilated": 69.0
+ },
+ {
+  "id": "01662ffb",
+  "prod": 68.0,
+  "prod_mask": "guide+unet",
+  "bare": 74.0,
+  "dilated": 71.0
+ },
+ {
+  "id": "474b4d6a",
+  "prod": 76.0,
+  "prod_mask": "guide+unet",
+  "bare": 73.0,
+  "dilated": 65.0
+ }
+]

@@ -108,6 +108,26 @@ _MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUT
 # conservative choice honouring the explicit "cover the pad" ask with limited downside --
 # confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
 
+# Guide-seeded component selection inside `_unet_mask` -- built and measured
+# 2026-08-27 (round 45), deliberately OFF.
+#
+# It works: 10/13 real captures locate the pad vs argmax(area)'s 9/13, verified
+# in this exact code path, +3 NFIQ2 on the one capture it changes and
+# byte-identical on the rest. The reason it is not enabled is the control run
+# in the same round: content-aware refinement OFF beats refinement ON by 2.92
+# NFIQ2 across 24 real captures (72.50 vs 69.58, worse on 13 of 24), equally
+# for both detectors. If refinement is net-negative, making the U-Net succeed
+# more often makes a losing mechanism fire more often -- the +3 would be a coin
+# flip that happened to land well.
+#
+# What would justify turning this on: refinement shown to help on real
+# MATCHABILITY, not NFIQ2. That needs the >=500-DPI scanner reference this
+# project has been blocked on throughout; NFIQ2 cannot tell "removed useful
+# ridge area" from "removed non-pad content NFIQ2 was happy to count", and
+# round 43's crease-trim result is the standing proof that it gets that
+# distinction wrong here. See fusion_brain/results/MASKING_FINDINGS.md.
+_UNET_GUIDE_SEED_ENABLED = False
+
 _FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0  # below this, treat the flash frame as
 # blown-out and don't trust it for flash-diff segmentation (2026-07-23: real capture
 # dadd4ef9 -- nfiq2Score 81, but a visibly jagged/notched superprint boundary with a
@@ -1286,8 +1306,40 @@ def _front_anchored_mosaic_zones(
     return mos, adj_guide, used
 
 
-def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
-    """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
+def _unet_mask(gray: np.ndarray,
+               guide_region: Optional[dict] = None) -> Optional[np.ndarray]:
+    """Thumb mask via the shared U-Net ONNX session (None if unavailable).
+
+    `guide_region` picks WHICH connected component to keep. Without it this
+    falls back to the largest by area, which is what this function did
+    exclusively until 2026-08-27.
+
+    Why that mattered, measured on 24 real recent front_only_v1 captures
+    (`fusion_brain/test_unet_guide_seed.py`): the U-Net is the detector on 13
+    of them and fails to locate the pad on 4 -- a 31% miss rate, against
+    flash-diff's 0/11 on the same population. Every miss is MIS-LOCATION: a
+    real blob exists, it just does not overlap the guide (survivors of the
+    bound intersection: 0%, 3%, 13%, 10%), never over- or under-segmentation.
+
+    That failure shape has a specific cause. `ml/thumb_seg/build_dataset.py`
+    generates this model's pseudo-labels by calling
+    `_segment_via_flash_diff(amb, fl, _KSIZE)` with NO seed -- i.e. with the
+    pre-round-16 frame-centre seed, the exact 555px error round 16 found and
+    fixed in production but never regenerated labels for. So the model was
+    distilled from a detector aimed at the wrong point and learned "the
+    near-camera blob near the frame centre" rather than "the guided pad".
+    Retraining against correctly-seeded labels is the root-cause fix; this is
+    the cheap inference-side mitigation.
+
+    ADDITIVE, deliberately. A straight swap to guide-seeded selection was
+    measured first and came out a WASH -- 9/13 either way: it recovered
+    474b4d6a but lost 774f2252, where the guide-centre pixel landed in a small
+    neighbouring component that failed the >=3% area floor. Falling back to
+    argmax whenever the seeded pick is unusable keeps the recovery without the
+    loss (10/13), and structurally can only ever turn a reject into an accept.
+    Confirmed end-to-end with the real NFIQ2 binary: 1 better (474b4d6a
+    73 -> 76), 0 worse, the other four byte-identical.
+    """
     try:
         import sfm_pipeline
         session = sfm_pipeline._get_thumb_seg_session()
@@ -1301,10 +1353,24 @@ def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
         m = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((21, 21), np.uint8))
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+        n, lab, stats, cents = cv2.connectedComponentsWithStats(m)
         if n > 1:
-            big = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            m = (lab == big).astype(np.uint8) * 255
+            big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            keep = big
+            if guide_region is not None:
+                h_img, w_img = m.shape[:2]
+                gx = int(min(w_img - 1, max(0, float(guide_region.get('cx', 0.5)) * w_img)))
+                gy = int(min(h_img - 1, max(0, float(guide_region.get('cy', 0.5)) * h_img)))
+                seeded = int(lab[gy, gx])
+                if seeded == 0:     # guide centre sits on background
+                    d = [np.hypot(cents[i][0] - gx, cents[i][1] - gy) for i in range(1, n)]
+                    seeded = 1 + int(np.argmin(d))
+                # Only take the seeded component if it is itself plausible --
+                # otherwise keep production's argmax pick. This is what makes
+                # the change additive rather than a swap; see the docstring.
+                if (lab == seeded).mean() >= 0.03:
+                    keep = seeded
+            m = (lab == keep).astype(np.uint8) * 255
         if (m > 0).mean() < 0.03:   # implausibly small — treat as failed
             return None
         return m
@@ -3104,7 +3170,8 @@ def generate(
             pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2], guide_region)
             refine_tag = 'flashdiff'
             if pad_mask is None:
-                pad_mask = _unet_mask(gray)
+                pad_mask = _unet_mask(
+                    gray, guide_region if _UNET_GUIDE_SEED_ENABLED else None)
                 refine_tag = 'unet'
         if pad_mask is not None:
             # Real bug found 2026-07-23 (capture dadd4ef9): a noisy detector
