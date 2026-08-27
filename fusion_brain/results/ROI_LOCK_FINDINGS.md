@@ -135,3 +135,60 @@ upstream:
    can be corrected once rather than re-detected per capture.
 3. Re-test content-aware refinement only after (1), when there is real
    ridge signal for it to find.
+
+---
+
+# CORRECTION (2026-08-27, before deploy): both backend changes REVERTED
+
+Caught at the deploy gate, by testing the change against real PRODUCTION
+captures instead of the 3 fusion captures it was built on. **My earlier
+"behaviour-neutral on all 3 real captures" claim was true but
+irrelevant** -- all 3 were `fusion_v1`. Production is `front_only_v1`, a
+different population, and the change is emphatically NOT neutral there.
+
+Measured across 77 real production captures currently using a refined mask
+(retention = refined mask area / guide area, guide area computed from each
+capture's own `guideRegion` via the superellipse area formula):
+
+| percentile | retention |
+|---|---|
+| p5 | 20.2% |
+| p25 | 36.1% |
+| **p50** | **62.6%** |
+| p75 | 84.9% |
+| p95 | 101.9% |
+
+**44 of 77 (57%) sit below the 0.70 floor I added** -- they would have
+flipped from a refined mask to the bare guide. The MEDIAN production
+capture (62.6%) is below my floor. Affected captures include several
+high-scoring ones (`01662ffb` nfiq2 86 at 42% retention, `f222e1df` 86 at
+22.5%, `6d0794fc` 84 at 37.5%).
+
+(The nfiq2 898 and 586 entries in that group are this project's own
+already-documented sidecar range bug, not real scores -- excluded from any
+reading of the group's quality.)
+
+So the 0.70 floor was calibrated on 3 captures from the wrong population
+and is far too aggressive for the one that matters. Reverted to the
+long-standing 0.35.
+
+The flash-diff gate rewrite is reverted **with** it, and deliberately so.
+The gate fix is still correct in principle (Laplacian genuinely cannot
+distinguish "blown out" from "soft"), but its whole effect is to ADMIT
+pairs that were previously rejected -- and on the one capture where that
+could be measured, the admitted mask cost 135 minutiae -> 61 and 44 -> 17.
+The retention floor was the safety net for exactly that, and the safety
+net is what just proved unshippable. Shipping the gate alone, with
+production's 0.35 accept-gate, would let that 52%-retention mask through.
+
+**Neither change is deployment-ready. Nothing backend was deployed.**
+
+What would make the gate fix shippable: a guard validated on the
+production population rather than on fusion captures -- i.e. re-run this
+retention analysis over front_only_v1, find where a refined mask actually
+starts costing real matchability (not merely where it looks aggressive),
+and set the floor from that. That needs real per-capture scoring across
+the production library, which is a larger piece of work than this was.
+
+The diagnosis in this document stands unchanged and is the durable
+deliverable; only the two code changes are withdrawn.
