@@ -594,6 +594,26 @@ class FusionCaptureController extends ChangeNotifier {
   Size? _screenSize;
   Size? _previewSize;
   int _sensorOrientation = 90;
+
+  // ---- thumb-orientation CV classifier (round 41 port) --------------
+  // Same port, same scope and rationale as clearbridge_beta's own copy of
+  // this block (front_capture_controller.dart) -- see that file's docs.
+  // Scoped to FusionPhase.frontHold only: the model's 4 trained classes
+  // ('front'/'right'/'top'/'left') match the discontinued multi-angle
+  // orbit's specific poses, not this app's tilt/sweep zone semantics, so
+  // only the front phase is a meaningful use of it. Diagnostic-only --
+  // never blocks the hold from completing.
+  final _orientationClassifier = ThumbOrientationClassifier();
+  static const int _cvClassifyThrottleMs = 90;
+  static const double _cvConfidenceThreshold = 0.45;
+  DateTime? _lastCvClassifyAt;
+  int _cvSamples = 0;
+  int _cvFrontSamples = 0;
+  double _cvConfidenceSum = 0.0;
+  double _cvMaxFrontConfidence = 0.0;
+  String? _cvLastAngleName;
+  double? _cvLastConfidence;
+
   Map<String, Map<String, dynamic>>? _cameraLensInfo;
   Map<String, bool>? _rawSensorSupport;
   /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
@@ -658,6 +678,13 @@ class FusionCaptureController extends ChangeNotifier {
     _debug.clear();
     _guideRegions.clear();
     _captureId = const Uuid().v4();
+    _lastCvClassifyAt = null;
+    _cvSamples = 0;
+    _cvFrontSamples = 0;
+    _cvConfidenceSum = 0.0;
+    _cvMaxFrontConfidence = 0.0;
+    _cvLastAngleName = null;
+    _cvLastConfidence = null;
     _apply((s) => const FusionState().copyWith(
           phase: FusionPhase.initializing,
           statusText: 'Starting camera…',
@@ -666,6 +693,7 @@ class FusionCaptureController extends ChangeNotifier {
         ));
 
     unawaited(_audio.init());
+    _orientationClassifier.initialize();
     _orientation.start();
     _gyroSteadyLast = true;
     _gyroSub ??= gyroscopeEventStream().listen((event) {
@@ -1625,6 +1653,35 @@ class FusionCaptureController extends ChangeNotifier {
   void _onFrame(CameraImage image) {
     if (_disposed) return;
     try {
+      // Throttled CV orientation confirmation -- see the field declarations'
+      // own docs for scope/rationale. Scoped to frontHold: this camera
+      // stream also feeds the tilt/sweep phases, whose poses the model was
+      // never trained to classify.
+      if (_state.phase == FusionPhase.frontHold) {
+        final cvNow = DateTime.now();
+        if (_lastCvClassifyAt == null ||
+            cvNow.difference(_lastCvClassifyAt!).inMilliseconds >=
+                _cvClassifyThrottleMs) {
+          _lastCvClassifyAt = cvNow;
+          final cvPred =
+              _orientationClassifier.classify(image, _sensorOrientation);
+          if (cvPred != null) {
+            _cvSamples++;
+            _cvConfidenceSum += cvPred.confidence;
+            _cvLastAngleName = cvPred.angleName;
+            _cvLastConfidence = cvPred.confidence;
+            if (cvPred.angleName == 'front' &&
+                cvPred.confidence > _cvMaxFrontConfidence) {
+              _cvMaxFrontConfidence = cvPred.confidence;
+            }
+            if (cvPred.angleName == 'front' &&
+                cvPred.confidence >= _cvConfidenceThreshold) {
+              _cvFrontSamples++;
+            }
+          }
+        }
+      }
+
       final roi = _scoreRoi;
       final raw = _hybrid.offerFrame(image, thumbRoi: roi);
       _liveAbsSharpness =
@@ -2015,6 +2072,15 @@ class FusionCaptureController extends ChangeNotifier {
         'fusionGuideRegions': _guideRegions,
         if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
         if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,
+        'orientationDebug': {
+          'samples': _cvSamples,
+          'frontConfidentSamples': _cvFrontSamples,
+          'meanConfidence': _cvSamples > 0 ? _cvConfidenceSum / _cvSamples : null,
+          'maxFrontConfidence': _cvMaxFrontConfidence,
+          'lastAngleName': _cvLastAngleName,
+          'lastConfidence': _cvLastConfidence,
+          'confidenceThreshold': _cvConfidenceThreshold,
+        },
         'fusionDebug': _debug,
       }, SetOptions(merge: true)).timeout(_networkTimeout);
 
@@ -2054,6 +2120,7 @@ class FusionCaptureController extends ChangeNotifier {
     _tiltAnglePoll = null;
     _orientation.dispose();
     _audio.dispose();
+    _orientationClassifier.dispose();
     unawaited(_cameraService.disposeCamera());
     super.dispose();
   }

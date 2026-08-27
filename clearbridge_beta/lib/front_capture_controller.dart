@@ -1496,6 +1496,42 @@ class FrontCaptureController extends ChangeNotifier {
   double? _liveWavelengthPx;
   double? _liveWavelengthStillPx;
   int _wavelengthSampleCount = 0;
+
+  // ---- thumb-orientation CV classifier (round 41 port) --------------
+  // Ported from the discontinued multi-angle architecture
+  // (MultiAngleCaptureController), where it exists specifically because
+  // ThumbLandmarkerService's landmark model needs a wrist/knuckles in
+  // frame to compute rotation -- unreliable at the close range this app
+  // captures at (see thumb_orientation_classifier_io.dart's own
+  // docstring). front_only_v1 has the identical close-range problem and
+  // never had any CV confirmation that the thumb is genuinely presented
+  // pad-first, only the geometric guide + coverage/focus/wavelength
+  // signals. The model's 4 trained classes ('front'/'right'/'top'/'left')
+  // were built for the multi-angle orbit's specific poses -- only 'front'
+  // is meaningful here, so this is scoped to a presentation-confidence
+  // signal, not an angle selector.
+  //
+  // DIAGNOSTIC-ONLY for this pass, matching this project's own standing
+  // rollout discipline (ship telemetry first, gate later once real data
+  // justifies it -- see the live-wavelength estimator's own hint-then-gate
+  // history). Runs only during `holding` (throttled, see _onFrame), never
+  // blocks the hold from completing. Whether/how to make this load-bearing
+  // is exactly the kind of decision to revisit once real scanner-backed
+  // matchability data exists.
+  final _orientationClassifier = ThumbOrientationClassifier();
+  static const int _cvClassifyThrottleMs = 90; // = multi-angle's own
+      // _detectThrottleMs -- the already-validated real-device cadence for
+      // this exact model, not a new guess.
+  static const double _cvConfidenceThreshold = 0.45; // = multi-angle's own
+      // _cvConfidenceThreshold.
+  DateTime? _lastCvClassifyAt;
+  int _cvSamples = 0;
+  int _cvFrontSamples = 0;
+  double _cvConfidenceSum = 0.0;
+  double _cvMaxFrontConfidence = 0.0;
+  String? _cvLastAngleName;
+  double? _cvLastConfidence;
+
   // Diagnostic-only counters added 2026-08-14 to answer a real, open
   // question: real Firestore data shows _wavelengthSampleCount stays 0 on
   // 71% of real front_only_v1 captures (24/34 checked), yet the backend's
@@ -1882,6 +1918,13 @@ class FrontCaptureController extends ChangeNotifier {
     _sweepLeftDwellStart = null;
     _lastCentroidX = null;
     _sweepDebug = {};
+    _lastCvClassifyAt = null;
+    _cvSamples = 0;
+    _cvFrontSamples = 0;
+    _cvConfidenceSum = 0.0;
+    _cvMaxFrontConfidence = 0.0;
+    _cvLastAngleName = null;
+    _cvLastConfidence = null;
     try {
       _maxZoomLevel = (await camera.getMaxZoomLevel()).clamp(1.0, _maxZoomFill);
     } catch (_) {}
@@ -1897,6 +1940,7 @@ class FrontCaptureController extends ChangeNotifier {
     // in its own setup; this call was never copied over when the chime call
     // sites were retrofitted into this controller).
     unawaited(_audio.init());
+    _orientationClassifier.initialize();
 
     _apply((s) => s.copyWith(phase: FrontCapturePhase.calibrating), force: true);
 
@@ -2365,6 +2409,33 @@ class FrontCaptureController extends ChangeNotifier {
     }
 
     if (_state.phase != FrontCapturePhase.holding) return;
+
+    // Throttled CV orientation confirmation -- see the field declarations'
+    // own docs for scope/rationale. Runs at the same real-device-validated
+    // cadence as the model's original (discontinued) call site so this
+    // isn't a fresh guess at how expensive synchronous TFLite inference is
+    // per frame.
+    final _cvNow = DateTime.now();
+    if (_lastCvClassifyAt == null ||
+        _cvNow.difference(_lastCvClassifyAt!).inMilliseconds >=
+            _cvClassifyThrottleMs) {
+      _lastCvClassifyAt = _cvNow;
+      final cvPred = _orientationClassifier.classify(image, _sensorOrientation);
+      if (cvPred != null) {
+        _cvSamples++;
+        _cvConfidenceSum += cvPred.confidence;
+        _cvLastAngleName = cvPred.angleName;
+        _cvLastConfidence = cvPred.confidence;
+        if (cvPred.angleName == 'front' &&
+            cvPred.confidence > _cvMaxFrontConfidence) {
+          _cvMaxFrontConfidence = cvPred.confidence;
+        }
+        if (cvPred.angleName == 'front' &&
+            cvPred.confidence >= _cvConfidenceThreshold) {
+          _cvFrontSamples++;
+        }
+      }
+    }
 
     // On-target: focus score crosses threshold, distance is right, AND the
     // device is objectively still (gyroscope-derived). Real captures showed
@@ -4836,6 +4907,15 @@ class FrontCaptureController extends ChangeNotifier {
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
         'refocusDebug': _refocusDebug,
+        'orientationDebug': {
+          'samples': _cvSamples,
+          'frontConfidentSamples': _cvFrontSamples,
+          'meanConfidence': _cvSamples > 0 ? _cvConfidenceSum / _cvSamples : null,
+          'maxFrontConfidence': _cvMaxFrontConfidence,
+          'lastAngleName': _cvLastAngleName,
+          'lastConfidence': _cvLastConfidence,
+          'confidenceThreshold': _cvConfidenceThreshold,
+        },
         if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
         'zoomDebug': {
           'zoomApplied': _zoomEverApplied,
@@ -5323,6 +5403,7 @@ class FrontCaptureController extends ChangeNotifier {
     unawaited(_gyroSub?.cancel());
     _gyroSub = null;
     _audio.dispose();
+    _orientationClassifier.dispose();
     super.dispose();
   }
 }
