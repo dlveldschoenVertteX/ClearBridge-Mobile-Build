@@ -108,6 +108,80 @@ _MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUT
 # conservative choice honouring the explicit "cover the pad" ask with limited downside --
 # confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
 
+# --- Flash-diff usability tests (rewritten 2026-08-27) ------------------
+# The two checks below REPLACE `_FLASH_DIFF_MIN_FLASH_LAPLACIAN` as the
+# gate on whether an ambient/flash pair can drive torch-falloff
+# segmentation. That constant is kept (still referenced by the fuse-pair
+# code below) but is no longer what admits or rejects a pair for masking.
+#
+# WHY, measured rather than argued (CTO report 2026-08-27: "the real
+# thumbprint is not always being given the ROI ... I need to lock the
+# thumbpad print with confidence and ignore background"). Traced on 3 real
+# fusion captures:
+#
+#   capture    flashLap  old gate  clipped%  torchDelta in/out  reality
+#   6b43c255      26.1   REJECT      1.1%      +15 / -13        WORKS (52% of guide)
+#   43378ea7     425.6   pass        0.0%      +55 / -41        works (86% of guide)
+#   5181d451      10.0   REJECT      0.0%       -9 /  +1        genuinely unusable
+#
+# `6b43c255` is the capture behind this whole track's fusion comparison,
+# and its pair was being thrown away despite being only 1.1% clipped and
+# carrying a textbook torch signature (near field +15 brighter, far field
+# -13 darker). With it rejected the render fell through to the BARE guide
+# oval -- no content awareness at all -- which is the background bleed
+# that was reported.
+#
+# Root cause: whole-frame Laplacian variance conflates two different
+# properties. It is low when a frame is BLOWN OUT (the documented intent)
+# but equally low when a frame is merely SOFT -- and softness is
+# irrelevant here, because torch-falloff differencing reads a LOW-FREQUENCY
+# brightness difference, not high-frequency detail. A soft flash frame
+# carries that cue perfectly well; `5181d451` (real sunlight capture) shows
+# the converse -- ambient sun overwhelms the torch so the differential is
+# INVERTED (-9), which a sharpness test cannot detect at all and which is
+# the only thing that actually disqualifies a pair.
+#
+# So both tests below measure the physically-correct property directly:
+#   1. is it actually saturated? -> fraction of clipped pixels
+#   2. is there a real near-field torch cue? -> ambient->flash delta
+# Test 2 is a physical precondition of the mechanism, not a tuned
+# parameter: at or below zero the near/far cue does not exist, so a small
+# positive floor is principled. Both are deliberately permissive -- the
+# existing area/coverage accept-gate downstream is unchanged and still has
+# the final say on any mask this admits.
+# Minimum share of the GUIDE a content-aware refinement must retain before
+# it is allowed to replace the bare guide mask. Raised from 0.35 to 0.70 on
+# 2026-08-27 alongside the flash-diff gate rewrite above, and it is what
+# makes that rewrite safe.
+#
+# Measured, on the real captures that motivated both changes. Retention vs
+# what the refined mask actually did to real bozorth3 scores:
+#
+#   6b43c255 front_v1   52% retained  ->  135 minutiae -> 61, 44 -> 17. BAD.
+#   6b43c255 tilt_right 27% retained  ->  a quarter of the guide. BAD.
+#   43378ea7 (7 sources) 73-90%       ->  already engaging today, fine.
+#   6b43c255 sweep_left  82%          ->  fine.
+#
+# The 52% case is instructive and is why a floor is the right shape of fix:
+# visual inspection showed the flash-diff mask cutting a HORIZONTAL line
+# across the thumb, keeping the lower half and discarding the upper half --
+# not because the upper half is background, but because a specular highlight
+# there is saturated in BOTH exposures, so it carries no torch differential.
+# The detector is answering its own question correctly ("no falloff cue
+# here") while being wrong about the question that matters ("is this pad").
+# A retention floor encodes the real prior: a refinement should REFINE the
+# guide, not overrule it. Anything that disagrees with the guide about most
+# of the pad falls back to the guide, which is exactly the behaviour that
+# capture already gets today.
+_MASK_MIN_GUIDE_RETENTION = 0.70
+
+_FLASH_DIFF_MAX_CLIP_FRAC = 0.20    # >20% of the flash frame at/above 250
+                                    # is genuinely blown out (measured: real
+                                    # usable pairs sit at 0.0-1.1%).
+_FLASH_DIFF_MIN_TORCH_DELTA = 5.0   # median(flash-ambient) inside the guide.
+                                    # Measured +15/+55 on pairs that work,
+                                    # -9 on the one that genuinely cannot.
+
 _FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0  # below this, treat the flash frame as
 # blown-out and don't trust it for flash-diff segmentation (2026-07-23: real capture
 # dadd4ef9 -- nfiq2Score 81, but a visibly jagged/notched superprint boundary with a
@@ -1593,15 +1667,36 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
             f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
             if a_gray.shape != shape or f_gray.shape != shape:
                 continue
-            # Blown-out flash frame guard -- see _FLASH_DIFF_MIN_FLASH_LAPLACIAN's
-            # own comment. A saturated/clipped flash frame has too little local
-            # gradient left for the torch-falloff cue to work, and produces a
-            # noisy mask rather than failing cleanly -- skip this pair (try the
-            # next burst pair, if any) rather than trust it.
-            f_lap = float(cv2.Laplacian(f_gray, cv2.CV_64F).var())
-            if f_lap < _FLASH_DIFF_MIN_FLASH_LAPLACIAN:
-                logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
-                            f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
+            # Usability tests -- see _FLASH_DIFF_MAX_CLIP_FRAC /
+            # _FLASH_DIFF_MIN_TORCH_DELTA above for the real measurements
+            # that replaced the old whole-frame-Laplacian proxy here. Both
+            # measure a physical precondition of torch-falloff differencing
+            # directly, instead of using sharpness to stand in for
+            # saturation. Skip this pair (trying the next burst pair, if
+            # any) rather than trust an unusable one.
+            clip_frac = float((f_gray >= 250).mean())
+            if clip_frac > _FLASH_DIFF_MAX_CLIP_FRAC:
+                logger.info('flash-diff: skipping blown-out flash frame '
+                            '(%.1f%% clipped > %.0f%%)',
+                            100.0 * clip_frac, 100.0 * _FLASH_DIFF_MAX_CLIP_FRAC)
+                continue
+            # Near-field torch cue, measured where the pad actually is when a
+            # guide is available (the whole frame otherwise). int16 so the
+            # subtraction cannot wrap on uint8.
+            if seed_cx is not None and guide_region:
+                probe = _superellipse_mask(shape, guide_region)
+            else:
+                probe = None
+            if probe is not None and (probe > 0).sum() > 1000:
+                sel = probe > 0
+            else:
+                sel = np.ones(shape, dtype=bool)
+            torch_delta = float(np.median(
+                f_gray[sel].astype(np.int16) - a_gray[sel].astype(np.int16)))
+            if torch_delta < _FLASH_DIFF_MIN_TORCH_DELTA:
+                logger.info('flash-diff: skipping pair with no usable torch '
+                            'falloff cue (delta=%.1f < %.1f)',
+                            torch_delta, _FLASH_DIFF_MIN_TORCH_DELTA)
                 continue
             result = sfm_pipeline._segment_via_flash_diff(
                 a_gray, f_gray, ksize=7, seed_cx=seed_cx, seed_cy=seed_cy)
@@ -3097,13 +3192,17 @@ def generate(
             else:
                 cand = cv2.bitwise_and(mask, pad_mask)      # legacy shrink-only
                 bound_area = (guide_mask > 0).sum()
-            # Accept only a plausible mask: at least a third of the guide (not
-            # a sliver from a misfire) and not filling ~the entire generous
-            # bound (which would mean the detector grabbed everything ->
-            # untrustworthy). Otherwise keep the bare guide.
+            # Accept only a plausible mask: it must RETAIN most of the guide
+            # (see _MASK_MIN_GUIDE_RETENTION -- a detector that wants to throw
+            # away half the guide is far more likely to be failing than to be
+            # right, because the user physically aligned the pad to that
+            # guide) and not fill ~the entire generous bound (which would mean
+            # the detector grabbed everything -> untrustworthy). Otherwise
+            # keep the bare guide.
             if cand is not None:
                 cov = (cand > 0).sum()
-                if 0.35 * (guide_mask > 0).sum() <= cov <= 0.92 * bound_area:
+                if (_MASK_MIN_GUIDE_RETENTION * (guide_mask > 0).sum() <= cov
+                        <= 0.92 * bound_area):
                     mask = cand
                     params['afisMask'] = f'guide+{refine_tag}'
                     params['afisMaskCoverPx'] = int(cov)
