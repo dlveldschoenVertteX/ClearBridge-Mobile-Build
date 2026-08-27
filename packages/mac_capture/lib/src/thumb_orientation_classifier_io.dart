@@ -166,14 +166,25 @@ class ThumbOrientationClassifier {
       final outTensor = _interpreter!.getOutputTensor(0);
       inTensor.setTo(inputData);
       _interpreter!.invoke();
-      final outputBuffer = Float32List(_classes.length);
-      outTensor.copyTo(outputBuffer);
+
+      // Output is rank-2 [1, nClasses], not a flat [nClasses] -- confirmed
+      // from the real model on a real capture (5e68ed01 reported
+      // outputShape "[1, 4]"), after a first attempt passing
+      // Float32List(_classes.length) failed with "Output object shape
+      // mismatch, interpreter returned output of shape: [1, 4] while shape
+      // of output provided as argument in run is: [4]". copyTo matches
+      // shapes strictly, so the destination has to carry the leading batch
+      // dimension. That error message is exactly what the outputShape
+      // diagnostic was added to make available.
+      final output = [List<double>.filled(_classes.length, 0.0)];
+      outTensor.copyTo(output);
+      final scores = output[0];
 
       var bestIdx = 0;
-      for (var i = 1; i < outputBuffer.length; i++) {
-        if (outputBuffer[i] > outputBuffer[bestIdx]) bestIdx = i;
+      for (var i = 1; i < scores.length; i++) {
+        if (scores[i] > scores[bestIdx]) bestIdx = i;
       }
-      return OrientationPrediction(_classes[bestIdx], outputBuffer[bestIdx]);
+      return OrientationPrediction(_classes[bestIdx], scores[bestIdx]);
     } catch (e) {
       _lastClassifyError = e.toString();
       debugPrint('[ThumbOrientation] classify error: $e');

@@ -1073,6 +1073,33 @@ class FusionCaptureController extends ChangeNotifier {
             PadSilhouetteShape.defaultShape.cy),
         minMs: _frontFocusMinMs,
         maxMs: _frontFocusMaxMs,
+        // DELIBERATELY not locked -- reversed 2026-08-27 after the first
+        // real capture with this convergence (5e68ed01) came back WORSE
+        // than the capture before it, on the CTO's report that even the
+        // flash frames were now blurry.
+        //
+        // The convergence itself behaved perfectly: it settled at 99.3% of
+        // its own observed peak with no drift retry. That is exactly the
+        // problem. Peak-tracking only detects drift AWAY from a peak it has
+        // already seen; it cannot tell that the peak itself was mediocre --
+        // the same "clean convergence against the wrong target proves
+        // nothing" trap this project already documented for the macro
+        // camera in round 33.
+        //
+        // Measured inside the guide, 2-4px band across the burst:
+        //   before (continuous AF)  0.20 - 2.02   <- one genuinely sharp frame
+        //   after  (converged+lock) 0.23 - 0.36   <- uniformly mediocre
+        // Locking removed the variance. Continuous AF kept hunting through
+        // the 8 shots and one of them landed well; the lock pinned all
+        // eight to a single mediocre point instead. With a backend that
+        // already selects the best frame of the burst, that variance is an
+        // asset, not noise to be eliminated.
+        //
+        // Keeping the convergence pass (it can only put the lens in the
+        // right region before the burst starts) but handing control back to
+        // continuous AF for the burst itself, which is what the earlier,
+        // better capture actually had.
+        lockAfter: false,
         debugOut: frontFocusDebug,
       );
     } catch (e) {
@@ -1188,12 +1215,12 @@ class FusionCaptureController extends ChangeNotifier {
         await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
       } catch (_) {}
     }
-    // The convergence above ends in FocusMode.locked, which is exactly what
-    // the 8-shot burst wants and exactly what the tilt and sweep phases must
-    // NOT inherit -- both move the phone to new poses and rely on continuous
-    // AF to follow. Leaving the lens pinned at the front working distance
-    // would have quietly defocused every later station: a regression this
-    // change would have introduced, not one that already existed.
+    // Belt and braces: the front convergence now passes lockAfter:false so
+    // the lens should already be in continuous AF, but the tilt and sweep
+    // phases both move the phone and depend on that being true. Asserting
+    // it explicitly costs one call and removes any path where a future
+    // change to the convergence helper silently defocuses every later
+    // station.
     try {
       await cam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);
     } catch (_) {}
@@ -1608,6 +1635,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<double?> _retargetAndConvergeMacro(CameraController cam, Offset pt,
       {int minMs = _macroFocusMinMs,
       int maxMs = _macroFocusMaxMs,
+      bool lockAfter = true,
       Map<String, dynamic>? debugOut}) async {
     double? lastSample;
     var maxSample = 0.0;
@@ -1646,10 +1674,13 @@ class FusionCaptureController extends ChangeNotifier {
       if (!driftedLow) break;
       driftRetried = true;
     }
-    try {
-      await cam.setFocusMode(FocusMode.locked).timeout(_macroFocusCallTimeout);
-    } catch (_) {}
+    if (lockAfter) {
+      try {
+        await cam.setFocusMode(FocusMode.locked).timeout(_macroFocusCallTimeout);
+      } catch (_) {}
+    }
     if (debugOut != null) {
+      debugOut['lockedAfter'] = lockAfter;
       debugOut['sharpness'] = lastSample;
       debugOut['maxSample'] = maxSample;
       debugOut['driftRetried'] = driftRetried;
