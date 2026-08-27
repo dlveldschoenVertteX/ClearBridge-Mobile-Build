@@ -67,3 +67,6 @@ scratchpad/
 # run is in flight (sanitised to basenames on completion). Belt-and-braces so
 # a mid-run commit can never publish a capturing user's uid to this PUBLIC repo.
 fusion_brain/results/frame_selection_test.json
+# Harness run logs are transient console capture, superseded by the findings
+# docs alongside them. No run log has ever been tracked here.
+fusion_brain/results/*.log
