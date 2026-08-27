@@ -72,6 +72,88 @@ payoff is the same noise-averaging stacking already attempts, which this
 same round measured losing to the burst's best single frame on 8 of 10
 captures.
 
+## Layer 2 (guide geometry): the secondary-camera guide was left in a coordinate space round 36 removed (2026-08-27, round 44)
+Second layer of the step-by-step architecture pass the CTO asked for. Audited
+for coordinate-space CORRECTNESS, not tuning -- this is the layer with the
+worst bug history in this project (BoxFit.cover mis-mapping, mirrored prints,
+macro offset, the `_isolate_thumb_lobe` frame-centre seed), and every one of
+those was caught only after it had corrupted something two layers downstream.
+
+**Checked and CORRECT, recorded so a later round doesn't re-litigate**: the
+BoxFit.cover + rotation transform (screen `rx=0.134604` -> still `ry=0.08298`,
+ratio 0.6164 = exactly the 0.4615/0.75 aspect crop), and `_scoreRoi` /
+`_focusPointScreenSpace` both now deriving from `_guideCx/_guideRy` at runtime
+with no copy left to drift.
+
+**Fix 1 -- fusion sweep stations had literally 0.0% overlap.** `cx = 0.2 +
+0.6*progress` put the stations perfectly disjoint on all three adjacent pairs
+(coverage 3.00x) against production sweep geometry's 35.9%. Mosaicking wants
+30-50%; with zero there is no shared content for registration to lock onto --
+a structural reason the sweep sources never registered well, not a tuning one.
+Swept about the guide's own centre with a 0.15 half-span. Coverage 3.00x ->
+2.28x is the deliberate trade: rounds 37-41 established unregisterable coverage
+is actively HARMFUL via the template-density penalty, not merely wasted.
+
+**Fix 2 -- `_sec_guide`'s constants outlived the frames they were measured on.**
+`main.py` used `cx=0.50, cy=0.34, rx=0.11, ry=0.13` for camera "2". Those were
+real measurements (rounds 31 and 33, off real frames) -- but off frames in a
+convention round 36 then changed and never came back to re-derive against.
+
+Confirmed, not assumed: both cached camera-"2" macro frames (`f4cb3ba5`,
+`b615f37b` -- the exact captures rounds 31/33/35 measured on) decode via plain
+`cv2.imdecode`, the same call this backend makes, to **2448x3264, PORTRAIT**,
+while every other frame in the request is 4266x3200 landscape. That mismatch IS
+the sideways bug round 36 diagnosed, and its fix (`_normalizeMacroFrame`) now
+routes this path through `decodeStillJpegToLuma`, which rotates 90 deg CW into
+landscape. **Round 36's own note records it was never device-tested**, so no real
+capture ever surfaced the leftover.
+
+Rotation read off the decoder's own indexing rather than its docstring
+(`rotated[y*dstW+x] = luma[(h-1-x)*w + y]`): `(u,v) -> (1-v, u)`, radii swapping
+axes. `portrait (0.500, 0.340) -> landscape (0.660, 0.500)`; `rx 0.11 / ry 0.13
+-> rx 0.13 / ry 0.11`.
+
+**Independent corroboration**: the MAIN guide's own real still-space position,
+measured off a real capture in round 16, is `cx=0.63 / cy=0.50`. The macro
+measurement rotates to `(0.66, 0.50)` -- 0.03 away on both axes, which is what it
+should be, since both shots aim at the same on-screen guide and the macro guide
+is only scaled 1.2x. Two numbers from completely different real data landing on
+the same spot is much stronger than either alone.
+
+**Measured on real data with the real NFIQ2 binary** (`test_sec_guide_rotation.py`
+applies the exact client rotation to reconstruct what the backend will receive):
+
+| frame the backend receives | constants | f4cb3ba5 | b615f37b |
+|---|---|---|---|
+| portrait (pre-round-36) | OLD | 62 | 59 |
+| landscape (post-round-36) | **OLD -- ships today** | 58 | 57 |
+| landscape (post-round-36) | **NEW -- rotated** | **67** | **72** |
+
+**+9 and +15** on the frames the pipeline will actually receive. On `b615f37b`
+the mask also moves from bare `guide` to `guide+unet` -- the content-aware
+refinement now finds a real pad to refine, which it could not on the OLD crop.
+That is mechanistic corroboration independent of the score.
+
+**Honest limit on the top row**: it is NOT a faithful reproduction of history --
+`b615f37b` scored a real production 75 via `afisMask: guide+flashdiff`, and this
+harness feeds a single frame so flash-diff can never engage. Absolute numbers are
+not comparable to production and no claim is made of beating it. The valid claim
+is the within-harness comparison: identical inputs, only constants and frame
+orientation vary.
+
+**Camera "3" fixed too, though unreachable today.** Its `cy=0.37` was never
+measured -- it was copied from `PadSilhouetteShape.cy`, a SCREEN-space constant,
+and used as a still-space `cy`. Round 27's audit listed "`defaultShape.cy` 0.37 ==
+`main.py`'s `_sec_cy`" among constants that AGREE; they agree numerically while
+living in different spaces, which is the actual defect. Corrected to the same
+rotation the main guide gets, `(0.5, 0.37) -> (0.63, 0.50)`. `_captureSecondaryBurst`
+was removed client-side 2026-08-03 so only camera "2" is captured -- fixed anyway
+because round 40 named camera "3" the better-evidenced diversity candidate if
+secondary cameras are revived. Full detail:
+`fusion_brain/results/GUIDE_GEOMETRY_FINDINGS.md`.
+
+**Not device-tested**; the backend half needs its own deploy go-ahead.
+
 ## Frame selection was the biggest single lever in the whole pipeline, and it was measured wrong (2026-08-27, round 42)
 CTO ran the fusion APK and reported "the ambient shots are extremely blurry
 ... image stabilization is a real flaw, OIS will definitely improve my
