@@ -31,39 +31,88 @@ class OrientationPrediction {
 class ThumbOrientationClassifier {
   Interpreter? _interpreter;
   bool _ready = false;
+  String? _lastInitError;
+  String? _loadedAssetKey;
 
   static const double _cropFraction = 0.85;
   static const int _inputSize = 224;
   static const List<String> _classes = ['front', 'right', 'top', 'left'];
 
+  /// Asset keys tried in order. A host app that declares the model in its
+  /// OWN pubspec (every app in this monorepo does) publishes it under the
+  /// bare path; one that ever relies on mac_capture shipping the model
+  /// itself would publish it package-scoped instead. Trying both removes a
+  /// whole failure class for the cost of one extra rootBundle miss, and
+  /// costs nothing at all in the common case -- the first key wins.
+  static const List<String> _assetKeys = [
+    'assets/models/thumb_orientation.tflite',
+    'packages/mac_capture/assets/models/thumb_orientation.tflite',
+  ];
+
   bool get isReady => _ready;
+
+  /// Why the model is not ready, when it is not. Exposed because this
+  /// classifier fails SILENTLY by design -- `classify()` returns null and
+  /// every caller falls back to IMU -- which means a permanently-failing
+  /// model load is invisible from the outside.
+  ///
+  /// REAL CASE this exists for (2026-08-27): the first fusion_capture run
+  /// to record classifier telemetry came back `orientationDebug.samples =
+  /// 0` while `padClipDebug` from the SAME `_onFrame` callback showed real
+  /// measurements -- so the frame callback was firing and every single
+  /// `classify()` call was returning null. "samples: 0" alone cannot
+  /// distinguish "the model never loaded" from "the model loaded and every
+  /// inference threw", and no capture in this project's Firestore history
+  /// has ever recorded a successful classification, so it is entirely
+  /// possible this model has never loaded on any real device. These two
+  /// fields are what make the next real capture answer that directly.
+  String? get lastInitError => _lastInitError;
+
+  /// Which of [_assetKeys] actually loaded, or null if none did.
+  String? get loadedAssetKey => _loadedAssetKey;
 
   void initialize() {
     _initAsync();
   }
 
   Future<void> _initAsync() async {
-    if (defaultTargetPlatform != TargetPlatform.android) return;
-    for (final useGpu in [true, false]) {
-      try {
-        final opts = InterpreterOptions()..threads = 2;
-        if (useGpu) opts.addDelegate(GpuDelegate());
-        _interpreter = await Interpreter.fromAsset(
-          'assets/models/thumb_orientation.tflite',
-          options: opts,
-        );
-        _ready = true;
-        debugPrint('[ThumbOrientation] init OK (${useGpu ? "gpu" : "cpu"})');
-        return;
-      } catch (e) {
-        debugPrint(
-            '[ThumbOrientation] init failed (${useGpu ? "gpu" : "cpu"}): $e');
-        _interpreter?.close();
-        _interpreter = null;
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      _lastInitError = 'not android';
+      return;
+    }
+    final failures = <String>[];
+    for (final assetKey in _assetKeys) {
+      for (final useGpu in [true, false]) {
+        try {
+          final opts = InterpreterOptions()..threads = 2;
+          if (useGpu) opts.addDelegate(GpuDelegate());
+          _interpreter = await Interpreter.fromAsset(assetKey, options: opts);
+          _ready = true;
+          _loadedAssetKey = assetKey;
+          _lastInitError = null;
+          debugPrint('[ThumbOrientation] init OK '
+              '(${useGpu ? "gpu" : "cpu"}, $assetKey)');
+          return;
+        } catch (e) {
+          failures.add('${useGpu ? "gpu" : "cpu"}/$assetKey: $e');
+          debugPrint('[ThumbOrientation] init failed '
+              '(${useGpu ? "gpu" : "cpu"}, $assetKey): $e');
+          _interpreter?.close();
+          _interpreter = null;
+        }
       }
     }
-    debugPrint('[ThumbOrientation] all delegates failed');
+    // Truncated: this is written to a Firestore diagnostic field, and a
+    // raw tflite stack trace can run to kilobytes.
+    final joined = failures.join(' | ');
+    _lastInitError =
+        joined.length > 400 ? '${joined.substring(0, 400)}...' : joined;
+    debugPrint('[ThumbOrientation] all delegates/assets failed');
   }
+
+  /// Set by [classify] when inference itself throws (as opposed to load).
+  String? get lastClassifyError => _lastClassifyError;
+  String? _lastClassifyError;
 
   /// Classifies the current camera frame's thumb orientation. Returns null
   /// when the model isn't ready or inference fails -- callers should treat
@@ -81,6 +130,7 @@ class ThumbOrientationClassifier {
       }
       return OrientationPrediction(_classes[bestIdx], outputBuffer[bestIdx]);
     } catch (e) {
+      _lastClassifyError = e.toString();
       debugPrint('[ThumbOrientation] classify error: $e');
       return null;
     }

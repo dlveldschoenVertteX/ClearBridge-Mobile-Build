@@ -2133,6 +2133,13 @@ class FusionCaptureController extends ChangeNotifier {
           'lastAngleName': _cvLastAngleName,
           'lastConfidence': _cvLastConfidence,
           'confidenceThreshold': _cvConfidenceThreshold,
+          // Without these, `samples: 0` is ambiguous between "the model
+          // never loaded" and "it loaded and every inference threw" -- the
+          // exact ambiguity the first real fusion capture landed in.
+          'modelReady': _orientationClassifier.isReady,
+          'modelAsset': _orientationClassifier.loadedAssetKey,
+          'initError': _orientationClassifier.lastInitError,
+          'classifyError': _orientationClassifier.lastClassifyError,
         },
         'fusionDebug': _debug,
       }, SetOptions(merge: true)).timeout(_networkTimeout);
