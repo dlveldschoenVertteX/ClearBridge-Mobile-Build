@@ -529,6 +529,13 @@ class FusionCaptureController extends ChangeNotifier {
   // need for a peak-tracking focus-convergence poll (its other phases rely
   // on continuous AF on one already-locked camera), so these did not exist
   // here before this port.
+  // Front-phase AF convergence bounds. Deliberately clearbridge_beta's own
+  // _refocusMinMs/_refocusMaxMs (600/1200), NOT the macro camera's longer
+  // 1200/2400: this is the main camera at its normal working distance, the
+  // exact case those production values were tuned for. The macro bounds are
+  // doubled specifically because camera "2" focuses slowly at close range.
+  static const int _frontFocusMinMs = 600;
+  static const int _frontFocusMaxMs = 1200;
   static const int _macroPollIntervalMs = 150;
   static const double _macroStableRatio = 0.12;
   static const int _macroStableStreakRequired = 2;
@@ -1027,6 +1034,52 @@ class FusionCaptureController extends ChangeNotifier {
           detailText: 'Hold still — capturing',
           silhouetteState: PadSilhouetteState.capturing,
         ));
+    // Explicit AF convergence before the burst, added 2026-08-27 on a direct
+    // CTO report that the ambient frames were still blurry under artificial
+    // light -- confirmed from the capture's own pixels, not taken on faith:
+    // measured inside the guide on 996a22c8, the ambient frames' MID
+    // frequencies had collapsed (2-4px band 0.72-0.80 and 4-8px band
+    // 0.56-0.67, against the best flash frame's 2.02 and 1.13) while their
+    // pixel-scale band stayed high. Mid-frequency loss with pixel-scale
+    // energy intact is blur, not noise; noise alone would inflate the
+    // highest band without removing the middle ones.
+    //
+    // Root cause, and it is structural rather than a tuning miss. This
+    // phase had NO explicit focus convergence at all -- it relied purely on
+    // continuous AF, as this file's own _macroPollIntervalMs comment
+    // admitted ("this app has no prior need for a peak-tracking focus-
+    // convergence poll"). Worse, the hold gate it does have cannot catch a
+    // defocused session: `_focusValue` is `abs / _focusPeak`, normalised
+    // against the running peak, so it reaches 1.0 at ANY absolute sharpness
+    // level. A uniformly out-of-focus hold satisfies that gate perfectly.
+    //
+    // clearbridge_beta has exactly the same relative gate but pairs it with
+    // a real _refocus() -- peak-tracking with a one-shot drift retry when
+    // the lens settles well below a sharpness it already saw. This app
+    // already has that machinery (ported for the macro phase); it simply
+    // was never pointed at the front burst. Reused rather than reinvented,
+    // aimed at the guide centre, with production's own front-camera bounds.
+    //
+    // Runs BEFORE _stopStream() deliberately: the poll reads
+    // `_liveAbsSharpness`, which only updates while _onFrame is running.
+    final frontFocusDebug = <String, dynamic>{};
+    try {
+      await _retargetAndConvergeMacro(
+        cam,
+        // Not `const`: PadSilhouetteShape.defaultShape.cx is not a constant
+        // expression, a real build failure this file's sibling already hit
+        // and documented (_sweepGuideShapeForProgress's own note).
+        Offset(PadSilhouetteShape.defaultShape.cx,
+            PadSilhouetteShape.defaultShape.cy),
+        minMs: _frontFocusMinMs,
+        maxMs: _frontFocusMaxMs,
+        debugOut: frontFocusDebug,
+      );
+    } catch (e) {
+      frontFocusDebug['error'] = e.toString();
+    }
+    _debug['frontFocusDebug'] = frontFocusDebug;
+
     await _stopStream();
 
     // Flash EV bracket, ported from clearbridge_beta 2026-08-27. This app
@@ -1052,8 +1105,16 @@ class FusionCaptureController extends ChangeNotifier {
     // conventionally-exposed flash frames -- the flash-diff mask needs a
     // real ambient/flash brightness delta, and a uniformly deep bracket
     // would erode it.
+    // Retuned shallower 2026-08-27 after this app's own first real capture
+    // with the bracket (996a22c8) refuted the deep-rung hypothesis: the deep
+    // rungs did reach the ISO floor (161 -> 55) but the shutter never left
+    // 29999us, and ridge-band energy inside the guide fell monotonically
+    // with depth -- the shallowest rung (-0.35 EV) measured 0.993 against
+    // 0.106-0.128 for the deep ones. See front_capture_controller.dart's
+    // _flashEvBracketMultipliers for the full measurement and the confound
+    // in my original reading. Device clamps at -2.0 EV regardless.
     const evBase = -0.7;
-    const evMultipliers = <double>[0.5, 1.0, 2.5, 4.0];
+    const evMultipliers = <double>[0.25, 0.5, 1.0, 1.5];
     double? minEv, maxEv;
     try {
       minEv = await cam.getMinExposureOffset();
@@ -1127,6 +1188,15 @@ class FusionCaptureController extends ChangeNotifier {
         await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
       } catch (_) {}
     }
+    // The convergence above ends in FocusMode.locked, which is exactly what
+    // the 8-shot burst wants and exactly what the tilt and sweep phases must
+    // NOT inherit -- both move the phone to new poses and rely on continuous
+    // AF to follow. Leaving the lens pinned at the front working distance
+    // would have quietly defocused every later station: a regression this
+    // change would have introduced, not one that already existed.
+    try {
+      await cam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);
+    } catch (_) {}
     // Front-only-v1's own visual confirmation the instant the burst
     // finishes ('✓ Captured' + a BRIGHT/FOCUS readout of the conditions it
     // was shot under) -- ported directly rather than leaving this phase's
@@ -1526,10 +1596,15 @@ class FusionCaptureController extends ChangeNotifier {
   /// drift retry, not a blind delay, per this project's own hard-learned
   /// lesson (front_capture_controller.dart's own history: "secondary-camera
   /// focus now actually measured, not guessed"). Polls the SAME
-  /// `_liveAbsSharpness` field `_onFrame` writes for the other phases; safe
-  /// to share since this only ever runs after the front/tilt/sweep image
-  /// stream has already been stopped (`_runMacroPhase` starts its own,
-  /// separate listener below), so there is no concurrent writer to race.
+  /// `_liveAbsSharpness` field `_onFrame` writes for the other phases.
+  ///
+  /// Shared by the macro phase and (2026-08-27) the FRONT phase. The two
+  /// differ in whether the shared image stream is running at the time, and
+  /// both are correct: the macro phase runs after `_stopStream()` and
+  /// starts its own separate listener, while the front phase runs while
+  /// `_onFrame` is still live -- which is not a race but a requirement,
+  /// since this poll has nothing to read unless something is writing
+  /// `_liveAbsSharpness` concurrently.
   Future<double?> _retargetAndConvergeMacro(CameraController cam, Offset pt,
       {int minMs = _macroFocusMinMs,
       int maxMs = _macroFocusMaxMs,
@@ -2302,6 +2377,8 @@ class FusionCaptureController extends ChangeNotifier {
           'modelAsset': _orientationClassifier.loadedAssetKey,
           'initError': _orientationClassifier.lastInitError,
           'classifyError': _orientationClassifier.lastClassifyError,
+          'inputShape': _orientationClassifier.inputShape,
+          'outputShape': _orientationClassifier.outputShape,
         },
         'fusionDebug': _debug,
       }, SetOptions(merge: true)).timeout(_networkTimeout);

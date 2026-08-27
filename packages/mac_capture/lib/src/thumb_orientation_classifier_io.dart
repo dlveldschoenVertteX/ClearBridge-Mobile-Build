@@ -71,6 +71,14 @@ class ThumbOrientationClassifier {
   /// Which of [_assetKeys] actually loaded, or null if none did.
   String? get loadedAssetKey => _loadedAssetKey;
 
+  /// The model's real tensor shapes, read off the interpreter at load.
+  /// Exposed because a shape mismatch is the failure mode that already cost
+  /// this classifier a full device round.
+  String? get inputShape => _inputShape;
+  String? get outputShape => _outputShape;
+  String? _inputShape;
+  String? _outputShape;
+
   void initialize() {
     _initAsync();
   }
@@ -87,6 +95,16 @@ class ThumbOrientationClassifier {
           final opts = InterpreterOptions()..threads = 2;
           if (useGpu) opts.addDelegate(GpuDelegate());
           _interpreter = await Interpreter.fromAsset(assetKey, options: opts);
+          // Explicit rather than relying on the first inference to do it:
+          // the tensor-level path in classify() does NOT allocate on our
+          // behalf the way runForMultipleInputs did.
+          _interpreter!.allocateTensors();
+          // Recorded so a REMAINING shape mismatch is immediately readable
+          // from a real capture instead of needing another round of
+          // guessing -- the whole reason the previous bug survived this
+          // long is that it surfaced only as a generic message.
+          _inputShape = _interpreter!.getInputTensor(0).shape.toString();
+          _outputShape = _interpreter!.getOutputTensor(0).shape.toString();
           _ready = true;
           _loadedAssetKey = assetKey;
           _lastInitError = null;
@@ -121,8 +139,35 @@ class ThumbOrientationClassifier {
     if (!_ready || _interpreter == null) return null;
     try {
       final inputData = _preprocess(image, sensorOrientation);
+
+      // REAL BUG, found from a real capture (2026-08-27, 996a22c8): the
+      // previous call was
+      //     _interpreter.runForMultipleInputs([inputData], {0: outputBuffer})
+      // with `inputData` a FLAT Float32List. That threw "Bad state: failed
+      // precondition" on every single inference -- confirmed live, with
+      // modelReady:true and initError:null in the same record, so the model
+      // loaded fine and only inference failed.
+      //
+      // Mechanism: runForMultipleInputs infers a shape from each input via
+      // Tensor.getInputShapeIfDifferent() and RESIZES the input tensor when
+      // it differs. A flat Float32List of 224*224*3 infers as shape
+      // [150528], which differs from the model's real [1, 224, 224, 3], so
+      // the interpreter dutifully resized its input tensor to a rank-1
+      // 150528 vector -- after which the first convolution has no valid
+      // spatial dimensions and the graph fails its own preconditions.
+      //
+      // The flat buffer itself was the right call (the nested form boxes
+      // 150K+ doubles per throttled inference, real jank on a budget phone).
+      // What was wrong was the entry point. The tensor-level API takes the
+      // same flat buffer and copies it into the already-correctly-shaped
+      // tensor WITHOUT any shape inference or resize, so it keeps the
+      // allocation win and drops the bug.
+      final inTensor = _interpreter!.getInputTensor(0);
+      final outTensor = _interpreter!.getOutputTensor(0);
+      inTensor.setTo(inputData);
+      _interpreter!.invoke();
       final outputBuffer = Float32List(_classes.length);
-      _interpreter!.runForMultipleInputs([inputData], {0: outputBuffer});
+      outTensor.copyTo(outputBuffer);
 
       var bestIdx = 0;
       for (var i = 1; i < outputBuffer.length; i++) {

@@ -681,51 +681,51 @@ class FrontCaptureController extends ChangeNotifier {
   //   1.0× = standard (the adaptive curve's own recommendation)
   //   2.5× / 4.0× = deep pulldown -- see below, this is the point
   //
-  // DEEPENED 2026-08-27 from [0.5, 1.0, 1.5, 0.75], on real measured data,
-  // to attack the single biggest capture-side defect this project has:
-  // torch light never becoming shutter speed.
+  // RETUNED SHALLOWER 2026-08-27, after the deepened bracket was tested on a
+  // real capture (996a22c8) and its central hypothesis was REFUTED.
   //
-  // Across 63 real production captures with per-frame EXIF, the AE has two
-  // clearly separated regimes:
-  //   * 46 captures where the flash frames sit pinned at the sensor's 30ms
-  //     (1/33s) exposure ceiling. There the torch light is spent ENTIRELY
-  //     on cutting ISO -- flash/ambient shutter ratio is 1.00 on every
-  //     single one, while ISO falls to 0.28-0.71× ambient.
-  //   * 16 brighter captures where ISO is already at its ~50 floor. There
-  //     the AE has no gain left to give back, so it converts the same light
-  //     into SHUTTER instead -- ratio 0.50, exposure halved, ISO actually
-  //     rising 1.38×.
-  // So the sensor will trade light for exposure time, but only after ISO
-  // bottoms out. That is a standard AE ladder: minimise gain first,
-  // shorten exposure last.
+  // The hypothesis: across 63 real captures the AE looked like it would
+  // trade light for a shorter exposure once ISO bottomed out (46 captures
+  // pinned at the 30ms ceiling spent torch light purely on gain reduction;
+  // 16 captures with ISO already at its ~50 floor showed exposure halving
+  // instead). So a bracket deep enough to reach the ISO floor should have
+  // converted torch light into shutter speed and cut motion blur.
   //
-  // The old bracket could not reach that crossover. Its deepest rung (1.5×)
-  // is a median -1.07 EV, against a median 1.88 stops of ISO headroom above
-  // the floor -- so it reached the floor on only 10 of 46 pinned captures
-  // (22%). Measured reach by deepest multiplier: 2.5× -> 37%, 3.0× -> 72%,
-  // 3.5× -> 87%, 4.0× -> 96%.
+  // Half of that is confirmed and half is wrong. The deep rungs DID walk
+  // the AE down its ladder exactly as predicted -- ISO fell 161 -> 55, the
+  // floor the old bracket never reached. But the shutter never moved: all
+  // eight frames stayed at 29999us. Once ISO bottoms out this AE simply
+  // UNDEREXPOSES rather than shortening exposure.
   //
-  // 0.5× and 1.0× are KEPT so the current behaviour is still two of the
-  // four rungs and the backend's existing max-of-variants selection can
-  // always fall back to it -- this cannot regress a capture that the old
-  // bracket already handled well. 0.75× is what gets dropped: at -0.54 EV
-  // it sits within a third of a stop of both 0.5× and 1.0×, a near-duplicate
-  // rung, and its slot buys far more as a rung that can actually cross the
-  // ISO floor.
+  // My reading of those 16 "shutter halved" captures was a brightness
+  // confound: every one of them was a scene whose AMBIENT was already off
+  // the 30ms ceiling, i.e. bright enough that the AE had left the ceiling
+  // on its own. That is not the same thing as the ISO floor causing it.
   //
-  // Deliberately NOT a manual-exposure lift: docs/LOCKED_SHUTTER_SPEED_SCOPE.md
-  // establishes that this plugin has no manual sensor API, that Camera2
-  // interop on this CameraX backend blocks the torch, and that CONTROL_AE_MODE
-  // is all-or-nothing. setExposureOffset is the one lever that reaches the
-  // AE without engaging interop at all -- this uses it to push the AE down
-  // its own ladder rather than trying to bypass it.
+  // Worse, the deep rungs actively cost frames. Measured inside the guide
+  // on that capture (ridge-band energy, not the whole-frame client proxy):
+  //   fl_1  EV -0.35  ISO 161  ridge 0.993  coherence 0.423   <- best
+  //   fl_3  EV -0.70  ISO 161  ridge 0.128  coherence 0.221
+  //   fl_5  EV -1.75  ISO  55  ridge 0.106  coherence 0.269
+  //   fl_7  EV -2.00  ISO  58  ridge 0.108  coherence 0.277
+  // Quality falls monotonically as the pulldown deepens, and the SHALLOWEST
+  // rung is dramatically the best -- 8x the ridge-band energy of any other
+  // frame. Two of four flash shots were being spent on frames that cannot
+  // win, which is a real reduction in effective burst depth.
   //
-  // Every rung is still clamped to the device's real getMin/MaxExposureOffset
-  // at the call site, so a device with a shallow EV range simply saturates
-  // instead of misbehaving -- and flashEvDebug now records that real range
-  // plus the actually-applied per-shot EV, so the next real capture shows
-  // both where the hardware clamped and whether shutter finally moved.
-  static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 2.5, 4.0];
+  // So the bracket should explore SHALLOWER, not deeper. 0.5x is retained
+  // as the rung that actually won, 1.0x as the adaptive curve's own
+  // recommendation, and 0.25x is added below both to test whether even less
+  // pulldown is better still -- the direction the data points and the one
+  // this bracket has never sampled. 1.5x is kept as the single blowout
+  // guard, since a bright scene genuinely can need it and this capture was
+  // taken under artificial light, not sun.
+  //
+  // Also learned from the same capture, and worth keeping: this device
+  // clamps exposure offset at -2.0 EV (flashEvRangeMin), so any multiplier
+  // past ~2.9x saturates and cannot be distinguished from 2.9x. That is a
+  // hard ceiling on how far this lever can ever be pushed on this hardware.
+  static const List<double> _flashEvBracketMultipliers = [0.25, 0.5, 1.0, 1.5];
 
   // Guided thumb-sweep capture (2026-07-30, diagnostic-first): replaces the
   // static "hold still -> fire immediately" trigger with two phases inserted
@@ -5033,6 +5033,8 @@ class FrontCaptureController extends ChangeNotifier {
           'modelAsset': _orientationClassifier.loadedAssetKey,
           'initError': _orientationClassifier.lastInitError,
           'classifyError': _orientationClassifier.lastClassifyError,
+          'inputShape': _orientationClassifier.inputShape,
+          'outputShape': _orientationClassifier.outputShape,
         },
         if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
         'zoomDebug': {
