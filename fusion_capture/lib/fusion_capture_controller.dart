@@ -487,7 +487,32 @@ class FusionCaptureController extends ChangeNotifier {
   // same working distance -- growing the guide on top of that would push
   // the user closer for no optical gain and risk the same softness camera
   // "2" has a documented history of. Standard guide, standard distance.
-  static const bool _cam3Enabled = true;
+  // DISABLED 2026-08-27 after its first real capture (ed242f1c). I
+  // recommended adding camera "3" on the strength of NFIQ2 win-rate
+  // statistics across 136 captures (it beat camera "2" on both mean and
+  // max, and has the largest sensor of all four). That recommendation was
+  // WRONG, and the first real frames from it say so unambiguously:
+  //
+  //   cam3_amb_0   Laplacian 5.3   ridge-band score 0.15
+  //   cam3_fl_0    Laplacian 5.7   ridge-band score 0.15
+  //   front_fl_7   Laplacian 341   ridge-band score 1.19
+  //
+  // Visually a featureless grey blur -- it cannot focus at this working
+  // distance at all. Both its frames are ~8x below the front camera on
+  // ridge content and carry no usable detail whatsoever.
+  //
+  // The NFIQ2 statistics that motivated this were measured on camera "3"
+  // acting as a SECONDARY capture in front_only_v1, at that flow's own
+  // framing -- not at fusion's closer guided distance. A win rate in one
+  // geometry did not transfer to another, which is exactly the sort of
+  // thing only a real capture can reveal.
+  //
+  // Kept as a flag rather than deleted: the code path is correct and
+  // costs nothing while off, and a phone whose camera "3" CAN focus this
+  // close would make it worth re-testing. Real cost saved while disabled:
+  // one camera open/close cycle, one focus convergence and two shutter
+  // presses per capture.
+  static const bool _cam3Enabled = false;
   static const String _cam3CameraName = '3';
   static const double _cam3GuideScaleFactor = 1.0;
   // Matches main.py's own `_sec_cy` for camera "3" (0.37), which is in
