@@ -62,3 +62,8 @@ ml/ridge_restore_curriculum/*.png
 # from prior sessions) -- ignore it explicitly so untracked-file hooks
 # don't flag every drop.
 scratchpad/
+
+# Frame-selection experiment output: records per-frame Storage paths while a
+# run is in flight (sanitised to basenames on completion). Belt-and-braces so
+# a mid-run commit can never publish a capturing user's uid to this PUBLIC repo.
+fusion_brain/results/frame_selection_test.json

@@ -487,6 +487,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         flash_burst    = None
         ambient_burst_gyros = None
         flash_burst_gyros   = None
+        _alt_flash_primary  = None
         arc_frame_wts  = None
         osc_theta_deg  = None
         if is_arc:
@@ -504,7 +505,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 **arc_sweep_stats,
             })
         elif is_front_only:
-            frames, frame_meta, actual_angles, ambient_frames, flash_frames = \
+            (frames, frame_meta, actual_angles, ambient_frames, flash_frames,
+             _alt_flash_primary) = \
                 _download_front_only_frames(capture_id, base_path)
             # Preserve the raw burst for the deepFuse variant -- same schema
             # _download_front_burst already expects (frames[] entries with
@@ -1456,6 +1458,55 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             best_afis_img = _b2_img
                             afis_params = {**_b2_p, 'afisNfiq': round(_b2_s, 2),
                                            'afisSecondBurstVariant': _b2_name}
+
+            # Alternate PRIMARY frame: the sharpest torch-lit frame in the
+            # burst, ranked inside the guide region (see
+            # _download_front_only_frames for the measurement that motivates
+            # it). Scored here as its own candidate -- native + freqNorm
+            # only, same bounded-cost pattern as the second-burst block
+            # above -- and kept only if it beats everything found so far.
+            #
+            # Deliberately ADDITIVE rather than a swap. main.py's own
+            # _download_front_only_frames carries a note that a 2026-07-24
+            # experiment swapping the primary to flash was refuted; that
+            # test replaced the primary using the client's whole-preview
+            # laplacianScore. This neither replaces nor uses that metric:
+            # the ambient primary still runs the entire variant pool exactly
+            # as before, and the flash frame only wins where real NFIQ2 says
+            # it is better. Worst case measured across 11 real production
+            # captures: exactly 0.
+            if (is_front_only and _alt_flash_primary is not None
+                    and time.monotonic() <= _variants_deadline):
+                for _af_name, _af_kw in (
+                    ('native',   dict()),
+                    ('freqNorm', dict(freq_normalize=True, freq_scale_min=0.9)),
+                ):
+                    _af_result = _call_with_hard_deadline(
+                        afis_print.generate,
+                        [_alt_flash_primary], [0.0], None,
+                        ambient_frames=ambient_frames, flash_frames=flash_frames,
+                        ambient_burst=ambient_burst, flash_burst=flash_burst,
+                        ambient_burst_gyros=ambient_burst_gyros,
+                        flash_burst_gyros=flash_burst_gyros,
+                        guide_region=_guide_region,
+                        stack_cache=_stack_cache,
+                        timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                        label=f'flashPrimary_{_af_name}',
+                        **_af_kw)
+                    if _af_result is None:
+                        continue
+                    _af_img, _af_p = _af_result
+                    if _af_img is None:
+                        continue
+                    _af_r = _score_ground_truth(_af_img)
+                    _af_s = _af_r.get('nfiq_score', 0.0) if not _af_r.get('error') else 0.0
+                    logger.info('flash-primary variant %s nfiq=%.1f (best so far=%.1f)',
+                                _af_name, _af_s, afis_nfiq)
+                    if _af_s > afis_nfiq:
+                        afis_nfiq = _af_s
+                        best_afis_img = _af_img
+                        afis_params = {**_af_p, 'afisNfiq': round(_af_s, 2),
+                                       'afisFlashPrimaryVariant': _af_name}
 
             # Per-zone focus-bracket stills (2026-08-17, client-side feature-
             # flagged off by default -- see FrontCaptureController's
@@ -3330,6 +3381,49 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     # right default. Do not re-attempt this exact swap without new data.
     best_arr = amb_frames_list[0] if amb_frames_list else fl_frames_list[0]
 
+    # ALTERNATE primary: the sharpest TORCH-LIT frame, measured inside the
+    # guide region. Returned alongside -- never instead of -- best_arr, and
+    # consumed below as one more max-of-variants candidate, so this cannot
+    # regress a capture the ambient primary already handles well.
+    #
+    # Measured 2026-08-27 on 18 real production front_only_v1 captures by
+    # rendering EVERY burst frame and scoring each with the real NIST NFIQ2
+    # binary, so the best possible choice was known rather than assumed:
+    #   * the current ambient-primary rule matched that best frame on 1 of
+    #     11 captures, leaving a mean 12.7 NFIQ2 points on the table
+    #   * swapping to flash-primary outright averaged +8.1 but cost as much
+    #     as -15 on individual captures -- which is why this is additive
+    #   * keeping both and letting NFIQ2 selection decide averaged +10.6
+    #     with a worst case of exactly 0, matching the best frame 7/11
+    #
+    # Two things make the guide-region Laplacian the right ranking here,
+    # both measured rather than assumed:
+    #   1. Restricting to one illumination removes an ISO confound. Across
+    #      63 real captures ambient frames run ISO 291 median against
+    #      flash's 140, and Laplacian variance rewards that broadband
+    #      sensor noise -- which is how a visibly blurry ambient frame
+    #      (real CTO report, capture ed242f1c) scores as the "sharpest".
+    #   2. Restricting to the guide removes a framing confound. generate()'s
+    #      own internal _ridge_energy ranks frames on a centre-half crop of
+    #      the frame, and the guide occupies only 12.5% of that crop on real
+    #      captures -- so 87.5% of what it measures is background.
+    _alt_primary = None
+    _guide = doc_dict.get('guideRegion')
+    if fl_frames_list and _guide:
+        def _guide_lap(_a):
+            _g = _a if _a.ndim == 2 else cv2.cvtColor(_a, cv2.COLOR_BGR2GRAY)
+            # Same superellipse the AFIS mask itself uses, so the frames are
+            # ranked on exactly the region that ends up being enhanced.
+            _m = afis_print._superellipse_mask(_g.shape[:2], _guide)
+            if _m is None or not (_m > 0).any():
+                return float(cv2.Laplacian(_g, cv2.CV_64F).var())
+            return float(np.var(cv2.Laplacian(_g, cv2.CV_64F)[_m > 0]))
+        try:
+            _alt_primary = max(fl_frames_list, key=_guide_lap)
+        except Exception as exc:
+            logger.warning('front_only: alt flash primary failed: %s', exc)
+            _alt_primary = None
+
     frames     = [best_arr]
     meta_out   = [{'angle': 'front', 'laplacianScore': 0, 'frameSource': 'front_only'}]
     angles_out = [0.0]
@@ -3338,9 +3432,11 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     ambient_frames_out = [amb_frames_list[0]] if amb_frames_list else [None]
     flash_frames_out   = [fl_frames_list[0]]  if fl_frames_list  else [None]
 
-    logger.info('front_only: %d ambient + %d flash frames loaded',
-                len(amb_frames_list), len(fl_frames_list))
-    return frames, meta_out, angles_out, ambient_frames_out, flash_frames_out
+    logger.info('front_only: %d ambient + %d flash frames loaded'
+                '%s', len(amb_frames_list), len(fl_frames_list),
+                '' if _alt_primary is None else ' (+alt flash primary)')
+    return (frames, meta_out, angles_out, ambient_frames_out,
+            flash_frames_out, _alt_primary)
 
 
 def _download_front_only_frames_burst2(capture_id: str, base_path: str):
