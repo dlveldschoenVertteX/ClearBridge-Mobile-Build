@@ -51,6 +51,24 @@ from frame_selection_test import (                # noqa: E402
 )
 
 
+def prod_ridge_energy(arr: np.ndarray) -> float:
+    """Byte-for-byte generate()'s own nested `_ridge_energy`, which is what
+    actually orders the stack pool in production. It is a closure, so it
+    cannot be imported -- this is a copy, and any drift in the original
+    invalidates this arm.
+
+    Two properties matter here and neither is incidental: it measures a
+    CENTRE-HALF crop of the frame (the guide is only ~12.5% of that on real
+    captures) and it is unnormalised, so a torch-lit frame's higher global
+    contrast raises it regardless of ridge resolution.
+    """
+    g = arr if arr.ndim == 2 else cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
+    h, w = g.shape
+    c = g[h // 4: 3 * h // 4, w // 4: 3 * w // 4].astype(np.float32)
+    return float(np.abs(cv2.GaussianBlur(c, (0, 0), 1.2)
+                        - cv2.GaussianBlur(c, (0, 0), 3.5)).mean())
+
+
 def stack_of(pool: List[np.ndarray], focus: bool) -> Optional[np.ndarray]:
     fn = ap._focus_stack_face_on if focus else ap._stack_face_on
     return fn(pool[:ap._STACK_MAX], None, {}, None)
@@ -77,18 +95,32 @@ def run_capture(doc: dict, tmp: str) -> Optional[dict]:
     for f in loaded:
         f.update(frame_metrics(f['img'], guide))
 
-    # generate()'s own pool ranking is a ridge-band-energy proxy; `ridge`
-    # here is the same physical quantity measured inside the guide.
-    rank = lambda xs: [f['img'] for f in sorted(xs, key=lambda f: -f['ridge'])]
-    pools = {'mixed': rank(loaded), 'ambient': rank(amb), 'flash': rank(fl)}
+    for f in loaded:
+        f['prod_re'] = prod_ridge_energy(f['img'])
+
+    # `prod` reproduces what production actually stacks today. The other
+    # three vary only the pool, each ranked by the guide-region ridge score
+    # -- so `prod` vs `mixed` isolates the RANKING and `mixed` vs
+    # `ambient`/`flash` isolates the ILLUMINATION MIX.
+    rank = lambda xs, k: [f['img'] for f in sorted(xs, key=lambda f: -f[k])]
+    pools = {
+        'prod': rank(loaded, 'prod_re'),
+        'mixed': rank(loaded, 'ridge'),
+        'ambient': rank(amb, 'ridge'),
+        'flash': rank(fl, 'ridge'),
+    }
 
     amb_burst = [f['img'] for f in sorted(amb, key=lambda f: -f['client_lap'])]
     fl_burst = [f['img'] for f in sorted(fl, key=lambda f: -f['client_lap'])]
 
-    top4 = sorted(loaded, key=lambda f: -f['ridge'])[:ap._STACK_MAX]
-    mix = f'{sum(1 for f in top4 if not f["flash"])}amb/{sum(1 for f in top4 if f["flash"])}fl'
+    def _mix(key):
+        t = sorted(loaded, key=lambda f: -f[key])[:ap._STACK_MAX]
+        return (f'{sum(1 for f in t if not f["flash"])}amb/'
+                f'{sum(1 for f in t if f["flash"])}fl')
 
-    row: Dict[str, object] = {'captureId': cid, 'mixedPoolTop4': mix}
+    row: Dict[str, object] = {'captureId': cid,
+                              'prodPoolTop4': _mix('prod_re'),
+                              'ridgePoolTop4': _mix('ridge')}
     for focus in (False, True):
         vname = 'focusStack' if focus else 'stack'
         for pname, pool in pools.items():
@@ -107,9 +139,10 @@ def run_capture(doc: dict, tmp: str) -> Optional[dict]:
                 except Exception as e:
                     print(f'    {vname}/{pname} failed: {e}')
             row[f'{vname}_{pname}'] = score
-    print(f'  {cid[:8]}  pool={mix}  '
-          + '  '.join(f'{k}={row[k]}' for k in row if k.endswith(
-              ('_mixed', '_ambient', '_flash'))))
+    print(f'  {cid[:8]}  prodPool={row["prodPoolTop4"]} '
+          f'ridgePool={row["ridgePoolTop4"]}  '
+          + '  '.join(f'{k}={row[k]}' for k in row if k.startswith(
+              ('stack_', 'focusStack_'))))
     return row
 
 
@@ -134,16 +167,15 @@ def main(limit: int = 12):
     print('\n=== RESULT ===')
     for vname in ('stack', 'focusStack'):
         print(f'\n{vname}')
-        base = [r[f'{vname}_mixed'] for r in rows]
-        for pname in ('mixed', 'ambient', 'flash'):
-            pairs = [(r[f'{vname}_mixed'], r[f'{vname}_{pname}']) for r in rows
-                     if r.get(f'{vname}_mixed') is not None
+        for pname in ('prod', 'mixed', 'ambient', 'flash'):
+            pairs = [(r[f'{vname}_prod'], r[f'{vname}_{pname}']) for r in rows
+                     if r.get(f'{vname}_prod') is not None
                      and r.get(f'{vname}_{pname}') is not None]
             if not pairs:
                 continue
             m = float(np.mean([p[1] for p in pairs]))
             d = [p[1] - p[0] for p in pairs]
-            print(f'  {pname:<8} mean {m:6.2f}  vs mixed {np.mean(d):+6.2f}  '
+            print(f'  {pname:<8} mean {m:6.2f}  vs prod {np.mean(d):+6.2f}  '
                   f'({sum(1 for x in d if x > 0)} better / '
                   f'{sum(1 for x in d if x < 0)} worse, n={len(pairs)})')
     print(f'\nwrote {out}')
