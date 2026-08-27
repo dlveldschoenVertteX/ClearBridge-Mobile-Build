@@ -81,12 +81,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest-harness-apk --yes 2>/dev/null || true
-          git push --delete origin latest-harness-apk 2>/dev/null || true
-          gh release create latest-harness-apk \
-            --title "Latest Harness APK (build ${{ github.run_number }})" \
-            --notes "Commit: ${{ github.sha }}" \
-            "capture_harness/build/app/outputs/flutter-apk/app-release.apk#clearbridge-harness.apk"
+          gh release delete latest-harness-apk --yes --cleanup-tag 2>/dev/null || true
+          for _attempt in 1 2 3; do
+            gh release create latest-harness-apk \
+              --title "Latest Harness APK (build ${{ github.run_number }})" \
+              --notes "Commit: ${{ github.sha }}" \
+              "capture_harness/build/app/outputs/flutter-apk/app-release.apk#clearbridge-harness.apk" && break
+            echo "release create failed (attempt $_attempt/3), retrying in 5s..."
+            sleep 5
+          done
           echo "Harness: https://github.com/${{ github.repository }}/releases/download/latest-harness-apk/clearbridge-harness.apk"
 
       - name: Upload harness APK to Firebase Storage
@@ -198,12 +201,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest-sweep-test-apk --yes 2>/dev/null || true
-          git push --delete origin latest-sweep-test-apk 2>/dev/null || true
-          gh release create latest-sweep-test-apk \
-            --title "Latest Sweep Test APK (build ${{ github.run_number }})" \
-            --notes "Commit: ${{ github.sha }}" \
-            "sweep_capture_test/build/app/outputs/flutter-apk/app-release.apk#clearbridge-sweep-test.apk"
+          gh release delete latest-sweep-test-apk --yes --cleanup-tag 2>/dev/null || true
+          for _attempt in 1 2 3; do
+            gh release create latest-sweep-test-apk \
+              --title "Latest Sweep Test APK (build ${{ github.run_number }})" \
+              --notes "Commit: ${{ github.sha }}" \
+              "sweep_capture_test/build/app/outputs/flutter-apk/app-release.apk#clearbridge-sweep-test.apk" && break
+            echo "release create failed (attempt $_attempt/3), retrying in 5s..."
+            sleep 5
+          done
           echo "Sweep test: https://github.com/${{ github.repository }}/releases/download/latest-sweep-test-apk/clearbridge-sweep-test.apk"
 
       - name: Upload sweep-test APK to Firebase Storage
@@ -317,12 +323,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest-fusion-capture-apk --yes 2>/dev/null || true
-          git push --delete origin latest-fusion-capture-apk 2>/dev/null || true
-          gh release create latest-fusion-capture-apk \
-            --title "Latest Fusion Capture APK (build ${{ github.run_number }})" \
-            --notes "Commit: ${{ github.sha }}" \
-            "fusion_capture/build/app/outputs/flutter-apk/app-release.apk#clearbridge-fusion-capture.apk"
+          gh release delete latest-fusion-capture-apk --yes --cleanup-tag 2>/dev/null || true
+          for _attempt in 1 2 3; do
+            gh release create latest-fusion-capture-apk \
+              --title "Latest Fusion Capture APK (build ${{ github.run_number }})" \
+              --notes "Commit: ${{ github.sha }}" \
+              "fusion_capture/build/app/outputs/flutter-apk/app-release.apk#clearbridge-fusion-capture.apk" && break
+            echo "release create failed (attempt $_attempt/3), retrying in 5s..."
+            sleep 5
+          done
           echo "Fusion capture: https://github.com/${{ github.repository }}/releases/download/latest-fusion-capture-apk/clearbridge-fusion-capture.apk"
 
       - name: Upload fusion-capture APK to Firebase Storage
@@ -442,12 +451,15 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release delete latest-clearbridge-beta-apk --yes 2>/dev/null || true
-          git push --delete origin latest-clearbridge-beta-apk 2>/dev/null || true
-          gh release create latest-clearbridge-beta-apk \
-            --title "Latest ClearBridge Beta APK (build ${{ github.run_number }})" \
-            --notes "Commit: ${{ github.sha }}" \
-            "clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk#clearbridge-beta.apk"
+          gh release delete latest-clearbridge-beta-apk --yes --cleanup-tag 2>/dev/null || true
+          for _attempt in 1 2 3; do
+            gh release create latest-clearbridge-beta-apk \
+              --title "Latest ClearBridge Beta APK (build ${{ github.run_number }})" \
+              --notes "Commit: ${{ github.sha }}" \
+              "clearbridge_beta/build/app/outputs/flutter-apk/app-release.apk#clearbridge-beta.apk" && break
+            echo "release create failed (attempt $_attempt/3), retrying in 5s..."
+            sleep 5
+          done
           echo "Beta: https://github.com/${{ github.repository }}/releases/download/latest-clearbridge-beta-apk/clearbridge-beta.apk"
 
       - name: Upload beta APK to Firebase Storage
