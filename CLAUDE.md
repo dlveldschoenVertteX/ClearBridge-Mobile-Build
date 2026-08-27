@@ -1,5 +1,114 @@
 # ClearBridge Mobile — persistent context
 
+## Frame selection was the biggest single lever in the whole pipeline, and it was measured wrong (2026-08-27, round 42)
+CTO ran the fusion APK and reported "the ambient shots are extremely blurry
+... image stabilization is a real flaw, OIS will definitely improve my
+captures", then asked to fix frame selection, look into ambient frames
+resolving better ridge content, and test their guess that "stacking ambient
+frames on noise explains why the stacking function performed so badly."
+
+**Method, chosen to avoid this session's own earlier mistake**: render EVERY
+burst frame of 18 real **production** `front_only_v1` captures as
+`generate()`'s primary and score each with the real NFIQ2 binary, holding
+`ambient_burst`/`flash_burst` -- and therefore every masking decision --
+identical. That makes the best possible choice known rather than assumed,
+and turns policy comparison into an offline question over recorded numbers.
+Deliberately NOT the `fusion_v1` population: earlier the same session a
+backend change looked behaviour-neutral on three captures that were all
+`fusion_v1`, and would have broken 57% of production.
+
+**Result: production picks the best frame in the burst 2 times in 18.**
+
+| policy | mean NFIQ2 | vs prod | worst case | picks best frame |
+|---|---|---|---|---|
+| prod (sharpest ambient, client laplacianScore) | 62.22 | -- | -- | **2/18** |
+| swap to flash, guide-region Laplacian | 65.50 | +3.28 | **-16** | 6/18 |
+| **additive: prod + best-flash candidate** (shipped) | **68.83** | **+6.61** | **0** | 8/18 |
+| additive + best-ambient too | 69.89 | +7.67 | 0 | 9/18 |
+| ORACLE (unknowable live) | 74.78 | +12.56 | -- | -- |
+
+**Two measured confounds, neither a tuning problem.**
+1. **ISO.** Across 63 production captures, ambient frames run **ISO 291**
+   median against flash's **140** -- and both sit at the SAME 30ms (1/33s)
+   AE ceiling (79% / 71% of frames). The torch never shortens the exposure;
+   the sensor spends the light on dropping ISO. Laplacian variance rewards
+   the broadband noise ambient carries twice as much of. Per frame inside
+   the guide: client Laplacian ambient 144.0 vs flash 57.5 (0.40x), but
+   ridge-band energy 0.350 vs 0.466 (**1.33x**) and orientation coherence
+   0.220 vs 0.369 (**1.68x**). Laplacian says ambient is 3.4x sharper; every
+   ridge-specific measure says flash is better. That is the CTO's own visual
+   report, quantified.
+2. **Framing.** `generate()`'s internal `_ridge_energy` ranks frames on a
+   centre-half crop of the frame, and the guide occupies only **12.5%** of
+   that crop on real captures -- 87.5% of what it ranks on is background.
+   This ranking also orders the `stack`/`focusStack` pool.
+
+**Shipped as ADDITIVE, not a swap.** `main.py` already carried a note that a
+2026-07-24 flash-preference experiment was refuted; that one REPLACED the
+primary using the client's whole-preview proxy. The swap rows above
+reproduce its failure from a different direction (-16 on individual
+captures). `_download_front_only_frames` now also returns the sharpest
+torch-lit frame ranked inside the guide, scored as one more `native`+
+`freqNorm` candidate -- same bounded-cost pattern as the second-burst block,
+worst case structurally 0.
+
+**A confound in my OWN comparison, found and corrected.** Checking against
+the `nfiq2Score` production actually delivered reported +18.50 -- but the
+five captures carrying nearly all of it (+64/+57/+56/+53/+41) were taken
+2026-07-24 to 2026-08-05 and delivered 5-10 via `secondary_3`/
+`minutiae_left`/`detailZoom`, selection paths since changed outright. That
+delta is three weeks of pipeline fixes. Restricted to comparable vintage
+(2026-08-17 onward, n=6): **+3.33 mean, improves 2 of 6, regresses 0, max
+single gain +14** -- the honest figure for what shipping this buys.
+
+**On OIS, since a Samsung A54 is about to be bought for it**: estimated
+motion smear from the recorded gyro rate at the 30ms exposure is 3.2px
+median / 4.7px p90, against a 9-15px ridge period. Across 52 scored
+captures, shutter, ISO and gyro all correlate with real NFIQ2 at |r| < 0.17.
+Captures with >=75% of frames pinned at the AE ceiling average 60.7 vs 64.0
+for those below 25% -- inside this project's own noise floor. OIS should
+help and a sensor that holds a shorter exposure would help more, but this
+data does not make stabilisation the dominant term; the ISO penalty is
+larger and it is fixable in software.
+
+**The stacking hypothesis: refuted, with a bigger reason found behind it.**
+Four pool arms on 12 real production captures, masking identical
+(`stack_policy_test.py`): production's own pool 63.70/65.80
+(stack/focusStack); re-ranked mixed -2.40/-1.78; **ambient-only -2.56/-4.00
+(the WORST arm of the four)**; flash-only -2.33/-3.62. Deliberately doing
+the thing the hypothesis warns against is what performs worst. The real
+reason, from the same captures' per-frame renders: **best single frame 74.5
+vs focusStack 65.8, stack 63.7, production's own primary 61.7.** Stacking
+beats production's CHOSEN frame 5-6/10 -- which is why it wins variants
+today -- but beats the burst's BEST frame only **2/10**. Its apparent value
+is largely a symptom of the bad primary-frame choice, not a gain of its own.
+Also: **21% of stack arms (20/96) failed ECC alignment outright**,
+concentrated on 4 of 12 captures. Not actioned -- these are additive
+candidates that still win 2/10, and the case for reclaiming their budget
+should be made after the new candidate has real data, on matchability rather
+than NFIQ2. Full detail: `fusion_brain/results/FRAME_SELECTION_FINDINGS.md`
+and `results/STACK_POOL_FINDINGS.md`.
+
+**Camera "3" disabled in `fusion_capture` (round 41's own recommendation,
+refuted by its first real capture).** I had recommended it as a diversity
+source from NFIQ2 win-rate stats measured in `front_only_v1` framing; those
+did not transfer to fusion's closer distance. Real first frames: Laplacian
+5.3, ridge score 0.15, featureless grey blur. `_cam3Enabled = false`.
+
+**Open bug, now diagnosable rather than fixed.** The ported
+`ThumbOrientationClassifier` recorded `orientationDebug.samples = 0` on the
+first real fusion capture, while `padClipDebug` -- measured in the SAME
+`_onFrame` callback -- had real values (`maxPadClipFracSeen` 0.52). So the
+callback fired repeatedly and every `classify()` returned null. Checked
+Firestore history: no capture in this project has ever recorded a successful
+classification (the old multi-angle flow wrote no CV debug at all), so it is
+entirely possible this model has never loaded on any real device -- it fails
+silently by design, callers falling back to IMU. Without device logs the
+cause is not determinable, so instead: `modelReady`/`modelAsset`/`initError`/
+`classifyError` are now recorded in `orientationDebug` on BOTH apps, and the
+package-scoped asset key is tried alongside the bare one. The next real
+capture answers it directly.
+
 ## Camera "2" is NOT a macro lens -- real device specs settle a standing assumption (2026-08-26, round 40)
 CTO asked directly, before buying a test phone: "are you actually using
 camera_index_macro or just cropping the main sensor output? ... if macro is
