@@ -1387,7 +1387,8 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
                        min_circvar: float = _CREASE_MIN_CIRCVAR,
                        min_run_frac: float = _CREASE_MIN_RUN_FRAC,
                        max_trim_frac: float = _CREASE_MAX_TRIM_FRAC,
-                       smooth_px: int = _CREASE_SMOOTH_PX
+                       smooth_px: int = _CREASE_SMOOTH_PX,
+                       orient_src: Optional[np.ndarray] = None
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """Trims print area toward the BASE half only (never the tip -- matches
     the CTO's own annotated photo, which flagged only the bottom boundary as
@@ -1418,10 +1419,34 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     trust the one point in the pipeline with a guaranteed, deterministic
     orientation contract, not an intermediate space's own field names.
 
-    Runs `_orientation_field` directly on the binarized ridge image --
-    already clean, high-contrast black/white content, which gives a
-    stronger edge signal for this purpose than the noisier pre-binarization
-    grayscale would.
+    `orient_src`, when given, is the image the orientation field is measured
+    on INSTEAD of `binimg`. `generate()` passes the pre-Gabor normalized
+    grayscale, in this same post-rotation geometry.
+
+    REAL CIRCULARITY this fixes, found 2026-08-27 from a direct CTO report
+    that a print was "enhancing everything past the crease at the bottom".
+    This function used to measure the binarized image, on the reasoning that
+    clean high-contrast black/white gives a stronger edge signal than the
+    noisier grayscale. That reasoning is sound about edge STRENGTH and wrong
+    about what is being asked: by then the Gabor bank has already run, and
+    this project has already documented that the bank "will impose ridge-like
+    structure on any input with enough local contrast". So the crease is
+    handed to the detector already wearing plausible, varied ridge flow --
+    the detector is reading data the enhancer has made fingerprint-shaped.
+
+    Measured on real capture b615f37b, where the trim did not fire and the
+    below-crease region survived into the delivered print:
+
+        base-half circular variance   post-Gabor   pre-Gabor
+        median                            0.506       0.181
+        longest run below threshold        27px       162px
+        fires (needs >= 29px)                no         yes
+
+    On two captures where the trim already fired (01662ffb, 8ed1c600) the
+    pre-Gabor measure fires as well, with longer runs -- so this changes the
+    captures that were failing without flipping the ones that were working.
+    Falls back to `binimg` when no source is supplied, so every other caller
+    keeps the previous behaviour exactly.
 
     Real, deliberate choice: scans from the CENTRE outward (not from the
     base edge inward) and requires a sustained run (on a SMOOTHED profile,
@@ -1445,7 +1470,11 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     span = y1 - y0
     if span < 40:
         return binimg, mask
-    orient = _orientation_field(binimg.astype(np.float32))
+    src = binimg if orient_src is None else orient_src
+    if src.shape[:2] != binimg.shape[:2]:
+        src = cv2.resize(src, (binimg.shape[1], binimg.shape[0]),
+                         interpolation=cv2.INTER_AREA)
+    orient = _orientation_field(src.astype(np.float32))
     mid_y = y0 + span // 2
 
     raw = np.full(y1 - y0 + 1, np.nan, dtype=np.float32)
@@ -3336,6 +3365,7 @@ def generate(
             params['afisEnhance'] = 'fomfe'
         else:
             params['afisEnhance'] = 'fomfe_unavailable'
+    pre_gabor_gray: Optional[np.ndarray] = None
     if binimg is None:
         # Either enhance == 'gabor', or a pyfing path was requested but the
         # sidecar wasn't configured/reachable -- same non-blocking contract
@@ -3350,6 +3380,14 @@ def generate(
             gamma=(gabor_gamma if gabor_gamma is not None else _GABOR_GAMMA),
         )
         binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
+        # Kept for the crease trim, which must NOT measure ridge orientation
+        # on the Gabor output -- see _trim_base_crease's own docstring for
+        # the circularity that causes and the real capture that found it.
+        # Only this branch is wired: it is the path every production
+        # front_only_v1 variant that has ever won selection goes through
+        # (native / freqNorm). The denoise-pre-pass branches fall back to
+        # the previous behaviour rather than being changed untested.
+        pre_gabor_gray = norm
         params.setdefault('afisEnhance', 'gabor')
 
     # Sub-pixel anti-alias pass (2026-08-03, visual-QA finding, MEASURED
@@ -3404,13 +3442,34 @@ def generate(
     alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
     binimg = (binimg.astype(np.float32) * alpha +
               255.0 * (1.0 - alpha)).astype(np.uint8)
+    # The crease trim runs post-rotation (see its docstring), so its
+    # orientation source has to make the same trip. Rotated with the SAME
+    # pre-rotation mask -- captured before the reassignment below, since
+    # `mask` is about to become the rotated one.
+    _mask_pre_rot = mask
+    _pre_rot_src = None
+    if pre_gabor_gray is not None:
+        _pre_rot_src = cv2.normalize(pre_gabor_gray.astype(np.float32), None,
+                                     0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if _pre_rot_src.shape[:2] != binimg.shape[:2]:
+            # freq_normalize resamples, so this can be at a different scale.
+            # Resize rather than drop it: the question asked of this image is
+            # about orientation structure, which a resample preserves.
+            _pre_rot_src = cv2.resize(_pre_rot_src,
+                                      (binimg.shape[1], binimg.shape[0]),
+                                      interpolation=cv2.INTER_AREA)
     if guide_region is not None and guide_mask is not None and 'tipAngleDeg' in guide_region:
         # Deterministic upright from the guide's known tip direction -- the pad
         # silhouette is near-symmetric, so PCA (_upright_rotate) can pick the
         # wrong axis; the app tells us exactly which way the tip points.
-        binimg, mask = _upright_from_tip(binimg, mask, float(guide_region['tipAngleDeg']))
+        _tip = float(guide_region['tipAngleDeg'])
+        binimg, mask = _upright_from_tip(binimg, mask, _tip)
+        if _pre_rot_src is not None:
+            _pre_rot_src = _upright_from_tip(_pre_rot_src, _mask_pre_rot, _tip)[0]
     else:
         binimg, mask = _upright_rotate(binimg, mask)
+        if _pre_rot_src is not None:
+            _pre_rot_src = _upright_rotate(_pre_rot_src, _mask_pre_rot)[0]
     params['afisRotated'] = True
 
     # Base-crease trim (2026-08-17, CTO-directed: "pad isolation needs to be
@@ -3423,10 +3482,13 @@ def generate(
     # own cy/ry) trimmed the wrong axis entirely.
     if crease_trim:
         pre_cov = int((mask > 0).sum())
-        binimg, mask = _trim_base_crease(binimg, mask)
+        binimg, mask = _trim_base_crease(binimg, mask,
+                                         orient_src=_pre_rot_src)
         trimmed_px = pre_cov - int((mask > 0).sum())
         if trimmed_px > 0:
             params['afisCreaseTrimPx'] = trimmed_px
+            params['afisCreaseTrimSrc'] = (
+                'preGabor' if _pre_rot_src is not None else 'binarized')
 
     # Circular/elliptical vignette (2026-08-17, CTO request: "have the
     # feathing be circular so it mimics real fingerprint scanner prints").
