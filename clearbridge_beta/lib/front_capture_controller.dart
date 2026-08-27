@@ -1447,6 +1447,32 @@ class FrontCaptureController extends ChangeNotifier {
   double _appliedEvOffset = 0.0;
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0;
+
+  // ---- pad highlight-clipping guard (2026-08-27) --------------------
+  // REAL, MEASURED GAP this closes. The glare pulldown above triggers on
+  // MEAN luma over the pad ROI (_glareHighLuma = 205). Mean is structurally
+  // blind to clipping. Measured across all 8 burst frames of a real capture
+  // (6b43c255): pad mean luma 167-201 -- under 205 on every frame, so the
+  // pulldown NEVER fired -- while 11-15% of the pad sat at/above 250 and
+  // 8.4% was pegged at exactly 255.
+  //
+  // That matters more than an ordinary exposure error because saturated
+  // pixels carry no gradient at all: the ridges under them are gone at
+  // capture time and no backend setting recovers them. Verified directly --
+  // the clipped fraction is byte-identical before and after every CLAHE
+  // limit the backend uses (1.0/2.0/3.0/4.0), and a full sweep of the
+  // enhancement filters found no processing setting that helps.
+  //
+  // Threshold: 4% of the pad ROI. Real usable captures in this project sit
+  // near 0%; the capture that motivated this ran 11-15%. 4% is deliberately
+  // well below the observed bad case rather than tuned to it, and it can
+  // only ever ADD a pulldown the mean-based rule already missed -- the
+  // existing hysteresis, settle delay and min/max clamping are untouched,
+  // so this cannot introduce oscillation the current rule doesn't already
+  // have.
+  static const double _padClipHighFrac = 0.04;
+  double _lastPadClipFrac = 0.0;
+  double _maxPadClipFracSeen = 0.0;
   DateTime? _lastGlareEvAdjustAt;
 
   // Zoom-to-fill (2026-07-22): compensates for the pad under-filling the
@@ -1918,6 +1944,8 @@ class FrontCaptureController extends ChangeNotifier {
     _sweepLeftDwellStart = null;
     _lastCentroidX = null;
     _sweepDebug = {};
+    _lastPadClipFrac = 0.0;
+    _maxPadClipFracSeen = 0.0;
     _lastCvClassifyAt = null;
     _cvSamples = 0;
     _cvFrontSamples = 0;
@@ -2373,6 +2401,14 @@ class FrontCaptureController extends ChangeNotifier {
     if (!(_flash?.isFlashOn ?? false)) {
       try {
         _lastStableBrightness = HybridCaptureService.meanLuma(image, roi: roi);
+        // Clipped fraction of the SAME pad ROI. See _padClipHighFrac for the
+        // real measurement this exists to catch -- mean luma cannot see
+        // blown highlights, and blown highlights are what actually destroy
+        // ridges.
+        _lastPadClipFrac = HybridCaptureService.clippedFraction(image, roi: roi);
+        if (_lastPadClipFrac > _maxPadClipFracSeen) {
+          _maxPadClipFracSeen = _lastPadClipFrac;
+        }
         _apply((s) => s.copyWith(
               lightingValue: (_lastStableBrightness / 255.0).clamp(0.0, 1.0),
             ));
@@ -3490,9 +3526,17 @@ class FrontCaptureController extends ChangeNotifier {
         now.difference(_lastGlareEvAdjustAt!).inMilliseconds < _glareEvSettleMs) {
       return;
     }
-    final wantsDarker = _lastStableBrightness > _glareHighLuma;
-    final wantsBrighter =
-        _lastStableBrightness < _glareLowLuma && _appliedEvOffset < 0.0;
+    // Darker if the pad is too bright ON AVERAGE (the original rule) OR if
+    // its highlights are clipping even though the average looks fine -- see
+    // _padClipHighFrac. Either condition alone is sufficient.
+    final wantsDarker = _lastStableBrightness > _glareHighLuma ||
+        _lastPadClipFrac > _padClipHighFrac;
+    final wantsBrighter = _lastStableBrightness < _glareLowLuma &&
+        _appliedEvOffset < 0.0 &&
+        // Never brighten back into clipping: a dim MEAN with blown
+        // highlights is exactly the state this guard exists for, and the
+        // old rule would have fought the pulldown that produced it.
+        _lastPadClipFrac <= _padClipHighFrac;
     if (!wantsDarker && !wantsBrighter) return;
     final step = wantsDarker ? _glareEvStep : -_glareEvStep;
     _evChangeInFlight = true;
@@ -4907,6 +4951,12 @@ class FrontCaptureController extends ChangeNotifier {
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
         'refocusDebug': _refocusDebug,
+        'padClipDebug': {
+          'lastPadClipFrac': _lastPadClipFrac,
+          'maxPadClipFracSeen': _maxPadClipFracSeen,
+          'threshold': _padClipHighFrac,
+          'appliedEvOffset': _appliedEvOffset,
+        },
         'orientationDebug': {
           'samples': _cvSamples,
           'frontConfidentSamples': _cvFrontSamples,

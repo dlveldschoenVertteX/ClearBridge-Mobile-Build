@@ -603,6 +603,22 @@ class FusionCaptureController extends ChangeNotifier {
   // orbit's specific poses, not this app's tilt/sweep zone semantics, so
   // only the front phase is a meaningful use of it. Diagnostic-only --
   // never blocks the hold from completing.
+  // ---- pad highlight-clipping measurement (2026-08-27) --------------
+  // DIAGNOSTIC ONLY here, deliberately. Production (front_only_v1) has an
+  // EV-pulldown control loop this now feeds; this app has never had any
+  // exposure adaptation during the hold at all (only a fixed -1.0 EV for
+  // the macro flash shot), so adding an untested control loop here would be
+  // a much larger, unvalidated change. Measure first, act once real fusion
+  // captures show how bad it is -- the same discipline the wavelength
+  // estimator followed (telemetry first, gate later).
+  //
+  // Why it is worth measuring: on a real capture, 8.4% of the pad was
+  // pegged at exactly 255. Saturated pixels carry no gradient, so those
+  // ridges are gone at capture time -- verified unrecoverable across every
+  // CLAHE setting the backend uses.
+  double _lastPadClipFrac = 0.0;
+  double _maxPadClipFracSeen = 0.0;
+
   final _orientationClassifier = ThumbOrientationClassifier();
   static const int _cvClassifyThrottleMs = 90;
   static const double _cvConfidenceThreshold = 0.45;
@@ -678,6 +694,8 @@ class FusionCaptureController extends ChangeNotifier {
     _debug.clear();
     _guideRegions.clear();
     _captureId = const Uuid().v4();
+    _lastPadClipFrac = 0.0;
+    _maxPadClipFracSeen = 0.0;
     _lastCvClassifyAt = null;
     _cvSamples = 0;
     _cvFrontSamples = 0;
@@ -1692,6 +1710,12 @@ class FusionCaptureController extends ChangeNotifier {
       // varies far too much across devices/lighting for a fixed threshold.
       _focusValue = _focusPeak > 0 ? (abs / _focusPeak).clamp(0.0, 1.0) : 0.0;
       _coverage = HybridCaptureService.meanLuma(image, roi: roi) / 255.0;
+      // Same pad ROI as the coverage read above, so the two describe
+      // exactly the same region.
+      _lastPadClipFrac = HybridCaptureService.clippedFraction(image, roi: roi);
+      if (_lastPadClipFrac > _maxPadClipFracSeen) {
+        _maxPadClipFracSeen = _lastPadClipFrac;
+      }
       // Live-push to FusionState (throttled, see _apply) so the front-phase
       // BRIGHT/FOCUS meters read live -- front_only_v1's own meters read
       // straight off the controller's live value every rebuild; this app's
@@ -2072,6 +2096,10 @@ class FusionCaptureController extends ChangeNotifier {
         'fusionGuideRegions': _guideRegions,
         if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
         if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,
+        'padClipDebug': {
+          'lastPadClipFrac': _lastPadClipFrac,
+          'maxPadClipFracSeen': _maxPadClipFracSeen,
+        },
         'orientationDebug': {
           'samples': _cvSamples,
           'frontConfidentSamples': _cvFrontSamples,
