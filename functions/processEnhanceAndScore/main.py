@@ -814,7 +814,46 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         logger.info('stage=nns_start      elapsed=%.1fs', time.monotonic() - t_start)
         # Bilateral pre-denoise: removes stitching seam artefacts before UNet.
         unwrapped_d = cv2.bilateralFilter(unwrapped, d=5, sigmaColor=20, sigmaSpace=20)
-        enhanced, enhancement_params = enhancement_pipeline.enhance(unwrapped_d, sfm_coverage=sfm_coverage)
+
+        # ROI-restricted ridge frequency/orientation measurement for the NNS
+        # enhancer, front_only_v1 only. REAL BUG this exists to fix: without
+        # it, enhance()'s Stage-3 filter measures frequency/orientation on
+        # the highest-contrast quadrant of the WHOLE frame -- background,
+        # not pad, on most real captures -- and stamps a single wrong-
+        # oriented Gabor kernel across the entire image. Direct CTO report
+        # (2026-08-27) of diagonal streaking through a real enhanced print;
+        # isolating the filter reproduced the artifact almost exactly. See
+        # enhancement_pipeline.enhance()'s own docstring for the full
+        # mechanism. Scoped to front_only_v1: `unwrapped` there is the same
+        # center-square frame guideRegion's cx/cy/rx/ry are already
+        # normalized to (generate()'s own crop mask uses the identical
+        # region), so the mapping into enhance()'s internal 512x512 space is
+        # a direct scale, not a re-derivation. A second Firestore read here
+        # is deliberate, not an oversight -- same "each side keeps its own
+        # copy" pattern this project already uses elsewhere (see the guide-
+        # region fetch further down this function) rather than restructuring
+        # this function's control flow to share one fetch across both.
+        _nns_roi_box = None
+        if is_front_only:
+            try:
+                _nns_db, _ = _get_firebase()
+                _nns_guide = (_nns_db.collection('captures').document(capture_id)
+                             .get().to_dict() or {}).get('guideRegion')
+                if _nns_guide:
+                    _gcx = float(_nns_guide.get('cx', 0.5))
+                    _gcy = float(_nns_guide.get('cy', 0.5))
+                    _grx = float(_nns_guide.get('rx', 0.2)) * 1.15
+                    _gry = float(_nns_guide.get('ry', 0.2)) * 1.15
+                    _nns_roi_box = (
+                        int((_gcx - _grx) * 512), int((_gcy - _gry) * 512),
+                        int((_gcx + _grx) * 512), int((_gcy + _gry) * 512),
+                    )
+            except Exception as exc:
+                logger.warning('NNS roi_box: guideRegion fetch failed (%s)', exc)
+
+        enhanced, enhancement_params = enhancement_pipeline.enhance(
+            unwrapped_d, sfm_coverage=sfm_coverage, roi_box=_nns_roi_box)
+        enhancement_params['nnsRoiRestricted'] = _nns_roi_box is not None
         if fallback_mask is not None and 0.0 < sfm_coverage < 1.0:
             # Composite the background/gap-filled periphery out now that ridge
             # filtering is done, with a feathered edge (not a hard cut) so no

@@ -1,0 +1,102 @@
+[
+  {
+    "captureId": "01662ffb-ef9d-4340-bd78-2d13ebc22e82",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 26.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 6.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 14.0
+  },
+  {
+    "captureId": "03b91b6f-92d0-45ff-a0ef-648d3c8fb1d2",
+    "guideFracOfScene": 0.0475,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 22.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 26.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 39.0
+  },
+  {
+    "captureId": "076a1775-1654-47c1-a769-7dc8b32bda3d",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 23.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 28.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 4.0
+  },
+  {
+    "captureId": "0bd23cc2-9bf4-4eb5-9ab0-76cd6c6022af",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 13.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 17.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 7.0
+  },
+  {
+    "captureId": "14674391-c65c-4c84-8e36-04b1c0690137",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 24.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 9.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 4.0
+  },
+  {
+    "captureId": "17dbee53-fa31-470f-859d-7a79013fdeb4",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 26.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 12.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 18.0
+  },
+  {
+    "captureId": "181e8cd8-85b6-44ac-a970-74fdc0ff7d99",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 23.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 15.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 14.0
+  },
+  {
+    "captureId": "1863e50f-b47c-4a59-9401-2b1b7b420554",
+    "guideFracOfScene": 0.0385,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 26.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 35.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 38.0
+  },
+  {
+    "captureId": "19184018-be77-4320-9648-42f44ba5a35b",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 12.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": 11.0,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 6.0
+  },
+  {
+    "captureId": "1c019820-5052-444c-be89-ef86b0345fdf",
+    "guideFracOfScene": 0.0312,
+    "ridgePeriod_scene": 50.0,
+    "nfiq2_scene": 19.0,
+    "ridgePeriod_guide": 50.0,
+    "nfiq2_guide": null,
+    "ridgePeriod_guideM": 50.0,
+    "nfiq2_guideM": 24.0
+  }
+]
