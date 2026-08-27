@@ -1,5 +1,77 @@
 # ClearBridge Mobile — persistent context
 
+## Crease trim fixed (a real circularity in my own detector); NNS enhancer's streaking root-caused and fixed; super-resolution ruled out with data (2026-08-27, round 43)
+Direct CTO report with an annotated print: below-crease content bleeding
+into a delivered superprint, plus visible diagonal streaking through an
+enhanced print, asking whether either was one image or the pipeline. Then,
+separately: "Have we ever tried to optimize the legacy NNS enhancer?" and
+"look into super resolution optimizations."
+
+**Crease trim: pipeline-wide (~1 capture in 5), and the cause was my own
+detector reading its own output.** Across 24 real captures since crease
+trim shipped, it fired on 19 and never fired on 5. `_trim_base_crease`
+decided "is this row a crease" from ridge-orientation uniformity measured
+on the BINARIZED print -- i.e. AFTER the Gabor bank ran, and this project
+has already documented that bank "will impose ridge-like structure on any
+input with enough local contrast". The crease reached the detector already
+wearing plausible ridge flow it never had. Measured on the real failure
+(`b615f37b`): base-half circular variance 0.506 post-Gabor vs **0.181**
+pre-Gabor; longest qualifying run 27px (below the 29px bar) vs **162px**.
+Fixed by threading the pre-Gabor normalized grayscale through as the
+orientation source, rotated through the same `_upright_from_tip` call.
+**Validated on 8 real captures**: the target failure went from 0.0% trimmed
+(NFIQ2 59) to 24.0% trimmed (NFIQ2 76); mean delta across all 8 was +0.88
+(3 up / 4 down / 1 same) -- neutral elsewhere, visually confirmed clean on
+both. Honest limit: on captures where the trim already worked, the new
+measure trims 1-4 points less (once 15.6) -- a real behaviour change, not
+obviously an improvement there. **Pushed.**
+
+**NNS enhancer's streaking: two real bugs in the same function, only one of
+which mattered.** `enhance()`'s Stage-3 path (`_ridge_pass`, confirmed
+active on every production capture via `enhancementParams.nnsStage: 3`)
+derives frequency AND a single dominant orientation from the highest-
+contrast quadrant of the WHOLE 512x512 scene, then stamps one Gabor kernel
+at that value across the entire image. (1) Frequency is pinned at its own
+50px clamp on every capture tested (n=10) -- the radial FFT spectrum is
+dominated by 1/f illumination falloff, never ridge structure. (2)
+Orientation locks onto whatever that quadrant contains, usually background.
+**Isolating the filter alone (`unet_weight=0`) on a real streaked capture
+reproduced the CTO-reported diagonal streaking almost exactly; isolating
+the UNet alone (`unet_weight=1`) did not** -- orientation, not frequency, is
+the dominant mechanism (fixing frequency alone on the full scene moved
+NFIQ2 only +0.50, noise, since the filter carries just 0.35 weight against
+the UNet's 0.65). **Guide-crop-as-whole-input tested first and refuted**
+(-4.00 mean, loses CLAHE/UNet context) -- that negative result is what led
+to separating "where is the pad measured" from "what does the enhancer
+see". Fix: `enhance()` gained `roi_box`, restricting ONLY where frequency/
+orientation are measured (CLAHE, UNet, and the final filter still run on
+the whole frame); `main.py` computes it from the same `guideRegion` AFIS
+already uses, front_only_v1 only. **Real result, 12 captures: NFIQ2 21.17
+-> 23.67 (+2.50, 8 better / 3 worse / 1 same).** Visually confirmed on the
+motivating capture: the pad goes from a near-featureless grey oval to real
+curved ridge flow, background no longer forced into the deck's diagonal.
+Recorded honestly where it didn't help: one capture's raw pad content was
+independently soft and NFIQ2 dropped there (16->11) -- no orientation fix
+recovers detail the optics never captured. **Pushed.**
+Full detail: `fusion_brain/results/CREASE_TRIM_FINDINGS.md`,
+`results/NNS_ORIENTATION_FINDINGS.md`.
+
+**Super-resolution: ruled out with data, not opinion.** Native ridge period
+across 65 real production captures is a median of **28px** in the full
+frame -- 100% of captures sit at or above the pipeline's own 9px target,
+91% at or above 2x oversampled. The AFIS path already *downsamples* toward
+9px. SR would add pixels where there is already a 3x surplus, and
+single-image SR cannot add information the optics didn't capture -- it
+hallucinates ridge structure, which this project has repeatedly shown fools
+NFIQ2 without improving matchability. The honest lever is the one the
+frame-selection/NNS work above already targets: this pipeline is blur- and
+noise-limited (30-40ms exposures at ISO 291-767, ~3.2px motion smear), not
+resolution-limited. Not built -- multi-frame SR from burst jitter is the
+only form that would add real information, and at 3x oversampling its
+payoff is the same noise-averaging stacking already attempts, which this
+same round measured losing to the burst's best single frame on 8 of 10
+captures.
+
 ## Frame selection was the biggest single lever in the whole pipeline, and it was measured wrong (2026-08-27, round 42)
 CTO ran the fusion APK and reported "the ambient shots are extremely blurry
 ... image stabilization is a real flaw, OIS will definitely improve my
