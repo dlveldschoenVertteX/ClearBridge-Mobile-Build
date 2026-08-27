@@ -246,21 +246,79 @@ const int _kStillDecodeTargetWidth = 3200;
 ///
 /// Returns the original bytes unchanged on any failure: a decode problem
 /// should cost upload size, never the frame itself.
-Future<Uint8List> _shrinkForUpload(Uint8List jpeg, int sensorOrientation) async {
+Future<_Shrunk> _shrinkForUpload(Uint8List jpeg, int sensorOrientation) async {
   try {
     final decoded = await decodeStillJpegToLuma(
       jpeg,
       sensorOrientation,
       targetWidth: _kStillDecodeTargetWidth,
     );
-    if (decoded == null) return jpeg;
-    return await compute(
+    if (decoded == null) return _Shrunk(jpeg, null);
+    final sharp = _lumaSharpness(decoded);
+    final bytes = await compute(
       _encodeIsolate,
       _EncodeArgs(decoded.luma, decoded.width, decoded.height),
     );
+    return _Shrunk(bytes, sharp);
   } catch (_) {
-    return jpeg;
+    return _Shrunk(jpeg, null);
   }
+}
+
+class _Shrunk {
+  const _Shrunk(this.bytes, this.sharpness);
+  final Uint8List bytes;
+  /// Null when the decode failed and the original bytes are being passed
+  /// through unchanged -- there is nothing to measure in that case.
+  final double? sharpness;
+}
+
+/// Laplacian variance over the DECODED, about-to-be-uploaded luma.
+///
+/// Deliberately measured here rather than copied from the live preview the
+/// way clearbridge_beta's `laplacianScore` is. That field is a whole-preview
+/// proxy sampled before the shutter fired, and this project measured it
+/// wrong twice: it reads identical across a burst, and on real captures it
+/// ranks a visibly blurry ambient frame ABOVE a torch-lit one because
+/// Laplacian variance rewards the broadband ISO noise a dark frame carries.
+/// Measuring the real uploaded pixels at least removes the first problem.
+///
+/// Still a whole-frame number, so it inherits the second: on real captures
+/// the guide occupies a minority of the frame, and this cannot tell ridge
+/// detail from background texture. It is recorded as a DIAGNOSTIC so the
+/// offline harness can compare it against guide-restricted measures on
+/// fusion captures the way it already can on production ones -- not as a
+/// selection signal.
+///
+/// Strided so this stays cheap on a budget phone: every 4th pixel in each
+/// direction, which is ~1/16 the work and leaves tens of thousands of
+/// samples at this decode width.
+double _lumaSharpness(DecodedStillLuma d) {
+  const stride = 4;
+  final w = d.width, h = d.height;
+  final px = d.luma;
+  var n = 0;
+  var sum = 0.0;
+  var sumSq = 0.0;
+  for (var y = stride; y < h - stride; y += stride) {
+    final row = y * w;
+    for (var x = stride; x < w - stride; x += stride) {
+      final i = row + x;
+      // 4-neighbour Laplacian at the sampled spacing.
+      final lap = (px[i - stride] +
+              px[i + stride] +
+              px[i - stride * w] +
+              px[i + stride * w] -
+              4 * px[i])
+          .toDouble();
+      sum += lap;
+      sumSq += lap * lap;
+      n++;
+    }
+  }
+  if (n == 0) return 0.0;
+  final mean = sum / n;
+  return (sumSq / n) - (mean * mean);
 }
 
 class _EncodeArgs {
@@ -279,12 +337,21 @@ class _Shot {
     required this.tag,
     required this.flashOn,
     this.exif,
+    this.gyroMagnitudeDegPerSec,
   });
   Uint8List jpeg;          // replaced in-place by _shrinkCaptured()
   bool shrunk = false;
   final String tag;        // storage/Firestore key, e.g. 'tilt_left_fl'
   final bool flashOn;
   final JpegExposureExif? exif;
+  /// Device rotation rate at the moment the shutter fired. Recorded because
+  /// this app's own real captures run a 40ms exposure at ISO 700+, where
+  /// hand motion is a plausible blur term -- and without a per-frame value
+  /// there is no way to test that against anything.
+  final double? gyroMagnitudeDegPerSec;
+  /// Set by _shrinkForUpload from the decoded luma; null if the decode
+  /// failed and the original bytes were passed through.
+  double? sharpness;
 }
 
 /// Three-phase fusion capture.
@@ -987,6 +1054,7 @@ class FusionCaptureController extends ChangeNotifier {
           tag: 'front_${wantFlash ? "fl" : "amb"}_$i',
           flashOn: wantFlash,
           exif: parseJpegExposureExif(bytes),
+          gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
         ));
         wasFlashLastShot = wantFlash;
       } catch (e) {
@@ -1091,6 +1159,7 @@ class FusionCaptureController extends ChangeNotifier {
               tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
               flashOn: wantFlash,
               exif: parseJpegExposureExif(bytes),
+              gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
             ));
           } catch (e) {
             debugPrint('[fusion] tilt station ${station.key} flash=$wantFlash failed: $e');
@@ -1350,6 +1419,7 @@ class FusionCaptureController extends ChangeNotifier {
             tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
             flashOn: wantFlash,
             exif: parseJpegExposureExif(bytes),
+            gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
           ));
         } catch (e) {
           debugPrint('[fusion] sweep station ${station.key} flash=$wantFlash failed: $e');
@@ -1593,22 +1663,36 @@ class FusionCaptureController extends ChangeNotifier {
         // always uses _sensorOrientation, so these two macro shots are
         // shrunk here instead, immediately, with the correct orientation,
         // and marked already-shrunk so the shared pass skips them.
+        // These two are shrunk here rather than in the shared pass, so the
+        // measured sharpness has to be carried across explicitly -- setting
+        // `shrunk = true` is exactly what stops that pass from ever seeing
+        // them again.
+        final ambShrunk =
+            await _shrinkForUpload(ambJpeg, macroDesc.sensorOrientation);
         final ambShot = _Shot(
-          jpeg: await _shrinkForUpload(ambJpeg, macroDesc.sensorOrientation),
+          jpeg: ambShrunk.bytes,
           tag: '${tagPrefix}_amb_0',
           flashOn: false,
           exif: ambExif,
-        )..shrunk = true;
+          gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+        )
+          ..shrunk = true
+          ..sharpness = ambShrunk.sharpness;
         _shots.add(ambShot);
 
         if (flashJpeg != null) {
           final flExif = parseJpegExposureExif(flashJpeg);
+          final flShrunk =
+              await _shrinkForUpload(flashJpeg, macroDesc.sensorOrientation);
           final flShot = _Shot(
-            jpeg: await _shrinkForUpload(flashJpeg, macroDesc.sensorOrientation),
+            jpeg: flShrunk.bytes,
             tag: '${tagPrefix}_fl_0',
             flashOn: true,
             exif: flExif,
-          )..shrunk = true;
+            gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+          )
+            ..shrunk = true
+            ..sharpness = flShrunk.sharpness;
           _shots.add(flShot);
         }
 
@@ -1667,7 +1751,9 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _shrinkCaptured() async {
     for (final shot in _shots) {
       if (shot.shrunk) continue;
-      shot.jpeg = await _shrinkForUpload(shot.jpeg, _sensorOrientation);
+      final shrunk = await _shrinkForUpload(shot.jpeg, _sensorOrientation);
+      shot.jpeg = shrunk.bytes;
+      shot.sharpness ??= shrunk.sharpness;
       shot.shrunk = true;
     }
   }
@@ -1969,7 +2055,9 @@ class FusionCaptureController extends ChangeNotifier {
       // Normally already shrunk at its phase boundary; this only does real
       // work if a phase timed out before its shrink pass ran.
       if (!shot.shrunk) {
-        shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+        final shrunk = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+        shot.jpeg = shrunk.bytes;
+        shot.sharpness ??= shrunk.sharpness;
         shot.shrunk = true;
       }
       final path = '$basePath/${shot.tag}.jpg';
@@ -2046,13 +2134,26 @@ class FusionCaptureController extends ChangeNotifier {
     for (final shot in _shots) {
       if (!uploadedTags.contains(shot.tag)) continue;
       final path = '$basePath/${shot.tag}.jpg';
+      // Key names deliberately match clearbridge_beta's own frame schema
+      // (shutterSpeedUs / isoValue / laplacianScore /
+      // gyroMagnitudeDegPerSec) rather than this app's earlier ad-hoc ones.
+      // The offline harnesses read the production population by those names;
+      // matching them is what lets a fusion capture be measured by the same
+      // scripts instead of needing a special case. Nothing reads the old
+      // `exposureTimeUs`/`iso` names -- checked before renaming -- so this
+      // costs nothing beyond captures already taken.
       final meta = <String, dynamic>{
         'path': path,
         'tag': shot.tag,
         'flashOn': shot.flashOn,
         if (shot.exif?.exposureTimeUs != null)
-          'exposureTimeUs': shot.exif!.exposureTimeUs,
-        if (shot.exif?.isoValue != null) 'iso': shot.exif!.isoValue,
+          'shutterSpeedUs': shot.exif!.exposureTimeUs,
+        if (shot.exif?.exposureTimeReadable != null)
+          'shutterSpeedReadable': shot.exif!.exposureTimeReadable,
+        if (shot.exif?.isoValue != null) 'isoValue': shot.exif!.isoValue,
+        if (shot.sharpness != null) 'laplacianScore': shot.sharpness,
+        if (shot.gyroMagnitudeDegPerSec != null)
+          'gyroMagnitudeDegPerSec': shot.gyroMagnitudeDegPerSec,
       };
       if (shot.tag.startsWith('front_')) {
         frames.add(meta);
