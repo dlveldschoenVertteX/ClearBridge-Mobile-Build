@@ -69,13 +69,42 @@ def _download(path: str) -> Optional[np.ndarray]:
     return cv2.imread(local)
 
 
-def _render(img: np.ndarray, guide: dict, tag: str) -> Optional[np.ndarray]:
-    cached = os.path.join(CACHE, f'print_{tag}.png')
+def _render(img: np.ndarray, guide: dict, tag: str,
+           flash_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
+           ) -> Optional[np.ndarray]:
+    """Render one source through generate().
+
+    REAL GAP found + fixed 2026-08-27: every call to this function across
+    this ENTIRE track, from Phase 3 through Phase 8, passed no
+    ambient_burst/flash_burst -- so `_flash_diff_mask` could never engage,
+    and on the one capture this was checked against, the `_unet_mask`
+    fallback also returned a region with ZERO overlap with the guide (a
+    real, separate anomaly, not yet explained). Every image and every
+    bozorth3 score in this track was therefore computed against the bare
+    geometric guide oval only, with no content-aware background exclusion
+    at all -- confirmed as the direct cause of a real, CTO-observed
+    background bleed in the rendered prints.
+
+    `flash_pair`, when supplied, threads a real (ambient, flash) frame
+    pair from the SAME source through to generate() as single-element
+    ambient_burst/flash_burst lists, letting flash-diff masking engage the
+    way production's own front_only_v1 pipeline already does. Optional and
+    backward compatible -- every existing 3-arg call site is unaffected
+    and keeps rendering with the bare guide, exactly as before this fix.
+    Cache key includes a 'masked' suffix when a pair is supplied, so a
+    fixed and an unfixed render of the same source can never collide.
+    """
+    suffix = '_masked' if flash_pair is not None else ''
+    cached = os.path.join(CACHE, f'print_{tag}{suffix}.png')
     if os.path.exists(cached):
         return cv2.imread(cached, cv2.IMREAD_GRAYSCALE)
+    kwargs = {}
+    if flash_pair is not None:
+        kwargs['ambient_burst'] = [flash_pair[0]]
+        kwargs['flash_burst'] = [flash_pair[1]]
     try:
         out, _ = ap.generate([img], [0.0], [None], guide_region=guide,
-                             freq_normalize=True, stack_cache={})
+                             freq_normalize=True, stack_cache={}, **kwargs)
     except Exception as e:
         print(f'    render failed {tag}: {e}')
         return None
@@ -83,6 +112,57 @@ def _render(img: np.ndarray, guide: dict, tag: str) -> Optional[np.ndarray]:
         return None
     cv2.imwrite(cached, out)
     return out if out.ndim == 2 else cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
+
+
+def _flash_pair_for(doc: dict, source: str
+                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """A real (ambient, flash) frame pair for one named source, for the
+    flash-diff masking fix above. Returns None (self-skip, same contract
+    as _flash_diff_mask itself) when the capture doesn't have both halves
+    for that source -- a caller passing None to `_render` just gets the
+    pre-fix bare-guide behaviour, never a crash.
+    """
+    if source == 'front_v1':
+        frames = doc.get('frames') or []
+        amb = [f for f in frames if not f.get('flashOn')]
+        fl = [f for f in frames if f.get('flashOn')]
+        if not amb or not fl:
+            return None
+        a = _download(max(amb, key=lambda f: f.get('laplacianScore') or 0)['path'])
+        b = _download(max(fl, key=lambda f: f.get('laplacianScore') or 0)['path'])
+        return (a, b) if a is not None and b is not None else None
+
+    if source in ('macro', 'cam3'):
+        shots = doc.get('macroShots' if source == 'macro' else 'cam3Shots') or []
+        amb = next((m for m in shots if not m.get('flashOn')), None)
+        fl = next((m for m in shots if m.get('flashOn')), None)
+        if amb is None or fl is None:
+            return None
+        a = _download(amb['path'])
+        b = _download(fl['path'])
+        return (a, b) if a is not None and b is not None else None
+
+    # tilt_*/sweep zone names: group the same per-station/zone tags
+    # collect_sources() itself already parses, but keep BOTH halves this
+    # time instead of only the ambient-preferred pick.
+    for field in ('tiltShots', 'sweepShots'):
+        items = doc.get(field) or []
+        grouped: Dict[str, Dict[str, dict]] = {}
+        for it in items:
+            tag = it.get('tag', '')
+            if '_' not in tag:
+                continue
+            station, kind = tag.rsplit('_', 1)
+            grouped.setdefault(station, {})[kind] = it
+        if source in grouped:
+            kinds = grouped[source]
+            amb, fl = kinds.get('amb'), kinds.get('fl')
+            if amb is None or fl is None:
+                return None
+            a = _download(amb['path'])
+            b = _download(fl['path'])
+            return (a, b) if a is not None and b is not None else None
+    return None
 
 
 def _coverage(print_img: np.ndarray) -> np.ndarray:
