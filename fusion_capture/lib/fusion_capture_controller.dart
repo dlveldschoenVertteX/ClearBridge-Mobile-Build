@@ -1595,11 +1595,46 @@ class FusionCaptureController extends ChangeNotifier {
     }
   }
 
+  /// Sweep-station guide placement.
+  ///
+  /// FIXED 2026-08-27. The offsets used to be `cx = 0.2 + 0.6 * progress`
+  /// -- stations at screen x 0.2 / 0.5 / 0.8 -- chosen, per the comment that
+  /// stood here, "so the guide never clips off-edge at the extremes". That
+  /// is a UI framing constant. Nothing ever derived it from what the fusion
+  /// pipeline downstream actually needs from these frames.
+  ///
+  /// Measured on a real capture's own recorded fusionGuideRegions
+  /// (5e68ed01), rasterising the real superellipse masks:
+  ///
+  ///   stations at 0.2/0.5/0.8   adjacent overlap  0.0%   coverage 3.00x
+  ///   stations at 0.35/0.5/0.65 adjacent overlap 35.9%   coverage 2.28x
+  ///
+  /// Zero. All three pairs. The three stations imaged completely disjoint
+  /// regions of the pad -- 3.00x coverage is exactly what perfectly
+  /// disjoint regions give -- so they shared no content and NOTHING could
+  /// register them to one another. Every sweep source could only ever be
+  /// tied in through whatever it happened to share with the front anchor.
+  ///
+  /// `0.35/0.5/0.65` is not a new guess: it reproduces clearbridge_beta's
+  /// own sweep geometry (cx shifted +/-0.15), whose ~48% area overlap with
+  /// centre is already recorded in this project's history. The measurement
+  /// above puts it at 35.9% by mask intersection, inside the 30-50% band
+  /// mosaicking normally wants, and 0.35-0.65 stays comfortably inside the
+  /// screen, so the original no-clipping concern is still satisfied.
+  ///
+  /// Real, deliberate trade: unique pad coverage drops 3.00x -> 2.28x. That
+  /// is the right direction given this project's own findings -- rounds
+  /// 37-41 established that added coverage which cannot be registered is
+  /// not merely useless but actively harmful, because it still pays the
+  /// template-density penalty while contributing nothing a matcher can use.
+  /// Registerable overlap is worth more than disjoint area.
+  ///
+  /// Not device-tested: this changes capture geometry, so it needs a real
+  /// sweep capture to confirm the stations now genuinely share content.
   PadSilhouetteShape _sweepGuideFor(SweepStation z) {
     const base = PadSilhouetteShape.defaultShape;
-    // Translate across the middle 60% of the screen so the guide never
-    // clips off-edge at the extremes.
-    final cx = 0.2 + 0.6 * z.progress;
+    const halfSpan = 0.15;
+    final cx = (0.5 - halfSpan) + (2 * halfSpan) * z.progress;
     return PadSilhouetteShape(
       cx: cx,
       cy: base.cy + z.dyFrac,

@@ -1897,8 +1897,74 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # pipeline (n=1) -- but a real, evidenced correction,
                         # not a guess, and can only move the crop TOWARD
                         # where the pad was actually observed to sit.
-                        _sec_cy = (0.37 if _cam.get('name') == '3'
-                                   else 0.34 if _cam.get('name') == '2'
+                        #
+                        # ROTATED INTO THE SHARED STILL CONVENTION
+                        # (2026-08-27, round 43). Everything above measured
+                        # cy=0.34 / rx=0.11 / ry=0.13 -- correctly, but in
+                        # the frame convention those captures actually
+                        # arrived in, which round 36 then CHANGED and never
+                        # came back to re-derive these against.
+                        #
+                        # Confirmed, not assumed: both real cached camera-"2"
+                        # macro frames (f4cb3ba5 round 32, b615f37b round 35 --
+                        # the exact captures rounds 31/33/35 measured on)
+                        # decode via plain cv2.imdecode, the same call this
+                        # backend makes, to 2448x3264 -- PORTRAIT. Every other
+                        # frame in the same request is 4266x3200, landscape.
+                        # That mismatch IS the sideways bug round 36 diagnosed,
+                        # and its fix (`_normalizeMacroFrame`, client side) now
+                        # routes this frame through `decodeStillJpegToLuma`
+                        # like every other path, which rotates it 90 deg CW
+                        # into landscape. So a fresh capture delivers this
+                        # frame in a different coordinate space than the one
+                        # every constant here was measured in -- and round 36's
+                        # own note records it was never device-tested, so no
+                        # real capture has surfaced it.
+                        #
+                        # The rotation is (u,v) -> (1-v, u), read directly off
+                        # decodeStillJpegToLuma's own indexing
+                        # (`rotated[y*dstW+x] = luma[(h-1-x)*w + y]`), not from
+                        # the docstring -- the identical transform
+                        # `_computeGuideRegion` already applies to the main
+                        # guide. Radii swap axes under it.
+                        #
+                        #   cam "2" measured portrait (0.500, 0.340)
+                        #                 -> landscape (0.660, 0.500)
+                        #           radii  portrait rx 0.11 / ry 0.13
+                        #                 -> landscape rx 0.13 / ry 0.11
+                        #
+                        # Independent corroboration that this is the right
+                        # reading rather than a plausible one: the MAIN guide's
+                        # own real still-space position, measured off a real
+                        # capture in round 16, is cx=0.63 / cy=0.50. The macro
+                        # measurement rotates to (0.66, 0.50) -- 0.03 away, on
+                        # both axes -- which is exactly what it should be,
+                        # since the user aims at the same on-screen guide for
+                        # both shots and the macro guide is only scaled 1.2x.
+                        # Two numbers derived from completely different real
+                        # data landing on the same spot is much stronger
+                        # evidence than either alone.
+                        #
+                        # Camera "3": its 0.37 was never measured at all -- it
+                        # was copied from PadSilhouetteShape.cy, a SCREEN-space
+                        # constant, and used as a still-space cy. (Round 27's
+                        # audit listed "defaultShape.cy 0.37 == main.py's
+                        # _sec_cy" as constants AGREEING; they agree
+                        # numerically while living in different spaces, which
+                        # is the actual defect.) Correct still-space value is
+                        # the same rotation of the same screen shape the main
+                        # guide already gets: (0.5, 0.37) -> (0.63, 0.50).
+                        # This branch is currently unreachable -- camera "3"
+                        # capture was removed client-side on 2026-08-03 -- but
+                        # round 40 named camera "3" the better-evidenced
+                        # diversity candidate if secondary cameras are revived,
+                        # so it is fixed now rather than left as a landmine for
+                        # whoever does that.
+                        _sec_cx = (0.63 if _cam.get('name') == '3'
+                                   else 0.66 if _cam.get('name') == '2'
+                                   else 0.5)
+                        _sec_cy = (0.50 if _cam.get('name') == '3'
+                                   else 0.50 if _cam.get('name') == '2'
                                    else 0.5)
                         # Camera "2" rx/ry, real data override (2026-08-20,
                         # round 33) -- direct CTO report ("mask is not
@@ -1930,8 +1996,11 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # still ratio-derived -- no real evidence this same
                         # gap applies there. Flagged provisional (n=1),
                         # same discipline as `_sec_cy`.
-                        _sec_rx = 0.11 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
-                        _sec_ry = 0.13 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
+                        # Axes swapped along with the centre above -- the
+                        # 0.11/0.13 pair was measured in the portrait frame,
+                        # and a 90 deg rotation exchanges rx and ry.
+                        _sec_rx = 0.13 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
+                        _sec_ry = 0.11 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
                         # tipAngleDeg was hardcoded 0.0 here -- real bug,
                         # found 2026-08-22 (direct CTO report: a macro
                         # superprint came out sideways). Client-side, every
@@ -1951,7 +2020,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # reuse the main capture's own measured value rather
                         # than a hardcoded assumption.
                         _sec_guide = {
-                            'cx': 0.5,
+                            'cx': _sec_cx,
                             'cy': _sec_cy,
                             'rx': _sec_rx,
                             'ry': _sec_ry,
