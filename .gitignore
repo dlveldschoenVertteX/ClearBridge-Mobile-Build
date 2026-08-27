@@ -69,3 +69,4 @@ scratchpad/
 # Harness run logs are transient console capture, superseded by the findings
 # docs alongside them. No run log has ever been tracked here.
 fusion_brain/results/*.log
+fusion_brain/results/sweep_stack_internals.json
