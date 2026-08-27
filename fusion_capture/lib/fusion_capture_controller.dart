@@ -1028,17 +1028,72 @@ class FusionCaptureController extends ChangeNotifier {
           silhouetteState: PadSilhouetteState.capturing,
         ));
     await _stopStream();
+
+    // Flash EV bracket, ported from clearbridge_beta 2026-08-27. This app
+    // previously applied NO exposure compensation to the front burst at all
+    // (only the macro shot had a fixed -1.0), which is a real gap: on this
+    // app's own first real capture the ambient frames ran 40ms at ISO 700
+    // and the flash frames 30ms at ISO 338 -- both pinned at the sensor's
+    // exposure ceiling with the torch light going entirely into gain
+    // reduction rather than shutter speed.
+    //
+    // Measured across 63 real production captures: the AE only converts
+    // light into a shorter exposure once ISO bottoms out (~50). Until then
+    // it holds the exposure ceiling and cuts gain. A deep negative EV is
+    // what walks it down to that crossover. See front_capture_controller
+    // .dart's _flashEvBracketMultipliers for the full measurement.
+    //
+    // Fixed multipliers rather than beta's adaptive curve: this app has no
+    // equivalent of _lastStableBrightness feeding an adaptive step, and
+    // inventing one here would be an untested control loop. A fixed -0.7 EV
+    // base matches the median step beta's own curve actually produced on
+    // real captures, so the rungs land in the same measured range.
+    // Shallow rungs are kept first so the burst always contains
+    // conventionally-exposed flash frames -- the flash-diff mask needs a
+    // real ambient/flash brightness delta, and a uniformly deep bracket
+    // would erode it.
+    const evBase = -0.7;
+    const evMultipliers = <double>[0.5, 1.0, 2.5, 4.0];
+    double? minEv, maxEv;
+    try {
+      minEv = await cam.getMinExposureOffset();
+      maxEv = await cam.getMaxExposureOffset();
+    } catch (_) {}
+    _debug['flashEvBase'] = evBase;
+    _debug['flashEvRangeMin'] = minEv;
+    _debug['flashEvRangeMax'] = maxEv;
+    final evApplied = <double>[];
+
     var wasFlashLastShot = false;
+    var flashShotIndex = 0;
     for (var i = 0; i < _burstFrameCount; i++) {
       if (_abortPhase || _disposed) break;
       final wantFlash = i.isOdd;
       try {
         if (wantFlash) {
           await _flash?.activate();
+          if (minEv != null && maxEv != null) {
+            final target = evBase *
+                evMultipliers[flashShotIndex % evMultipliers.length];
+            final applied = target.clamp(minEv, maxEv);
+            try {
+              await cam.setExposureOffset(applied);
+              evApplied.add(double.parse(applied.toStringAsFixed(3)));
+            } catch (_) {}
+          }
+          flashShotIndex++;
           await Future<void>.delayed(
               const Duration(milliseconds: _burstFlashSettleMs));
         } else {
           await _flash?.deactivate();
+          if (minEv != null && maxEv != null) {
+            // Ambient frames go back to the sensor's own metering -- they
+            // exist to give the flash-diff mask its unlit half, not to be
+            // exposure-hunted.
+            try {
+              await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
+            } catch (_) {}
+          }
           // Symmetric settle: the sensor needs time to re-converge coming
           // DOWN off the torch too, not just going up. Only pay it when the
           // previous shot actually fired the flash.
@@ -1066,6 +1121,12 @@ class FusionCaptureController extends ChangeNotifier {
           ));
     }
     await _flash?.deactivate();
+    _debug['flashEvApplied'] = evApplied;
+    if (minEv != null && maxEv != null) {
+      try {
+        await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
+      } catch (_) {}
+    }
     // Front-only-v1's own visual confirmation the instant the burst
     // finishes ('✓ Captured' + a BRIGHT/FOCUS readout of the conditions it
     // was shot under) -- ported directly rather than leaving this phase's

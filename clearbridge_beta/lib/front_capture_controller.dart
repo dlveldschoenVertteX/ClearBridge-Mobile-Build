@@ -675,17 +675,57 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _stillDecodeTargetWidth = 3200;
   static const int _burstFlashSettleMs = 70;
   // EV multipliers applied to flashEvStep across the 4 flash shots in the
-  // main burst. flashEvStep is negative (reduces exposure to guard against
-  // torch blowout), so:
+  // main burst. flashEvStep is negative (reduces exposure), so a larger
+  // multiplier means a deeper pulldown.
   //   0.5× = lighter reduction = brighter effective flash (catches dark scenes)
   //   1.0× = standard (the adaptive curve's own recommendation)
-  //   1.5× = heavier reduction = darker flash (hard blowout guard)
-  //   0.75× = intermediate
-  // The backend picks the sharpest frame via Laplacian ranking; the bracket
-  // gives it 4 real exposure candidates instead of 4 identical ones.
-  // Works via setExposureOffset() -- no hardware variable-intensity flash
-  // needed, same safe API already proven for the adaptive EV step itself.
-  static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 1.5, 0.75];
+  //   2.5× / 4.0× = deep pulldown -- see below, this is the point
+  //
+  // DEEPENED 2026-08-27 from [0.5, 1.0, 1.5, 0.75], on real measured data,
+  // to attack the single biggest capture-side defect this project has:
+  // torch light never becoming shutter speed.
+  //
+  // Across 63 real production captures with per-frame EXIF, the AE has two
+  // clearly separated regimes:
+  //   * 46 captures where the flash frames sit pinned at the sensor's 30ms
+  //     (1/33s) exposure ceiling. There the torch light is spent ENTIRELY
+  //     on cutting ISO -- flash/ambient shutter ratio is 1.00 on every
+  //     single one, while ISO falls to 0.28-0.71× ambient.
+  //   * 16 brighter captures where ISO is already at its ~50 floor. There
+  //     the AE has no gain left to give back, so it converts the same light
+  //     into SHUTTER instead -- ratio 0.50, exposure halved, ISO actually
+  //     rising 1.38×.
+  // So the sensor will trade light for exposure time, but only after ISO
+  // bottoms out. That is a standard AE ladder: minimise gain first,
+  // shorten exposure last.
+  //
+  // The old bracket could not reach that crossover. Its deepest rung (1.5×)
+  // is a median -1.07 EV, against a median 1.88 stops of ISO headroom above
+  // the floor -- so it reached the floor on only 10 of 46 pinned captures
+  // (22%). Measured reach by deepest multiplier: 2.5× -> 37%, 3.0× -> 72%,
+  // 3.5× -> 87%, 4.0× -> 96%.
+  //
+  // 0.5× and 1.0× are KEPT so the current behaviour is still two of the
+  // four rungs and the backend's existing max-of-variants selection can
+  // always fall back to it -- this cannot regress a capture that the old
+  // bracket already handled well. 0.75× is what gets dropped: at -0.54 EV
+  // it sits within a third of a stop of both 0.5× and 1.0×, a near-duplicate
+  // rung, and its slot buys far more as a rung that can actually cross the
+  // ISO floor.
+  //
+  // Deliberately NOT a manual-exposure lift: docs/LOCKED_SHUTTER_SPEED_SCOPE.md
+  // establishes that this plugin has no manual sensor API, that Camera2
+  // interop on this CameraX backend blocks the torch, and that CONTROL_AE_MODE
+  // is all-or-nothing. setExposureOffset is the one lever that reaches the
+  // AE without engaging interop at all -- this uses it to push the AE down
+  // its own ladder rather than trying to bypass it.
+  //
+  // Every rung is still clamped to the device's real getMin/MaxExposureOffset
+  // at the call site, so a device with a shallow EV range simply saturates
+  // instead of misbehaving -- and flashEvDebug now records that real range
+  // plus the actually-applied per-shot EV, so the next real capture shows
+  // both where the hardware clamped and whether shutter finally moved.
+  static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 2.5, 4.0];
 
   // Guided thumb-sweep capture (2026-07-30, diagnostic-first): replaces the
   // static "hold still -> fire immediately" trigger with two phases inserted
@@ -3638,6 +3678,14 @@ class FrontCaptureController extends ChangeNotifier {
           .toList(),
       'flashIntensity': _flash?.intensity,
       'flashMode': _flash?.modeName,
+      // The REQUESTED bracket above is not necessarily what the sensor got:
+      // every rung is clamped to the device's own exposure-offset range at
+      // the call site. Without these two, a deep rung that silently
+      // saturated is indistinguishable from one that applied in full --
+      // which is exactly the question the deepened bracket needs answered on
+      // its first real capture. 'evApplied' below records the real
+      // post-clamp value per flash shot.
+      'evApplied': <double>[],
     };
     // Snapshot the running live-wavelength estimate at the moment the burst
     // actually fires (same convention as _flashEvDebug above), not at
@@ -3724,6 +3772,14 @@ class FrontCaptureController extends ChangeNotifier {
         maxEv = await cam?.getMaxExposureOffset();
       } catch (_) {}
     }
+    // The deepened EV bracket's rungs reach -2.5 to -2.9 EV on this
+    // project's own measured flashEvStep range; a device whose exposure
+    // offset bottoms out shallower than that will silently saturate them.
+    // Recording the real range is what tells the difference on the next
+    // capture, rather than leaving a flat evApplied list ambiguous between
+    // "hardware clamped" and "the step was small".
+    _flashEvDebug?['evRangeMin'] = minEv;
+    _flashEvDebug?['evRangeMax'] = maxEv;
 
     final rawShots = <_RawShot>[];
 
@@ -3771,7 +3827,10 @@ class FrontCaptureController extends ChangeNotifier {
                   final multiplier = _flashEvBracketMultipliers[
                       flashShotIndex % _flashEvBracketMultipliers.length];
                   final target = _appliedEvOffset + flashEvStep * multiplier;
-                  await cam.setExposureOffset(target.clamp(minEv, maxEv));
+                  final applied = target.clamp(minEv, maxEv);
+                  await cam.setExposureOffset(applied);
+                  (_flashEvDebug?['evApplied'] as List<double>?)
+                      ?.add(double.parse(applied.toStringAsFixed(3)));
                 }
                 await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
               } else {
