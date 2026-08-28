@@ -96,6 +96,30 @@ the **best** delta at +8, while an essentially area-neutral mask (`5363a49b`,
 So this is not refinement making the mask smaller. It is refinement making the
 mask a different SHAPE -- and that shape scores worse.
 
+### Third arm: the dilated guide alone, no detector at all
+
+If refinement's cost were really about area, the DILATED guide (the same
+outer bound refinement is clipped to, ~1.69x the tight guide's area, no
+content-aware selection whatsoever) should sit somewhere between bare and
+refined, or beat both if bigger is simply better.
+
+    refined (production)     69.71
+    bare guide (tight)       72.50
+    dilated guide (no det.)  60.67
+
+**The dilated guide is the WORST of the three arms**, by a wide margin --
+worse than refined, worse than bare. This rules out "more area helps" outright
+in either direction: a mask that is purely bigger, with no detector narrowing
+it back down, is worse than either the tight guide or the detector-refined
+result. NFIQ2 does not reward area for its own sake here; it penalizes
+non-pad content, and the dilated guide includes the most of it.
+
+(Note: this run predates gating `_UNET_GUIDE_SEED_ENABLED` off, so its
+`refined` column used the seeded U-Net on the captures where that changes the
+mask -- e.g. `474b4d6a` reads 76 here vs 73 in the primary control. The `bare`
+and `dilated` arms both disable the detector entirely and are unaffected; the
+three-way ranking above is unchanged by that discrepancy.)
+
 ### Caveats that must travel with that number
 
 1. **NFIQ2 is a floor, not the target** — this project's own prime directive.

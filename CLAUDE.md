@@ -72,6 +72,70 @@ payoff is the same noise-averaging stacking already attempts, which this
 same round measured losing to the burst's best single frame on 8 of 10
 captures.
 
+## Layer 3 (masking): the control this layer never had -- refinement ON vs OFF, on real captures (2026-08-27, round 45)
+Third layer of the step-by-step architecture pass. Every prior masking round
+compared the two content-aware detectors against EACH OTHER (rounds 16, 20,
+21). None had run the more basic control: does content-aware refinement beat
+the bare guide at all. Ran it, on 132 real `front_only_v1` captures' population
+and 24 recent ones scored end to end with the real NFIQ2 binary.
+
+**Population**: `guide+flashdiff` 37%, bare `guide` 34%, `guide+unet` 28% --
+a third of production already ships with no refinement at all.
+
+**Two of my own hypotheses refuted before shipping.** (1) "The U-Net over-
+segments and the area-only accept gate mislabels the result" -- false; every
+accepted mask cuts 36-78% of the bound (median 48%), zero cases under 10%. My
+own earlier contrary numbers were measurement error: that set included
+`front_focuszone_*` diagnostic stills the mask path never runs on. (2) "Guide-
+seeded component selection fixes the U-Net" -- as a straight swap it's a wash,
+9/13 either way (recovers one capture, loses another to the 3% area floor).
+
+**What is real: the detectors are not equally reliable.** flash-diff located
+the pad on 11/11 real recent captures; the U-Net failed on 4/13 (31%), and
+every failure is MIS-LOCATION (0/3/10/13% of the bound survives), never over-
+or under-segmentation. Traceable cause: `ml/thumb_seg/build_dataset.py`
+generates this model's pseudo-labels via `_segment_via_flash_diff` called with
+NO seed -- the exact pre-round-16 frame-centre seed, the 555px error round 16
+fixed in production but never regenerated training labels for. The model was
+distilled from a detector aimed at the wrong point.
+
+**The control that changes the recommendation, n=24 real captures, identical
+inputs, only the masking decision varied:**
+
+| arm | mean NFIQ2 |
+|---|---|
+| production refinement | 69.58 |
+| **bare guide, no detector** | **72.50** |
+| dilated guide, no detector | 60.67 |
+
+Refinement costs **-2.92** (worse on 13/24), the same for both detectors
+(-3.5 flashdiff, -3.6 unet) -- so which detector runs isn't the variable.
+**Ruled out the area confound rather than waving at it**: refinement changes
+mask area 0.53-1.08x, and NFIQ2 partly rewards area, but correlation(area
+ratio, dNFIQ2) is only r=+0.317 (~10% of variance) and the two most
+informative points run the WRONG way for area -- the biggest shrink (0.37x)
+scored the best delta (+8), an area-neutral mask (0.96x) scored -9. Shape,
+not size. **Confirmed a third way**: the dilated guide (biggest mask, zero
+detector) is the WORST of all three arms -- rules out "more area helps" in
+either direction.
+
+**Held, not shipped.** The additive guide-seeded U-Net fix (prefer the
+component under the guide centre, fall back to `argmax(area)` when unusable --
+10/13 vs 9/13, +3 on the one capture it changes, others byte-identical,
+verified in the shipped code path) is implemented but gated OFF
+(`_UNET_GUIDE_SEED_ENABLED = False`). If refinement is net-negative, making
+the U-Net succeed more often makes a losing mechanism fire more often -- the
++3 would be a coin flip that happened to land well. Same reasoning shelves the
+bigger item: retraining the U-Net against correctly-seeded labels is NOT
+justified until refinement itself is shown to be worth having.
+
+**Not recommending refinement be disabled either**, on this same evidence.
+NFIQ2 cannot distinguish "removed useful ridge area" from "removed non-pad
+content NFIQ2 was happy to count" -- round 43's crease-trim result is the
+standing proof it gets that distinction wrong here. This is the single
+highest-value thing to re-run the moment a real >=500-DPI scanner reference
+exists. Full detail: `fusion_brain/results/MASKING_FINDINGS.md`.
+
 ## Layer 2 (guide geometry): the secondary-camera guide was left in a coordinate space round 36 removed (2026-08-27, round 44)
 Second layer of the step-by-step architecture pass the CTO asked for. Audited
 for coordinate-space CORRECTNESS, not tuning -- this is the layer with the
