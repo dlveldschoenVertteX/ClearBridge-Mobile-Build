@@ -72,6 +72,49 @@ payoff is the same noise-averaging stacking already attempts, which this
 same round measured losing to the burst's best single frame on 8 of 10
 captures.
 
+## Layer 5 (enhancement): two-model architecture confirmed sound; a real boundary-leak fix, also held (2026-08-28, round 47)
+Fifth layer. Two parts.
+
+**Architecture question, answered with real data**: `main.py` picks the
+delivered print from whichever of two independent pipelines scores higher
+real NFIQ2 -- AFIS binarized Gabor (`nfiqSource: afis`) or NNS continuous-
+tone (`nfiqSource: cylindrical`). Across 120 real `front_only_v1` captures,
+**AFIS wins 119/120 (99%)**; NNS wins exactly 1, by a real +10.4 margin
+when it does (34.0 vs 44.4). A legitimate rare-but-real fallback, not dead
+weight -- same max-of-variants philosophy as the rest of this pipeline. Not
+recommending removing it.
+
+**New hypothesis, tested**: does the default `enhance='gabor'` path (every
+production variant that has ever won selection routes through this) leak
+background into real pad content near the mask edge? `_orientation_field`
+(boxFilter 16px + Gaussian sigma 15) and `_gabor_enhance` (kernel radius
+~18-39px at wl 9-20) both run on the FULL unmasked frame -- `binimg[mask==0]
+=255` only discards the OUTPUT afterward, it can't undo a boundary-adjacent
+pad pixel's response having been computed partly from background within
+kernel reach. `_FADE_INSET_PX=25` (the band that keeps some Gabor output
+near the edge) overlaps that same reach. A different mechanism from the
+already-refuted Phase 7-8 "mask-aware `_normalize`" (byte-identical there,
+since `_normalize` is a pure affine map; orientation/Gabor respond to local
+gradient content directly, which affine invariance doesn't cover).
+
+**Fix**: replace background with the in-mask mean, feathered narrowly
+(8px sigma, deliberately much narrower than `_FADE_INSET_PX=25`) so it
+can't manufacture the "ridge terminating on one curve" artifact that
+constant exists to avoid. Gated behind `_GABOR_BOUNDARY_FEATHER` (default
+`False`).
+
+**Result, n=24, real NFIQ2, same production `freq_normalize=True` path**:
+feathered mean 66.79 vs production 69.58 (**-2.79**). Better on 8, worse on
+16, tied on 0 -- stable across the whole run, never crossed net-positive at
+any checkpoint. Same shape as rounds 43/45/46: removing real background
+influence from where the pad reconstruction actually happens, and NFIQ2
+scores it worse more often than not. **Held, not shipped** --
+`_GABOR_BOUNDARY_FEATHER` stays `False`, production unchanged. Needs the
+standing >=500dpi matchability reference to know whether the feathered
+version is a genuinely better print NFIQ2 can't see, or a real regression
+from the narrow feather itself. Full detail:
+`fusion_brain/results/GABOR_BOUNDARY_FINDINGS.md`.
+
 ## Layer 4 (pre-processing/normalization): a real measurement leak, gated off because the correct fix costs real NFIQ2 (2026-08-27/28, round 46)
 Fourth layer of the architecture pass. `_ridge_wavelength` (and its
 diagnostic companion `_ridge_wavelength_robust`) -- the estimator that

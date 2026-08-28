@@ -91,6 +91,13 @@ _FADE_INSET_PX = 25.0       # 2026-08-03: real visual-QA finding -- a hard mask
 # measurement this is gated on.
 _WAVELENGTH_MASK_RESTRICT = False
 
+# Grey-fill background before the default Gabor pass (round 47), gated
+# pending its own real NFIQ2 check -- see that section's own comment below
+# for the mechanism and fusion_brain/results/ for the measurement.
+_GABOR_BOUNDARY_FEATHER = False
+_GABOR_BOUNDARY_FEATHER_SIGMA = 8.0
+
+
 _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
 # shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
 # native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
@@ -3490,7 +3497,40 @@ def generate(
         # sidecar wasn't configured/reachable -- same non-blocking contract
         # as every other optional signal in this module (fall back, don't
         # fail).
-        norm = _normalize(g8)
+        #
+        # Boundary-feather (round 47), gated OFF pending its own NFIQ2 check.
+        # `_orientation_field` (boxFilter _BLOCK=16 + Gaussian _ORIENT_SMOOTH
+        # =15) and `_gabor_enhance` (kernel radius ~18-39px at wl 9-20) both
+        # run on the WHOLE frame here -- background is still sitting in `g8`
+        # at this point, and neither function is mask-aware. `binimg[mask==0]
+        # =255` only discards the OUTPUT afterwards; it cannot undo a
+        # boundary-adjacent PAD pixel's orientation/Gabor response having
+        # been computed partly from background content within the kernel's
+        # reach. `_FADE_INSET_PX=25` (the band that keeps some Gabor output
+        # near the edge, applied further down) overlaps this same reach, so
+        # real delivered ridge content near the pad edge can be measurably
+        # background-influenced, not just wasted computation on discarded
+        # output. A different mechanism from the already-refuted Phase 7-8
+        # "mask-aware `_normalize`" experiment (byte-identical there, because
+        # `_normalize` reduces to a pure global affine map that gradient/
+        # contrast-sensitive orientation and Gabor filtering don't share).
+        #
+        # Replaces background with the in-mask mean, feathered at the
+        # boundary (small Gaussian on the fill alpha, not a hard step) so
+        # this can't manufacture the exact "ridge terminating on one curve"
+        # artifact `_FADE_INSET_PX` exists to avoid downstream -- deliberately
+        # a much narrower feather than that constant (`_GABOR_BOUNDARY_FEATHER
+        # _SIGMA=8` vs `_FADE_INSET_PX=25`), since the goal here is to
+        # suppress background content close to the boundary, not soften a
+        # wide band of it.
+        g8_in = g8
+        if _GABOR_BOUNDARY_FEATHER and mask is not None and (mask > 0).any():
+            fill_val = float(g8[mask > 0].mean())
+            alpha = cv2.GaussianBlur((mask == 0).astype(np.float32), (0, 0),
+                                     sigmaX=_GABOR_BOUNDARY_FEATHER_SIGMA)
+            g8_in = (g8.astype(np.float32) * (1.0 - alpha)
+                     + fill_val * alpha).astype(np.uint8)
+        norm = _normalize(g8_in)
         orient = _orientation_field(norm)
         enh = _gabor_enhance(
             norm, orient, wl,
