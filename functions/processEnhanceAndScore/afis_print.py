@@ -84,6 +84,13 @@ _FADE_INSET_PX = 25.0       # 2026-08-03: real visual-QA finding -- a hard mask
 # toward white over the same distance as they approach the edge, so the
 # print visually thins out and terminates before the crop boundary rather
 # than being sliced by it -- see the distance-transform blend below.
+# Mask-restricted ridge-wavelength estimation ( _ridge_wavelength's new
+# `mask` param, round 46), deliberately OFF pending its own real NFIQ2/
+# matchability check -- same discipline as _UNET_GUIDE_SEED_ENABLED above.
+# See that function's docstring and fusion_brain/results/ for the real
+# measurement this is gated on.
+_WAVELENGTH_MASK_RESTRICT = False
+
 _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
 # shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
 # native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
@@ -390,9 +397,38 @@ def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
     return 0.5 * np.arctan2(sn_blend, cs_blend) + np.pi / 2
 
 
-def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> float:
+def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32,
+                      mask: Optional[np.ndarray] = None) -> float:
+    """`mask`, added 2026-08-27 (round 46): restrict which blocks contribute
+    to the pad, when one is available.
+
+    Real defect measured on 24 real recent front_only_v1 captures
+    (`fusion_brain/diag_wavelength_mask_leak.py`): this function scans the
+    FULL, un-cropped frame -- no mask parameter existed before this -- and
+    the guide occupies only ~3% of that frame's area. Across the population,
+    **96% of every block that ever contributes a frequency sample sits
+    OUTSIDE the guide**. Round 33 already measured, on a real capture, that
+    background can carry HIGHER local contrast than the pad itself
+    (Laplacian 2282 background vs 1619 pad, same frame) -- so the bare
+    `std() >= 8` gate below has no reason to prefer pad content, and at this
+    area ratio it structurally can't: even a pad with every block passing
+    would be outnumbered roughly 30:1 by background candidates. On 11/23
+    captures the reported wavelength moves by >=1px once restricted to the
+    pad (mean |delta| 2.2px, max 9px) -- this is the estimate that decides
+    `freq_normalize`'s resample scale for the whole Gabor bank, so a few px
+    here is not a rounding error.
+
+    Backward compatible by construction: every existing call site that
+    doesn't pass `mask` is byte-for-byte unaffected (this parameter is
+    additive, not a signature change to anything already in use). When a
+    mask IS passed, falls back to the full unmasked population if zero
+    in-mask blocks qualify -- can only ever narrow toward better-targeted
+    real content, never regress a capture that had no real pad signal to
+    find in the first place.
+    """
     h, w = img.shape
     freqs = []
+    in_freqs = []
     for y in range(0, h - bsize, bsize):
         for x in range(0, w - bsize, bsize):
             blk = img[y:y + bsize, x:x + bsize]
@@ -424,6 +460,10 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
             peaks = peaks[peaks > 3]
             if len(peaks):
                 freqs.append(peaks[0])
+                if mask is not None and mask[y + bsize // 2, x + bsize // 2] > 0:
+                    in_freqs.append(peaks[0])
+    if mask is not None and in_freqs:
+        return float(np.clip(np.median(in_freqs), 5, 20))
     if not freqs:
         return 9.0
     return float(np.clip(np.median(freqs), 5, 20))
@@ -3254,9 +3294,21 @@ def generate(
     # enhancement (mask stays at native res for the U-Net; only the Gabor stage
     # sees the resampled version). Grid search over real captures: consistent
     # NFIQ gain when the estimate is reliable.
+    #
+    # "on the MASKED pad" above was aspirational, not actual, until
+    # `_WAVELENGTH_MASK_RESTRICT` (round 46) -- `_ridge_wavelength` had no
+    # mask parameter at all before this, and scanned the full un-cropped
+    # frame. Measured on 24 real recent captures
+    # (fusion_brain/diag_wavelength_mask_leak.py): the guide occupies ~3% of
+    # frame area, and 96% of every contributing block sat OUTSIDE it -- on
+    # 11/23 captures restricting to the pad moves the reported wavelength by
+    # >=1px (mean 2.2, max 9). Gated behind this flag pending the real
+    # NFIQ2/matchability check every other change in this pipeline gets
+    # before shipping -- see fusion_brain/results/ once that lands.
     norm0 = _normalize(g8)
     orient0 = _orientation_field(norm0)
-    native_wl = _ridge_wavelength(norm0, orient0)
+    native_wl = _ridge_wavelength(
+        norm0, orient0, mask=mask if _WAVELENGTH_MASK_RESTRICT else None)
     params['afisWavelengthPx'] = float(round(native_wl, 1))
     # Diagnostic-only, unclipped, multi-peak-averaged companion measurement
     # -- see _ridge_wavelength_robust's docstring. Does NOT feed the

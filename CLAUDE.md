@@ -72,6 +72,58 @@ payoff is the same noise-averaging stacking already attempts, which this
 same round measured losing to the burst's best single frame on 8 of 10
 captures.
 
+## Layer 4 (pre-processing/normalization): a real measurement leak, gated off because the correct fix costs real NFIQ2 (2026-08-27/28, round 46)
+Fourth layer of the architecture pass. `_ridge_wavelength` (and its
+diagnostic companion `_ridge_wavelength_robust`) -- the estimator that
+decides `freq_normalize`'s resample scale for the whole Gabor bank on every
+production variant -- never had a mask parameter at all. It scans the FULL,
+un-cropped frame in 32x32 blocks, keeping any block with local contrast
+above a bare threshold.
+
+**Measured on 24 real recent `front_only_v1` captures**: the guide occupies
+only ~3% of frame area, and **96% of every block that ever contributes a
+frequency sample sits OUTSIDE the guide**. Same failure MODE as round 42's
+NNS `_ridge_pass` fix (measuring frequency from "the highest-contrast
+quadrant of the WHOLE scene"), but a different function on the path every
+production variant actually runs -- and a genuinely different mechanism from
+the already-closed Phase 7-8 "mask-aware `_normalize`" experiment (refuted
+there because `_normalize` is a pure affine map; block SELECTION by
+std/periodicity is not affine-invariant the same way). On 11/23 captures
+with real in-mask signal, restricting to the pad moves the reported
+wavelength by >=1px (mean 2.2px, max 9px).
+
+**Fixed, additive and gated**: `_ridge_wavelength` gained an optional `mask`
+param -- every existing call site is byte-for-byte unaffected; when passed,
+falls back to the full unmasked population if zero in-mask blocks qualify,
+so it can only narrow toward better-targeted content, never regress a
+capture with no real pad signal. Wired into `generate()` behind
+`_WAVELENGTH_MASK_RESTRICT` (default `False`).
+
+**Verified against the shipped code with the real NFIQ2 binary, n=24, same
+production `freq_normalize=True` path**: masked mean 68.04 vs production
+69.58 (delta -1.54). **Masked better on 0, worse on 3, tied on 21** -- the
+three real deltas (-14, -6, -17) are not noise. Mechanism: `_FREQ_SCALE_MIN
+=0.7` clamps the scale for any wavelength >=~12.9px; the contaminated
+estimate lands there on 21/24 captures (background reads coarser than the
+pad), while the corrected estimate sometimes escapes the floor to a milder
+0.72-0.82 -- and every time it does, the milder, more-accurate correction
+scores WORSE on real NFIQ2. Same shape as round 43's crease-trim and round
+45's masking control: a measurably more correct measurement, and NFIQ2
+doesn't reward it. **Held, not shipped** -- `_WAVELENGTH_MASK_RESTRICT`
+stays `False`; production is unchanged. Needs the standing >=500dpi
+matchability reference to resolve honestly, not more NFIQ2 tuning.
+
+**Secondary finding, checked and NOT acted on**: `_liveWavelengthTooHighPx=
+35.0` (round 17's client-side distance gate) was calibrated off
+`afisWavelengthPxRaw`, which has the identical unmasked defect --
+per-capture values swing wildly once masked (28->10.8, 29->9.0, 15->30.0),
+more than half the population moves by double digits. But the AGGREGATE
+statistic the threshold was derived from barely moves (mean+2sd 37.4 ->
+36.8, both round to ~35) -- per-capture noise cancels at the population
+level. Not recommending a recalibration on this evidence; the number this
+data would justify is essentially the one already shipped. Full detail:
+`fusion_brain/results/WAVELENGTH_LEAK_FINDINGS.md`.
+
 ## Layer 3 (masking): the control this layer never had -- refinement ON vs OFF, on real captures (2026-08-27, round 45)
 Third layer of the step-by-step architecture pass. Every prior masking round
 compared the two content-aware detectors against EACH OTHER (rounds 16, 20,
