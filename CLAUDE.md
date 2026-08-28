@@ -1,5 +1,49 @@
 # ClearBridge Mobile — persistent context
 
+## Layer-by-layer architecture pass, layer 7 (variant selection): main.py's own fusion-selection guard measured the whole frame, not the pad -- fixed, low-risk, SHIPPED (2026-08-28, round 49)
+Seventh layer of the pass. `main.py` carries its OWN, separate fusion-
+selection sharpness guard (`_fusion_guarded`, built 2026-07-23 after real
+capture `913758cf` showed a fusion variant winning selection despite its
+flash frames being badly blown out relative to ambient) -- distinct from
+layer 6's `_FUSE_FLASH_SOFTNESS_GUARD` inside `afis_print.py`, which gates
+whether a pair gets fused AT ALL; this one gates whether an ALREADY-fused
+candidate needs to beat `native` by a `+3.0` NFIQ2 margin before it can win
+production selection. Its trigger computed ambient:flash sharpness ratio
+over the WHOLE frame (`cv2.Laplacian(ambient_frames[0]).var()` /
+`...flash_frames[0]...`, no masking) -- predating
+`flash_pair_sharpness_ratio` (2026-08-12), whose own docstring already
+states why that's wrong: "a whole-frame Laplacian is dominated by
+background texture." Same background-contamination pattern already found
+independently in layers 3/4/5/6 of this pass, just never checked in this
+second, separate guard.
+
+**Diagnostic, 24 real captures** (`fusion_brain/
+diag_fusion_guard_wholeframe.py`): 3/24 (12.5%) disagree on whether the
+guard's own 4.0 threshold fires, ALWAYS in the direction of whole-frame
+under-detecting (background dilutes a real blowout signal that the pad
+crop shows clearly) -- zero cases the other way, so restricting to the pad
+can only add newly-detected real cases, never remove one.
+
+**Tested whether it matters, not assumed**: on the 3 disagreement
+captures, `deepFuse`'s real margin over `native` was +3.0/+17.0/+33.0 --
+already clearing the guard's own +3.0 requirement regardless of which
+measurement triggers it. Honest result: a real correctness fix with no
+demonstrated change to the delivered print on this evidence, only to the
+guard's own internal accuracy. Secondary fix caught along the way: the OLD
+code gated the check on `_fl_lap > 0`, so a flash frame with LITERALLY
+ZERO variance (the most suspicious case of all) was treated as not
+guarded; `flash_pair_sharpness_ratio` correctly returns `inf` there,
+closing that edge case too.
+
+**Shipped, no flag needed** -- reuses `flash_pair_sharpness_ratio`
+verbatim (the same already-shipped, already-tested function layer 6 relies
+on), so there's no new untested code path to gate, and the guard's own
+action when triggered is a bounded safety margin, never a hard block.
+**Honest limit**: only `deepFuse` was tested end-to-end on the 3
+disagreement captures; `fuseMaxc`/`fuseSoft`/`deepMaxc` weren't separately
+checked (`fuseAvg` already self-forfeited via layer 6's own guard on all
+3). Full detail: `fusion_brain/results/FUSION_GUARD_PAD_CROP_FINDINGS.md`.
+
 ## Layer-by-layer architecture pass, layer 6 (fusion): sweep's flash-softness guard ported to front_only_v1 -- first net-positive fix in this pass, SHIPPED (2026-08-28, round 48)
 Sixth layer of the step-by-step architecture pass (layers 2-5: guide geometry,
 masking, wavelength measurement, Gabor enhancement -- see their own round

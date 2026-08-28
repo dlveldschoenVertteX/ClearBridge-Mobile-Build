@@ -1294,18 +1294,37 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # 3.0 matches the existing fusion-sharpness guard's own margin.
             _FREQNORM_RISK_VARIANT_NAMES = {'freqNorm', 'mosaicFreq', 'deepFuse', 'deepMaxc'}
             _FREQNORM_RISK_MARGIN_REQUIRED = 3.0
-            try:
-                # front_only_v1 can supply [None] (no ambient/flash frame was
-                # uploaded) -- a one-element list is still truthy, so `if
-                # ambient_frames` alone doesn't catch it; check the actual
-                # first element too.
-                _amb_lap = (float(cv2.Laplacian(ambient_frames[0], cv2.CV_64F).var())
-                            if ambient_frames and ambient_frames[0] is not None else 0.0)
-                _fl_lap = (float(cv2.Laplacian(flash_frames[0], cv2.CV_64F).var())
-                           if flash_frames and flash_frames[0] is not None else 0.0)
-            except Exception:   # noqa: BLE001 — guard is best-effort, never blocks scoring
-                _amb_lap = _fl_lap = 0.0
-            _fusion_guarded = _fl_lap > 0 and (_amb_lap / _fl_lap) >= _SHARPNESS_RATIO_GUARD
+            # Layer 7 (variant selection) audit, round 49: this guard's own
+            # trigger measured ambient:flash sharpness over the WHOLE frame,
+            # no masking -- built 2026-07-23, predating
+            # afis_print.flash_pair_sharpness_ratio (2026-08-12), whose own
+            # docstring states why that's wrong for this exact measurement:
+            # "a whole-frame Laplacian is dominated by background texture
+            # and says almost nothing about the ridge content the fusion
+            # actually operates on." Same background-contamination pattern
+            # already found and fixed in layers 3/4/5/6 of this pass.
+            # Diagnostic on 24 real captures (fusion_brain/
+            # diag_fusion_guard_wholeframe.py): 3/24 disagree on whether the
+            # guard's own 4.0 threshold fires, ALWAYS in the direction of
+            # whole-frame under-detecting (background dilutes a real
+            # torch-blowout signal) -- never over-detecting, so restricting
+            # to the pad can only make the guard fire on MORE real blowout
+            # cases, never fewer. Checked whether that actually matters: on
+            # all 3 disagreement captures, deepFuse's real margin over
+            # native (+3.0 / +17.0 / +33.0 NFIQ2) already clears
+            # _FUSION_MARGIN_REQUIRED regardless of which measurement
+            # triggers the guard -- so on this evidence the fix is a real
+            # correctness improvement with no demonstrated behavior change,
+            # not a guess. `_FUSE_FLASH_SOFTNESS_GUARD` in afis_print.py
+            # (layer 6) already reuses this same function for the pairs it
+            # actually fuses; this makes main.py's own pre-existing,
+            # independent guard consistent with it.
+            _fusion_guard_ratio = afis_print.flash_pair_sharpness_ratio(
+                ambient_frames[0] if ambient_frames else None,
+                flash_frames[0] if flash_frames else None,
+                _guide_region)
+            _fusion_guarded = (isinstance(_fusion_guard_ratio, float)
+                                and _fusion_guard_ratio >= _SHARPNESS_RATIO_GUARD)
             _native_nfiq = None
 
             # fuseAvg/fuseMaxc/fuseSoft each pair a single flash_frames[0] with
@@ -1426,8 +1445,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         and _s < _native_nfiq + _FUSION_MARGIN_REQUIRED):
                     logger.info(
                         'AFIS variant %s suppressed by sharpness guard '
-                        '(amb/fl lap ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
-                        _vname, (_amb_lap / _fl_lap) if _fl_lap else 0.0,
+                        '(pad amb/fl ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
+                        _vname, _fusion_guard_ratio or 0.0,
                         _native_nfiq, _FUSION_MARGIN_REQUIRED, _s)
                     continue
                 if (_vname in _NEURAL_GUARDED_VARIANT_NAMES and _native_nfiq is not None
