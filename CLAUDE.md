@@ -1,5 +1,67 @@
 # ClearBridge Mobile — persistent context
 
+## Layer-by-layer architecture pass, layer 6 (fusion): sweep's flash-softness guard ported to front_only_v1 -- first net-positive fix in this pass, SHIPPED (2026-08-28, round 48)
+Sixth layer of the step-by-step architecture pass (layers 2-5: guide geometry,
+masking, wavelength measurement, Gabor enhancement -- see their own round
+entries below). `flash_pair_sharpness_ratio`/`_FLASH_PAIR_MAX_SHARPNESS_RATIO
+=2.0` was built and calibrated 2026-08-12 on real **sweep** captures: every
+zone whose ambient+flash pair actually fused scored LOWER than that zone's
+plain ambient frame (5/5 zones, 2/2 mosaics, up to -13 NFIQ2, zero
+counter-examples) once flash ran softer than ~2.8x ambient's own sharpness --
+the same torch-blowout signature already documented on the main front burst
+elsewhere in this project (round 42: ambient Laplacian ~3.4x flash's). That
+guard was wired ONLY into the sweep zone-fusion path (`main.py`) -- confirmed
+via `grep` that `front_only_v1`'s own fuse family (`fuseAvg`/`fuseMaxc`/
+`fuseSoft`/`deepFuse`/`deepMaxc`/`deepSoft`/`deepAmbBestFl`, the path nearly
+every real production capture routes through) never got it, despite fusing
+ambient/flash pairs through the identical `_fuse_flash_ambient` mechanism.
+
+**Fixed, gated behind `_FUSE_FLASH_SOFTNESS_GUARD`**: wired into all three
+real call sites in `afis_print.py` that build a fused candidate from an
+ambient/flash pair -- the deep-family stack-then-fuse path (falls back to
+plain ambient stack, never to nothing), the single-pair candidate loop
+(skips an over-ratio pair, tries the next), and the 2026-07-24 burst-fallback
+loop (same per-pair gate). Backward compatible in every branch when the
+guard doesn't fire.
+
+**Real test, 12 captures (9 guard-firing + 3 controls, narrowed from the
+full 24-capture library via a cheap Laplacian-ratio pre-pass -- full-res ECC
+in `_fuse_flash_ambient` makes an exhaustive 24x2-arm run impractical, same
+narrowing technique as round 45), real shipped `generate(fuse='avg', ...)`
+run twice per capture with production's own argument shape (including
+`ambient_burst`/`flash_burst` -- an earlier draft of this test omitted them
+and made the guarded arm look artificially worse; caught and fixed before
+drawing any conclusion, since production always passes the full burst)**:
+
+**Controls (ratio<=2.0): exact no-op on all 3** (+0/+0/+0) -- confirms the
+gate only changes behavior when it should. **Guard-firing, non-forfeit
+subset (3 of 9)**: +13 / -1 / -3, mean +3.0 -- real, mixed but net positive.
+**Guard-firing, forfeit subset (6 of 9, 67%)**: every pair in the WHOLE
+burst (not just the pre-selected one) exceeds the ratio threshold, so
+`fuse='avg'` in isolation returns `None` entirely -- in real production this
+is not a regression on its own, since `main.py`'s variant loop is max-of-
+variants and a `None` result just forfeits that one candidate while
+`native`/`freqNorm`/other fuse modes/`deepFuse` still compete normally.
+Mechanistically consistent with, not contrary to, the validated sweep
+finding: trusting none of a uniformly-blown-out burst's pairs is the
+behavior the sweep data already showed correct. **Paired mean across all 6
+non-forfeit comparisons: +1.50.**
+
+**Decision: SHIP ENABLED (`_FUSE_FLASH_SOFTNESS_GUARD = True`)** -- the
+first fix in this round's layer-by-layer pass (layers 2-6) that is not a net
+negative. Layers 4/5's boundary/measurement fixes were both correctly-more-
+faithful and both measurably worse on real NFIQ2; this one ports an
+already-validated mechanism from a sibling capture mode, shows zero
+regression where it shouldn't fire, and a net-positive real delta where it
+fires and can still produce a candidate. **Honest limits**: only 3 of 12
+real comparisons are non-trivial (thinner evidence than the sweep's own
+5/5+2/2), and only the single-pair family was tested end-to-end -- the
+deep-family path (`deepFuse`/`deepMaxc`/`deepSoft`, this project's own
+higher win-rate/higher-mean-quality variants per round 29) shares the
+identical gate mechanism but wasn't separately validated here; worth a
+dedicated check if revisited. Full detail:
+`fusion_brain/results/FUSE_SOFTNESS_GUARD_FINDINGS.md`.
+
 ## Crease trim fixed (a real circularity in my own detector); NNS enhancer's streaking root-caused and fixed; super-resolution ruled out with data (2026-08-27, round 43)
 Direct CTO report with an annotated print: below-crease content bleeding
 into a delivered superprint, plus visible diagonal streaking through an

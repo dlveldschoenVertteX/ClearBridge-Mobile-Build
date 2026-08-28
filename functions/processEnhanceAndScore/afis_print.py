@@ -97,6 +97,22 @@ _WAVELENGTH_MASK_RESTRICT = False
 _GABOR_BOUNDARY_FEATHER = False
 _GABOR_BOUNDARY_FEATHER_SIGMA = 8.0
 
+# Apply the already-validated sweep flash-softness guard
+# (flash_pair_sharpness_ratio / _FLASH_PAIR_MAX_SHARPNESS_RATIO, calibrated
+# 2026-08-12 on real sweep captures: 5/5 zones and 2/2 mosaics scored LOWER
+# after fusing a pair where flash ran 2.8-17.8x softer than ambient, up to
+# -13 NFIQ2, zero counter-examples) to front_only_v1's OWN fuse variants
+# (fuseAvg/fuseMaxc/fuseSoft/deepFuse/deepMaxc/...), which have never had
+# this guard at all despite this project's own repeated documentation that
+# the main burst's flash frames hit the identical torch-blowout pattern
+# (round 42: ambient Laplacian 3.4x flash's on real front bursts). Verified
+# on THIS population (round 48, real generate() end-to-end, real NFIQ2,
+# n=12): 3 controls exact no-op, 3 real deltas +13/-1/-3 (mean +3.0), 6
+# forfeit to None (whole burst uniformly blown out -- safe, another variant
+# competes) -- net positive, no control regressed. See
+# fusion_brain/results/FUSE_SOFTNESS_GUARD_FINDINGS.md.
+_FUSE_FLASH_SOFTNESS_GUARD = True
+
 
 _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
 # shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
@@ -3004,7 +3020,13 @@ def generate(
         if df is not None and df.ndim != 2:
             df = cv2.cvtColor(df, cv2.COLOR_BGR2GRAY)
         if da is not None and df is not None:
-            fused = _fuse_flash_ambient(da, df, mode=_deep_mode)
+            _da_df_ratio = (flash_pair_sharpness_ratio(da, df, guide_region)
+                            if _FUSE_FLASH_SOFTNESS_GUARD else None)
+            _da_df_ok = (_da_df_ratio is None
+                        or _da_df_ratio <= _FLASH_PAIR_MAX_SHARPNESS_RATIO)
+            fused = _fuse_flash_ambient(da, df, mode=_deep_mode) if _da_df_ok else None
+            if _FUSE_FLASH_SOFTNESS_GUARD and not _da_df_ok:
+                params['afisFuseSoftnessSkipped'] = round(_da_df_ratio, 2)
             gray = fused if fused is not None else da
         elif da is not None or df is not None:
             gray = da if da is not None else df
@@ -3034,6 +3056,11 @@ def generate(
                             key=_pair_key)
         fused = None
         for i in pair_cands:
+            if _FUSE_FLASH_SOFTNESS_GUARD:
+                _pratio = flash_pair_sharpness_ratio(
+                    ambient_frames[i], flash_frames[i], guide_region)
+                if _pratio is not None and _pratio > _FLASH_PAIR_MAX_SHARPNESS_RATIO:
+                    continue
             fused = _fuse_flash_ambient(ambient_frames[i], flash_frames[i], mode=fuse)
             if fused is not None:
                 gray = fused
@@ -3061,6 +3088,11 @@ def generate(
                 range(_n),
                 key=lambda i: -min(_ridge_energy(_burst_amb[i]), _ridge_energy(_burst_fla[i])))
             for i in _burst_pairs:
+                if _FUSE_FLASH_SOFTNESS_GUARD:
+                    _pratio = flash_pair_sharpness_ratio(
+                        _burst_amb[i], _burst_fla[i], guide_region)
+                    if _pratio is not None and _pratio > _FLASH_PAIR_MAX_SHARPNESS_RATIO:
+                        continue
                 fused = _fuse_flash_ambient(_burst_amb[i], _burst_fla[i], mode=fuse)
                 if fused is not None:
                     gray = fused
