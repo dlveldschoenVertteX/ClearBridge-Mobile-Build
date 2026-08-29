@@ -1,0 +1,294 @@
+{
+ "old": [
+  {
+   "id": "e33d618e",
+   "detected": true,
+   "cov_over_guide": 0.9104631830094214,
+   "accepted": true
+  },
+  {
+   "id": "a262d2b3",
+   "detected": true,
+   "cov_over_guide": 1.690129533435407,
+   "accepted": false
+  },
+  {
+   "id": "01662ffb",
+   "detected": true,
+   "cov_over_guide": 0.9109586789280381,
+   "accepted": true
+  },
+  {
+   "id": "474b4d6a",
+   "detected": true,
+   "cov_over_guide": 0.0,
+   "accepted": false
+  },
+  {
+   "id": "4ae6d13c",
+   "detected": true,
+   "cov_over_guide": 0.05451159601348876,
+   "accepted": false
+  },
+  {
+   "id": "5363a49b",
+   "detected": true,
+   "cov_over_guide": 0.9618515109103035,
+   "accepted": true
+  },
+  {
+   "id": "181e8cd8",
+   "detected": true,
+   "cov_over_guide": 1.0775956001841085,
+   "accepted": true
+  },
+  {
+   "id": "eacb0b2c",
+   "detected": true,
+   "cov_over_guide": 1.080267990493993,
+   "accepted": true
+  },
+  {
+   "id": "80a994ca",
+   "detected": true,
+   "cov_over_guide": 0.22800326886406974,
+   "accepted": false
+  },
+  {
+   "id": "286f1f0a",
+   "detected": true,
+   "cov_over_guide": 1.0608497167923803,
+   "accepted": true
+  },
+  {
+   "id": "1c019820",
+   "detected": true,
+   "cov_over_guide": 0.6745366760912652,
+   "accepted": true
+  },
+  {
+   "id": "4508786f",
+   "detected": true,
+   "cov_over_guide": 0.9681849350454166,
+   "accepted": true
+  },
+  {
+   "id": "e50047c7",
+   "detected": true,
+   "cov_over_guide": 0.6759879390187772,
+   "accepted": true
+  },
+  {
+   "id": "774f2252",
+   "detected": true,
+   "cov_over_guide": 0.5293375853615007,
+   "accepted": true
+  },
+  {
+   "id": "315f79f1",
+   "detected": true,
+   "cov_over_guide": 0.9981377807418819,
+   "accepted": true
+  },
+  {
+   "id": "fc142f97",
+   "detected": true,
+   "cov_over_guide": 0.444574906771621,
+   "accepted": true
+  },
+  {
+   "id": "1cc301a8",
+   "detected": true,
+   "cov_over_guide": 1.690129533435407,
+   "accepted": false
+  },
+  {
+   "id": "d0ec5195",
+   "detected": true,
+   "cov_over_guide": 1.0350252209770898,
+   "accepted": true
+  },
+  {
+   "id": "c27d0004",
+   "detected": true,
+   "cov_over_guide": 0.8942644586178716,
+   "accepted": true
+  },
+  {
+   "id": "8ed1c600",
+   "detected": true,
+   "cov_over_guide": 0.21978414225194676,
+   "accepted": false
+  },
+  {
+   "id": "5d3fb521",
+   "detected": true,
+   "cov_over_guide": 1.170417719497647,
+   "accepted": true
+  },
+  {
+   "id": "f4cb3ba5",
+   "detected": true,
+   "cov_over_guide": 1.6572131055147992,
+   "accepted": false
+  },
+  {
+   "id": "b615f37b",
+   "detected": true,
+   "cov_over_guide": 0.8959082839402963,
+   "accepted": true
+  },
+  {
+   "id": "1d186afc",
+   "detected": true,
+   "cov_over_guide": 0.16906978273325882,
+   "accepted": false
+  }
+ ],
+ "new": [
+  {
+   "id": "e33d618e",
+   "detected": true,
+   "cov_over_guide": 0.8676931964418226,
+   "accepted": true
+  },
+  {
+   "id": "a262d2b3",
+   "detected": true,
+   "cov_over_guide": 0.8481222818174132,
+   "accepted": true
+  },
+  {
+   "id": "01662ffb",
+   "detected": true,
+   "cov_over_guide": 0.8773800242346819,
+   "accepted": true
+  },
+  {
+   "id": "474b4d6a",
+   "detected": false,
+   "cov_over_guide": 0.0,
+   "accepted": false
+  },
+  {
+   "id": "4ae6d13c",
+   "detected": true,
+   "cov_over_guide": 0.8413356315576889,
+   "accepted": true
+  },
+  {
+   "id": "5363a49b",
+   "detected": true,
+   "cov_over_guide": 0.9250533069068844,
+   "accepted": true
+  },
+  {
+   "id": "181e8cd8",
+   "detected": true,
+   "cov_over_guide": 1.028919584065227,
+   "accepted": true
+  },
+  {
+   "id": "eacb0b2c",
+   "detected": true,
+   "cov_over_guide": 0.9637677415718727,
+   "accepted": true
+  },
+  {
+   "id": "80a994ca",
+   "detected": true,
+   "cov_over_guide": 0.8473496839158737,
+   "accepted": true
+  },
+  {
+   "id": "286f1f0a",
+   "detected": true,
+   "cov_over_guide": 1.009459040569609,
+   "accepted": true
+  },
+  {
+   "id": "1c019820",
+   "detected": true,
+   "cov_over_guide": 0.7931034482758621,
+   "accepted": true
+  },
+  {
+   "id": "4508786f",
+   "detected": true,
+   "cov_over_guide": 0.8100606806376164,
+   "accepted": true
+  },
+  {
+   "id": "e50047c7",
+   "detected": true,
+   "cov_over_guide": 0.957293418123409,
+   "accepted": true
+  },
+  {
+   "id": "774f2252",
+   "detected": true,
+   "cov_over_guide": 0.9214979475666688,
+   "accepted": true
+  },
+  {
+   "id": "315f79f1",
+   "detected": true,
+   "cov_over_guide": 0.8548384824204623,
+   "accepted": true
+  },
+  {
+   "id": "fc142f97",
+   "detected": true,
+   "cov_over_guide": 0.8593754403103542,
+   "accepted": true
+  },
+  {
+   "id": "1cc301a8",
+   "detected": true,
+   "cov_over_guide": 0.010351402887496594,
+   "accepted": false
+  },
+  {
+   "id": "d0ec5195",
+   "detected": true,
+   "cov_over_guide": 0.962121567927559,
+   "accepted": true
+  },
+  {
+   "id": "c27d0004",
+   "detected": true,
+   "cov_over_guide": 0.9516926704177195,
+   "accepted": true
+  },
+  {
+   "id": "8ed1c600",
+   "detected": true,
+   "cov_over_guide": 0.9579697348274923,
+   "accepted": true
+  },
+  {
+   "id": "5d3fb521",
+   "detected": true,
+   "cov_over_guide": 0.897857391108314,
+   "accepted": true
+  },
+  {
+   "id": "f4cb3ba5",
+   "detected": true,
+   "cov_over_guide": 0.8509050432560892,
+   "accepted": true
+  },
+  {
+   "id": "b615f37b",
+   "detected": true,
+   "cov_over_guide": 0.9824556871659512,
+   "accepted": true
+  },
+  {
+   "id": "1d186afc",
+   "detected": false,
+   "cov_over_guide": 0.0,
+   "accepted": false
+  }
+ ]
+}
