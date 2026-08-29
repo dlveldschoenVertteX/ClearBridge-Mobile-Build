@@ -61,7 +61,11 @@ estimator = PyTorch(
         'val-frac': 0.15,
     },
     sagemaker_session=sess,
-    max_run=3600,  # hard 1h cap -- real expectation is well under this
+    # Raised 3600 -> 14400 (4h) after a real run: 30 epochs took ~59min on
+    # GPU (train.py's own heavy CPU-side copy-paste augmentation, not GPU
+    # compute, is the real bottleneck -- ~2min/epoch), so 80 epochs needs
+    # ~2.5-3h. 4h leaves real margin without being unbounded.
+    max_run=14400,
     base_job_name='thumb-seg-unet-seeded',
 )
 
