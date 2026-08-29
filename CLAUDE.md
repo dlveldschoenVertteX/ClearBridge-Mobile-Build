@@ -1,5 +1,46 @@
 # ClearBridge Mobile — persistent context
 
+## Layer 3 follow-up: U-Net retrained on correctly-seeded flash-diff labels -- real, safe localization win, held on real net-negative NFIQ2 (2026-08-29, round 50)
+Executed round 45's own named root-cause fix: `ml/thumb_seg/build_dataset.py`
+generated this model's training labels via unseeded (pre-round-16)
+flash-diff, so the U-Net learned "near-camera blob near frame centre"
+instead of "the guided pad" -- a 31% (4/13) real mis-location rate. Fixed
+`build_dataset.py` to seed from each capture's real `guideRegion` (same
+formula `afis_print._flash_diff_mask` already uses in production);
+regenerated the dataset (107 real captures, 610 images); visually spot-
+checked 6 random new labels against raw photos (all correctly on the pad).
+Retrained on real SageMaker GPU (`ml.g4dn.xlarge`, same architecture/
+hyperparameters, no tuning, 80 epochs, best val loss 0.1693); exported to
+ONNX matching the exact production I/O contract.
+
+**Real A/B, localization (primary gate), same 24-capture population as
+round 45**: fail rate **33% -> 12%** (8/24 -> 3/24), **zero regressions** --
+every previously-passing capture still passes. 5/8 previously-failing
+captures fixed, including 2 of round 45's own 4 named failures
+(`4ae6d13c` 5.5%->84.1% guide overlap, `80a994ca` 22.8%->84.7%). The other
+2 named failures (`474b4d6a`, `1d186afc`) still fail, now via no-detection
+rather than a wrong-location blob -- real, substantial, safe, but not the
+0/13 target.
+
+**Real A/B, end-to-end NFIQ2 (secondary), 13 real captures that actually
+route to the U-Net in production**: mean delta **-2.46**, 3 better / 7
+worse / 3 tied, including two real double-digit regressions (`1c019820`
+-14, `eacb0b2c` -18). Both localization-fixed captures scored LOWER NFIQ2
+despite objectively better mask placement (-6, -2) -- the same NFIQ2-
+doesn't-reward-fidelity pattern layers 3/4/5 of this pass already found
+independently, now confirmed a fourth time on a genuinely different
+mechanism (a retrained detector, not a measurement-restriction flag).
+
+**Held, not swapped into production** -- real, useful progress (correctly-
+seeded dataset, a validated, safe localization improvement, a ready
+checkpoint) but doesn't cross the spec's own stated bar and costs real
+NFIQ2 on average, same standing need for a real >=500-DPI scanner
+reference as every other correctness fix in this pass. Checkpoint/ONNX
+kept local (gitignored, same convention as every other model binary this
+project produces); code (dataset fix, SageMaker launcher, ONNX exporter,
+both A/B scripts) committed and reusable. Full detail:
+`fusion_brain/results/THUMB_SEG_RETRAIN_FINDINGS.md`.
+
 ## Layer-by-layer architecture pass, layer 7 (variant selection): main.py's own fusion-selection guard measured the whole frame, not the pad -- fixed, low-risk, SHIPPED (2026-08-28, round 49)
 Seventh layer of the pass. `main.py` carries its OWN, separate fusion-
 selection sharpness guard (`_fusion_guarded`, built 2026-07-23 after real
