@@ -13,6 +13,7 @@ ml.g4dn.xlarge, per this project's own prior pricing check) -- a small
 30 minutes even with instance startup + data download overhead.
 """
 import os
+import sys
 import sagemaker
 from sagemaker.pytorch import PyTorch
 
@@ -28,13 +29,20 @@ sess = sagemaker.Session(
     default_bucket=BUCKET,
 )
 
-print('uploading dataset to S3 (this is the slow local step, ~3.3GB)...')
-s3_data = sess.upload_data(
-    path=os.path.join(HERE, 'dataset_seeded'),
-    bucket=BUCKET,
-    key_prefix=f'{PREFIX}/data',
-)
-print('uploaded to', s3_data)
+# --skip-upload reuses the dataset already uploaded by a prior run (the
+# slow local step, ~3.3GB) -- e.g. after a real container/dependency fix
+# that only touches requirements.txt/train.py, not the data itself.
+if '--skip-upload' in sys.argv:
+    s3_data = f's3://{BUCKET}/{PREFIX}/data'
+    print('reusing already-uploaded dataset at', s3_data)
+else:
+    print('uploading dataset to S3 (this is the slow local step, ~3.3GB)...')
+    s3_data = sess.upload_data(
+        path=os.path.join(HERE, 'dataset_seeded'),
+        bucket=BUCKET,
+        key_prefix=f'{PREFIX}/data',
+    )
+    print('uploaded to', s3_data)
 
 estimator = PyTorch(
     entry_point='train.py',
