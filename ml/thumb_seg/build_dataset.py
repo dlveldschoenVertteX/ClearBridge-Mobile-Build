@@ -63,6 +63,7 @@ def main() -> int:
     os.makedirs(img_dir, exist_ok=True)
     os.makedirs(mask_dir, exist_ok=True)
 
+    n_unseeded = 0
     for d in docs:
         data = d.to_dict()
         if data.get('captureMethod') not in _RELEVANT_METHODS:
@@ -72,6 +73,20 @@ def main() -> int:
         flash = [f for f in frames if f.get('flashOn') is True and f.get('path')]
         if not ambient or not flash:
             continue
+
+        # Round 45 (layer 3) real root cause: this loop used to call
+        # _segment_via_flash_diff with no seed at all, i.e. the pre-round-16
+        # frame-centre default -- the exact 555px mis-seed round 16 (2026-
+        # 08-19) found and fixed for LIVE production masking, but never
+        # regenerated this model's own training labels for. guideRegion is
+        # already written on every real front_only_v1 capture doc; reuse it
+        # exactly the way afis_print._flash_diff_mask already does (real
+        # still-space fractional coords * frame dimensions), so the labels
+        # this model trains on are seeded the same way the mask it's meant
+        # to approximate already is. Falls back to unseeded (old behaviour)
+        # only when a capture genuinely has no guideRegion, so this can only
+        # ever add correctly-seeded labels, never lose real data.
+        guide_region = data.get('guideRegion')
 
         n_pairs_this_capture = min(len(ambient), len(flash))
         for i in range(n_pairs_this_capture):
@@ -89,7 +104,19 @@ def main() -> int:
             if amb_gray is None or fl_gray is None or amb_gray.shape != fl_gray.shape:
                 continue
 
-            result = _segment_via_flash_diff(amb_gray, fl_gray, _KSIZE)
+            seed_cx = seed_cy = None
+            if isinstance(guide_region, dict):
+                try:
+                    h, w = amb_gray.shape[:2]
+                    seed_cx = float(guide_region['cx']) * w
+                    seed_cy = float(guide_region['cy']) * h
+                except (KeyError, TypeError, ValueError):
+                    seed_cx = seed_cy = None
+            if seed_cx is None:
+                n_unseeded += 1
+
+            result = _segment_via_flash_diff(amb_gray, fl_gray, _KSIZE,
+                                              seed_cx=seed_cx, seed_cy=seed_cy)
             if result is None:
                 print(f'  skip (flash-diff failed to segment): {d.id} pair {i}')
                 continue
@@ -119,6 +146,7 @@ def main() -> int:
     print(f'\ncaptures used: {captures_used}')
     print(f'flash-diff pairs successfully segmented: {pairs_built}')
     print(f'training images saved (amb+flash, both against the same mask): {frames_saved}')
+    print(f'pairs with no guideRegion (fell back to unseeded frame-centre): {n_unseeded}')
     return 0
 
 
