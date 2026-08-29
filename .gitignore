@@ -37,6 +37,7 @@ firebase-debug.log
 # project deploys via Cloud Storage, never git, same as every existing
 # *.onnx model already in the pipeline.
 ml/**/dataset/
+ml/**/dataset_*/
 ml/**/runs/
 ml/**/*.onnx
 ml/**/*.pt
