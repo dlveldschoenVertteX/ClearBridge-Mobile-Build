@@ -1,5 +1,52 @@
 # ClearBridge Mobile — persistent context
 
+## Round 50 follow-up: real matchability test on the seeded-label U-Net found a real false-match risk -- recommendation strengthened from "held" to "do not pursue without a real fix" (2026-08-29, round 51)
+Direct CTO ask, same session as round 50: test matchability (SourceAFIS),
+not just NFIQ2, before treating the retrain as promising. Used two real
+genuine cross-session pairs that exist inside the 13-capture unet-routed
+population itself (same `userId`, two real captures each): `4ae6d13c` x
+`5363a49b` (one of round 50's own localization-fixed captures) and
+`1d186afc` x `b615f37b` (`1d186afc` is one of the two still-failing
+captures). Rendered each capture's best-of-variant-pool print (not just
+`native` -- round 50's own NFIQ2 secondary check had understated the real
+achievable quality per capture, caught directly by the CTO asking why one
+capture's best print looked worse than an unrelated one sent earlier;
+re-verified: `80a994ca` reaches real NFIQ2 78 via `deepFuse` once the
+correctly-located mask feeds the full variant pool, not just 32 via
+`native` alone) under old vs new model, scored genuine pairs and an 8-real-
+capture impostor pool via SourceAFIS.
+
+**Genuine matching: no real gain, both pairs stay in the noise floor.**
+`4ae6d13c`x`5363a49b`: 0.62 -> 0.71. `1d186afc`x`b615f37b`: 0.00 -> 9.74 (a
+real increase, but nowhere near SourceAFIS's own ~40 "reliable match"
+threshold either way).
+
+**The real finding is a false-match risk, not a genuine-match gain.**
+`b615f37b`'s impostor max jumped **2.14 -> 71.55** -- nearly 2x
+SourceAFIS's own recommended threshold -- against one specific real
+impostor (`01662ffb`). Isolated to that single pairing and visually
+confirmed: these are two clearly different real fingers (different core/
+delta placement, different overall pattern), yet the new model's rendering
+of `b615f37b` scores as a strong match against an unrelated real identity.
+`b615f37b` was not even one of the localization-fixed captures -- its mask
+was already correctly accepted under both models -- but swapping the U-Net
+changed which variant wins selection for it (`fuseMaxc`@74 old ->
+`freqNorm`@60 new), and that different print carries real cross-identity
+risk. The other two test captures' impostor risk moved only mildly
+(2.26->3.51, 2.56->3.85).
+
+**Recommendation strengthened**: round 50 held this on a net-negative
+NFIQ2 result alone, which left the door open to "worth it once a better
+reference exists." This round's finding is a stronger, independent reason
+to hold: a biometric identity system trading a real mis-location fix for
+even one demonstrated real cross-identity false-match risk is the wrong
+trade regardless of what NFIQ2 or a better scanner reference would show.
+Needs a real fix (more/better training data, a different loss term, or at
+minimum evaluating a much wider set of genuine/impostor pairs to know how
+common this specific failure mode is) before being reconsidered at all --
+not just a stronger ground-truth reference. Full detail appended to
+`fusion_brain/results/THUMB_SEG_RETRAIN_FINDINGS.md`.
+
 ## Layer 3 follow-up: U-Net retrained on correctly-seeded flash-diff labels -- real, safe localization win, held on real net-negative NFIQ2 (2026-08-29, round 50)
 Executed round 45's own named root-cause fix: `ml/thumb_seg/build_dataset.py`
 generated this model's training labels via unseeded (pre-round-16)

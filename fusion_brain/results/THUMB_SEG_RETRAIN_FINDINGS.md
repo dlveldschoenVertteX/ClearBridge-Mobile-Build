@@ -81,7 +81,52 @@ pattern layers 3/4/5 of this architecture pass already found independently,
 now confirmed a fourth time on a genuinely different mechanism (a retrained
 detector, not a measurement-restriction flag).
 
-## Decision: HOLD, do not swap into production yet
+## Real A/B test 3: matchability (SourceAFIS, not NFIQ2) -- found a real false-match risk
+
+CTO asked directly to test matchability rather than trust NFIQ2 alone, per
+this project's own standing prime directive. Two real genuine cross-session
+pairs exist inside the 13-capture unet-routed population itself (same
+`userId`, two real captures each): `4ae6d13c` x `5363a49b` (one of the
+localization-fixed captures) and `1d186afc` x `b615f37b` (`1d186afc` is one
+of the two still-failing captures). Rendered each capture's best-of-
+variant-pool print under old/new, scored genuine pairs and an 8-capture
+real impostor pool via SourceAFIS.
+
+**Genuine scores stay in the noise floor either way** -- neither pair gets
+close to SourceAFIS's own ~40 "reliable match" guidance, old or new
+(`4ae6d13c`x`5363a49b`: 0.62 -> 0.71; `1d186afc`x`b615f37b`: 0.00 -> 9.74,
+a real increase but still far below a genuine match).
+
+**The real finding is a false-match risk, not a genuine-match gain.**
+`b615f37b`'s impostor max jumped **2.14 -> 71.55** -- nearly 2x SourceAFIS's
+own recommended threshold -- against ONE specific real impostor
+(`01662ffb`). Isolated and visually confirmed: these are two clearly
+different real fingers (different core/delta placement, different overall
+pattern), yet the new model's rendering of `b615f37b` scores as a strong
+match against an unrelated identity. `b615f37b` was not even one of the
+localization-fixed captures -- its mask was already correctly accepted
+under both models -- but swapping the U-Net changed which variant wins
+selection for it (`fuseMaxc`@74 old -> `freqNorm`@60 new), and that
+different print carries real cross-identity false-match risk. The other
+two test captures' impostor risk moved only mildly (2.26->3.51, 2.56->3.85,
+both still low).
+
+Same 4 captures' full-variant-pool NFIQ2 (a partial correction to test 2
+above, which only used the plain `native` variant): `4ae6d13c` 67->64,
+`5363a49b` 67->79, `1d186afc` 68->68, `b615f37b` 74->60 -- confirms test 2's
+own native-only numbers understated what's achievable per capture, but
+doesn't change the verdict below.
+
+## Decision: HOLD, do not move toward production -- a real false-match risk, not just a quality-metric wash
+
+The false-match finding is more serious than the NFIQ2 result alone would
+have suggested, and on its own is sufficient reason not to move this
+checkpoint toward production: a biometric identity system trading a
+mis-location fix for even one real cross-identity false-match risk is the
+wrong trade, independent of whether NFIQ2 nets positive or negative. This
+needs a real fix (more training data, a different loss, or evaluating a
+wider set of genuine/impostor pairs to know how common this is) before
+being reconsidered, not just a stronger scanner reference.
 
 Per the spec's own stated bar ("if it's 0/13... conditionally shippable" --
 we got 2/4 named, 5/8 overall) and the real net-negative NFIQ2 result, this
