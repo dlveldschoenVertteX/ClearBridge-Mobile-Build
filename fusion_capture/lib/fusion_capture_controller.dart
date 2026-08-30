@@ -731,6 +731,8 @@ class FusionCaptureController extends ChangeNotifier {
 
   Map<String, Map<String, dynamic>>? _cameraLensInfo;
   Map<String, bool>? _rawSensorSupport;
+  Future<Map<String, Map<String, dynamic>>?>? _cameraLensInfoFuture;
+  Future<Map<String, bool>?>? _rawSensorSupportFuture;
   /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
   /// WAITING but does not cancel the work behind the future -- without this
   /// an abandoned station loop keeps driving takePicture() while the NEXT
@@ -835,6 +837,19 @@ class FusionCaptureController extends ChangeNotifier {
     });
 
     try {
+      // Kicked off in parallel with camera init, NOT awaited here. Real bug
+      // found 2026-08-30 (CTO report: "lag when the capture process
+      // starts"): these two read-only CameraCharacteristics queries (each
+      // a full MethodChannel round-trip that internally loops all 4
+      // cameras on the device) were previously awaited sequentially,
+      // directly between camera-open and the front phase's hold beginning
+      // -- yet neither value is consumed until _finishAndUpload() writes
+      // the doc, minutes later. Starting them here and only awaiting the
+      // futures at the point of actual use lets them resolve for free
+      // during the front-phase hold/burst instead of blocking it.
+      _cameraLensInfoFuture = _queryCameraLensInfo();
+      _rawSensorSupportFuture = _queryRawSensorSupport();
+
       await _cameraService.initializeCamera();
       final cam = _camera;
       if (cam == null) {
@@ -845,13 +860,6 @@ class FusionCaptureController extends ChangeNotifier {
       if (pv != null) _previewSize = Size(pv.width, pv.height);
       _sensorOrientation = cam.description.sensorOrientation;
       _flash = AdaptiveFlashController(cam);
-      // Queried once, sequentially, right here -- not raced against any
-      // other call site -- so the static per-process cache in
-      // _queryCameraLensInfo/_queryRawSensorSupport can never be read
-      // while still mid-flight. Real hardware constants for this device,
-      // safe to await now and reuse at upload time.
-      _cameraLensInfo = await _queryCameraLensInfo();
-      _rawSensorSupport = await _queryRawSensorSupport();
       final mainRegion = _guideRegionFor(PadSilhouetteShape.defaultShape);
       if (mainRegion != null) {
         _guideRegions['main'] = mainRegion;
@@ -2121,6 +2129,17 @@ class FusionCaptureController extends ChangeNotifier {
         ));
     try {
       await _cameraService.disposeCamera();
+    } catch (_) {}
+
+    // Started back in start(), run in the background the whole session --
+    // by now (all phases already ran) these have almost certainly long
+    // since resolved, so this await is effectively free. See the comment
+    // at the start() call site for why these aren't awaited any earlier.
+    try {
+      _cameraLensInfo = await _cameraLensInfoFuture;
+    } catch (_) {}
+    try {
+      _rawSensorSupport = await _rawSensorSupportFuture;
     } catch (_) {}
 
     // REAL DEVICE FEEDBACK (2026-08-22): decode/encode used to run at the
