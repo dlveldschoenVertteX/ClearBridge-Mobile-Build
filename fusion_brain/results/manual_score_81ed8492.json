@@ -28,27 +28,27 @@
   "guide"
  ],
  "sweep_left": [
-  60.0,
-  "guide"
+  41.0,
+  "guide+flashdiff"
  ],
  "sweep_center": [
-  43.0,
-  "guide"
+  49.0,
+  "guide+flashdiff"
  ],
  "sweep_right": [
-  65.0,
-  "guide"
+  42.0,
+  "guide+flashdiff"
  ],
  "tilt_left": [
-  52.0,
-  "guide"
+  57.0,
+  "guide+flashdiff"
  ],
  "tilt_tip": [
-  64.0,
-  "guide"
+  39.0,
+  "guide+flashdiff"
  ],
  "tilt_right": [
-  63.0,
-  "guide"
+  52.0,
+  "guide+flashdiff"
  ]
 }
