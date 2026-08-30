@@ -1,5 +1,57 @@
 # ClearBridge Mobile — persistent context
 
+## fusion_capture round: capture-start lag fixed; macro flash-diff self-skip traced to underexposure, not blowout (2026-08-30)
+Real fusion_v1 test capture (`81ed8492`), manually scored offline (production
+trigger is off for this experimental mode). CTO reported both a real lag at
+capture start and background contamination in the superprint I first sent.
+
+**Capture-start lag, real and fixed.** `FusionCaptureController.start()`
+awaited two read-only camera-capability queries
+(`getCameraLensInfo`/`getRawSensorSupport`, each looping all 4 cameras via a
+full MethodChannel round-trip) sequentially, directly between camera-open
+and the front phase's hold beginning — despite neither value being consumed
+until `_finishAndUpload()` writes the Firestore doc, minutes later. Now
+kicked off as background futures in parallel with camera init and only
+awaited at their actual point of use, removing two avoidable native
+round-trips from the user-visible time-to-first-hold-frame. Client-only,
+pushed, not yet device-tested.
+
+**Background contamination: real, but the cause was my own test script, not
+a pipeline regression.** The first superprint I sent (`sweep_right`, NFIQ2
+65) rendered with `afisMask: "guide"` — zero content-aware refinement —
+because my manual-scoring harness never passed the sweep/tilt/macro zones'
+single ambient/flash pair as `ambient_burst`/`flash_burst`
+(`_flash_diff_mask` reads those specific params, not `ambient_frames`/
+`flash_frames`), so flash-diff never got a chance to engage on those
+candidates. Fixed the harness and re-scored: every sweep/tilt candidate now
+correctly resolves to `guide+flashdiff`, background properly excluded.
+Expected, already-documented side effect: NFIQ2 DROPPED on every
+newly-refined zone (sweep_right 65→42, tilt_tip 64→39) — the same
+NFIQ2-rewards-raw-area-not-correctness pattern this project has found
+repeatedly (round 45 et al.), not a quality regression. New honest best
+candidate: front freqNorm, NFIQ2 60, `guide+flashdiff`.
+
+**Macro still self-skips flash-diff — root cause found, not a bug.**
+`_flash_diff_mask`'s blowout guard (`_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0`)
+skipped the macro flash frame at Laplacian variance 49.17 — a ~2% miss.
+Checked the actual pixel content rather than assuming blowout: this frame
+is NOT saturated (0.04% of pixels clipped white) — it's **underexposed**
+(mean 51.5/255, 14.2% of pixels near-black). Both overexposure and
+underexposure genuinely destroy the local gradient the torch-falloff cue
+needs, and the guard's variance check correctly catches either direction
+even though its docstring only describes the blowout case. This is a new,
+previously undocumented failure direction for the macro path: round 34's
+`-1.0` EV pulldown before the macro flash shot was built specifically to
+prevent OVEREXPOSURE at close macro range; this capture shows the same path
+can also land underexposed instead. Macro only ever fires one ambient/flash
+pair (no burst fallback), so one weak frame is enough to sink that
+candidate's masking entirely, falling through to bare `guide`. **Not
+actioned** — n=1, borderline miss, same "don't retune a threshold off one
+data point" discipline as everywhere else in this project. Worth watching
+on future macro captures; if it recurs, the EV pulldown (not the guard
+threshold) is the more likely correct lever, since it's the value actually
+targeting macro-range exposure.
+
 ## Round 50 follow-up: real matchability test on the seeded-label U-Net found a real false-match risk -- recommendation strengthened from "held" to "do not pursue without a real fix" (2026-08-29, round 51)
 Direct CTO ask, same session as round 50: test matchability (SourceAFIS),
 not just NFIQ2, before treating the retrain as promising. Used two real
