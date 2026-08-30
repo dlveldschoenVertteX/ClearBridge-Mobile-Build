@@ -82,8 +82,10 @@ macro_guide = dict(cx=0.66, cy=0.50, rx=0.13, ry=0.11, tipAngleDeg=0.0)
 macro = {f['tag']: fetch(f['path']) for f in d.get('macroShots', [])}
 m_amb = macro.get('macro_amb_0'); m_fl = macro.get('macro_fl_0')
 if m_amb is not None:
+    fl_list = [m_fl] if m_fl is not None else [m_amb]
     img, p = afis_print.generate([m_amb], [0.0], ['ambient'], guide_region=macro_guide,
-                                  ambient_frames=[m_amb], flash_frames=[m_fl] if m_fl is not None else [m_amb],
+                                  ambient_frames=[m_amb], flash_frames=fl_list,
+                                  ambient_burst=[m_amb], flash_burst=fl_list,
                                   stack_cache={})
     s = nfiq2(img)
     print("  native  nfiq2=%s mask=%s" % (s, p.get('afisMask')))
@@ -98,8 +100,11 @@ for zone, gkey in (('left', 'sweep_left'), ('center', 'sweep_center'), ('right',
     za = sweep.get('sweep_%s_amb' % zone)
     g = fgr.get(gkey)
     if za is None or g is None: continue
+    zf = sweep.get('sweep_%s_fl' % zone)
+    fl_list = [zf] if zf is not None else [za]
     img, p = afis_print.generate([za], [0.0], ['ambient'], guide_region=g,
-                                  ambient_frames=[za], flash_frames=[sweep.get('sweep_%s_fl' % zone)] if sweep.get('sweep_%s_fl' % zone) is not None else [za],
+                                  ambient_frames=[za], flash_frames=fl_list,
+                                  ambient_burst=[za], flash_burst=fl_list,
                                   stack_cache={})
     s = nfiq2(img)
     print("  %-8s nfiq2=%s mask=%s" % (zone, s, p.get('afisMask')))
@@ -113,8 +118,11 @@ main_g = fgr.get('main', guide)
 for zone in ('left', 'tip', 'right'):
     ta = tilt.get('tilt_%s_amb' % zone)
     if ta is None: continue
+    tf = tilt.get('tilt_%s_fl' % zone)
+    fl_list = [tf] if tf is not None else [ta]
     img, p = afis_print.generate([ta], [0.0], ['ambient'], guide_region=main_g,
-                                  ambient_frames=[ta], flash_frames=[tilt.get('tilt_%s_fl' % zone)] if tilt.get('tilt_%s_fl' % zone) is not None else [ta],
+                                  ambient_frames=[ta], flash_frames=fl_list,
+                                  ambient_burst=[ta], flash_burst=fl_list,
                                   stack_cache={})
     s = nfiq2(img)
     print("  %-8s nfiq2=%s mask=%s" % (zone, s, p.get('afisMask')))
