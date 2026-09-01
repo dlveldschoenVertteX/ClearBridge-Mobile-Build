@@ -1,5 +1,89 @@
 # ClearBridge Mobile — persistent context
 
+## IDEA, SAVED NOT BUILT: color/chrominance as an additional thumb-vs-background segmentation lever (2026-08-31)
+CTO proposal, explicitly asked to be saved for a future revisit rather than
+built now — priority right now is masking RELIABILITY (see entry below),
+not adding a new lever on top of an already-imperfect mask.
+
+**The premise, confirmed in code first, not assumed**: color is discarded
+on the CLIENT, before upload, not just before masking on the backend.
+`decodeStillJpegToLuma` (`packages/mac_capture/lib/src/
+still_jpeg_downscaler.dart`, used by every capture path in this project --
+front_capture_controller, fusion_capture_controller, arc_sweep) decodes the
+real color JPEG, converts to single-channel luma via a BT.601 weighted sum
+(`77*R + 150*G + 29*B`), and only the luma bytes get re-encoded and
+uploaded. The backend's `cv2.imdecode(..., IMREAD_COLOR)` calls always
+return a 3-channel array, but R=G=B in every pixel -- there is no real
+chrominance anywhere past the moment of capture, confirmed by reading the
+actual decode function, not inferred.
+
+**The idea**: upload real color (not luma-only) and use skin chrominance
+(YCbCr/HSV-style skin thresholding) as an additional, genuinely orthogonal
+segmentation cue alongside flash-diff's illumination-falloff mechanism and
+the U-Net. A real, different signal axis, not a duplicate of what already
+exists.
+
+**Real considerations flagged before building, for whoever picks this up**:
+- This project has already tried several "extra segmentation/pre-pass"
+  ideas (pyfing, NNS, coherence-diffusion, masked ECC, pad-only correlation
+  gate) -- every one either didn't help or measurably hurt real
+  matchability once tested. A plausible-sounding new lever still needs a
+  real A/B, not just intuition, before being trusted.
+- Real risk specific to color: this project has already documented capture
+  sessions with strong color casts that would directly confuse a naive
+  skin-color classifier -- a red ambient-light cast, and worse, direct
+  sunlight TRANSILLUMINATING the fingertip (making the whole pad read
+  bright monochromatic red from within, not from surface reflection). A
+  chrominance-based classifier is exactly the mechanism most exposed to
+  that already-observed failure mode.
+- Real cost: requires a client-side capture change (color JPEGs instead of
+  luma-only), which multiplies per-frame upload size -- this project has
+  hit real "looks hung" upload-time bugs before from oversized frames
+  (round 21's raw-bytes-no-decode bug).
+- Real scope limit: color could only ever improve the MASK. The Gabor
+  enhancement/binarization chain stays grayscale-based regardless, so this
+  targets "is background excluded," not ridge continuity/enhancement
+  quality directly -- those are the CTO's own established separate axes
+  (round 45: content-aware masking correctness and print quality don't
+  move together).
+
+**Not actioned.** Revisit once mask reliability (see below) is solid and/or
+once there's a concrete real failure case where flash-diff/U-Net both miss
+and a chrominance-based fallback plausibly would have caught it.
+
+## Standing priority, restated by the CTO directly (2026-08-31): the mask must be impeccable before enhancement work continues
+Direct CTO framing: "my main concern is the mask needs to be impeccable and
+always find only the thumbprint, this is the only way I can ensure I build
+for enhancement in the correct way." This reprioritizes ongoing work --
+masking CORRECTNESS/RELIABILITY (does the mask reliably find only the pad,
+every capture, every zone, every camera) is the blocking prerequisite for
+any further enhancement-quality (ridge continuity) work, not a parallel
+concern. Consistent with round 45's own finding that masking correctness
+and print quality are separate axes -- but the CTO's direction makes clear
+masking reliability is the one to lock down FIRST, since unreliable/
+inconsistent masking makes it impossible to attribute an enhancement
+change's effect correctly (can't tell if a print got better/worse from the
+enhancement tweak or from a differently-behaving mask underneath it).
+
+Real, current known gaps in mask reliability, from this same session's
+work, worth prioritizing over new enhancement ideas: macro's flash-diff
+self-skip on borderline over/under-exposed flash frames (round above, one
+real capture, `_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0` guard); the seeded-
+label U-Net retrain's real false-match risk (round 51, held); U-Net's
+remaining real mis-location failures even post-retrain (round 50: 3/24
+still fail, 2 via no-detection at all).
+
+## New test device incoming: Samsung A55 (2026-08-31)
+CTO's real device arrives tomorrow. Real, concrete opportunity once it
+does: `cameraLensInfo`/`rawSensorSupport` (already wired, `fusion_capture`'s
+`getCameraLensInfo`/`getRawSensorSupport` MethodChannel, see round 40's own
+real 4-camera table for the CTO's current device) gives a full real-camera-
+hardware readout from a single capture -- worth pulling immediately on the
+first A55 capture to know whether this device's cameras differ meaningfully
+(sensor size, focal length, real macro-lens minFocusDistance) from the
+current test device before drawing conclusions from A55 data that assume
+the same hardware.
+
 ## fusion_capture round: capture-start lag fixed; macro flash-diff self-skip traced to underexposure, not blowout (2026-08-30)
 Real fusion_v1 test capture (`81ed8492`), manually scored offline (production
 trigger is off for this experimental mode). CTO reported both a real lag at
