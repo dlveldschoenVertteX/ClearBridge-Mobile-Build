@@ -12,7 +12,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, '..', 'functions', 'processEnhanceAndScore'))
 import afis_print  # noqa: E402
 
-CID = '73c86c41-d432-41a6-a026-2ced715f6f12'
+CID = '73c86c41-447e-4dc3-91d1-f055114096e9'
 CACHE = os.path.join(HERE, 'results', 'cache', '73c86c41')
 IMGDIR = '/tmp/73c86c41_imgs'
 os.makedirs(IMGDIR, exist_ok=True)
