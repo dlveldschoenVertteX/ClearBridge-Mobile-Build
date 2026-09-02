@@ -1,5 +1,56 @@
 # ClearBridge Mobile — persistent context
 
+## Masking-guard audit's own flagged next step, completed: the exposure guard is correctly calibrated -- no mask fix needed, the 4 sampled captures are just genuinely soft (2026-09-02)
+Direct follow-up, completing the "real next step" the masking-reliability
+audit (below) left open: determine whether the 4 real guard-failing
+front_only_v1 captures (`181e8cd8`, `4ae6d13c`, `474b4d6a`, `c4dd4b24`) trip
+`_FLASH_DIFF_MIN_FLASH_LAPLACIAN` because the flash frame is over-exposed
+(the guard's own docstring assumption) or under-exposed (the direction
+already confirmed for macro) -- before touching either candidate lever.
+
+**Real pixel measurement on all 16 real ambient/flash pairs across the 4
+captures: neither.** Clipped-white fraction is ~0.000% in every single
+pair (max 0.039%) -- zero evidence of blowout anywhere. Mean brightness
+(88-144/255) and clipped-black fraction (also ~0%) rule out the macro
+precedent's dramatic underexposure (mean 51.5, 14.2% near-black) too. These
+flash frames are neither blown out nor dark -- they are simply
+low-local-contrast at an otherwise normal brightness, a condition the
+guard's own docstring never anticipated.
+
+**Checked whether the threshold itself is miscalibrated before touching
+it, per this project's own standing discipline** -- pulled 8 real captures
+that DID pass the guard (`afisMask: guide+flashdiff`) and measured the
+actual passing pair's `flash_lap`. **Real, clean, wide separation**: every
+passing pair measured **142.8-888.9**; every one of the 16 failing pairs
+measured **6.9-37.4**. A real empirical gap of over 100 points with zero
+observed data on either side of the 50.0 threshold -- it is not clipping
+into legitimate content, and lowering it would not have helped any of
+these 4 captures reach it (the closest failing value, 37.4, is still 3.8x
+below the lowest real passing value).
+
+**Conclusion: the guard is doing its job correctly.** The 4 sampled
+captures are genuinely, substantially softer than every real passing
+example (4-10x lower Laplacian variance) -- not a masking-code defect, not
+a miscalibrated threshold, and not fixable by adjusting exposure/EV (there
+is no exposure problem to fix). In 3 of 4 captures the AMBIENT frame is
+similarly low (7.9-23.2), meaning the whole burst was soft, not just the
+flash half -- consistent with a general capture-quality issue (the kind
+the separate focus-lock-to-shutter-gate work targets) rather than anything
+masking-specific. Falling back to bare `guide` on these 4 captures is the
+correct, safe behavior, not a bug to route around.
+
+**Resolves the audit's own open decision point with a real answer: neither
+candidate lever (relax the guard vs. fix the exposure that trips it) is
+warranted.** No code change made -- a real "no fix needed" finding, not a
+gap left unaddressed. One real methodology caveat recorded rather than
+glossed over: one of the 8 passing-sample captures (`2a85bb36`, recorded
+`afisMask: guide+flashdiff`) showed all 4 of its own pairs BELOW the guard
+under this same replay (23.0-32.5) -- most likely this test harness's
+simple ambient/flash zip-by-storage-order doesn't exactly reproduce
+production's real pairing, not a sign the guard behaves differently live;
+flagged for whoever next needs exact pair-order fidelity, not investigated
+further since it doesn't change the 7-of-8 result above.
+
 ## Real device test found the tested APK predated both new features, PLUS a genuine tilt-reference gyro bug fixed along the way (2026-09-02)
 CTO tested a fresh capture and reported: "Macro still did not focus on
 thumb ridges"; "Gyro did not calibrate correctly during sweep, I was
