@@ -54,6 +54,11 @@ class MainActivity : FlutterActivity() {
                     } catch (e: Exception) {
                         result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
                     }
+                    "getPhysicalCameraIds" -> try {
+                        result.success(physicalCameraIdsByCameraId())
+                    } catch (e: Exception) {
+                        result.error("CAMERA_CAPABILITIES_ERROR", e.message, null)
+                    }
                     else -> result.notImplemented()
                 }
             }
@@ -130,6 +135,39 @@ class MainActivity : FlutterActivity() {
                 "hasOpticalStabilization" to hasOis,
                 "afAvailableModes" to afModeNames,
             )
+        }
+        return info
+    }
+
+    // Real, direct test of the CTO's "3 physical rear cameras, camera 1
+    // must be the macro by elimination" hypothesis (2026-09-02) -- the
+    // decisive counter-evidence so far is photographic (camera "1"'s own
+    // captured frame is unambiguously a selfie), but `cameraManager
+    // .cameraIdList` only enumerates LOGICAL/top-level camera ids, which
+    // on many Samsung devices does not include every physical rear lens
+    // separately. A macro sensor grouped under a logical multi-camera id
+    // (API 28+, `CameraCharacteristics.getPhysicalCameraIds()`) would
+    // never show up as its own top-level id at all -- exactly the shape
+    // that would explain camera "0" being the only id whose
+    // `afAvailableModes` advertises MACRO: id "0" may be the logical
+    // camera that internally owns a hidden physical macro sensor. This
+    // answers that directly instead of inferring it from AF-mode lists.
+    private fun physicalCameraIdsByCameraId(): Map<String, List<String>> {
+        val cameraManager = applicationContext
+            .getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        val info = mutableMapOf<String, List<String>>()
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.P) {
+            // getPhysicalCameraIds() is API 28+; below that, report an
+            // empty list per id rather than crash -- absence of physical
+            // sub-ids is meaningful data only when we can actually query
+            // it. No known device in this project's fleet is this old,
+            // but there is no reason to hard-fail if one ever is.
+            for (id in cameraManager.cameraIdList) info[id] = emptyList()
+            return info
+        }
+        for (id in cameraManager.cameraIdList) {
+            val chars = cameraManager.getCameraCharacteristics(id)
+            info[id] = chars.physicalCameraIds.toList()
         }
         return info
     }

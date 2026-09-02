@@ -842,6 +842,32 @@ class FusionCaptureController extends ChangeNotifier {
     return _rawSensorSupportCache;
   }
 
+  // Real, direct test (2026-09-02) of whether a physical macro sensor is
+  // hiding as a physical sub-camera under a logical multi-camera id (see
+  // MainActivity.kt's own `physicalCameraIdsByCameraId` docs) rather than
+  // being exposed as its own top-level id -- the concrete mechanism that
+  // would explain a device having 3 real rear lenses while
+  // `cameraManager.cameraIdList` only ever shows 2 rear top-level ids.
+  static Map<String, List<String>>? _physicalCameraIdsCache;
+  static bool _physicalCameraIdsQueried = false;
+
+  static Future<Map<String, List<String>>?> _queryPhysicalCameraIds() async {
+    if (_physicalCameraIdsQueried) return _physicalCameraIdsCache;
+    _physicalCameraIdsQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getPhysicalCameraIds');
+      if (result != null) {
+        _physicalCameraIdsCache = result.map(
+          (k, v) => MapEntry(k, (v as List).map((e) => e as String).toList()),
+        );
+      }
+    } catch (e) {
+      debugPrint('[fusion] physical-camera-ids query failed (non-fatal): $e');
+    }
+    return _physicalCameraIdsCache;
+  }
+
   // ---- pre-shutter countdown (real device feedback, 2026-08-22): every
   // station/burst previously fired the instant positioning finished, with
   // no final beat for the user to settle -- "it just fires without me
@@ -927,8 +953,10 @@ class FusionCaptureController extends ChangeNotifier {
 
   Map<String, Map<String, dynamic>>? _cameraLensInfo;
   Map<String, bool>? _rawSensorSupport;
+  Map<String, List<String>>? _physicalCameraIds;
   Future<Map<String, Map<String, dynamic>>?>? _cameraLensInfoFuture;
   Future<Map<String, bool>?>? _rawSensorSupportFuture;
+  Future<Map<String, List<String>>?>? _physicalCameraIdsFuture;
   /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
   /// WAITING but does not cancel the work behind the future -- without this
   /// an abandoned station loop keeps driving takePicture() while the NEXT
@@ -1050,6 +1078,7 @@ class FusionCaptureController extends ChangeNotifier {
       // during the front-phase hold/burst instead of blocking it.
       _cameraLensInfoFuture = _queryCameraLensInfo();
       _rawSensorSupportFuture = _queryRawSensorSupport();
+      _physicalCameraIdsFuture = _queryPhysicalCameraIds();
 
       await _cameraService.initializeCamera();
       final cam = _camera;
@@ -2716,6 +2745,9 @@ class FusionCaptureController extends ChangeNotifier {
     try {
       _rawSensorSupport = await _rawSensorSupportFuture;
     } catch (_) {}
+    try {
+      _physicalCameraIds = await _physicalCameraIdsFuture;
+    } catch (_) {}
 
     // REAL DEVICE FEEDBACK (2026-08-22): decode/encode used to run at the
     // end of EACH phase (see the phase methods' own "Decode/encode is
@@ -3019,6 +3051,7 @@ class FusionCaptureController extends ChangeNotifier {
         'fusionGuideRegions': _guideRegions,
         if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
         if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,
+        if (_physicalCameraIds != null) 'physicalCameraIds': _physicalCameraIds,
         'padClipDebug': {
           'lastPadClipFrac': _lastPadClipFrac,
           'maxPadClipFracSeen': _maxPadClipFracSeen,
