@@ -538,7 +538,9 @@ class FusionCaptureController extends ChangeNotifier {
     if (focalLengthMm == null) return null;
     const calibrations = <List<double>>[
       [2.37, 0.34], // original test device, rounds 31-34
-      [1.74, 0.45], // Samsung A55, 2026-09-02, n=1 visual measurement
+      [1.74, 0.46], // Samsung A55, refined 2026-09-02 against the CTO's own
+      // direct annotation of where the real print sits (must match
+      // main.py's own _CAM2_CALIBRATION cy exactly)
     ];
     for (final c in calibrations) {
       if ((focalLengthMm - c[0]).abs() <= 0.05) return c[1];

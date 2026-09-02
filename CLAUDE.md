@@ -46,15 +46,20 @@ own reported focal length (a stable hardware signature, matched with a
 - old test device (2.37mm): `cx=0.66, cy=0.50, rx=0.13, ry=0.11` (rounds
   31-34's own real values, byte-identical — zero behavior change for this
   device)
-- A55 (1.74mm): `cx=0.54, cy=0.45, rx=0.14, ry=0.07` — real, visually
-  measured off this capture's own raw macro frame (grid-overlay technique,
-  same discipline as round 31's original old-device measurement).
-  Re-rendered with the corrected crop and visually confirmed: the box now
-  covers ~75-80% real pad content, not ~30% — a large, real, honest
-  improvement, though not pixel-perfect (still a small background sliver
-  at the right edge, accepted per this project's own standing "generous
-  margin costs less than clipping real pad content" philosophy rather than
-  further hand-tuning a single blurry n=1 photo).
+- A55 (1.74mm): `cx=0.61, cy=0.46, rx=0.11, ry=0.12` — refined twice, same
+  session. First pass (`cx=0.54, cy=0.45, rx=0.14, ry=0.07`) was my own
+  grid-overlay visual estimate off the raw frame, same discipline as round
+  31's original old-device measurement — real improvement (box went from
+  ~30% pad content to ~75-80%) but still undershot toward the tip per
+  direct CTO feedback: sent the rendered overlay, CTO annotated a photo
+  showing exactly where the real print sits, which turned out to be my own
+  overlay image auto-rotated 90° CCW by their photo viewer (confirmed by
+  reproducing that exact rotation locally and matching it pixel-for-pixel
+  against their background/pose). Mapped their annotated region back
+  through that rotation to landscape still-space, re-rendered with the
+  corrected numbers, and visually confirmed the box now tightly wraps the
+  actual rounded pad — a real, CTO-verified correction, not my own
+  estimate alone.
 - any OTHER device's camera "2" (focal length matching neither entry):
   falls back to the existing ratio-derived formula (the same mechanism
   camera "3" already uses) instead of silently reusing a wrong device's
