@@ -1,5 +1,62 @@
 # ClearBridge Mobile — persistent context
 
+## Focus-lock-to-shutter softness gap found on 2 of 4 real masking-guard-failure captures -- real, not yet actioned, needs a product call (2026-09-02)
+Direct follow-up to the exposure-guard audit below ("yes go there next" --
+does the live focus signal at hold-complete actually predict the
+sharpness of the frames that get delivered). Pulled the real
+`captureTelemetry` docs (per-hold `liveAbsSharpness` samples timestamped
+against `refocusLocked`/`holdComplete`/`shotFired` checkpoints, built
+specifically for this question) for the 4 real captures already flagged
+by the exposure-guard audit as guard-failing.
+
+**Real, mixed result across the 4 -- two different failure mechanisms,
+not one.** `4ae6d13c`: live signal was already low (28-30) at BOTH
+`refocusLocked` and `holdComplete` -- a genuine poor-AF-convergence case
+(the lens itself never found a sharp lock), correctly caught by the guard
+downstream. `c4dd4b24`: no `captureTelemetry` doc exists for this capture
+(404) -- can't be assessed either way.
+
+**`474b4d6a` is the real, concerning case.** Live signal reads healthy and
+STABLE the whole hold: 106.58 at `refocusLocked`, 103.69 at
+`holdComplete` (1.5s later) -- a clean, converged lock that never drifts.
+But the backend-measured delivered still frames from this same capture's
+burst scored only Laplacian **12-23** -- a 5-9x gap. Checked against
+`181e8cd8` (a non-guard-failing capture) as a baseline for how much
+live-vs-still domain scaling alone should explain: that capture's own
+live-to-still ratio is a much milder ~2.6x. `474b4d6a`'s 5-9x gap is not
+explained by the same normal domain-scaling factor.
+
+**Mechanism, reasoned not guessed**: focus is locked (`FocusMode.locked`)
+immediately once `_refocus()` converges, BEFORE the hold-duration wait
+even begins -- so by the time the burst fires, AF has been sitting fixed
+on one focal plane for the whole hold. Active AF-hunting during the burst
+itself is therefore not the likely explanation (there's nothing left to
+hunt -- the lens is locked). The more plausible mechanism is the thumb
+itself moving slightly relative to that now-fixed focal plane during the
+hold+burst window -- a real, physically plausible failure mode gyro
+telemetry cannot see (gyro measures phone motion, not thumb-to-lens
+distance), and one the current live-sharpness signal also can't see,
+since it's only ever sampled up to `holdComplete`, not through the burst
+itself.
+
+**Not actioned -- this is a real architectural trade-off, not a one-line
+fix.** Locking focus early exists specifically to prevent AF-hunting
+during the burst; the candidate fixes are: (a) shorten the lock-to-shutter
+window (fire the burst sooner after lock, giving the thumb less time to
+drift) -- lower risk, but doesn't address a thumb that moves during the
+now-shorter window; or (b) keep AF continuously active later into the
+sequence (re-verify/re-lock closer to shutter, or extend live-sharpness
+sampling through the burst itself as a real post-hoc quality signal) --
+more thorough, but reintroduces some AF-hunting risk right before the
+shot, the exact risk early-locking was built to avoid. **n=1 real
+confirmed case (474b4d6a), n=1 inconclusive (c4dd4b24, no telemetry)** --
+same standing "don't act on a single data point" discipline as everywhere
+else in this project; the honest next step is watching whether this
+recurs on the next several real captures with `captureTelemetry` data
+before picking a fix, not committing to (a) or (b) off one case. Recorded
+here rather than acted on, pending explicit product direction on which
+trade-off to take.
+
 ## Real audit: 34% of ALL real front_only_v1 captures ship with zero content-aware masking -- the exposure guard is the dominant, cross-architecture cause (2026-09-02)
 Direct follow-up to the CTO's masking-correlation question above ("why
 doesn't the backend mask match the on-screen guide") and the standing
