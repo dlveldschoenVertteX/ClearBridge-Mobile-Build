@@ -1,5 +1,62 @@
 # ClearBridge Mobile — persistent context
 
+## Real audit: 34% of ALL real front_only_v1 captures ship with zero content-aware masking -- the exposure guard is the dominant, cross-architecture cause (2026-09-02)
+Direct follow-up to the CTO's masking-correlation question above ("why
+doesn't the backend mask match the on-screen guide") and the standing
+priority that masking must be impeccable. Confirmed first, not assumed:
+the backend mask IS already anchored to and clipped within the exact
+`guide_region` the user held their thumb inside — refinement (flash-diff/
+U-Net) only ever narrows within a dilated version of it, never operates
+independently, and falls back to the bare guide if refinement looks
+untrustworthy. So the real question is how OFTEN that fallback fires.
+
+**Real aggregate rate, the FULL real front_only_v1 population (132
+captures, 120 with a recorded mask — this is not a sample, front_only_v1
+production volume stopped after 2026-08-21 when testing moved to
+fusion_capture, so this is the complete real history)**:
+
+| result | count | % |
+|---|---|---|
+| `guide+flashdiff` (refined) | 44 | 36.7% |
+| `guide+unet` (refined) | 33 | 27.5% |
+| **`guide` (bare, zero refinement)** | **41** | **34.2%** |
+
+**Flat, not improving**: July 37% bare, August 32% bare — no real trend
+across the whole history. Matches round 45's own earlier snapshot (34%)
+almost exactly, confirming this hasn't moved.
+
+**Sampled 8 of the 41 bare-guide captures and replayed each through the
+CURRENT masking code (not just re-reading the stale recorded reason) to
+find the real mechanism**:
+
+| cause | count |
+|---|---|
+| Blowout/underexposure guard fires on all 4 real ambient/flash pairs | **4/8 (50%)** |
+| Would actually be ACCEPTED under current code (stale — fixed by later real changes, not a live bug) | 2/8 (25%) |
+| Genuine current accept-gate rejection (detected region only 17% of guide area — too small) | 1/8 (12.5%) |
+| `_flash_diff_mask` returns None even though every pair passes the guard (not yet root-caused) | 1/8 (12.5%) |
+
+U-Net rescued 0/8 of these — consistent with round 45's own 31% U-Net
+failure rate; it isn't picking up the slack here.
+
+**The real, decisive finding: this is not a macro-only problem.** The
+exact same `_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0` guard that self-skipped
+the A55 macro shot (round above) is the single biggest cause of FRONT
+captures losing all masking too — half of this sample, hitting all 4
+burst pairs simultaneously on a real production capture, not an edge
+case. A real, cross-architecture lever, not something specific to one
+camera or one device.
+
+**Not actioned yet — a real decision point, not a blind fix.** Two
+candidate levers, deliberately not chosen between without more data:
+relax the guard threshold itself, or fix whatever exposure behavior is
+tripping it in the first place (matches this session's macro finding,
+where the cause turned out to be underexposure, not blowout, despite the
+guard's own docstring only describing blowout). Real next step: determine
+which direction (over- or under-exposed) each of the 4 guard-failing
+front captures actually falls on, the same underexposed-not-blown-out
+check already done for macro, before touching either lever.
+
 ## Consistent 3-2-1 countdown added to sweep and macro/cam3 (2026-09-02)
 Direct CTO ask: the same numeral countdown front_v1 (and tilt) already use
 should appear at the start of every capture phase, not just some of them.
