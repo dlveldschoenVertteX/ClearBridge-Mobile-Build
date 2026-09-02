@@ -558,58 +558,49 @@ class FusionCaptureController extends ChangeNotifier {
   // every "macro is blurry / focused on the background" report from round
   // 31 onward. Camera "2" is NOT the macro lens -- it is the ULTRA-WIDE.
   //
-  // Decisive, from this device's own reported optics (capture 1117a364)
-  // plus a direct visual check of its raw frames:
+  // REVISED 2026-09-02, second correction the same day: camera "1" was
+  // never device-tested when it was picked as "the remaining rear camera"
+  // (see the superseded reasoning further down in git history) -- the
+  // first real capture from it (90ab8139) shows the raw macro frame is a
+  // photo of the user's own face and shirt, with the thumb held up near
+  // the lens. Camera "1" is a FRONT-facing sensor on this device
+  // (cameraLensInfo['1'].lensFacing == 0, confirmed correct here, not a
+  // misreport -- the same field already correctly identified camera "0"
+  // and "2" as BACK-facing on every capture this session). The earlier
+  // "elimination" argument assumed the A55 exposes 3 distinct rear camera
+  // IDs (main/ultrawide/macro) plus 1 front -- real data says otherwise:
+  // of ids 0-3, exactly two report BACK (0 = main, 2 = confirmed
+  // ultra-wide) and two report FRONT (1, and 3 -- CTO already visually
+  // confirmed 3 shows his own face in an earlier round). There is no
+  // fourth, distinct rear ID for a macro module anywhere in this device's
+  // standard Camera2 enumeration (`cameraManager.cameraIdList`, verified
+  // in MainActivity.kt to be the full unrestricted list, not a filtered
+  // one).
   //
-  //   cam  focal   sensor        diagonal FOV   role
-  //   0    5.54mm  8.16x6.12mm   85.3 deg       main (only one with real AF)
-  //   1    3.72mm  5.22x3.92mm   82.5 deg       MACRO (5MP, fixed ~close)
-  //   2    1.74mm  4.48x3.36mm   116.3 deg      ULTRA-WIDE
-  //   3    3.72mm  4.61x3.17mm   73.9 deg       SELFIE (CTO-confirmed)
+  // The real, concrete clue for where macro actually lives on this
+  // device: camera "0" (main)'s own `afAvailableModes` explicitly
+  // includes `MACRO` alongside AUTO/CONTINUOUS_PICTURE -- the only camera
+  // on this device with that mode at all. On phones where the macro
+  // lens isn't exposed as its own top-level Camera2 id, this is the real,
+  // standard mechanism: macro range is folded into the main sensor's own
+  // continuous/auto AF rather than switched via a separate physical
+  // camera. Routing this phase through the MAIN camera (already proven,
+  // real full AF, used by the front/tilt/sweep phases all session) at a
+  // pulled-in guide scale is the correct redirect given that constraint --
+  // not a new hardware assumption, just no longer assuming a rear macro
+  // id exists when the device's own enumeration says it doesn't.
   //
-  // 116 degrees is not a macro lens by any reading -- it matches the A55's
-  // published 123-degree ultra-wide, and camera "2"'s own raw "macro"
-  // frame shows the entire room (ceiling slats, far wall, floor) with the
-  // background razor-sharp and the thumb a featureless blur. That is a
-  // fixed-hyperfocal ultra-wide doing exactly what it is built to do. No
-  // AF timing, threshold, crop calibration or peak-search can make it
-  // resolve a thumb at close range, which is why rounds 31-45's macro work
-  // never landed: the lens was never capable of the shot being asked of it.
-  //
-  // Round 40 actually reached the same conclusion from minimum-focus
-  // distance ("camera 2 is not optically a macro lens... it is the
-  // ultrawide sensor") -- but the name stuck and later rounds kept
-  // treating it as the macro. Corrected here at the source.
-  //
-  // Camera "1" is the remaining rear camera and, by elimination against
-  // the A55's real 4-camera lineup (main/ultrawide/macro/selfie), is the
-  // 5MP macro. It reports afAvailableModes: [OFF] like every other
-  // non-main camera on this device -- but for a DEDICATED macro module
-  // fixed-focus means fixed at a CLOSE plane (~4cm), which is precisely
-  // the geometry this phase wants. The peak-search added last round
-  // (_waitForMacroFocusPeak) becomes correct rather than counterproductive
-  // once pointed here: "bring the thumb closer" genuinely walks the pad
-  // INTO this lens's focal plane, whereas on the ultra-wide it walked it
-  // further OUT of one. Real evidence that is exactly what was happening:
-  // capture 1117a364's macroDebug ran the full 6s window with
-  // baseline == maxSample (109.1) and finalSample 79.7 -- sharpness only
-  // ever DECLINED as the thumb approached, never peaked.
-  //
-  // UNCONFIRMED until the next real capture: camera "1" has never been
-  // captured from by any build of this app. If its frames come back wrong,
-  // this one constant is the only thing that needs to change.
-  static const String _macroCameraName = '1';
+  // This also directly explains the CTO's live "front cam is still
+  // connected" report on the very capture that surfaced this: it was
+  // literally true, camera "1" IS the front camera, confirmed by its own
+  // photographed output, not a stale-build artifact.
+  static const String _macroCameraName = '0';
   static const double _macroGuideScaleFactor = 1.2;
-  // 0.37 = PadSilhouetteShape.defaultShape.cy, i.e. the main guide's own
-  // position -- deliberately NOT the old 0.34, which was real-measured on
-  // camera "2" (now known to be the ultra-wide) of a DIFFERENT device and
-  // has no bearing on this lens. Camera "1"'s field of view (82.5 deg
-  // diagonal) is within 3 deg of the main camera's own (85.3), so the pad
-  // lands in very nearly the same relative place and the main guide's own
-  // position is the best-evidenced starting point available. Same
-  // reasoning and same value as `_cam3FocusTargetCy` already uses. Not a
-  // measurement -- the first real camera-"1" capture is what would let
-  // this be measured properly, exactly as rounds 31-34 did for camera "2".
+  // 0.37 = PadSilhouetteShape.defaultShape.cy, the main guide's own
+  // position. Now genuinely exact rather than an estimate: this phase
+  // routes through camera "0" itself (2026-09-02 fix), the same camera
+  // and same guide the front phase already uses -- there is no separate
+  // lens geometry to correct for any more.
   static const double _macroFocusTargetCy = 0.37;
 
   /// Real per-device AF-target calibration for macro-class secondary
@@ -2081,17 +2072,22 @@ class FusionCaptureController extends ChangeNotifier {
     return lastSample;
   }
 
-  /// Real focus-search for a camera with NO autofocus mechanism (see
-  /// `_macroPeakSearchMaxMs`'s own docs -- camera "2" reports
-  /// `afAvailableModes: [OFF]` on the A55). Since there is no lens motor
-  /// to drive, the USER's own hand motion IS the focus search: a
-  /// fixed-focus lens still has one real plane of sharpest focus, and
-  /// `_liveAbsSharpness` genuinely rises approaching it and falls again
-  /// past it. This polls that signal, live-guides the user via
-  /// `distanceHint`, and only returns once the signal holds near its own
-  /// observed running peak for a real streak -- or the bound is hit,
-  /// whichever comes first (never blocks indefinitely, same discipline as
-  /// every other real-time gate in this file).
+  /// Originally built (2026-09-02) for a camera with NO autofocus
+  /// mechanism -- see `_macroPeakSearchMaxMs`'s own docs. As of the same
+  /// day's later camera-identity fix, the macro phase now routes through
+  /// camera "0" (real AF), so this poll is watching a signal an actual AF
+  /// motor drives, not just hand motion -- but the mechanism itself is
+  /// unchanged and still correct either way: it only watches
+  /// `_liveAbsSharpness` rise then hold near its own running peak,
+  /// agnostic to what causes the rise. Still used verbatim by the
+  /// (currently disabled) cam3 path, where the fixed-focus/hand-motion
+  /// framing below still applies exactly as written.
+  ///
+  /// This polls that signal, live-guides the user via `distanceHint`, and
+  /// only returns once the signal holds near its own observed running
+  /// peak for a real streak -- or the bound is hit, whichever comes first
+  /// (never blocks indefinitely, same discipline as every other real-time
+  /// gate in this file).
   ///
   /// Deliberately does NOT require the peak to exceed the starting sample
   /// by any margin: a user who is already well-positioned when this
@@ -2147,19 +2143,24 @@ class FusionCaptureController extends ChangeNotifier {
     debugOut['waitedMs'] = sw.elapsedMilliseconds;
   }
 
-  /// Dedicated final capture on camera "2" (the macro/close-up lens),
-  /// ported from clearbridge_beta's own `_captureMacroShot`
+  /// Dedicated final close-up capture, ORIGINALLY on a separate physical
+  /// lens (camera "2", then "1"), NOW on camera "0" (main -- see the
+  /// 2026-09-02 camera-identity fix on `_macroCameraName`, no rear macro
+  /// id exists in this device's real Camera2 enumeration). Ported from
+  /// clearbridge_beta's own `_captureMacroShot`
   /// (front_capture_controller.dart) -- real, already-validated capture
   /// logic, not new design. Guide grown `_macroGuideScaleFactor` (20%)
   /// larger than the standard shape, same explicit direction as the
-  /// source: pull the thumb physically closer to this lens.
+  /// source: pull the thumb physically closer than the front phase's own
+  /// working distance.
   ///
   /// Self-skipping at every step (missing camera id, failed open, failed
   /// capture, failed upload) -- can only ever ADD a fourth candidate
   /// source, never block or regress the front/tilt/sweep phases that
-  /// already ran. Real, deliberate cost: one more camera open/close cycle,
-  /// one focus convergence, two shutter presses (ambient + flash) on top
-  /// of the three phases before it.
+  /// already ran. Real, deliberate cost: one more camera open/close cycle
+  /// (of a camera already used earlier this same capture), one focus
+  /// convergence, two shutter presses (ambient + flash) on top of the
+  /// three phases before it.
   /// Generalised in round 40 so camera "3" can reuse this exact,
   /// already-device-validated sequence rather than get a second parallel
   /// implementation that could drift from it. Every parameter below is a
@@ -2279,12 +2280,14 @@ class FusionCaptureController extends ChangeNotifier {
         final focusDebug = <String, dynamic>{};
         final focusSw = Stopwatch()..start();
         try {
-          // Best-effort only -- see _waitForMacroFocusPeak's own docs on
-          // why this camera has nothing to actually rack focus with. Kept
-          // for exposure metering at the target point, and forward
-          // compatibility if a future device's camera "2" turns out to
-          // have real AF after all (afAvailableModes would then show more
-          // than OFF, though nothing here branches on that yet).
+          // For the macro phase (camera "0", 2026-09-02 fix): this is
+          // now real AF, not best-effort -- setFocusMode(auto) has an
+          // actual motor to drive, and _waitForMacroFocusPeak's polling
+          // loop still works unchanged (it only watches live sharpness
+          // rise-then-hold, agnostic to whether an AF motor or the user's
+          // own hand motion produces the rise). For the disabled cam3
+          // path, still best-effort -- that camera reports afAvailableModes:
+          // [OFF], so these calls are metering-only there.
           final pt = Offset(0.5, effectiveFocusTargetCy);
           try {
             await macroCam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);

@@ -1,5 +1,93 @@
 # ClearBridge Mobile — persistent context
 
+## Second correction the same day: camera "1" is ALSO front-facing on this device -- there is no rear macro camera id, macro now routes through camera "0" (2026-09-02)
+Direct real-device follow-up on the previous fix. CTO tested the very next
+build and reported "front cam is still connected" while capturing -- flagged
+as possibly a stale build. Checked first before assuming either: the capture
+this produced (`90ab8139`) carries `macroCameraName: "1"` and
+`macroCameraFocalLengthMm: 3.72` in its own `fusionDebug` -- this is
+unambiguously the current build (CI run #501, `b6b4504`), not a stale
+install.
+
+**Downloaded and visually inspected `macro_fl_0.jpg` from this exact real
+capture -- decisive, first-hand evidence, not inference.** The frame is a
+photo of the CTO's own face and shirt, with his thumb held up near the
+lens. **Camera "1" is a front-facing sensor on this device.** Confirmed by
+its own `cameraLensInfo['1'].lensFacing == 0` (FRONT) -- and critically,
+that same field correctly reports camera "0" and "2" as BACK on every
+capture this session, so there is no reason to distrust it here; it was
+simply never cross-checked against real captured content before this
+fix shipped.
+
+**The earlier "camera 1 is the remaining rear camera, by elimination"
+reasoning was wrong, and the error was available in this project's own
+prior history the whole time**: an earlier round ("Camera '3' ported into
+the sweep architecture") had ALREADY found and recorded that "camera '1'
+ALSO reports FRONT on the same real capture, which is physically
+impossible on a device with one selfie camera" -- and resolved that
+contradiction by elimination + sensor-size fit, assigning camera "1" to
+selfie and camera "3" to ultra-wide. The later round (this same day, the
+ultra-wide/macro relabel) silently re-litigated that same elimination
+puzzle from scratch, this time assigning camera "1" to macro and camera
+"3" to selfie (on CTO's direct visual confirmation for "3"), without
+re-checking "1"'s own already-recorded FRONT self-report against the new
+conclusion. A real lesson repeating this file's own standing warning about
+carrying an unverified label forward -- this time the unverified label was
+my own, from earlier the same day.
+
+**Real, concrete finding for where macro capability actually lives on this
+device**: camera "0" (main)'s own `afAvailableModes` is the only one on
+the device that includes `MACRO` (`OFF, AUTO, MACRO, CONTINUOUS_VIDEO,
+CONTINUOUS_PICTURE`) -- every other camera reports `[OFF]` only. On a
+device where the macro lens isn't exposed as its own top-level Camera2 id
+(confirmed: `cameraManager.cameraIdList` in `MainActivity.kt` is the full,
+unfiltered list, and it returns exactly 4 ids -- 0/2 back, 1/3 front, no
+fifth rear id anywhere), this is the standard real mechanism: macro range
+is folded into the main sensor's own AF rather than switched to a separate
+physical camera.
+
+**Fixed**: `_macroCameraName` '1' -> **'0'**. The macro phase now reuses
+the main camera (already open earlier the same capture for front/tilt/
+sweep) with the guide grown 20% to pull the user physically closer than
+the front phase's own working distance, real full AF (not the peak-search
+workaround built for a motorless lens, though that same polling mechanism
+is left in place since it is agnostic to whether an AF motor or hand
+motion drives the sharpness rise -- and now genuinely benefits from a real
+motor actively hunting instead of only reflecting user movement).
+`_macroFocusTargetCy` stays 0.37 -- exact now, not an estimate, since this
+is literally the same camera and same guide the front phase already uses.
+The per-device `_cam2FocalLengthCalibratedCy` table (keyed by macro-lens
+focal length, 1.74mm/2.37mm) safely falls through to the 0.37 default for
+camera "0"'s real 5.54mm focal length -- no change needed there, it was
+already built to no-op on an unrecognized focal length.
+
+**Camera "3" remains unresolved and disabled** (`_cam3Enabled = false`,
+unchanged) -- also self-reports FRONT, also CTO-visually-confirmed showing
+his own face in an earlier round. Two of four ids reporting front on one
+physical device with one selfie camera is still a real, standing
+oddity -- not re-investigated this round since camera "3" isn't on the
+live capture path (only feeds the disabled single-shot phase and the
+ultra-wide-sweep phase, which correctly uses camera "2" instead).
+
+**Also confirmed while investigating, unrelated to the fix**: the
+ultra-wide sweep phase (`_runUltrawideSweepPhase`, camera "2") IS working
+correctly -- its frames (tagged `cam3_sweep_*` for Firestore-bucket-reuse
+reasons only, not a camera-identity signal) show the real 116-degree
+whole-room fisheye view, consistent with confirmed ultra-wide optics, not
+a face. No collision with the disabled `_runCam3Phase`'s own `cam3_*`
+tags (different tag names, `cam3_amb_0` vs `cam3_sweep_*`).
+
+**Real, separate finding from this same capture, not yet actioned**: every
+sweep zone (both main-camera `sweep_*` and ultra-wide `cam3_sweep_*`)
+recorded `readyDetected: false`, with `absAtFire` sitting well below
+`absFloor` (1929.2) in 5 of 6 zones -- the new absolute-floor sweep gate
+never resolved on this capture and every zone fired only via its bounded
+timeout, not a genuine focus-on-thumb detection. Worth watching on the
+next real capture now that macro is no longer confounding the picture,
+but not touched this round -- one variable at a time.
+
+**Not yet device-tested.**
+
 ## THE macro root cause, finally: camera "2" is the ULTRA-WIDE, not the macro lens -- the whole round-31-through-52 macro thread was aimed at the wrong camera (2026-09-02)
 Third consecutive real device test reporting the same thing ("Macro still
 does not focus on thumbprint at all, the background is more crisp"). This
