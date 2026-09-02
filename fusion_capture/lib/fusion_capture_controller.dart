@@ -520,6 +520,31 @@ class FusionCaptureController extends ChangeNotifier {
   static const String _macroCameraName = '2';
   static const double _macroGuideScaleFactor = 1.2;
   static const double _macroFocusTargetCy = 0.34;
+
+  /// Real per-device AF-target calibration for macro-class secondary
+  /// cameras, keyed by the camera's own reported focal length -- a stable
+  /// hardware signature, since this lens differs meaningfully device to
+  /// device (2026-09-02: the original test device's camera "2" is 2.37mm;
+  /// a Samsung A55's camera "2" is 1.74mm, with a real, differently-
+  /// measured pad position). MUST be kept numerically in sync with
+  /// `main.py`'s own `_CAM2_CALIBRATION` table -- the same duplication-risk
+  /// class already documented elsewhere in this project (`_sec_cy`,
+  /// `_macroGuideScaleFactor`), not a new design choice, just the
+  /// established pattern for constants shared across this client/backend
+  /// boundary. Returns null (caller keeps its own default) when the
+  /// reported focal length doesn't match any calibrated device -- can only
+  /// ever correct a known-wrong default, never regress an unrecognized one.
+  static double? _cam2FocalLengthCalibratedCy(double? focalLengthMm) {
+    if (focalLengthMm == null) return null;
+    const calibrations = <List<double>>[
+      [2.37, 0.34], // original test device, rounds 31-34
+      [1.74, 0.45], // Samsung A55, 2026-09-02, n=1 visual measurement
+    ];
+    for (final c in calibrations) {
+      if ((focalLengthMm - c[0]).abs() <= 0.05) return c[1];
+    }
+    return null;
+  }
   static const int _macroFocusMinMs = 1200;
   static const int _macroFocusMaxMs = 2400;
   static const int _macroCaptureTimeoutMs = 60000;
@@ -1813,7 +1838,32 @@ class FusionCaptureController extends ChangeNotifier {
         // this is ported from: camera "2"'s pad sits at cy~0.34, and
         // autofocus/sharpness-ROI aimed at 0.5 was measurably tracking
         // background/crease content instead.
-        final macroRoi = Rect.fromLTWH(0.25, focusTargetCy - 0.19, 0.5, 0.4);
+        //
+        // REAL FIX (2026-09-02): that 0.34 is only correct for the ONE
+        // device it was measured on. A Samsung A55's camera "2" has
+        // meaningfully different optics (1.74mm focal length vs the
+        // original test device's 2.37mm) and a real, differently-measured
+        // pad position -- confirmed by visually locating the pad on an
+        // actual A55 raw macro frame (round 2026-09-02), which showed the
+        // OLD constant's crop landing mostly on background. Rather than
+        // overwrite one device's calibration with another's (same mistake
+        // repeated on the next new phone), look up the ACTUAL detected
+        // camera's own reported focal length against a real per-device
+        // table and only override when it matches a calibrated device;
+        // otherwise keep the caller's own default. Falls back to the
+        // existing behaviour whenever cameraLensInfo hasn't resolved or
+        // reports nothing usable -- can only ever correct a known-wrong
+        // default, never regress an already-calibrated device.
+        final lensInfo = await _cameraLensInfoFuture;
+        final camFocalLengthMm =
+            (lensInfo?[cameraName]?['focalLengthMm'] as num?)?.toDouble();
+        final calibratedCy = _cam2FocalLengthCalibratedCy(camFocalLengthMm);
+        final effectiveFocusTargetCy = calibratedCy ?? focusTargetCy;
+        if (calibratedCy != null) {
+          _debug['${debugKey}CalibratedFocusTargetCy'] = calibratedCy;
+        }
+        final macroRoi =
+            Rect.fromLTWH(0.25, effectiveFocusTargetCy - 0.19, 0.5, 0.4);
         void macroFrameListener(CameraImage image) {
           try {
             final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
@@ -1825,7 +1875,7 @@ class FusionCaptureController extends ChangeNotifier {
         final focusSw = Stopwatch()..start();
         try {
           await _retargetAndConvergeMacro(
-              macroCam, Offset(0.5, focusTargetCy),
+              macroCam, Offset(0.5, effectiveFocusTargetCy),
               debugOut: focusDebug);
         } finally {
           try {

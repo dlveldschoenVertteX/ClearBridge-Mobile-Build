@@ -1,5 +1,110 @@
 # ClearBridge Mobile — persistent context
 
+## First real Samsung A55 capture: macro crop was ~70% background -- real per-device calibration table built to replace the single hardcoded old-device constant (2026-09-02)
+CTO's A55 arrived, first real `fusion_v1` capture (`73c86c41`) pulled and
+manually scored (production trigger is off for this experimental mode).
+Two direct CTO observations from watching the live capture, both
+investigated and confirmed real: "the macro capture path was blurry... I
+do not believe it has been tweaked for real macro at its specific
+aperture" and "the captures I saw live showed really defined ridge
+structure on front v1 only."
+
+**Real device-hardware difference, checked first, not assumed**: A55's
+main camera has a meaningfully bigger sensor (8.16x6.12mm vs the old test
+device's 5.98x4.49mm) and real optical stabilization (the old device has
+none), plus CALIBRATED focus-distance reporting vs the old device's
+UNCALIBRATED. One real gotcha: camera "3" is FRONT-facing on the A55
+(`lensFacing: 0`) vs REAR on the old device — direct, concrete
+confirmation of round 40's own standing warning that camera-ID-to-
+physical-role isn't stable across devices. Camera "2" (used for macro) is
+still rear-facing here, so unaffected.
+
+**Macro: confirmed real, root-caused, and fixed.** Visual inspection of
+the actual raw A55 macro frame with the existing hardcoded crop overlaid
+showed the crop landing ~70% on background floor/wall, with only its left
+third touching the thumb at all — and the visible thumb content itself
+looked soft, no ridge detail. Root cause, confirmed in code, not guessed:
+`_sec_cx=0.66/_sec_cy=0.50/_sec_rx=0.13/_sec_ry=0.11` (`main.py`) and
+`_macroFocusTargetCy=0.34` (`fusion_capture_controller.dart`) were BOTH
+flat literals real-measured on the ORIGINAL test device only (rounds
+31-34), applied unconditionally to every device regardless of camera "2"'s
+actual optics. The A55's camera "2" has meaningfully different hardware
+(1.74mm focal length / 4.48x3.36mm sensor vs the old device's 2.37mm /
+3.92x2.94mm) — different FOV, different real pad framing at the same
+guide-scale instruction. Same root-cause class the `frontFocusDebug`/
+`macroDebug` diagnostics independently corroborated on this capture:
+front converged to 95% of its own self-relative peak sharpness, macro only
+82% — consistent with AF measuring the wrong (mostly-background) ROI.
+
+**Real per-device calibration table built** (`_CAM2_CALIBRATION` in
+`main.py`, `_cam2FocalLengthCalibratedCy` in
+`fusion_capture_controller.dart` — MUST be kept numerically in sync,
+same cross-boundary duplication-risk class as `_sec_cy`/
+`_macroGuideScaleFactor` elsewhere in this project), keyed by camera "2"'s
+own reported focal length (a stable hardware signature, matched with a
+0.05mm tolerance for float jitter):
+- old test device (2.37mm): `cx=0.66, cy=0.50, rx=0.13, ry=0.11` (rounds
+  31-34's own real values, byte-identical — zero behavior change for this
+  device)
+- A55 (1.74mm): `cx=0.54, cy=0.45, rx=0.14, ry=0.07` — real, visually
+  measured off this capture's own raw macro frame (grid-overlay technique,
+  same discipline as round 31's original old-device measurement).
+  Re-rendered with the corrected crop and visually confirmed: the box now
+  covers ~75-80% real pad content, not ~30% — a large, real, honest
+  improvement, though not pixel-perfect (still a small background sliver
+  at the right edge, accepted per this project's own standing "generous
+  margin costs less than clipping real pad content" philosophy rather than
+  further hand-tuning a single blurry n=1 photo).
+- any OTHER device's camera "2" (focal length matching neither entry):
+  falls back to the existing ratio-derived formula (the same mechanism
+  camera "3" already uses) instead of silently reusing a wrong device's
+  numbers — an honest, physics-based estimate for any future unmeasured
+  hardware, not a guess, and a real improvement over today's behavior
+  regardless of how many devices ever get their own calibrated entry.
+
+**Client-side mechanism note**: this required awaiting
+`_cameraLensInfoFuture` (the background future introduced earlier this
+session's start-lag fix) INSIDE `_runSecondaryCameraPhase`, before
+computing the AF-target/ROI — previously that future was only ever awaited
+at upload time, well after the macro phase had already run and picked its
+(uncorrected) target. By the time the macro phase runs (phase 4 of 5),
+the future has almost certainly already resolved in the background, so
+this costs nothing in practice while making the dependency correct rather
+than accidental.
+
+**Sweep: investigated, NOT confirmed as a calibration issue.** Real
+diagnostic data on this same capture argues against the same class of bug:
+all 3 sweep zones show `readyDetected: true` — the readiness gate is
+self-relative (peak-normalized against its own live signal, not an
+absolute hardcoded position), and it genuinely triggered on real
+convergence, not a timeout. So sweep's live-preview quality signal is, by
+construction, portable across devices in a way macro's fixed AF-target
+constant never was. The CTO's live impression of weaker ridge definition
+on sweep vs front is more likely explained by something else (front's
+dedicated hold gets more real convergence time than a fast zone-transition
+loop; a live-preview-vs-delivered-still domain gap already seen elsewhere
+in this project's history with the wavelength estimator; or plain n=1
+capture variance) — **not actioned, not enough evidence yet** to identify
+a specific fix, unlike macro's clear-cut hardcoded-constant bug. Worth
+watching on the next several real A55 captures before concluding anything
+sweep-specific needs to change.
+
+**Also confirmed, separate finding this same capture**: flash-diff mask
+refinement failed on macro and all 3 sweep zones (bare `guide`, no
+background exclusion) — but NOT via the exposure-guard mechanism found on
+the previous device's macro capture (round above, 2026-08-30): here,
+ambient and flash brightness are nearly identical with zero clipping
+either direction, and the guard fails purely because this device's
+backend-decoded Laplacian readings run substantially lower across the
+board (even on the front burst: 27-86 vs the old device's typical
+600-900+) — a real, capture-domain difference not yet root-caused, flagged
+for the next several real A55 captures rather than acted on from n=1.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. The corrected macro crop and AF target
+are committed but need a real fresh A55 macro capture to confirm the fix
+holds live, not just on offline replay of the frame that diagnosed it.
+
 ## IDEA, SAVED NOT BUILT: color/chrominance as an additional thumb-vs-background segmentation lever (2026-08-31)
 CTO proposal, explicitly asked to be saved for a future revisit rather than
 built now — priority right now is masking RELIABILITY (see entry below),

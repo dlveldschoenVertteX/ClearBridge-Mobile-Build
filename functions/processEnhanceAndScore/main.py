@@ -111,6 +111,51 @@ _SECONDARY_MAX_WAVELENGTH_PX_IR = 16.0
 # distance -- re-check against the first several real macro captures the
 # same way round 17 itself was validated, not assumed permanent.
 _SECONDARY_MAX_WAVELENGTH_PX_MACRO = 35.0
+
+# Real per-device calibration table for camera "2" (macro), keyed by its
+# own reported focal length -- a stable hardware signature. Real fix,
+# 2026-09-02: `_sec_cx`/`_sec_cy`/`_sec_rx`/`_sec_ry` below used to hardcode
+# ONE device's own real-measured macro crop (rounds 31-34) unconditionally
+# for every device running this pipeline. A Samsung A55's camera "2" has
+# meaningfully different optics (1.74mm focal length vs the original test
+# device's 2.37mm, plus a different sensor size) -- confirmed via a real
+# A55 capture whose macro frame, visually inspected, showed that old crop
+# landing ~70% on background floor/wall, not the pad. Each entry here is a
+# real, per-device measured (cx, cy, rx, ry) in the shared landscape
+# still-space convention (see the round-43 rotation note below) -- not a
+# formula guess. Matched by focal length with a small tolerance (repeat
+# units of the same phone model report identical specs; float jitter from
+# Camera2 characteristics is otherwise possible). MUST be kept numerically
+# in sync with `fusion_capture_controller.dart`'s own
+# `_cam2FocalLengthCalibratedCy` table (client only needs cy, for AF
+# targeting) -- same cross-boundary duplication-risk class already
+# documented elsewhere in this project (`_sec_cy`, `_macroGuideScaleFactor`).
+# A camera "2" whose focal length matches NEITHER entry falls back to the
+# existing ratio-derived formula (same mechanism camera "3" already uses)
+# instead of silently reusing a wrong device's numbers -- an honest, if
+# imperfect, physics-based estimate for any future unmeasured device,
+# not a guess. Both entries provisional (n=1 real measurement each), same
+# discipline as every other threshold in this pipeline.
+_CAM2_CALIBRATION = [
+    # (focal_length_mm, cx, cy, rx, ry)
+    (2.37, 0.66, 0.50, 0.13, 0.11),  # original test device, rounds 31-34
+    (1.74, 0.54, 0.45, 0.14, 0.07),  # Samsung A55, 2026-09-02
+]
+_CAM2_FL_TOLERANCE_MM = 0.05
+
+
+def _cam2_calibration_for(focal_length_mm):
+    """Real per-device (cx, cy, rx, ry) for camera "2", or None if the
+    reported focal length doesn't match a calibrated device (caller falls
+    back to the ratio-derived formula)."""
+    if focal_length_mm is None:
+        return None
+    for fl, cx, cy, rx, ry in _CAM2_CALIBRATION:
+        if abs(focal_length_mm - fl) <= _CAM2_FL_TOLERANCE_MM:
+            return (cx, cy, rx, ry)
+    return None
+
+
 # IR-tuned Gabor sigma ratio: IR ridge contrast is steeper (less ambient
 # scattering) and may benefit from a tighter envelope. Used as a second
 # max-of-variants candidate when scoring a MONO/NIR camera frame, alongside
@@ -1979,11 +2024,18 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # diversity candidate if secondary cameras are revived,
                         # so it is fixed now rather than left as a landmine for
                         # whoever does that.
+                        # Real per-device lookup for camera "2" (see
+                        # _CAM2_CALIBRATION's own docstring above) -- only
+                        # replaces the flat single-device literal this used
+                        # to be; camera "3" and any other name are
+                        # untouched.
+                        _cam2_cal = (_cam2_calibration_for(_fl_sec)
+                                     if _cam.get('name') == '2' else None)
                         _sec_cx = (0.63 if _cam.get('name') == '3'
-                                   else 0.66 if _cam.get('name') == '2'
+                                   else _cam2_cal[0] if _cam2_cal is not None
                                    else 0.5)
                         _sec_cy = (0.50 if _cam.get('name') == '3'
-                                   else 0.50 if _cam.get('name') == '2'
+                                   else _cam2_cal[1] if _cam2_cal is not None
                                    else 0.5)
                         # Camera "2" rx/ry, real data override (2026-08-20,
                         # round 33) -- direct CTO report ("mask is not
@@ -2018,8 +2070,10 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # Axes swapped along with the centre above -- the
                         # 0.11/0.13 pair was measured in the portrait frame,
                         # and a 90 deg rotation exchanges rx and ry.
-                        _sec_rx = 0.13 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
-                        _sec_ry = 0.11 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
+                        _sec_rx = (_cam2_cal[2] if _cam2_cal is not None
+                                   else _guide_region['rx'] * _rx_ratio)
+                        _sec_ry = (_cam2_cal[3] if _cam2_cal is not None
+                                   else _guide_region['ry'] * _ry_ratio)
                         # tipAngleDeg was hardcoded 0.0 here -- real bug,
                         # found 2026-08-22 (direct CTO report: a macro
                         # superprint came out sideways). Client-side, every
