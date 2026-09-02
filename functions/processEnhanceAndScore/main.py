@@ -139,12 +139,15 @@ _SECONDARY_MAX_WAVELENGTH_PX_MACRO = 35.0
 _CAM2_CALIBRATION = [
     # (focal_length_mm, cx, cy, rx, ry)
     (2.37, 0.66, 0.50, 0.13, 0.11),  # original test device, rounds 31-34
-    (1.74, 0.61, 0.46, 0.11, 0.12),  # Samsung A55, refined 2026-09-02 against
-    # the CTO's own direct annotation of where the real print sits (a first
-    # visual-only pass undershot toward the tip and was too wide/too short --
-    # this value is mapped back from that annotation, re-verified by
-    # re-rendering the crop and visually confirming it now tightly wraps the
-    # rounded pad).
+    (1.74, 0.61, 0.49, 0.11, 0.09),  # Samsung A55, refined twice 2026-09-02
+    # against the CTO's own direct annotations of where the real print sits.
+    # Pass 1 (0.54, 0.45, 0.14, 0.07) was my own visual estimate off the raw
+    # frame -- real improvement but undershot toward the tip and too
+    # wide/short. Pass 2 (0.61, 0.46, 0.11, 0.12) mapped the CTO's own
+    # annotation of the true print region back through the display
+    # rotation. Pass 3 (this one) tightened cy/ry after the CTO flagged a
+    # remaining background sliver on one edge of pass 2's box, re-verified
+    # by re-rendering and visually confirming a tight fit.
 ]
 _CAM2_FL_TOLERANCE_MM = 0.05
 

@@ -46,8 +46,9 @@ own reported focal length (a stable hardware signature, matched with a
 - old test device (2.37mm): `cx=0.66, cy=0.50, rx=0.13, ry=0.11` (rounds
   31-34's own real values, byte-identical — zero behavior change for this
   device)
-- A55 (1.74mm): `cx=0.61, cy=0.46, rx=0.11, ry=0.12` — refined twice, same
-  session. First pass (`cx=0.54, cy=0.45, rx=0.14, ry=0.07`) was my own
+- A55 (1.74mm): `cx=0.61, cy=0.49, rx=0.11, ry=0.09` — refined THREE times,
+  same session, each pass driven by real evidence rather than more
+  guessing. Pass 1 (`cx=0.54, cy=0.45, rx=0.14, ry=0.07`) was my own
   grid-overlay visual estimate off the raw frame, same discipline as round
   31's original old-device measurement — real improvement (box went from
   ~30% pad content to ~75-80%) but still undershot toward the tip per
@@ -55,11 +56,17 @@ own reported focal length (a stable hardware signature, matched with a
   showing exactly where the real print sits, which turned out to be my own
   overlay image auto-rotated 90° CCW by their photo viewer (confirmed by
   reproducing that exact rotation locally and matching it pixel-for-pixel
-  against their background/pose). Mapped their annotated region back
-  through that rotation to landscape still-space, re-rendered with the
-  corrected numbers, and visually confirmed the box now tightly wraps the
-  actual rounded pad — a real, CTO-verified correction, not my own
-  estimate alone.
+  against their background/pose). Pass 2 (`cx=0.61, cy=0.46, rx=0.11,
+  ry=0.12`) mapped that annotated region back through the rotation to
+  landscape still-space. CTO caught a remaining real defect in pass 2's
+  own rendered result: a visible strip of background still clipped inside
+  one edge of the box (screenshotted and annotated again, red highlight on
+  the specific edge) — traced that edge back through the same rotation
+  math to the `cy`/`ry` pair specifically (the flagged edge mapped to the
+  box's y0 boundary in landscape space, not cx/rx), tightened it, and
+  re-rendered. Visually confirmed pass 3 wraps the pad tightly with
+  minimal background on any edge — a real, CTO-verified correction across
+  two full annotation-and-tighten rounds, not a single guess.
 - any OTHER device's camera "2" (focal length matching neither entry):
   falls back to the existing ratio-derived formula (the same mechanism
   camera "3" already uses) instead of silently reusing a wrong device's
