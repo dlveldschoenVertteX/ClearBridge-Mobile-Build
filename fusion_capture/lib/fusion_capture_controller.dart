@@ -1586,9 +1586,20 @@ class FusionCaptureController extends ChangeNotifier {
       _debug['${station.key}_readyDetected'] = readyDetected;
       if (_abortPhase || _disposed) break;
 
+      // Same 3-2-1 countdown every other phase uses (front, tilt, macro/
+      // cam3), CTO's explicit ask for a consistent capture cue across the
+      // whole session (2026-09-02). Deliberately layered ON TOP of the
+      // real content-driven readiness gate above, not replacing it --
+      // that gate is a genuine, already-validated convergence-quality
+      // check (round 2026-08-22), not just a stand-in for this UX cue.
+      // The gate still decides WHEN it's safe to capture; the countdown
+      // now gives the user the same visual/audible warning beforehand
+      // that every other phase already gives.
+      await _runCountdown();
+      if (_abortPhase || _disposed) break;
+
       // Visual "capturing now" cue -- flips the guide to green/locked for
-      // the real duration of the shutter sequence, replacing the removed
-      // verbal countdown.
+      // the real duration of the shutter sequence.
       unawaited(HapticFeedback.mediumImpact());
       _apply((s) => s.copyWith(
             zoneCaptureFlash: true,
@@ -1886,6 +1897,14 @@ class FusionCaptureController extends ChangeNotifier {
         }
         focusDebug['convergedMs'] = focusSw.elapsedMilliseconds;
         _debug['${debugKey}Debug'] = focusDebug;
+
+        // Same 3-2-1 countdown every other phase uses (front, tilt, sweep),
+        // CTO's explicit ask for a consistent capture cue across the whole
+        // session (2026-09-02). Right after focus convergence, before the
+        // shutter sequence -- shared by both macro and cam3 since they run
+        // through this same function.
+        await _runCountdown();
+        if (_abortPhase || _disposed) return;
 
         // Ambient+flash pair (not a single shot) so the backend's real
         // flash-diff segmentation can engage for this candidate -- same

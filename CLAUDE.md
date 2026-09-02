@@ -1,5 +1,32 @@
 # ClearBridge Mobile — persistent context
 
+## Consistent 3-2-1 countdown added to sweep and macro/cam3 (2026-09-02)
+Direct CTO ask: the same numeral countdown front_v1 (and tilt) already use
+should appear at the start of every capture phase, not just some of them.
+Checked before touching anything: sweep and macro/cam3 genuinely had none.
+
+**Sweep** deliberately removed its own countdown in an earlier round
+(2026-08-22) in favor of a content-driven readiness gate + a visual green-
+flip cue -- a real, validated mechanism (the gate only proceeds once the
+live sharpness signal genuinely converges, not a fixed timer). Restoring a
+plain fixed-timer countdown INSTEAD of that gate would be a real regression
+of an already-validated design. Layered the countdown ON TOP of it instead:
+the readiness gate still decides *when* it's safe to capture; once it
+clears, the same `_runCountdown()` front/tilt already use now runs before
+the shutter fires, giving the same visual/audible warning every other phase
+gives, without touching the underlying quality check.
+
+**Macro/cam3** (`_runSecondaryCameraPhase`, shared by both) had no
+countdown and no equivalent visual cue at all -- added `_runCountdown()`
+right after focus convergence, before the ambient/flash shutter pair.
+
+**Real, deliberate cost, not hidden**: ~2.35s per sweep zone (3 zones →
+~7s added to that phase) and ~2.35s added to the macro shot. A genuine
+UX-consistency trade the CTO asked for directly, not a free change.
+
+Not yet device-tested -- same standing discipline as every other capture-
+side change this project.
+
 ## First real A55 test of the corrected macro crop: framing fix CONFIRMED working, but the pad itself is genuinely soft -- a real, separate AF problem (2026-09-02)
 First real device test of the crop/AF-target fix above (capture
 `086fc79c`). CTO report: "the macro capture is still not focused on the
