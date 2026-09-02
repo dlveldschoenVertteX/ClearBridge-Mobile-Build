@@ -1,5 +1,68 @@
 # ClearBridge Mobile — persistent context
 
+## Camera "2" macro on the A55 has NO real autofocus at all -- decisive, visually confirmed answer, closes the round-31-through-45 macro-blur thread (2026-09-02)
+First real A55 capture (`24a2e023`) on the build carrying the `afAvailableModes`
+diagnostic added specifically to answer this. CTO report on the live test:
+"Macro capture was extremely short, there is definitely a issue, it could be
+focused on the background instead of foreground." Both halves of that report
+are now directly confirmed, not inferred.
+
+**The decisive number, straight from this real capture's own `cameraLensInfo`**:
+
+| cam | afAvailableModes | focusDistanceCalibration |
+|---|---|---|
+| 0 (main) | `OFF, AUTO, MACRO, CONTINUOUS_VIDEO, CONTINUOUS_PICTURE` | CALIBRATED |
+| 1 | `OFF` only | UNCALIBRATED |
+| **2 (macro)** | **`OFF` only** | UNCALIBRATED |
+| 3 | `OFF` only | UNCALIBRATED |
+
+**Camera "2" has no autofocus mode at all on this device -- it is fixed-focus
+hardware.** Only camera "0" (the main sensor) has real AF on the A55; every
+other camera reports `OFF` exclusively. This settles round 33's "secondary,
+unconfirmed hypothesis" and this session's earlier `afAvailableModes`
+diagnostic add cleanly: it isn't a timing/threshold problem, and it isn't the
+crop/AF-target calibration (already fixed and confirmed correctly framed,
+previous entry) -- the lens physically cannot rack focus to macro range,
+regardless of anything client- or backend-side.
+
+**Visually confirmed on this exact capture's own raw macro frame**: the
+background (wood floor boards, a threshold strip) shows crisp, detailed grain
+texture, while the thumb pad occupying the centre of the same frame is a
+smooth, essentially featureless blur with zero visible ridge structure --
+unambiguous, direct confirmation of the CTO's own "focused on the background
+instead of foreground" read, not focused-but-still-soft.
+
+**Mechanism behind "extremely short," found by re-reading
+`_retargetAndConvergeMacro`'s own code, not guessed**: it calls
+`cam.setFocusMode(FocusMode.auto)` then polls `_liveAbsSharpness` for
+relative-stability (`stableStreak`) before locking. Against a lens whose only
+real mode is `OFF`, the `FocusMode.auto` request has nothing to act on -- the
+lens never physically moves, so the sharpness reading never meaningfully
+changes between polls. A signal that was never going to move looks "stable"
+from the very first sample, so the loop satisfies its own stability
+requirement and exits at (or near) `_macroFocusMinMs`, the bare floor, instead
+of genuinely searching. This exactly matches "extremely short": it isn't
+failing to converge, there was never anything to converge.
+
+**Real, decisive scoring result on this capture (full variant pool, all four
+phases, real NFIQ2)**: front wins outright, `freqNorm` at **73** -- clean,
+sent to CTO. Macro's own best candidate (flash-base) scored only **47**,
+sweep 45-49, tilt 41-52 -- consistent with a hardware ceiling on macro/cam3/
+cam1, not a software gap.
+
+**Not actioned unilaterally -- a real product-scope call, not a code fix.**
+No further AF-timing, drift-threshold, or crop-calibration work on camera "2"
+(or "1"/"3") can fix a lens with no autofocus mechanism -- that thread is now
+closed with a definitive answer, not another guess. The real remaining
+question is what to do about it: drop camera "2"/macro from this device's
+capture flow entirely (since it can never contribute real ridge detail at
+macro range), keep it only as a coarse diversity candidate the way the
+already-established max-of-variants selection already discounts a weak
+source, or check whether OTHER devices' camera "2" report real AF modes
+before generalizing this as a cross-device conclusion. Flagged for explicit
+direction rather than acted on solo, same standing discipline as every other
+product-scope decision this project.
+
 ## Focus-lock-to-shutter softness gap: BOTH candidate fixes shipped together, direct CTO call (2026-09-02)
 Direct follow-up to the entry immediately below. CTO's answer to the two
 candidate fixes laid out there: "a - Yes" (shorten the lock-to-shutter
