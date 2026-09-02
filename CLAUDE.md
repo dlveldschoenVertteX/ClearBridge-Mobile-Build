@@ -1,5 +1,97 @@
 # ClearBridge Mobile — persistent context
 
+## Two direct CTO asks built together: a real live focus-search for macro (no AF motor, so the user's own approach becomes the search) + camera "3" ported into the sweep architecture (2026-09-02)
+Direct follow-up to the "camera 2 has no real AF" finding immediately below.
+CTO's two asks: (1) "fix this focus issue on Macro, perhaps bringing the
+thumbprint closer will lock it automatically, just make it catch focus on
+the ridge pattern" -- i.e. don't fight the hardware limitation, work with it;
+(2) "The A55 has 3 cameras on the back, port the UltraWide cam into the
+sweep architecture, I want to see how that pans out." Both built in
+`fusion_capture_controller.dart`, **neither device-tested yet** -- same
+standing discipline as every other capture-side change this project.
+
+**Macro fix: a real peak-search replaces the broken stability check.** The
+OLD convergence loop (`_retargetAndConvergeMacro`, still correct and still
+used for the FRONT camera, which DOES have real AF) declared "converged" the
+moment its relative-stability check was satisfied -- trivially true almost
+immediately against a signal from a lens with no motor to hunt with. That's
+the actual mechanism behind "extremely short": it was never converging fast,
+there was never anything to converge. Since there's no AF to drive, the fix
+makes the USER's own hand motion the focus search instead: a fixed-focus
+lens still has one real plane of sharpest focus, and `_liveAbsSharpness`
+genuinely rises approaching it and falls again past it, independent of any
+AF mechanism. New `_waitForMacroFocusPeak()`: polls that signal, live-guides
+the user via a `distanceHint` banner ("Bring thumb closer" / "Hold there" /
+"Pull back slightly"), and only allows the shutter once the signal holds
+near its own observed running peak (`_macroPeakHoldRatio=0.85`, deliberately
+tighter than the existing `_macroDriftAcceptRatio=0.6` rejection bar
+elsewhere in this file, since this is a POSITIVE "found it" bar not a
+"not obviously worse" one) for a real streak, or a bounded 6s window elapses
+(`_macroPeakSearchMaxMs`, widened from the old 2400ms AF-search bound since
+this now has to cover real human movement time -- a deliberate, stated
+cost). Deliberately does NOT require a % rise over the starting sample --
+a user already well-positioned at the start should converge fast and
+correctly, not be forced to manufacture an "improvement" that was never
+there. New `macroDebug` fields (`baseline`/`maxSample`/`finalSample`/
+`peakHoldStreak`/`peakFound`/`waitedMs`) replace the old `lockedAfter`/
+`driftRetried` shape -- the real next-capture data that shows whether 0.85
+is right, too loose, or too tight, and whether "closer" genuinely resolves
+the softness the way the CTO's own hypothesis expects.
+
+**Camera "3" ported into the sweep architecture, real camera-identity
+puzzle resolved by elimination, not guessed.** This capture's own
+`cameraLensInfo` shows camera "3" self-reporting `lensFacing: 0` (FRONT) on
+the A55 -- the same "camera-ID-to-role isn't stable across devices" gotcha
+already in this project's history. But camera "1" ALSO reports FRONT on the
+same real capture, which is physically impossible on a device with one
+selfie camera. Resolved by elimination + sensor-size fit, not a coin flip:
+the A55's real hardware lineup is exactly 4 cameras (main/ultrawide/macro/
+front, no depth sensor); "0"=main and "2"=macro are already established
+from earlier rounds, leaving only "1" and "3" for front/ultrawide. Camera
+"1"'s sensor (5.22x3.92mm, ~6.53mm diagonal) matches a 32MP 1/2.8"-class
+selfie sensor; camera "3"'s (4.61x3.17mm, ~5.59mm diagonal) matches a 12MP
+1/3.06"-class ultra-wide, matching the A55's published spec -- and matches
+this project's OWN earlier note that singled out camera "3" specifically as
+the anomaly (camera "1" was never flagged, i.e. its FRONT reading was never
+surprising). **UNCONFIRMED until the next real capture's frames are
+visually reviewed** -- if wrong, only the `_uwSweepCameraName` constant
+needs to change.
+
+Built as a real 6th phase (`_runUltrawideSweepPhase`), reusing the EXACT
+sweep zone-loop mechanic (`_runSweepStations`, now parameterized to accept
+a station list + camera override rather than duplicated) instead of a
+second copy that could drift from it -- the same real bug class
+(`sweepShots` corruption) this file's own tag-routing already guards
+against elsewhere. Purely additive: shots tag `cam3_sweep_*`, landing in
+the SAME `cam3Shots` Firestore bucket `_runCam3Phase` already writes to, no
+new field, no upload-routing changes. Self-skips cleanly if the camera
+can't be opened, bounded by its own outer timeout (75s, deliberately larger
+than the zone loop's own 60s inner bound rather than reusing the same
+value, which would race on which fires first with no real margin between
+them).
+
+**Two real, necessary fixes found and made along the way, not just new
+feature code:**
+- `_runSecondaryCameraPhase`'s own camera lookup filtered on
+  `lensDirection == .back` -- which would have silently skipped camera "3"
+  outright on the A55 (it self-reports FRONT), independently breaking
+  `_runCam3Phase` too if it's ever re-enabled. Changed to match by NAME
+  only; camera "2" (macro) already reports back correctly, so this is
+  strictly more permissive there, not a behavior change.
+- The ambient/flash shutter pair inside `_runSweepStations` used to
+  unconditionally drive `_flash` (the `AdaptiveFlashController` bound ONLY
+  to the main camera) -- for camera "3" this would have silently toggled
+  the WRONG camera's torch. Now branches: main camera keeps the existing
+  adaptive controller unchanged, a camera override drives its own torch +
+  a real EV pulldown directly, same pattern `_runSecondaryCameraPhase`'s
+  macro/cam3 shutter pair already uses.
+- `_guideRegionFor()` (needed per zone, for the first time on a non-main
+  camera) reads `_previewSize`, set once for the main camera in `start()`
+  and never refreshed on any later camera swap -- macro/cam3's own
+  single-shot phase never needed it (fixed ROI + backend fallback only).
+  Refreshed to camera "3"'s own preview size before the zone loop runs,
+  restored to the main camera's afterward.
+
 ## Camera "2" macro on the A55 has NO real autofocus at all -- decisive, visually confirmed answer, closes the round-31-through-45 macro-blur thread (2026-09-02)
 First real A55 capture (`24a2e023`) on the build carrying the `afAvailableModes`
 diagnostic added specifically to answer this. CTO report on the live test:
