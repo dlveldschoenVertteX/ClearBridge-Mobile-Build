@@ -905,7 +905,25 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _focusZoneMinMs = 250;
   static const int _focusZoneMaxMs = 700;
 
-  static const int _holdDurationMs = 1500;
+  // Shortened 1500ms -> 900ms, 2026-09-02, direct CTO product call on the
+  // real focus-lock-to-shutter softness finding (CLAUDE.md: capture
+  // 474b4d6a -- live signal read healthy and stable through the whole
+  // hold, yet the delivered still frames scored a real 5-9x softer than
+  // that signal implied). This dwell is the window during which AF sits
+  // FocusMode.locked (set by _refocus() before this timer even starts)
+  // while the thumb can still drift against that now-fixed focal plane --
+  // shortening it directly shrinks that drift window. Not further swept
+  // against real data beyond this one deliberate reduction; paired with
+  // _waitForShutterSharpness() below (the CTO's own explicit ask: keep AF
+  // active/verified, don't just shorten blind) so the real verification
+  // work no longer rests on dwell time alone.
+  static const int _holdDurationMs = 900;
+  // Real, bounded re-check of live sharpness immediately before the burst
+  // fires -- see _waitForShutterSharpness()'s own docs. Reuses
+  // _refocusDriftAcceptRatio (the SAME already-validated peak-relative
+  // threshold _refocus() itself trusts) rather than inventing a new one.
+  static const int _shutterSharpnessMaxWaitMs = 900;
+  static const int _shutterSharpnessPollIntervalMs = 60;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
   static const int _emitThrottleMs = 80;
@@ -1393,6 +1411,19 @@ class FrontCaptureController extends ChangeNotifier {
   bool _starting = false;
   bool _streamRunning = false;
   bool _burstInFlight = false;
+  // Guards the gap between hold-complete and _fireBurst actually starting
+  // (_burstInFlight only becomes true once _fireBurst's own synchronous
+  // prefix runs) -- see _waitForShutterSharpness()'s own docs. Without
+  // this, the hold-complete branch in _onFrame could fire a SECOND
+  // _fireAfterShutterSharpnessGate() while the first is still polling for
+  // sharpness, since _holdStart resets and the shortened _holdDurationMs
+  // can elapse again before the first gate resolves.
+  bool _shutterPending = false;
+  // Peak liveAbsSharpness observed during this hold's own _refocus() poll
+  // (its own local `maxSample`) -- the reference _waitForShutterSharpness()
+  // checks the live signal against right before the shutter fires. Reset
+  // per hold alongside _refocusedThisHold.
+  double? _lockPeakSharpness;
   // True if the capture-side sequence in _fireBurst ever exceeded
   // _burstCaptureTimeoutMs -- see that constant's own docs. Written to the
   // capture doc as `burstCaptureDebug.timedOut` so a real capture shows
@@ -1942,6 +1973,8 @@ class FrontCaptureController extends ChangeNotifier {
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
     _refocusedThisHold = false;
+    _shutterPending = false;
+    _lockPeakSharpness = null;
     // Same reset as the per-hold "thumb genuinely left" trigger a few lines
     // below in _onFrame (2026-08-15 fix) -- belt-and-suspenders for a
     // session-level equivalent. Currently inert (front_capture_screen.dart
@@ -2572,8 +2605,9 @@ class FrontCaptureController extends ChangeNotifier {
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
       _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
-      if (heldMs >= _holdDurationMs) {
+      if (heldMs >= _holdDurationMs && !_shutterPending) {
         _holdStart = null;
+        _shutterPending = true;
         // Real checkpoint: sharpness/coverage right as the hold completes,
         // directly comparable against 'refocusLocked' above (same
         // liveAbsSharpness signal, same units) to see whether anything
@@ -2584,8 +2618,9 @@ class FrontCaptureController extends ChangeNotifier {
         // Sweep behind a disabled flag (see _sweepEnabled's own docs) --
         // routes back to the proven static burst path _fireBurst() by
         // default, which is _fireBurst's original pre-sweep behaviour when
-        // called with no preCollectedShots argument.
-        unawaited(_sweepEnabled ? _beginSweepPositioning() : _fireBurst());
+        // called with no preCollectedShots argument. Both now go through
+        // _waitForShutterSharpness() first -- see that method's own docs.
+        unawaited(_fireAfterShutterSharpnessGate());
       }
     } else {
       _holdStart = null;
@@ -3498,6 +3533,10 @@ class FrontCaptureController extends ChangeNotifier {
         break;
       }
       await _lockFocusOnly();
+      // See _lockPeakSharpness's own declaration -- the reference
+      // _waitForShutterSharpness() re-checks the live signal against right
+      // before the shutter fires, later in this same hold.
+      _lockPeakSharpness = maxSample > 0 ? maxSample : null;
       _logTelemetry('refocusLocked', extra: {
         'converged': converged,
         'finalSharpnessAtLock': lastSample,
@@ -3528,6 +3567,76 @@ class FrontCaptureController extends ChangeNotifier {
       debugPrint('[front] refocus failed (non-fatal): $e');
     } finally {
       _refocusing = false;
+    }
+  }
+
+  /// Real, bounded re-check of live sharpness immediately before the main
+  /// burst fires -- direct CTO product call, 2026-09-02, on the real
+  /// focus-lock-to-shutter softness finding (CLAUDE.md: capture
+  /// `474b4d6a` -- `liveAbsSharpness` read a healthy, STABLE value through
+  /// the whole hold, 106.58 at lock -> 103.69 at hold-complete 1.5s later,
+  /// yet the delivered still frames scored a real 5-9x softer than that
+  /// signal implied). AF was already `FocusMode.locked` by `_refocus()`
+  /// well before this point -- this method never re-issues autofocus, it
+  /// only gates WHEN the shutter fires, so it cannot reintroduce the
+  /// AF-hunting risk early-locking exists to avoid. Paired with
+  /// `_holdDurationMs` being shortened 1500ms -> 900ms the same round: the
+  /// dwell no longer has to carry the whole burden of "hope nothing
+  /// drifted" by itself, since this is a real, live check instead.
+  ///
+  /// Polls the same `_liveAbsSharpness` signal `_refocus()` itself
+  /// trusts, against the SAME peak observed at lock time
+  /// (`_lockPeakSharpness`) and the SAME `_refocusDriftAcceptRatio`
+  /// `_refocus()`'s own drift-retry check uses -- reusing an
+  /// already-validated threshold rather than guessing a new one, per this
+  /// project's own standing discipline. Bounded by
+  /// `_shutterSharpnessMaxWaitMs`: fires anyway once the bound is hit,
+  /// same "never block indefinitely" pattern as every other real-time
+  /// gate in this file (e.g. `_wavelengthOnlyBlockMaxMs`). No peak to
+  /// compare against (e.g. `_refocus()` never got a usable sample) is
+  /// treated as already-cleared -- this gate can only ever ADD a bounded
+  /// wait on top of an already-working hold, never block a capture that
+  /// would otherwise have succeeded.
+  Future<void> _waitForShutterSharpness() async {
+    final peak = _lockPeakSharpness;
+    final sw = Stopwatch()..start();
+    var cleared = peak == null || peak <= 0;
+    var clearedAtMs = 0;
+    final sampleAtStart = _liveAbsSharpness;
+    if (!cleared) {
+      while (sw.elapsedMilliseconds < _shutterSharpnessMaxWaitMs) {
+        if (_disposed) return;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample >= peak * _refocusDriftAcceptRatio) {
+          cleared = true;
+          clearedAtMs = sw.elapsedMilliseconds;
+          break;
+        }
+        await Future<void>.delayed(
+            const Duration(milliseconds: _shutterSharpnessPollIntervalMs));
+      }
+    }
+    _logTelemetry('shutterSharpnessGate', extra: {
+      'peakAtLock': peak,
+      'sampleAtGateStart': sampleAtStart,
+      'sampleAtFire': _liveAbsSharpness,
+      'cleared': cleared,
+      'waitedMs': sw.elapsedMilliseconds,
+      'clearedAtMs': cleared && clearedAtMs > 0 ? clearedAtMs : null,
+    });
+  }
+
+  /// Thin wrapper around the hold-complete -> burst hand-off: waits for
+  /// `_waitForShutterSharpness()` (bounded, see its own docs) before
+  /// actually firing, then clears `_shutterPending` so a later hold in the
+  /// same session isn't permanently blocked from ever firing again.
+  Future<void> _fireAfterShutterSharpnessGate() async {
+    try {
+      await _waitForShutterSharpness();
+      if (_disposed) return;
+      await (_sweepEnabled ? _beginSweepPositioning() : _fireBurst());
+    } finally {
+      _shutterPending = false;
     }
   }
 

@@ -1,5 +1,65 @@
 # ClearBridge Mobile — persistent context
 
+## Focus-lock-to-shutter softness gap: BOTH candidate fixes shipped together, direct CTO call (2026-09-02)
+Direct follow-up to the entry immediately below. CTO's answer to the two
+candidate fixes laid out there: "a - Yes" (shorten the lock-to-shutter
+window) AND "b - Yes keep active, but burst should only fire once
+laplacian variance is at a high enough threshold" -- both, not a choice
+between them, with (b) specified precisely enough to build directly (a
+real pre-shutter sharpness gate, not just "keep AF active longer").
+
+**Built in `front_capture_controller.dart` (clearbridge_beta), not yet
+device-tested -- same standing discipline as every other capture-side
+change this project:**
+
+- **(a) `_holdDurationMs` shortened 1500ms -> 900ms.** This is the dwell
+  window between `_refocus()` locking AF (`FocusMode.locked`, well before
+  this timer starts) and the burst firing -- shortening it directly
+  shrinks how long the thumb has to drift against the now-fixed focal
+  plane before capture. A single deliberate reduction, not swept against
+  real data; justified because (b) below now does the actual verification
+  work this dwell was implicitly leaning on.
+- **(b) `_waitForShutterSharpness()`, a new real, bounded gate fired right
+  before the shutter.** Does NOT re-issue autofocus (so it can't
+  reintroduce the AF-hunting risk early-locking exists to prevent) --
+  it only delays WHEN the already-locked burst fires. Polls the same
+  `_liveAbsSharpness` signal `_refocus()` itself already trusts, checked
+  against the SAME peak sharpness observed at lock time
+  (`_lockPeakSharpness`, newly captured from `_refocus()`'s own
+  `maxSample`) using the SAME `_refocusDriftAcceptRatio=0.6` threshold
+  `_refocus()`'s own drift-retry check already relies on -- reusing an
+  already-validated number rather than inventing a new one, per this
+  project's standing discipline. Bounded at `_shutterSharpnessMaxWaitMs=
+  900ms`: fires anyway once the bound is hit, same "never block
+  indefinitely" pattern as every other real-time gate in this file (e.g.
+  `_wavelengthOnlyBlockMaxMs`). A capture whose `_refocus()` never got a
+  usable peak sample is treated as already-cleared, so this gate can only
+  ever add a bounded wait on top of an already-working hold, never block
+  one that would otherwise have succeeded.
+- New `shutterSharpnessGate` telemetry checkpoint (`peakAtLock`,
+  `sampleAtGateStart`, `sampleAtFire`, `cleared`, `waitedMs`,
+  `clearedAtMs`) -- the real next-capture data that answers whether this
+  actually catches a drift case (a capture where `cleared` only resolves
+  late, or never, inside the bound) versus clearing near-instantly on
+  every normal hold (the expected common case).
+- New `_shutterPending` guard, needed because the async gate can now take
+  up to 900ms and `_onFrame` keeps running during that window -- without
+  it, the shortened `_holdDurationMs` could elapse a second time before
+  the first gate resolves and fire a second, overlapping gate/burst
+  attempt. Reset in a `finally` so a disposed/errored gate can't
+  permanently strand a later hold.
+
+**Real, deliberate cost, stated plainly**: worst case this adds
+`_shutterSharpnessMaxWaitMs` (900ms) to the capture sequence beyond the
+new, shorter hold -- in the common case (sample already at/above 60% of
+peak, the expected steady-state reading) it resolves in well under one
+poll interval and costs almost nothing. Not yet confirmed on a real
+device; the next real capture with `captureTelemetry` data is what shows
+whether `474b4d6a`'s specific failure mode (`shotFired` still soft
+despite a healthy `holdComplete` reading) actually stops recurring, or
+whether the gate's threshold/bound need a further real-data-driven
+adjustment.
+
 ## Focus-lock-to-shutter softness gap found on 2 of 4 real masking-guard-failure captures -- real, not yet actioned, needs a product call (2026-09-02)
 Direct follow-up to the exposure-guard audit below ("yes go there next" --
 does the live focus signal at hold-complete actually predict the
