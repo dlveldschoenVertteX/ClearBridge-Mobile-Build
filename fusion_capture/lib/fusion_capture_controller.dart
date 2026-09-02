@@ -473,6 +473,18 @@ class FusionCaptureController extends ChangeNotifier {
   /// (GAME_ROTATION_VECTOR), so this does not need a live camera frame to
   /// sample, unlike oscillating's own per-camera-frame sampling.
   static const int _tiltPollMs = 60;
+  // Real, bounded wait for gyro steadiness right before the tilt
+  // reference is zeroed -- see the call site's own docs (CTO report,
+  // 2026-09-02: "Gyro did not calibrate correctly... struggling to lock
+  // into angle even though I was moving the phone"). Not a guessed
+  // number: oscillating_capture_controller.dart's own history already
+  // found insufficient sensor settle time before captureReference()
+  // biases the whole session's zero point by "several degrees" (its own
+  // fix was a flat 500ms pause). Bounded here rather than a blind delay,
+  // since the front hold's own on-target check never gates on gyro
+  // steadiness at all (focus+coverage only) -- a flat delay can't help if
+  // the user is still adjusting grip past it.
+  static const int _tiltReferenceSettleMaxMs = 800;
 
   // ---- phase 3: sweep stations ----
   // Real device feedback (2026-08-22): this phase should look exactly like
@@ -1039,11 +1051,34 @@ class FusionCaptureController extends ChangeNotifier {
           const Duration(milliseconds: _frontPhaseTimeoutMs));
       if (!held) _debug['frontHoldTimedOut'] = true;
       // Zero the tilt phase's orientation reference to whatever pose the
-      // phone is actually in right now -- the same timing
-      // oscillating_capture_controller.dart uses (captureReference() at its
-      // own FRONT calibration). This is the user's natural hold, so every
-      // later tilt target is measured relative to how THEY actually hold
-      // the phone, not an arbitrary app-launch orientation.
+      // phone is actually in right now. This is the user's natural hold,
+      // so every later tilt target is measured relative to how THEY
+      // actually hold the phone, not an arbitrary app-launch orientation.
+      //
+      // REAL FIX 2026-09-02 (CTO report: "Gyro did not calibrate
+      // correctly during sweep, I was struggling to lock into angle even
+      // tho I was moving the phone" -- the tilt phase, not sweep itself,
+      // is the one with any angle-based mechanic at all; sweep has none).
+      // The front hold's own on-target check (`_awaitHold` above) never
+      // gates on gyro steadiness -- only focus+coverage -- so the hold
+      // can complete, and this used to zero the reference immediately,
+      // while the phone was still being actively moved. Every later tilt
+      // target would then be measured against a biased zero point,
+      // exactly matching the report. oscillating_capture_controller.dart's
+      // own history already found this same class of bug (insufficient
+      // settle time before its own captureReference() call) and fixed it
+      // with a flat 500ms pause; done here as a real bounded WAIT on the
+      // live steadiness signal instead of a blind delay, since a fixed
+      // pause can't help if the user is still adjusting grip past it.
+      final refSettleSw = Stopwatch()..start();
+      while (_gyroMagnitudeDegPerSec >= _maxSteadyDegPerSec &&
+          refSettleSw.elapsedMilliseconds < _tiltReferenceSettleMaxMs) {
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+        if (_disposed) break;
+      }
+      _debug['tiltReferenceSettleMs'] = refSettleSw.elapsedMilliseconds;
+      _debug['tiltReferenceSettledSteady'] =
+          _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
       _orientation.captureReference();
       // The BURST needs its own bound too. Previously only the hold was
       // wrapped, leaving 8 raw takePicture() calls completely unprotected --

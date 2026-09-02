@@ -1,5 +1,66 @@
 # ClearBridge Mobile — persistent context
 
+## Real device test found the tested APK predated both new features, PLUS a genuine tilt-reference gyro bug fixed along the way (2026-09-02)
+CTO tested a fresh capture and reported: "Macro still did not focus on
+thumb ridges"; "Gyro did not calibrate correctly during sweep, I was
+struggling to lock into angle even tho I was moving the phone." Pulled the
+real capture (`49d21adf`) before assuming either report was about the
+code just shipped.
+
+**Real, decisive evidence this specific capture ran on an OLDER build,
+predating both today's macro-peak-search fix and the ultra-wide-sweep
+port.** `fusionDebug.macroDebug` on this capture has the OLD field shape
+(`maxSample`/`lockedAfter`/`driftRetried`/`sharpness`) -- `_waitForMacroFocusPeak`
+writes a completely different shape (`baseline`/`finalSample`/
+`peakHoldStreak`/`peakFound`/`waitedMs`), which is nowhere in this
+document. `fusionPhases` is also missing the `uwSweep` key entirely (added
+in the same commit as the macro fix), and there's no `cam3Shots` field and
+no `uwSweep*` debug key of any kind -- not even a self-skip flag. Both are
+airtight: this capture cannot have run today's code. Very likely an
+already-installed APK from an earlier build in this same session was
+reused rather than the freshly-published one. **Not yet re-tested on the
+actual current build** -- asked the CTO to grab the latest release link
+again before drawing any conclusion about whether the macro fix works.
+
+**"Gyro did not calibrate correctly" -- investigated anyway, and found a
+real, separate, pre-existing bug independent of which build was tested.**
+Sweep itself has no angle-based mechanic at all (confirmed: no `calib`/
+angle-tracking code path in the sweep phase) -- the tilt phase (2 of 5,
+immediately before sweep) is the one with a live angle target, so the
+report is almost certainly describing tilt, referenced loosely as "sweep."
+
+Root cause, found by comparing this file's own `_orientation.captureReference()`
+call against the exact mechanic it was ported from
+(`oscillating_capture_controller.dart`). That source has its OWN
+documented history of this precise failure class: an earlier version
+zeroed the reference only 50ms after the phone was first raised into
+position, and the sensor hadn't settled -- "biasing the whole session's
+'0° = FRONT' zero point by several degrees," fixed there with a flat
+500ms pause before `captureReference()`. This file's own port carried a
+comment claiming "the same timing oscillating_capture_controller.dart
+uses" -- checked directly, and that claim doesn't hold: oscillating zeroes
+at session START with an explicit 500ms settle wait; this file zeroes
+right after the front HOLD completes, with **no settle wait of any kind**.
+Worse than the original bug's own conditions: `_awaitHold`'s own on-target
+check gates only on focus+coverage, never on gyro steadiness (the
+steadiness signal IS computed live elsewhere in this file, just never
+consulted here) -- so the hold can complete, and the reference used to
+zero, while the phone is still being actively moved. That is a direct,
+literal match for "struggling to lock into angle even though I was moving
+the phone": every later tilt target is measured against a zero point that
+was captured mid-motion.
+
+**Fixed**: right before `captureReference()`, now waits (bounded
+`_tiltReferenceSettleMaxMs=800ms`) on the SAME live
+`_gyroMagnitudeDegPerSec < _maxSteadyDegPerSec` signal this file already
+tracks continuously via its own gyroscope subscription, not a blind delay
+-- a fixed pause can't help if the user is still adjusting grip past it,
+which a real steadiness check can. Bounded so a genuinely unsteady hold
+still zeroes eventually rather than hanging. New `tiltReferenceSettleMs`/
+`tiltReferenceSettledSteady` debug fields record whether the wait
+actually resolved on real steadiness or hit the bound, for the next real
+capture to confirm. **Not yet device-tested.**
+
 ## Two direct CTO asks built together: a real live focus-search for macro (no AF motor, so the user's own approach becomes the search) + camera "3" ported into the sweep architecture (2026-09-02)
 Direct follow-up to the "camera 2 has no real AF" finding immediately below.
 CTO's two asks: (1) "fix this focus issue on Macro, perhaps bringing the
