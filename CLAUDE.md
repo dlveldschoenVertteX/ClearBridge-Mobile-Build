@@ -1,5 +1,111 @@
 # ClearBridge Mobile — persistent context
 
+## THE macro root cause, finally: camera "2" is the ULTRA-WIDE, not the macro lens -- the whole round-31-through-52 macro thread was aimed at the wrong camera (2026-09-02)
+Third consecutive real device test reporting the same thing ("Macro still
+does not focus on thumbprint at all, the background is more crisp"). This
+time the answer is decisive, and it invalidates the premise every previous
+macro round was built on.
+
+**Real optics, computed from this capture's own `cameraLensInfo`
+(`1117a364`):**
+
+| cam | focal | sensor | diagonal FOV | afModes | real role |
+|---|---|---|---|---|---|
+| 0 | 5.54mm | 8.16x6.12mm | 85.3° | full AF | main (50MP) |
+| 1 | 3.72mm | 5.22x3.92mm | 82.5° | OFF | **MACRO (5MP)** |
+| 2 | 1.74mm | 4.48x3.36mm | **116.3°** | OFF | **ULTRA-WIDE** |
+| 3 | 3.72mm | 4.61x3.17mm | 73.9° | OFF | selfie (CTO-confirmed) |
+
+**116 degrees is not a macro lens.** It matches the A55's published
+123-degree ultra-wide. And camera "2"'s own raw "macro" frame confirms it
+visually beyond argument: the frame shows the ENTIRE ROOM -- ceiling
+slats, far wall, floor, window -- with the background razor-sharp and the
+thumb a smooth featureless blur. That is a fixed-hyperfocal ultra-wide
+behaving exactly as designed. **No AF timing, drift threshold, crop
+calibration, EV curve or peak-search could ever have fixed it**, which is
+why rounds 31-52 of macro work never landed: the lens was physically
+incapable of the shot being asked of it.
+
+**Round 40 actually reached this same conclusion** ("camera 2 is not
+optically a macro lens... it is the ultrawide sensor") from minimum-focus
+distance -- but the NAME stuck, and every later round kept treating it as
+the macro camera anyway. A real lesson about carrying an unverified label
+forward: the evidence was already in this file, and got argued past.
+
+**Direct confirmation the peak-search shipped last round was correct code
+pointed at the wrong lens**: this capture's `macroDebug` ran the full 6s
+window with `baseline == maxSample` (109.1) and `finalSample` 79.7 --
+sharpness only ever DECLINED as the thumb approached, never peaked.
+Against a hyperfocal lens that is the right answer: moving closer walks
+the pad further OUT of the only focal plane it has. The same mechanism
+pointed at a real macro module (fixed at ~4cm) should behave the opposite
+way.
+
+**Fixed**: `_macroCameraName` '2' -> **'1'** (the remaining rear camera,
+82.5° FOV, by elimination the 5MP macro). Its AF target defaults to the
+main guide's own cy (0.37) rather than the 0.34 that was real-measured on
+a different device's ultra-wide and has no bearing on this lens. New
+`macroCameraName`/`macroCameraFocalLengthMm` debug fields so the next
+capture confirms which lens actually opened without another round of
+inference. **Camera "1" has never been captured from by any build** --
+if its frames come back wrong, that one constant is all that changes.
+
+**Also fixed: the ultra-wide sweep was pointed at the selfie camera.** My
+camera-"3" identification last round was wrong -- the CTO's test settled
+it directly (its sweep frames came back as a photo of his face, confirmed
+visually). `_uwSweepCameraName` '3' -> **'2'**, the real ultra-wide. So
+the ultra-wide was being captured all along, just under the wrong name and
+aimed at a shot it cannot take; this phase now uses it at the normal
+working distance its hyperfocal plane actually suits.
+
+## Sweep focused on the background every time, and its readiness gate could never have caught it (2026-09-02)
+Same device test: "Sweep was blurry no focus on foreground at all but
+background was crisp." Confirmed visually on this capture's own
+`sweep_center_amb` frame -- wall planks and floor razor-sharp, thumb and
+hand blurred. Two real, independent code causes, both found by reading the
+sweep loop rather than guessing:
+
+1. **The sweep never pointed autofocus at the thumb at all.** No
+   `setFocusPoint` call anywhere in the zone loop -- it simply inherited
+   whatever the front phase left behind (deliberately unlocked, on
+   continuous AF, see `_fireFrontBurst`'s own 2026-08-27 reasoning) and
+   let the lens meter the whole scene. Against a textured wall and a
+   smooth low-contrast thumb, continuous AF picks the wall essentially
+   every time. Fixed: each zone now retargets AF to that zone's own guide
+   centre and converges (`_retargetAndConvergeMacro`, main camera only --
+   every other camera reports `afAvailableModes: [OFF]`), with
+   `lockAfter: false` to respect the front phase's own hard-won finding
+   that locking pins a burst to one mediocre point.
+
+2. **The readiness gate was structurally incapable of detecting it.**
+   `_focusValue` is `abs / _focusPeak` -- peak-NORMALISED -- and
+   `_focusPeak` is reset to 0 at the top of every zone, so the very first
+   sample sets the peak and the ratio is 1.0 immediately. Every zone of
+   every capture duly recorded `readyDetected: true` while imaging a sharp
+   wall. This file's own front-phase docs already spell the trap out
+   ("reaches 1.0 at ANY absolute sharpness level. A uniformly
+   out-of-focus hold satisfies that gate perfectly") -- it was simply
+   never applied to the sweep gate. Fixed with an ABSOLUTE floor
+   (`_sweepFocusFloorRatio = 0.5`) referenced against
+   `_frontFocusPeakAbs`, the peak sharpness the front hold itself observed
+   on this thumb, this device, this light -- a real session-local
+   reference rather than a guessed constant. Deliberately permissive (the
+   sweep images the pad off-centre and at an angle, so it should not be
+   held to the front hold's face-on peak): this is a floor against
+   "focused on the far wall", not a quality bar. Bounded by the existing
+   max-wait, so a zone that never clears still fires and records that it
+   did.
+
+**Third real bug found in the same loop**: `_scoreRoi` was hardcoded to
+`PadSilhouetteShape.defaultShape` -- the CENTRE guide position -- while
+the sweep translates the guide to cx 0.35/0.50/0.65. So for the left and
+right zones, every live reading (sharpness, coverage, the gate itself) was
+sampled from a region the thumb was no longer in. Fixed with
+`_liveRoiOverride`, set per zone and cleared in both sweep phases'
+`finally` blocks so no later phase inherits it.
+
+**None of this is device-tested yet.**
+
 ## Masking-guard audit's own flagged next step, completed: the exposure guard is correctly calibrated -- no mask fix needed, the 4 sampled captures are just genuinely soft (2026-09-02)
 Direct follow-up, completing the "real next step" the masking-reliability
 audit (below) left open: determine whether the 4 real guard-failing

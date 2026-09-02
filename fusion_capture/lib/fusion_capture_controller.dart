@@ -508,6 +508,31 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _sweepZoneReadyMinWaitMs = 300;
   static const int _sweepZoneReadyMaxWaitMs = 1400;
   static const int _sweepPhaseTimeoutMs = 60000;
+  /// Fraction of the front hold's own observed peak sharpness
+  /// (`_frontFocusPeakAbs`) that a sweep zone's live reading must reach
+  /// before it is treated as genuinely focused ON THE THUMB.
+  ///
+  /// REAL BUG this fixes, 2026-09-02 (CTO: "Sweep was blurry no focus on
+  /// foreground at all but background was crisp"). The readiness gate used
+  /// `_focusValue >= _focusThreshold` -- but `_focusValue` is
+  /// `abs / _focusPeak`, peak-NORMALISED, and `_focusPeak` is reset to 0
+  /// at the top of every zone. The very first sample therefore SETS the
+  /// peak and the ratio is 1.0 immediately, so the gate passed instantly
+  /// no matter what the lens was actually focused on. This file's own
+  /// front-phase docs already spell the trap out ("normalised against the
+  /// running peak, so it reaches 1.0 at ANY absolute sharpness level. A
+  /// uniformly out-of-focus hold satisfies that gate perfectly") -- it was
+  /// simply never applied to the sweep gate. Every zone of every capture
+  /// duly reported `readyDetected: true` while imaging a sharp wall and a
+  /// blurred thumb.
+  ///
+  /// 0.5 is deliberately permissive: the sweep images the pad at an angle
+  /// and off-centre, so it should not be held to the front hold's own
+  /// face-on peak. This is a floor against "focused on the far wall", not
+  /// a quality bar. Bounded by `_sweepZoneReadyMaxWaitMs` like every other
+  /// real-time gate in this file -- if it never clears, the zone still
+  /// fires and records that it did.
+  static const double _sweepFocusFloorRatio = 0.5;
 
   // ---- phase 4: macro (camera "2") close-up ----
   // Ported from clearbridge_beta's own front_capture_controller.dart
@@ -529,9 +554,63 @@ class FusionCaptureController extends ChangeNotifier {
   // space, not pixel space"), whether it is WORTH fusing is a premise to
   // measure once real capture data exists, not to assume -- this only
   // ports the CAPTURE, it does not change how fusion_brain treats it.
-  static const String _macroCameraName = '2';
+  // CAMERA IDENTITY CORRECTED 2026-09-02, and this is the root cause of
+  // every "macro is blurry / focused on the background" report from round
+  // 31 onward. Camera "2" is NOT the macro lens -- it is the ULTRA-WIDE.
+  //
+  // Decisive, from this device's own reported optics (capture 1117a364)
+  // plus a direct visual check of its raw frames:
+  //
+  //   cam  focal   sensor        diagonal FOV   role
+  //   0    5.54mm  8.16x6.12mm   85.3 deg       main (only one with real AF)
+  //   1    3.72mm  5.22x3.92mm   82.5 deg       MACRO (5MP, fixed ~close)
+  //   2    1.74mm  4.48x3.36mm   116.3 deg      ULTRA-WIDE
+  //   3    3.72mm  4.61x3.17mm   73.9 deg       SELFIE (CTO-confirmed)
+  //
+  // 116 degrees is not a macro lens by any reading -- it matches the A55's
+  // published 123-degree ultra-wide, and camera "2"'s own raw "macro"
+  // frame shows the entire room (ceiling slats, far wall, floor) with the
+  // background razor-sharp and the thumb a featureless blur. That is a
+  // fixed-hyperfocal ultra-wide doing exactly what it is built to do. No
+  // AF timing, threshold, crop calibration or peak-search can make it
+  // resolve a thumb at close range, which is why rounds 31-45's macro work
+  // never landed: the lens was never capable of the shot being asked of it.
+  //
+  // Round 40 actually reached the same conclusion from minimum-focus
+  // distance ("camera 2 is not optically a macro lens... it is the
+  // ultrawide sensor") -- but the name stuck and later rounds kept
+  // treating it as the macro. Corrected here at the source.
+  //
+  // Camera "1" is the remaining rear camera and, by elimination against
+  // the A55's real 4-camera lineup (main/ultrawide/macro/selfie), is the
+  // 5MP macro. It reports afAvailableModes: [OFF] like every other
+  // non-main camera on this device -- but for a DEDICATED macro module
+  // fixed-focus means fixed at a CLOSE plane (~4cm), which is precisely
+  // the geometry this phase wants. The peak-search added last round
+  // (_waitForMacroFocusPeak) becomes correct rather than counterproductive
+  // once pointed here: "bring the thumb closer" genuinely walks the pad
+  // INTO this lens's focal plane, whereas on the ultra-wide it walked it
+  // further OUT of one. Real evidence that is exactly what was happening:
+  // capture 1117a364's macroDebug ran the full 6s window with
+  // baseline == maxSample (109.1) and finalSample 79.7 -- sharpness only
+  // ever DECLINED as the thumb approached, never peaked.
+  //
+  // UNCONFIRMED until the next real capture: camera "1" has never been
+  // captured from by any build of this app. If its frames come back wrong,
+  // this one constant is the only thing that needs to change.
+  static const String _macroCameraName = '1';
   static const double _macroGuideScaleFactor = 1.2;
-  static const double _macroFocusTargetCy = 0.34;
+  // 0.37 = PadSilhouetteShape.defaultShape.cy, i.e. the main guide's own
+  // position -- deliberately NOT the old 0.34, which was real-measured on
+  // camera "2" (now known to be the ultra-wide) of a DIFFERENT device and
+  // has no bearing on this lens. Camera "1"'s field of view (82.5 deg
+  // diagonal) is within 3 deg of the main camera's own (85.3), so the pad
+  // lands in very nearly the same relative place and the main guide's own
+  // position is the best-evidenced starting point available. Same
+  // reasoning and same value as `_cam3FocusTargetCy` already uses. Not a
+  // measurement -- the first real camera-"1" capture is what would let
+  // this be measured properly, exactly as rounds 31-34 did for camera "2".
+  static const double _macroFocusTargetCy = 0.37;
 
   /// Real per-device AF-target calibration for macro-class secondary
   /// cameras, keyed by the camera's own reported focal length -- a stable
@@ -678,7 +757,7 @@ class FusionCaptureController extends ChangeNotifier {
   // burned by more than once (_scoreRoi/_focusPointScreenSpace).
   static const double _cam3FocusTargetCy = 0.37;
 
-  // ---- phase 6 (experimental): ultra-wide sweep, camera "3" ---------
+  // ---- phase 6 (experimental): ultra-wide sweep, camera "2" ---------
   // Direct CTO ask, 2026-09-02: "The A55 has 3 cameras on the back, port
   // the UltraWide cam into the sweep architecture, I want to see how that
   // pans out." Purely additive -- runs after every existing phase, writes
@@ -686,26 +765,19 @@ class FusionCaptureController extends ChangeNotifier {
   // every other secondary-camera path in this file if the camera can't be
   // opened.
   //
-  // Real, unresolved camera-identity note, stated plainly rather than
-  // assumed: this app's own `cameraLensInfo` reports camera "3" as
-  // FRONT-facing (`lensFacing: 0`) on the A55 -- the same real
-  // "camera-ID-to-role isn't stable across devices" gotcha already
-  // flagged in this project's history. But camera "1" ALSO reports FRONT
-  // on the same real capture, which is physically impossible on a device
-  // with exactly one selfie camera. Reasoned identification, not a guess:
-  // camera "1"'s sensor (5.22x3.92mm, ~6.53mm diagonal) matches a 32MP
-  // 1/2.8"-class selfie sensor; camera "3"'s (4.61x3.17mm, ~5.59mm
-  // diagonal) matches a 12MP 1/3.06"-class ultra-wide -- consistent with
-  // the A55's own published spec, and consistent with this project's
-  // OWN earlier note that singled out camera "3" specifically as the
-  // anomaly (camera "1" was never flagged, i.e. its FRONT reading was
-  // never surprising). By elimination against the A55's real 4-camera
-  // lineup (main/ultrawide/macro/front, no depth sensor) camera "3" is
-  // the only candidate left once "0"=main and "2"=macro are already
-  // established. UNCONFIRMED until the next real capture's frames are
-  // visually reviewed -- if wrong, only this one name constant changes.
+  // CAMERA CORRECTED 2026-09-02. My first pass pointed this at camera "3"
+  // on a sensor-size argument. That was wrong, and the CTO's own device
+  // test settled it: camera "3" is the SELFIE camera -- its sweep frames
+  // came back as a picture of his face. The real ultra-wide is camera "2"
+  // (116.3 deg diagonal FOV vs the main camera's 85.3 -- see
+  // _macroCameraName's own table), the camera this project has been
+  // mislabelling as "macro" since round 31. So the ultra-wide was already
+  // being captured all along, just under the wrong name and pointed at a
+  // shot it physically cannot take. This phase now uses it for what it is
+  // actually good for: a genuinely wider field over the same sweep zones,
+  // at the normal working distance its fixed hyperfocal plane suits.
   static const bool _uwSweepEnabled = true;
-  static const String _uwSweepCameraName = '3';
+  static const String _uwSweepCameraName = '2';
   // Same 3-zone stations as the main sweep, same progress fractions
   // (0.0/0.5/1.0) -- the on-screen guide is screen-space and
   // camera-agnostic (confirmed: PadSilhouetteShape.defaultShape.cy
@@ -878,6 +950,11 @@ class FusionCaptureController extends ChangeNotifier {
   // live signals from the preview stream
   double _focusValue = 0.0;
   double _focusPeak = 0.0;
+  /// Peak absolute sharpness observed during the front hold's own AF
+  /// convergence -- the session's reference for a real, thumb-focused
+  /// reading. Null until the front phase has run. See
+  /// `_sweepFocusFloorRatio`.
+  double? _frontFocusPeakAbs;
   double? _liveAbsSharpness;
   double _coverage = 0.0;
   DateTime? _holdStart;
@@ -1274,6 +1351,15 @@ class FusionCaptureController extends ChangeNotifier {
       frontFocusDebug['error'] = e.toString();
     }
     _debug['frontFocusDebug'] = frontFocusDebug;
+    // Remembered as the session's own reference for "what a real, in-focus
+    // reading on THIS thumb, on THIS device, in THIS light looks like" --
+    // the sweep readiness gate needs an ABSOLUTE reference and has never
+    // had one (see _sweepFocusFloorRatio). Measured during the front hold,
+    // which is the one phase that genuinely converges on the pad.
+    final frontPeak = frontFocusDebug['maxSample'];
+    if (frontPeak is num && frontPeak > 0) {
+      _frontFocusPeakAbs = frontPeak.toDouble();
+    }
 
     await _stopStream();
 
@@ -1616,6 +1702,9 @@ class FusionCaptureController extends ChangeNotifier {
       _abortPhase = true;
     } finally {
       _abortPhase = false;
+      // Never leave a later phase measuring the last zone's region --
+      // see _liveRoiOverride's own docs.
+      _liveRoiOverride = null;
       await _stopStream();
     }
   }
@@ -1714,19 +1803,69 @@ class FusionCaptureController extends ChangeNotifier {
       final zoneLabel = station.key.replaceFirst('sweep_', '');
       _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zoneLabel'),
           force: true);
+
+      // Measure the live signal where the guide ACTUALLY is for this zone,
+      // not at the centre default -- see _liveRoiOverride's own docs.
+      final zoneShape = _sweepGuideFor(station);
+      _liveRoiOverride = Rect.fromCenter(
+        center: Offset(zoneShape.cx, zoneShape.cy),
+        width: zoneShape.rx * 2,
+        height: zoneShape.ry * 2,
+      );
+
+      // Point AF at this zone's own guide centre before the shutter.
+      // Previously the sweep NEVER called setFocusPoint at all: it simply
+      // inherited whatever the front phase left behind (deliberately
+      // unlocked, on continuous AF) and let the lens meter the whole
+      // scene. Against a textured wall or floor and a smooth, low-contrast
+      // thumb, continuous AF reliably picks the background -- which is
+      // exactly what the CTO reported and what this capture's own frames
+      // show. Only the main camera has real AF (afAvailableModes on every
+      // other camera is [OFF]), so this is skipped for a camera override.
+      //
+      // lockAfter: false, matching the front phase's own hard-won
+      // conclusion (see _fireFrontBurst) that locking pins the burst to one
+      // mediocre point; the convergence pass alone "can only put the lens
+      // in the right place".
+      if (camOverride == null) {
+        try {
+          await _retargetAndConvergeMacro(
+            cam,
+            Offset(zoneShape.cx, zoneShape.cy),
+            minMs: _frontFocusMinMs,
+            maxMs: _frontFocusMaxMs,
+            lockAfter: false,
+          );
+        } catch (_) {}
+        if (_abortPhase || _disposed) break;
+      }
+
       final readyStart = DateTime.now();
       var readyDetected = false;
+      // Absolute floor, not just the peak-normalised ratio -- see
+      // _sweepFocusFloorRatio. Null reference (front phase never produced
+      // one) falls back to the old relative-only behaviour rather than
+      // blocking on a bar that cannot be evaluated.
+      final absFloor = _frontFocusPeakAbs != null
+          ? _frontFocusPeakAbs! * _sweepFocusFloorRatio
+          : null;
       while (DateTime.now().difference(readyStart).inMilliseconds <
           _sweepZoneReadyMaxWaitMs) {
         if (_abortPhase || _disposed) break;
         final elapsed = DateTime.now().difference(readyStart).inMilliseconds;
-        if (elapsed >= _sweepZoneReadyMinWaitMs && _focusValue >= _focusThreshold) {
+        final abs = _liveAbsSharpness;
+        final absOk = absFloor == null || (abs != null && abs >= absFloor);
+        if (elapsed >= _sweepZoneReadyMinWaitMs &&
+            _focusValue >= _focusThreshold &&
+            absOk) {
           readyDetected = true;
           break;
         }
         await Future<void>.delayed(const Duration(milliseconds: 80));
       }
       _debug['${station.key}_readyDetected'] = readyDetected;
+      _debug['${station.key}_absAtFire'] = _liveAbsSharpness;
+      _debug['${station.key}_absFloor'] = absFloor;
       if (_abortPhase || _disposed) break;
 
       // Same 3-2-1 countdown every other phase uses (front, tilt, macro/
@@ -2121,6 +2260,13 @@ class FusionCaptureController extends ChangeNotifier {
         if (calibratedCy != null) {
           _debug['${debugKey}CalibratedFocusTargetCy'] = calibratedCy;
         }
+        // Records WHICH physical camera this phase actually opened, and its
+        // own reported optics, so the next real capture confirms the
+        // 2026-09-02 camera-identity correction landed (macro should now be
+        // camera "1", ~3.72mm, NOT camera "2"'s 1.74mm ultra-wide) without
+        // needing another round of inference.
+        _debug['${debugKey}CameraName'] = cameraName;
+        _debug['${debugKey}CameraFocalLengthMm'] = camFocalLengthMm;
         final macroRoi =
             Rect.fromLTWH(0.25, effectiveFocusTargetCy - 0.19, 0.5, 0.4);
         void macroFrameListener(CameraImage image) {
@@ -2349,6 +2495,7 @@ class FusionCaptureController extends ChangeNotifier {
         } on TimeoutException {
           _debug['uwSweepPhaseTimedOut'] = true;
         } finally {
+          _liveRoiOverride = null;
           await _stopStream();
           _previewSize = savedPreviewSize;
         }
@@ -2466,7 +2613,22 @@ class FusionCaptureController extends ChangeNotifier {
   /// front_only_v1 was burned twice by hand-copied geometry constants
   /// drifting from PadSilhouetteShape -- deriving it keeps one source of
   /// truth.
+  /// Set while a sweep zone is active so the live signal is measured where
+  /// the guide ACTUALLY is, not where it starts.
+  ///
+  /// REAL BUG, found 2026-09-02 (CTO: "Sweep was blurry no focus on
+  /// foreground at all but background was crisp", visually confirmed on
+  /// this capture's own sweep frames -- wall planks and floor razor-sharp,
+  /// thumb blurred). The sweep phase translates the guide to cx 0.35 /
+  /// 0.50 / 0.65, but `_scoreRoi` was hardcoded to
+  /// PadSilhouetteShape.defaultShape -- the CENTRE position -- so for the
+  /// left and right zones every live reading (sharpness, coverage, the
+  /// readiness gate) was sampled from a region the thumb was no longer in.
+  Rect? _liveRoiOverride;
+
   Rect get _scoreRoi {
+    final override = _liveRoiOverride;
+    if (override != null) return override;
     const g = PadSilhouetteShape.defaultShape;
     return Rect.fromCenter(
       center: Offset(g.cx, g.cy),
