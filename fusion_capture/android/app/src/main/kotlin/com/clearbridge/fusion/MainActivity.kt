@@ -77,6 +77,16 @@ class MainActivity : FlutterActivity() {
         else -> null
     }
 
+    private fun afModeName(value: Int): String = when (value) {
+        CameraCharacteristics.CONTROL_AF_MODE_OFF -> "OFF"
+        CameraCharacteristics.CONTROL_AF_MODE_AUTO -> "AUTO"
+        CameraCharacteristics.CONTROL_AF_MODE_MACRO -> "MACRO"
+        CameraCharacteristics.CONTROL_AF_MODE_CONTINUOUS_VIDEO -> "CONTINUOUS_VIDEO"
+        CameraCharacteristics.CONTROL_AF_MODE_CONTINUOUS_PICTURE -> "CONTINUOUS_PICTURE"
+        CameraCharacteristics.CONTROL_AF_MODE_EDOF -> "EDOF"
+        else -> "UNKNOWN_$value"
+    }
+
     private fun cameraLensInfoByCameraId(): Map<String, Map<String, Any?>> {
         val cameraManager = applicationContext
             .getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -93,6 +103,21 @@ class MainActivity : FlutterActivity() {
             val ois = chars.get(CameraCharacteristics.LENS_INFO_AVAILABLE_OPTICAL_STABILIZATION)
                 ?: IntArray(0)
             val hasOis = ois.any { it != CameraCharacteristics.LENS_OPTICAL_STABILIZATION_MODE_OFF }
+            // Real diagnostic, 2026-09-02: CTO reported the A55's macro shot
+            // (camera "2") stays soft even after the crop/AF-target fix
+            // landed on the right region -- direct hypothesis was "maybe
+            // this lens doesn't even have real autofocus". minFocusDistance
+            // alone can't answer that (it read null on every camera on this
+            // device, which just means the native query found nothing, not
+            // that the lens is fixed-focus -- a genuinely fixed-focus lens
+            // reports EXACTLY 0.0 there per Android's own spec, not null).
+            // CONTROL_AF_AVAILABLE_MODES is the real, direct answer: a
+            // fixed-focus lens reports only OFF (or an empty/absent list);
+            // a lens with real AF reports AUTO/CONTINUOUS_PICTURE/etc.
+            // alongside it.
+            val afModes = chars.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
+                ?: IntArray(0)
+            val afModeNames = afModes.map { afModeName(it) }
             info[id] = mapOf(
                 "focalLengthMm" to focalLengths?.firstOrNull()?.toDouble(),
                 "sensorWidthMm" to sensorSize?.width?.toDouble(),
@@ -103,6 +128,7 @@ class MainActivity : FlutterActivity() {
                 "focusDistanceCalibration" to focusDistanceCalibrationName(focusCalib),
                 "minFocusDistanceDiopters" to minFocusDistanceDiopters?.toDouble(),
                 "hasOpticalStabilization" to hasOis,
+                "afAvailableModes" to afModeNames,
             )
         }
         return info

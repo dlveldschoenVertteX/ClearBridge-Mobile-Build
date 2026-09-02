@@ -1,5 +1,65 @@
 # ClearBridge Mobile — persistent context
 
+## First real A55 test of the corrected macro crop: framing fix CONFIRMED working, but the pad itself is genuinely soft -- a real, separate AF problem (2026-09-02)
+First real device test of the crop/AF-target fix above (capture
+`086fc79c`). CTO report: "the macro capture is still not focused on the
+thumb it's blurry... AF may not be working correctly... macro may not even
+be in the same camera location as the old model it may be a different
+cam."
+
+**Framing fix confirmed real and working.** `fusionDebug.macroCalibratedFocusTargetCy:
+0.49` is written to this real capture's doc — direct proof the per-device
+lookup matched this device's real reported focal length and applied the
+corrected A55 value, not the old device's 0.34. Pulled the actual raw
+macro frame and overlaid the current crop region: it now sits tightly on
+the real thumb pad, matching the offline verification from the previous
+entry. The crop/framing half of this bug is closed.
+
+**Softness is real and separate, confirmed visually, not a framing
+artifact.** The pad itself shows no ridge detail — a smooth, featureless
+blob — while everything else in the SAME frame (wrist skin, sleeve fabric,
+background floor/bannister) is visibly sharp. Since the guide/crop now
+correctly targets the pad, this rules out "AF was aimed at the wrong
+region" as the remaining explanation — it genuinely isn't reaching focus
+on the pad.
+
+**Checked whether "camera 2 has no real autofocus" (the CTO's own
+hypothesis) is likely, not assumed either way.** `minFocusDistanceDiopters`
+reads `null` for every camera on this device — but that's NOT decisive
+either way: a genuinely fixed-focus lens reports exactly `0.0` there per
+Android's own CameraCharacteristics spec, not `null` — `null` more likely
+means the native query simply found nothing, the same ambiguity as always.
+Added a new, more direct diagnostic (`afAvailableModes`, `MainActivity.kt`)
+that reads `CONTROL_AF_AVAILABLE_MODES` — the field that actually answers
+this: a fixed-focus lens reports only `OFF`; a lens with real autofocus
+reports `AUTO`/`CONTINUOUS_PICTURE`/etc. alongside it. Same safe, read-only
+pattern as every other `cameraLensInfo` field. Answers definitively on the
+next real capture rather than guessing.
+
+**Checked whether the drift-retry threshold is the fix — real evidence
+found, but it does NOT support changing it.** `macroDebug` on this capture:
+`maxSample=172.74`, settled `sharpness=131.37` — 76% of its own peak, a
+real, meaningful excursion-then-drift (not flat, which argues against a
+fixed-focus lens too — a truly fixed-focus camera wouldn't show this
+pattern at all). `driftRetried: false` because `_macroDriftAcceptRatio=0.6`
+only fires below 60% of peak, and 76% clears that bar. Before touching this
+threshold, checked whether it's actually mis-tuned: it isn't a local guess
+— it's the exact same value as `clearbridge_beta`'s own already-validated
+`_refocusDriftAcceptRatio` (unchanged since round 26, used for the main
+front-hold's identical drift-retry mechanism project-wide). Front's OWN
+convergence on this same device settled to 95-97% of peak
+(`frontFocusDebug`), well clear of this bar — so the bar itself isn't
+obviously wrong; camera "2"'s AF is genuinely converging worse than the
+main camera's, which is a real, different question the AF-modes diagnostic
+above is what should actually answer. **Not touching
+`_macroDriftAcceptRatio` on this evidence** — same standing discipline
+against tuning a threshold off n=1 when a more direct diagnostic is
+available instead.
+
+**Not yet resolved**: whether camera "2" has real AF at all on this
+device. The next real macro capture (once this diagnostic build lands)
+answers it directly.
+
 ## First real Samsung A55 capture: macro crop was ~70% background -- real per-device calibration table built to replace the single hardcoded old-device constant (2026-09-02)
 CTO's A55 arrived, first real `fusion_v1` capture (`73c86c41`) pulled and
 manually scored (production trigger is off for this experimental mode).
