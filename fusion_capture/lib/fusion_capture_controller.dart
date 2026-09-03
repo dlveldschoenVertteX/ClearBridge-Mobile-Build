@@ -407,6 +407,21 @@ class FusionCaptureController extends ChangeNotifier {
   static const bool _sweepEnabled = true;
   static const bool _macroEnabled = true;
 
+  // Direct CTO ask (2026-09-03): apply the same "pull the user physically
+  // closer" principle the camera-0 macro fix uses to the tilt phase too --
+  // real full AF on camera 0 gets meaningfully more ridge magnification at
+  // a closer working distance for the same sensor resolution (confirmed:
+  // macro's own real NFIQ2 matched front's best variant on the first real
+  // camera-0 capture, 71 vs 71). More conservative than macro's own 1.2x
+  // on purpose: tilt's whole point is exposing the pad EDGE as it rotates
+  // into view, and a closer guide shrinks the real margin before that edge
+  // clips out of frame at the tilted stations (unlike macro/front, which
+  // stay face-on the whole time). 1.1x is a first cut, not swept against
+  // real data -- the next real capture's tilt-zone NFIQ2/visual review is
+  // what confirms whether this is worth its own real cost (one more
+  // real AF reconvergence at phase start) without losing edge coverage.
+  static const double _tiltGuideScaleFactor = 1.1;
+
   /// Whether to invoke the deployed production Cloud Function on this
   /// capture. OFF on purpose.
   ///
@@ -1534,12 +1549,15 @@ class FusionCaptureController extends ChangeNotifier {
   /// asked for -- the ask was the degree measure and hold-to-lock mechanic,
   /// which this delivers with the same live sensor oscillating itself uses.
   Future<void> _runTiltPhase() async {
+    final tiltShape = _tiltGuideScaleFactor == 1.0
+        ? PadSilhouetteShape.defaultShape
+        : PadSilhouetteShape.defaultShape.scaled(_tiltGuideScaleFactor);
     _apply((s) => s.copyWith(
           phase: FusionPhase.tilt,
           statusText: 'Phase 2 of 5 — Edge detail',
           detailText: 'Small tilts reveal the sides of your print',
           silhouetteState: PadSilhouetteState.aligning,
-          guideShape: PadSilhouetteShape.defaultShape,
+          guideShape: tiltShape,
           phaseProgress: 0.0,
           stationsDone: 0,
           clearStationIndex: true,
@@ -1549,6 +1567,30 @@ class FusionCaptureController extends ChangeNotifier {
     if (cam == null) return;
     _tiltAngularVelocity = 0.0;
     _tiltLastAngleAt = null;
+    // Keep the live sharpness/coverage ROI in sync with the guide actually
+    // shown -- same real bug class already fixed once for sweep zones
+    // (_liveRoiOverride's own docs): a scaled-up guide with an unscaled
+    // ROI silently measures the wrong region.
+    _liveRoiOverride = Rect.fromCenter(
+      center: Offset(tiltShape.cx, tiltShape.cy),
+      width: tiltShape.rx * 2,
+      height: tiltShape.ry * 2,
+    );
+    // One real, bounded reconvergence at the new (closer) working distance
+    // before the first station -- not per-station, since the guide scale
+    // is constant across all three tilt angles. Same shared, already-
+    // validated peak-tracking helper the macro/sweep phases use, not a
+    // blind delay.
+    if (_tiltGuideScaleFactor != 1.0) {
+      final tiltFocusDebug = <String, dynamic>{};
+      await _retargetAndConvergeMacro(
+        cam,
+        Offset(tiltShape.cx, tiltShape.cy),
+        lockAfter: false,
+        debugOut: tiltFocusDebug,
+      );
+      _debug['tiltCloserFocusDebug'] = tiltFocusDebug;
+    }
     try {
       for (var i = 0; i < _tiltStations.length; i++) {
         if (_abortPhase || _disposed) break;
@@ -1615,6 +1657,7 @@ class FusionCaptureController extends ChangeNotifier {
       _tiltAnglePoll?.cancel();
       _tiltAnglePoll = null;
       _abortPhase = false;
+      _liveRoiOverride = null;
     }
   }
 

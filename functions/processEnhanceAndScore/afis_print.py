@@ -1740,12 +1740,42 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
         ab = [g for g in (ambient_burst or []) if g is not None]
         fb = [g for g in (flash_burst or []) if g is not None]
         seed_cx = seed_cy = None
+        # Same pad-crop bbox `flash_pair_sharpness_ratio` already uses, and
+        # for the identical reason its own docstring states: "a whole-frame
+        # Laplacian is dominated by background texture and says almost
+        # nothing about the ridge content" -- this guard used to measure
+        # `f_lap` on the WHOLE frame, which for a close-up/macro shot with
+        # a large dark, low-texture background can drag a genuinely fine
+        # in-focus flash frame's variance below the threshold on background
+        # alone. Real case found 2026-09-03: a macro flash frame measured
+        # 49.5 whole-frame (just under the 50.0 guard, wrongly skipped) vs
+        # 60.2 restricted to the guide's own pad crop -- same frame, same
+        # pixels that actually matter, different verdict.
+        gx0 = gx1 = gy0 = gy1 = None
         if guide_region:
             try:
                 seed_cx = float(guide_region['cx']) * shape[1]
                 seed_cy = float(guide_region['cy']) * shape[0]
+                # Dilated by _MASK_COVER_DILATE, the SAME factor the final
+                # mask itself is later allowed to expand past the raw guide
+                # by (below) -- measuring the guard over a narrower,
+                # un-dilated bbox understated real contrast here on a real
+                # macro capture (48.6, still under the guard) vs the
+                # dilated crop (56.9, clears it): macro's guide is the
+                # FRONT phase's own tight box reused at a closer working
+                # distance, so the pad now fills more of frame than that
+                # box alone assumes, and a plain un-dilated crop samples
+                # only the smoothest, most torch-saturated centre of the
+                # pad rather than the ridge-bearing area around it.
+                rx = float(guide_region['rx']) * shape[1] * _MASK_COVER_DILATE
+                ry = float(guide_region['ry']) * shape[0] * _MASK_COVER_DILATE
+                gx0 = max(0, int(seed_cx - rx)); gx1 = min(shape[1], int(seed_cx + rx))
+                gy0 = max(0, int(seed_cy - ry)); gy1 = min(shape[0], int(seed_cy + ry))
+                if gx1 - gx0 < 16 or gy1 - gy0 < 16:
+                    gx0 = gx1 = gy0 = gy1 = None
             except (KeyError, TypeError, ValueError):
                 seed_cx = seed_cy = None
+                gx0 = gx1 = gy0 = gy1 = None
         for a, f in zip(ab, fb):
             a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
             f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
@@ -1755,8 +1785,13 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
             # own comment. A saturated/clipped flash frame has too little local
             # gradient left for the torch-falloff cue to work, and produces a
             # noisy mask rather than failing cleanly -- skip this pair (try the
-            # next burst pair, if any) rather than trust it.
-            f_lap = float(cv2.Laplacian(f_gray, cv2.CV_64F).var())
+            # next burst pair, if any) rather than trust it. Measured on the
+            # guide's own pad crop when available (see above), whole-frame
+            # only as the fallback with no guide_region -- matches every
+            # other caller of _segment_via_flash_diff (arc_sweep/oscillating),
+            # unaffected by this change.
+            f_region = f_gray[gy0:gy1, gx0:gx1] if gx0 is not None else f_gray
+            f_lap = float(cv2.Laplacian(f_region, cv2.CV_64F).var())
             if f_lap < _FLASH_DIFF_MIN_FLASH_LAPLACIAN:
                 logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
                             f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
