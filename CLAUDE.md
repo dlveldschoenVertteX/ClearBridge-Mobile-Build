@@ -1,5 +1,66 @@
 # ClearBridge Mobile — persistent context
 
+## Real matchability check: does the A55 genuinely improve matching? Real data says NO, at this sample size -- and surfaced a real, untested mirroring question for the new fusion_capture pipeline (2026-09-04)
+Direct CTO ask, after several rounds of camera-identity/masking fixes that all
+looked good on NFIQ2: check real matchability (SourceAFIS, this project's own
+established gate -- never NFIQ2) rather than assume the A55 fixes translate
+into better real matching. Built both matchers fresh in a clean sandbox
+(mindtct/bozorth3 from the vendored NBIS source, SourceAFIS 3.18.1 cloned +
+built from `robertvazan/sourceafis-java` via Maven -- both real, local,
+reproducible builds, not assumed).
+
+**Real genuine pool**: 8 real `fusion_capture` A55 captures spanning this
+project's whole A55 testing window (2026-09-02 through today), rendered via
+the same `afis_print.generate()` pipeline this project always uses for this
+test -- all one physical thumb (this project's single tester), so every
+cross-capture pair is a genuine same-finger comparison, same convention as
+every prior real matchability round.
+
+**Real result: genuine cross-session mean 0.54 (max 4.91) via SourceAFIS** --
+essentially indistinguishable from this project's own already-established
+real impostor noise floor (mean 0.07, max 5.6, from 55 real distinct-subject
+fingerphotos, see the PRIME DIRECTIVE section's "External impostor check").
+Compared directly against this project's own documented OLD-device numbers
+(same section, 2026-08-13 sweep-vs-front_only_v1 test): OLD front_only_v1
+scored genuine mean 1.06 (0/45 ever beat a real impostor's max) -- the SAME
+order of magnitude as this A55 sample, not better. OLD sweep was the one
+real positive result ever recorded in this project (genuine mean 13.65, real
++10.57 separation from impostors, 15% beat impostor max) -- but sweep on the
+A55 has had real, documented focus/masking bugs through nearly this entire
+testing window (only fixed this same week), so this sample has no fair
+sweep-vs-sweep counterpart to compare against yet.
+
+**Real, previously-untested confound found and checked**: mirroring. This
+project's OLD architecture (front_only_v1/oscillating) has a long-documented,
+never-fully-resolved mirroring question (thumb-twist capture geometry) --
+`fusion_capture` (the architecture behind every A55 fix this week) had never
+been checked for the same thing. Testing best-of(normal, probe-mirrored)
+across all 28 real pairs raised the mean to 1.29 (max 9.53) -- a real,
+non-trivial, previously-undiscovered effect on several specific pairs
+(one pair jumped 1.70 -> 9.53), but NOT uniform (several pairs got WORSE
+mirrored), and even the best-of ceiling stays inside the noise-floor range
+this project's own data already established for genuine matching before any
+correction (5.6-14.2) -- nowhere near SourceAFIS's own ~40 practical match
+threshold either way.
+
+**Honest verdict, not spun either direction**: this real data does NOT show
+the A55 has increased matchability -- it sits at or below the old device's
+already-weakest real result, not anywhere near its best. This is not
+necessarily an indictment of the hardware itself: n=8 real captures (28
+pairs) is a small, mixed-architecture sample (front/macro/tilt candidates,
+not a clean single-architecture comparison) spanning several different, some
+genuinely broken, pipeline versions across one week of active development:
+half of this pool (`cap01`-`cap05`) predates this week's camera-identity fix
+entirely. No fresh external impostor population was recomputed this round
+(this sandbox has no AWS/S3 credentials configured and GitHub's API is
+blocked here, both previously used for real impostor pulls) -- this result
+is anchored against the project's own already-validated impostor noise
+floor, not a newly-measured one. **Real next step, not yet done**: a
+controlled same-architecture (front-vs-front, or once sweep is solid,
+sweep-vs-sweep) genuine comparison on fully-fixed A55 code only, plus
+resolving whether `fusion_capture`'s own capture geometry needs the same
+mirror-correction investigation the old architecture never fully closed out.
+
 ## Second correction the same day: camera "1" is ALSO front-facing on this device -- there is no rear macro camera id, macro now routes through camera "0" (2026-09-02)
 Direct real-device follow-up on the previous fix. CTO tested the very next
 build and reported "front cam is still connected" while capturing -- flagged
