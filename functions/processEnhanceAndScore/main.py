@@ -111,6 +111,59 @@ _SECONDARY_MAX_WAVELENGTH_PX_IR = 16.0
 # distance -- re-check against the first several real macro captures the
 # same way round 17 itself was validated, not assumed permanent.
 _SECONDARY_MAX_WAVELENGTH_PX_MACRO = 35.0
+
+# Real per-device calibration table for camera "2" (macro), keyed by its
+# own reported focal length -- a stable hardware signature. Real fix,
+# 2026-09-02: `_sec_cx`/`_sec_cy`/`_sec_rx`/`_sec_ry` below used to hardcode
+# ONE device's own real-measured macro crop (rounds 31-34) unconditionally
+# for every device running this pipeline. A Samsung A55's camera "2" has
+# meaningfully different optics (1.74mm focal length vs the original test
+# device's 2.37mm, plus a different sensor size) -- confirmed via a real
+# A55 capture whose macro frame, visually inspected, showed that old crop
+# landing ~70% on background floor/wall, not the pad. Each entry here is a
+# real, per-device measured (cx, cy, rx, ry) in the shared landscape
+# still-space convention (see the round-43 rotation note below) -- not a
+# formula guess. Matched by focal length with a small tolerance (repeat
+# units of the same phone model report identical specs; float jitter from
+# Camera2 characteristics is otherwise possible). MUST be kept numerically
+# in sync with `fusion_capture_controller.dart`'s own
+# `_cam2FocalLengthCalibratedCy` table (client only needs cy, for AF
+# targeting) -- same cross-boundary duplication-risk class already
+# documented elsewhere in this project (`_sec_cy`, `_macroGuideScaleFactor`).
+# A camera "2" whose focal length matches NEITHER entry falls back to the
+# existing ratio-derived formula (same mechanism camera "3" already uses)
+# instead of silently reusing a wrong device's numbers -- an honest, if
+# imperfect, physics-based estimate for any future unmeasured device,
+# not a guess. Both entries provisional (n=1 real measurement each), same
+# discipline as every other threshold in this pipeline.
+_CAM2_CALIBRATION = [
+    # (focal_length_mm, cx, cy, rx, ry)
+    (2.37, 0.66, 0.50, 0.13, 0.11),  # original test device, rounds 31-34
+    (1.74, 0.61, 0.49, 0.11, 0.09),  # Samsung A55, refined twice 2026-09-02
+    # against the CTO's own direct annotations of where the real print sits.
+    # Pass 1 (0.54, 0.45, 0.14, 0.07) was my own visual estimate off the raw
+    # frame -- real improvement but undershot toward the tip and too
+    # wide/short. Pass 2 (0.61, 0.46, 0.11, 0.12) mapped the CTO's own
+    # annotation of the true print region back through the display
+    # rotation. Pass 3 (this one) tightened cy/ry after the CTO flagged a
+    # remaining background sliver on one edge of pass 2's box, re-verified
+    # by re-rendering and visually confirming a tight fit.
+]
+_CAM2_FL_TOLERANCE_MM = 0.05
+
+
+def _cam2_calibration_for(focal_length_mm):
+    """Real per-device (cx, cy, rx, ry) for camera "2", or None if the
+    reported focal length doesn't match a calibrated device (caller falls
+    back to the ratio-derived formula)."""
+    if focal_length_mm is None:
+        return None
+    for fl, cx, cy, rx, ry in _CAM2_CALIBRATION:
+        if abs(focal_length_mm - fl) <= _CAM2_FL_TOLERANCE_MM:
+            return (cx, cy, rx, ry)
+    return None
+
+
 # IR-tuned Gabor sigma ratio: IR ridge contrast is steeper (less ambient
 # scattering) and may benefit from a tighter envelope. Used as a second
 # max-of-variants candidate when scoring a MONO/NIR camera frame, alongside
@@ -487,6 +540,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         flash_burst    = None
         ambient_burst_gyros = None
         flash_burst_gyros   = None
+        _alt_flash_primary  = None
         arc_frame_wts  = None
         osc_theta_deg  = None
         if is_arc:
@@ -504,7 +558,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                 **arc_sweep_stats,
             })
         elif is_front_only:
-            frames, frame_meta, actual_angles, ambient_frames, flash_frames = \
+            (frames, frame_meta, actual_angles, ambient_frames, flash_frames,
+             _alt_flash_primary) = \
                 _download_front_only_frames(capture_id, base_path)
             # Preserve the raw burst for the deepFuse variant -- same schema
             # _download_front_burst already expects (frames[] entries with
@@ -812,7 +867,46 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
         logger.info('stage=nns_start      elapsed=%.1fs', time.monotonic() - t_start)
         # Bilateral pre-denoise: removes stitching seam artefacts before UNet.
         unwrapped_d = cv2.bilateralFilter(unwrapped, d=5, sigmaColor=20, sigmaSpace=20)
-        enhanced, enhancement_params = enhancement_pipeline.enhance(unwrapped_d, sfm_coverage=sfm_coverage)
+
+        # ROI-restricted ridge frequency/orientation measurement for the NNS
+        # enhancer, front_only_v1 only. REAL BUG this exists to fix: without
+        # it, enhance()'s Stage-3 filter measures frequency/orientation on
+        # the highest-contrast quadrant of the WHOLE frame -- background,
+        # not pad, on most real captures -- and stamps a single wrong-
+        # oriented Gabor kernel across the entire image. Direct CTO report
+        # (2026-08-27) of diagonal streaking through a real enhanced print;
+        # isolating the filter reproduced the artifact almost exactly. See
+        # enhancement_pipeline.enhance()'s own docstring for the full
+        # mechanism. Scoped to front_only_v1: `unwrapped` there is the same
+        # center-square frame guideRegion's cx/cy/rx/ry are already
+        # normalized to (generate()'s own crop mask uses the identical
+        # region), so the mapping into enhance()'s internal 512x512 space is
+        # a direct scale, not a re-derivation. A second Firestore read here
+        # is deliberate, not an oversight -- same "each side keeps its own
+        # copy" pattern this project already uses elsewhere (see the guide-
+        # region fetch further down this function) rather than restructuring
+        # this function's control flow to share one fetch across both.
+        _nns_roi_box = None
+        if is_front_only:
+            try:
+                _nns_db, _ = _get_firebase()
+                _nns_guide = (_nns_db.collection('captures').document(capture_id)
+                             .get().to_dict() or {}).get('guideRegion')
+                if _nns_guide:
+                    _gcx = float(_nns_guide.get('cx', 0.5))
+                    _gcy = float(_nns_guide.get('cy', 0.5))
+                    _grx = float(_nns_guide.get('rx', 0.2)) * 1.15
+                    _gry = float(_nns_guide.get('ry', 0.2)) * 1.15
+                    _nns_roi_box = (
+                        int((_gcx - _grx) * 512), int((_gcy - _gry) * 512),
+                        int((_gcx + _grx) * 512), int((_gcy + _gry) * 512),
+                    )
+            except Exception as exc:
+                logger.warning('NNS roi_box: guideRegion fetch failed (%s)', exc)
+
+        enhanced, enhancement_params = enhancement_pipeline.enhance(
+            unwrapped_d, sfm_coverage=sfm_coverage, roi_box=_nns_roi_box)
+        enhancement_params['nnsRoiRestricted'] = _nns_roi_box is not None
         if fallback_mask is not None and 0.0 < sfm_coverage < 1.0:
             # Composite the background/gap-filled periphery out now that ridge
             # filtering is done, with a feathered edge (not a hard cut) so no
@@ -1253,18 +1347,37 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
             # 3.0 matches the existing fusion-sharpness guard's own margin.
             _FREQNORM_RISK_VARIANT_NAMES = {'freqNorm', 'mosaicFreq', 'deepFuse', 'deepMaxc'}
             _FREQNORM_RISK_MARGIN_REQUIRED = 3.0
-            try:
-                # front_only_v1 can supply [None] (no ambient/flash frame was
-                # uploaded) -- a one-element list is still truthy, so `if
-                # ambient_frames` alone doesn't catch it; check the actual
-                # first element too.
-                _amb_lap = (float(cv2.Laplacian(ambient_frames[0], cv2.CV_64F).var())
-                            if ambient_frames and ambient_frames[0] is not None else 0.0)
-                _fl_lap = (float(cv2.Laplacian(flash_frames[0], cv2.CV_64F).var())
-                           if flash_frames and flash_frames[0] is not None else 0.0)
-            except Exception:   # noqa: BLE001 — guard is best-effort, never blocks scoring
-                _amb_lap = _fl_lap = 0.0
-            _fusion_guarded = _fl_lap > 0 and (_amb_lap / _fl_lap) >= _SHARPNESS_RATIO_GUARD
+            # Layer 7 (variant selection) audit, round 49: this guard's own
+            # trigger measured ambient:flash sharpness over the WHOLE frame,
+            # no masking -- built 2026-07-23, predating
+            # afis_print.flash_pair_sharpness_ratio (2026-08-12), whose own
+            # docstring states why that's wrong for this exact measurement:
+            # "a whole-frame Laplacian is dominated by background texture
+            # and says almost nothing about the ridge content the fusion
+            # actually operates on." Same background-contamination pattern
+            # already found and fixed in layers 3/4/5/6 of this pass.
+            # Diagnostic on 24 real captures (fusion_brain/
+            # diag_fusion_guard_wholeframe.py): 3/24 disagree on whether the
+            # guard's own 4.0 threshold fires, ALWAYS in the direction of
+            # whole-frame under-detecting (background dilutes a real
+            # torch-blowout signal) -- never over-detecting, so restricting
+            # to the pad can only make the guard fire on MORE real blowout
+            # cases, never fewer. Checked whether that actually matters: on
+            # all 3 disagreement captures, deepFuse's real margin over
+            # native (+3.0 / +17.0 / +33.0 NFIQ2) already clears
+            # _FUSION_MARGIN_REQUIRED regardless of which measurement
+            # triggers the guard -- so on this evidence the fix is a real
+            # correctness improvement with no demonstrated behavior change,
+            # not a guess. `_FUSE_FLASH_SOFTNESS_GUARD` in afis_print.py
+            # (layer 6) already reuses this same function for the pairs it
+            # actually fuses; this makes main.py's own pre-existing,
+            # independent guard consistent with it.
+            _fusion_guard_ratio = afis_print.flash_pair_sharpness_ratio(
+                ambient_frames[0] if ambient_frames else None,
+                flash_frames[0] if flash_frames else None,
+                _guide_region)
+            _fusion_guarded = (isinstance(_fusion_guard_ratio, float)
+                                and _fusion_guard_ratio >= _SHARPNESS_RATIO_GUARD)
             _native_nfiq = None
 
             # fuseAvg/fuseMaxc/fuseSoft each pair a single flash_frames[0] with
@@ -1385,8 +1498,8 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         and _s < _native_nfiq + _FUSION_MARGIN_REQUIRED):
                     logger.info(
                         'AFIS variant %s suppressed by sharpness guard '
-                        '(amb/fl lap ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
-                        _vname, (_amb_lap / _fl_lap) if _fl_lap else 0.0,
+                        '(pad amb/fl ratio %.1fx, needed >= native(%.1f)+%.1f, got %.1f)',
+                        _vname, _fusion_guard_ratio or 0.0,
                         _native_nfiq, _FUSION_MARGIN_REQUIRED, _s)
                     continue
                 if (_vname in _NEURAL_GUARDED_VARIANT_NAMES and _native_nfiq is not None
@@ -1456,6 +1569,55 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                             best_afis_img = _b2_img
                             afis_params = {**_b2_p, 'afisNfiq': round(_b2_s, 2),
                                            'afisSecondBurstVariant': _b2_name}
+
+            # Alternate PRIMARY frame: the sharpest torch-lit frame in the
+            # burst, ranked inside the guide region (see
+            # _download_front_only_frames for the measurement that motivates
+            # it). Scored here as its own candidate -- native + freqNorm
+            # only, same bounded-cost pattern as the second-burst block
+            # above -- and kept only if it beats everything found so far.
+            #
+            # Deliberately ADDITIVE rather than a swap. main.py's own
+            # _download_front_only_frames carries a note that a 2026-07-24
+            # experiment swapping the primary to flash was refuted; that
+            # test replaced the primary using the client's whole-preview
+            # laplacianScore. This neither replaces nor uses that metric:
+            # the ambient primary still runs the entire variant pool exactly
+            # as before, and the flash frame only wins where real NFIQ2 says
+            # it is better. Worst case measured across 11 real production
+            # captures: exactly 0.
+            if (is_front_only and _alt_flash_primary is not None
+                    and time.monotonic() <= _variants_deadline):
+                for _af_name, _af_kw in (
+                    ('native',   dict()),
+                    ('freqNorm', dict(freq_normalize=True, freq_scale_min=0.9)),
+                ):
+                    _af_result = _call_with_hard_deadline(
+                        afis_print.generate,
+                        [_alt_flash_primary], [0.0], None,
+                        ambient_frames=ambient_frames, flash_frames=flash_frames,
+                        ambient_burst=ambient_burst, flash_burst=flash_burst,
+                        ambient_burst_gyros=ambient_burst_gyros,
+                        flash_burst_gyros=flash_burst_gyros,
+                        guide_region=_guide_region,
+                        stack_cache=_stack_cache,
+                        timeout_sec=_FUSE_PAIR_HARD_TIMEOUT_SEC,
+                        label=f'flashPrimary_{_af_name}',
+                        **_af_kw)
+                    if _af_result is None:
+                        continue
+                    _af_img, _af_p = _af_result
+                    if _af_img is None:
+                        continue
+                    _af_r = _score_ground_truth(_af_img)
+                    _af_s = _af_r.get('nfiq_score', 0.0) if not _af_r.get('error') else 0.0
+                    logger.info('flash-primary variant %s nfiq=%.1f (best so far=%.1f)',
+                                _af_name, _af_s, afis_nfiq)
+                    if _af_s > afis_nfiq:
+                        afis_nfiq = _af_s
+                        best_afis_img = _af_img
+                        afis_params = {**_af_p, 'afisNfiq': round(_af_s, 2),
+                                       'afisFlashPrimaryVariant': _af_name}
 
             # Per-zone focus-bracket stills (2026-08-17, client-side feature-
             # flagged off by default -- see FrontCaptureController's
@@ -1807,8 +1969,81 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # pipeline (n=1) -- but a real, evidenced correction,
                         # not a guess, and can only move the crop TOWARD
                         # where the pad was actually observed to sit.
-                        _sec_cy = (0.37 if _cam.get('name') == '3'
-                                   else 0.34 if _cam.get('name') == '2'
+                        #
+                        # ROTATED INTO THE SHARED STILL CONVENTION
+                        # (2026-08-27, round 43). Everything above measured
+                        # cy=0.34 / rx=0.11 / ry=0.13 -- correctly, but in
+                        # the frame convention those captures actually
+                        # arrived in, which round 36 then CHANGED and never
+                        # came back to re-derive these against.
+                        #
+                        # Confirmed, not assumed: both real cached camera-"2"
+                        # macro frames (f4cb3ba5 round 32, b615f37b round 35 --
+                        # the exact captures rounds 31/33/35 measured on)
+                        # decode via plain cv2.imdecode, the same call this
+                        # backend makes, to 2448x3264 -- PORTRAIT. Every other
+                        # frame in the same request is 4266x3200, landscape.
+                        # That mismatch IS the sideways bug round 36 diagnosed,
+                        # and its fix (`_normalizeMacroFrame`, client side) now
+                        # routes this frame through `decodeStillJpegToLuma`
+                        # like every other path, which rotates it 90 deg CW
+                        # into landscape. So a fresh capture delivers this
+                        # frame in a different coordinate space than the one
+                        # every constant here was measured in -- and round 36's
+                        # own note records it was never device-tested, so no
+                        # real capture has surfaced it.
+                        #
+                        # The rotation is (u,v) -> (1-v, u), read directly off
+                        # decodeStillJpegToLuma's own indexing
+                        # (`rotated[y*dstW+x] = luma[(h-1-x)*w + y]`), not from
+                        # the docstring -- the identical transform
+                        # `_computeGuideRegion` already applies to the main
+                        # guide. Radii swap axes under it.
+                        #
+                        #   cam "2" measured portrait (0.500, 0.340)
+                        #                 -> landscape (0.660, 0.500)
+                        #           radii  portrait rx 0.11 / ry 0.13
+                        #                 -> landscape rx 0.13 / ry 0.11
+                        #
+                        # Independent corroboration that this is the right
+                        # reading rather than a plausible one: the MAIN guide's
+                        # own real still-space position, measured off a real
+                        # capture in round 16, is cx=0.63 / cy=0.50. The macro
+                        # measurement rotates to (0.66, 0.50) -- 0.03 away, on
+                        # both axes -- which is exactly what it should be,
+                        # since the user aims at the same on-screen guide for
+                        # both shots and the macro guide is only scaled 1.2x.
+                        # Two numbers derived from completely different real
+                        # data landing on the same spot is much stronger
+                        # evidence than either alone.
+                        #
+                        # Camera "3": its 0.37 was never measured at all -- it
+                        # was copied from PadSilhouetteShape.cy, a SCREEN-space
+                        # constant, and used as a still-space cy. (Round 27's
+                        # audit listed "defaultShape.cy 0.37 == main.py's
+                        # _sec_cy" as constants AGREEING; they agree
+                        # numerically while living in different spaces, which
+                        # is the actual defect.) Correct still-space value is
+                        # the same rotation of the same screen shape the main
+                        # guide already gets: (0.5, 0.37) -> (0.63, 0.50).
+                        # This branch is currently unreachable -- camera "3"
+                        # capture was removed client-side on 2026-08-03 -- but
+                        # round 40 named camera "3" the better-evidenced
+                        # diversity candidate if secondary cameras are revived,
+                        # so it is fixed now rather than left as a landmine for
+                        # whoever does that.
+                        # Real per-device lookup for camera "2" (see
+                        # _CAM2_CALIBRATION's own docstring above) -- only
+                        # replaces the flat single-device literal this used
+                        # to be; camera "3" and any other name are
+                        # untouched.
+                        _cam2_cal = (_cam2_calibration_for(_fl_sec)
+                                     if _cam.get('name') == '2' else None)
+                        _sec_cx = (0.63 if _cam.get('name') == '3'
+                                   else _cam2_cal[0] if _cam2_cal is not None
+                                   else 0.5)
+                        _sec_cy = (0.50 if _cam.get('name') == '3'
+                                   else _cam2_cal[1] if _cam2_cal is not None
                                    else 0.5)
                         # Camera "2" rx/ry, real data override (2026-08-20,
                         # round 33) -- direct CTO report ("mask is not
@@ -1840,8 +2075,13 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # still ratio-derived -- no real evidence this same
                         # gap applies there. Flagged provisional (n=1),
                         # same discipline as `_sec_cy`.
-                        _sec_rx = 0.11 if _cam.get('name') == '2' else _guide_region['rx'] * _rx_ratio
-                        _sec_ry = 0.13 if _cam.get('name') == '2' else _guide_region['ry'] * _ry_ratio
+                        # Axes swapped along with the centre above -- the
+                        # 0.11/0.13 pair was measured in the portrait frame,
+                        # and a 90 deg rotation exchanges rx and ry.
+                        _sec_rx = (_cam2_cal[2] if _cam2_cal is not None
+                                   else _guide_region['rx'] * _rx_ratio)
+                        _sec_ry = (_cam2_cal[3] if _cam2_cal is not None
+                                   else _guide_region['ry'] * _ry_ratio)
                         # tipAngleDeg was hardcoded 0.0 here -- real bug,
                         # found 2026-08-22 (direct CTO report: a macro
                         # superprint came out sideways). Client-side, every
@@ -1861,7 +2101,7 @@ def processEnhanceAndScore(req: https_fn.CallableRequest):
                         # reuse the main capture's own measured value rather
                         # than a hardcoded assumption.
                         _sec_guide = {
-                            'cx': 0.5,
+                            'cx': _sec_cx,
                             'cy': _sec_cy,
                             'rx': _sec_rx,
                             'ry': _sec_ry,
@@ -3330,6 +3570,49 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     # right default. Do not re-attempt this exact swap without new data.
     best_arr = amb_frames_list[0] if amb_frames_list else fl_frames_list[0]
 
+    # ALTERNATE primary: the sharpest TORCH-LIT frame, measured inside the
+    # guide region. Returned alongside -- never instead of -- best_arr, and
+    # consumed below as one more max-of-variants candidate, so this cannot
+    # regress a capture the ambient primary already handles well.
+    #
+    # Measured 2026-08-27 on 18 real production front_only_v1 captures by
+    # rendering EVERY burst frame and scoring each with the real NIST NFIQ2
+    # binary, so the best possible choice was known rather than assumed:
+    #   * the current ambient-primary rule matched that best frame on 1 of
+    #     11 captures, leaving a mean 12.7 NFIQ2 points on the table
+    #   * swapping to flash-primary outright averaged +8.1 but cost as much
+    #     as -15 on individual captures -- which is why this is additive
+    #   * keeping both and letting NFIQ2 selection decide averaged +10.6
+    #     with a worst case of exactly 0, matching the best frame 7/11
+    #
+    # Two things make the guide-region Laplacian the right ranking here,
+    # both measured rather than assumed:
+    #   1. Restricting to one illumination removes an ISO confound. Across
+    #      63 real captures ambient frames run ISO 291 median against
+    #      flash's 140, and Laplacian variance rewards that broadband
+    #      sensor noise -- which is how a visibly blurry ambient frame
+    #      (real CTO report, capture ed242f1c) scores as the "sharpest".
+    #   2. Restricting to the guide removes a framing confound. generate()'s
+    #      own internal _ridge_energy ranks frames on a centre-half crop of
+    #      the frame, and the guide occupies only 12.5% of that crop on real
+    #      captures -- so 87.5% of what it measures is background.
+    _alt_primary = None
+    _guide = doc_dict.get('guideRegion')
+    if fl_frames_list and _guide:
+        def _guide_lap(_a):
+            _g = _a if _a.ndim == 2 else cv2.cvtColor(_a, cv2.COLOR_BGR2GRAY)
+            # Same superellipse the AFIS mask itself uses, so the frames are
+            # ranked on exactly the region that ends up being enhanced.
+            _m = afis_print._superellipse_mask(_g.shape[:2], _guide)
+            if _m is None or not (_m > 0).any():
+                return float(cv2.Laplacian(_g, cv2.CV_64F).var())
+            return float(np.var(cv2.Laplacian(_g, cv2.CV_64F)[_m > 0]))
+        try:
+            _alt_primary = max(fl_frames_list, key=_guide_lap)
+        except Exception as exc:
+            logger.warning('front_only: alt flash primary failed: %s', exc)
+            _alt_primary = None
+
     frames     = [best_arr]
     meta_out   = [{'angle': 'front', 'laplacianScore': 0, 'frameSource': 'front_only'}]
     angles_out = [0.0]
@@ -3338,9 +3621,11 @@ def _download_front_only_frames(capture_id: str, base_path: str):
     ambient_frames_out = [amb_frames_list[0]] if amb_frames_list else [None]
     flash_frames_out   = [fl_frames_list[0]]  if fl_frames_list  else [None]
 
-    logger.info('front_only: %d ambient + %d flash frames loaded',
-                len(amb_frames_list), len(fl_frames_list))
-    return frames, meta_out, angles_out, ambient_frames_out, flash_frames_out
+    logger.info('front_only: %d ambient + %d flash frames loaded'
+                '%s', len(amb_frames_list), len(fl_frames_list),
+                '' if _alt_primary is None else ' (+alt flash primary)')
+    return (frames, meta_out, angles_out, ambient_frames_out,
+            flash_frames_out, _alt_primary)
 
 
 def _download_front_only_frames_burst2(capture_id: str, base_path: str):

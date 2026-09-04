@@ -1,0 +1,50 @@
+{
+  "capture": "5181d451-3031-4e60-8ef8-65d6ec2eac8c",
+  "max_added": 15,
+  "stats": [
+    {
+      "source": "tilt_tip",
+      "area_px": 770,
+      "overlap_px": 0,
+      "overlap_pct": 0.0,
+      "mean_coherence": 0.845,
+      "bridges": 0,
+      "kept": 1
+    },
+    {
+      "source": "tilt_right",
+      "area_px": 3420,
+      "overlap_px": 0,
+      "overlap_pct": 0.0,
+      "mean_coherence": 0.8658,
+      "bridges": 11,
+      "kept": 9
+    },
+    {
+      "source": "sweep_left",
+      "area_px": 1828,
+      "overlap_px": 0,
+      "overlap_pct": 0.0,
+      "mean_coherence": 0.8412,
+      "bridges": 0,
+      "kept": 3
+    },
+    {
+      "source": "sweep_right",
+      "area_px": 1092,
+      "overlap_px": 0,
+      "overlap_pct": 0.0,
+      "mean_coherence": 0.8229,
+      "bridges": 1,
+      "kept": 2
+    }
+  ],
+  "multi_source_px": 0,
+  "attribution_map": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_attribution_map.png",
+  "isolated": {
+    "tilt_tip": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_iso_tilt_tip.png",
+    "tilt_right": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_iso_tilt_right.png",
+    "sweep_left": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_iso_sweep_left.png",
+    "sweep_right": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/5181d451-303_iso_sweep_right.png"
+  }
+}

@@ -30,6 +30,12 @@ class OrientationPrediction {
 class ThumbOrientationClassifier {
   bool get isReady => false;
 
+  String? get lastInitError => 'web stub';
+  String? get inputShape => null;
+  String? get outputShape => null;
+  String? get lastClassifyError => null;
+  String? get loadedAssetKey => null;
+
   void initialize() {}
 
   OrientationPrediction? classify(CameraImage image, int sensorOrientation) =>

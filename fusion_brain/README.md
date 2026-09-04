@@ -116,15 +116,123 @@ deformations, used for both registration AND mosaicking.
   **learned per-minutia reliability model**: predict which candidate
   minutiae are worth merging, which is what the selectivity result says
   actually matters. Still gated on real scanner references for labels.
-- **Stage C — compositing into a real superprint image.** Phase 1/Stage A
-  produce a matching TEMPLATE (a point set), not a picture. `tps.warp_image`
-  is built for this. Once a source is elastic-warped into anchor space,
-  ridge PHASE should line up at the seams — the thing every prior
-  pixel-fusion attempt in this project lacked, since none corrected
-  non-rigid deformation first. Blend with
-  `sfm_pipeline._multiband_combine()` (Laplacian-pyramid seam blending,
-  already built and unused) gated by the coherence-confidence check
-  `_fuse_flash_ambient` already uses.
+- **Stage C — compositing into a real superprint image.** `tps.warp_image`
+  + `sfm_pipeline._multiband_combine()`, gated by the same coherence-
+  confidence check `_fuse_flash_ambient` uses, restricted to the same
+  selectively-kept minutiae Stage A validated (`phase3_composite.py`).
+  Hard-edge and phase-correlation-corrected compositing of already-
+  binarized content are both real, decisive negatives (0/2 informative
+  references, TPS position was already correct at the real measured
+  overlap — see `results/PHASE3_COMPOSITE_FINDINGS.md`). **Follow-up
+  found the first real positive result in this track's history**
+  (`phase3c_continuous_blend.py`): compositing SOFTENED (not hard-binary)
+  content, binarizing once at the end, at a moderate selective-merge cap
+  (`max_added` in roughly 12-17) beats anchor-alone on BOTH informative
+  references on the first capture, partially replicated (1/2 references)
+  on a second. **Promising, not yet validated** — n=2 captures, same
+  standing caveat as everything else here; needs more real captures
+  before this becomes a trusted parameter rather than a hypothesis.
+  **Important caveat found on direct visual review, 2026-08-26**: the
+  composite is NOT a visually coherent single print in either version —
+  it's a clean core print with several small, disconnected circular
+  patches of ridge texture stuck around its edge (root cause:
+  `_keep_mask`'s 24px-radius discs, one per kept minutia, mostly don't
+  touch each other). The bozorth3 score genuinely improves (it scores
+  minutiae correspondence, which the patches do add), but "scores
+  better" and "looks fused" are two separate claims — only the first is
+  currently true. The proposed fix (merge/dilate neighboring discs into
+  contiguous regions) was then built and tested twice
+  (`phase3d_merged_regions.py`, superseded; `phase3e_angle_gated_merge.py`,
+  correct): merging DOES produce a visually coherent single shape, but
+  consistently COSTS real matchability on the stronger reference across
+  both real captures and five settings (40→31 and 29→20). The
+  orientation-gated refinement is measurably inert (targets <5% of
+  composited area; changes 0.03% of pixels, identical scores). Net: the
+  blobby version scores better, the merged version looks better, and no
+  tested setting gets both — a product call, not a tuning problem. Full
+  detail, including a correction to phase3d's own erroneous conclusion
+  (drawn from a conflated test): `results/PHASE3_COMPOSITE_FINDINGS.md`.
+  **Resolved 2026-08-26 (`phase3f_validated_merge.py`)**: the CTO's read —
+  the blobs beat the merge because they reconstruct ridges only where the
+  data supports it — is confirmed and quantified. Sources present 119-134
+  UNVALIDATED minutiae inside their contributing coverage against only 15
+  validated ones, so naive merging pastes ~38 unvetted feature points to
+  gain 15 vetted ones, and Stage A's density penalty does the rest.
+  Bridging two validated points only when the corridor between them
+  contains no unvalidated minutia is **matchability-neutral on all three
+  real captures** (matches the best blob score exactly: 40/30, 29/17,
+  21/19) while drawing real bridges — the first merge that costs nothing.
+  Relaxing that gate one step admits 6 bridges, adds 3 minutiae, and costs
+  6 and 4 points: a clean dose-response. Honest limitation: the gate is so
+  strict it barely changes the picture (±200-640px of area), because the
+  blobs are very nearly the entire region this data can support. Also
+  records a structural bug worth knowing: weight attenuation CANNOT remove
+  content from `_multiband_combine` (it normalizes by total weight, so a
+  lone source survives at any nonzero weight — measured: 1 pixel of
+  176,710 changed).
+
+- **Phase 4 — hierarchical per-bracket fusion (CTO's proposal). Premise
+  SUPPORTED, architecture REFUTED.** Build a superprint per architecture
+  (front / tilt / sweep), then fuse those. Premise check across 126 real
+  registrations: intra-bracket pairs register measurably better than
+  cross-bracket (42.47 vs 40.69 mean inliers, 100% vs 96.7% gate pass) —
+  real, but only ~4%. Image-level hierarchy scored 0/2 (it compounds the
+  density penalty: Stage 1 injected 36 and 22 unvetted minutiae, which
+  Stage 2 then trusted). Template-level hierarchy — same architecture, no
+  intermediate picture, zero unvetted additions — recovered most of that
+  to 1/2 but still trailed the flat merge. Raising the Stage 1 budget
+  (25→50→100→999, saturating) never closed the gap: Stage 2 took exactly
+  15 points from `tilt_sp` and 0 from `sweep_sp` at every budget, best
+  case 34/30 vs flat's 40/30. Mechanism: hierarchy points take an extra
+  registration hop (member → bracket anchor → front) and each transform
+  adds positional error, which a 4% pose-family edge cannot pay for —
+  which is exactly why a true premise can still yield a losing
+  architecture. **Flat selection across all sources at once is already
+  near-optimal for this data.** Full detail:
+  `results/PHASE4_HIERARCHY_FINDINGS.md`.
+
+## Macro (camera "2") wired into `collect_sources()`, premise untested
+
+`fusion_capture` gained a fourth capture phase (2026-08-26, client-side
+port of `clearbridge_beta`'s own already-validated `_captureMacroShot`) —
+a dedicated close-up ambient/flash pair on camera "2". `collect_sources()`
+(`phase0c_real_fusion_capture.py`) now recognises `macroShots` the same
+way it already does `tiltShots`/`sweepShots`, which every downstream
+script (`phase3f`'s flat validated-bridge merge, the Phase 4 premise
+check) inherits automatically since they all iterate whatever sources it
+returns.
+
+**Updated same day**: `fusion_capture` now records `cameraLensInfo` too
+(ported native probe + Dart query, same shape as `clearbridge_beta`'s own
+already-validated version), and `collect_sources()` uses it when present
+— `_macro_guide()` applies the same general FOV-correction formula
+production's own secondary-camera loop uses (angular FOV ≈ sensor-size /
+focal-length, so `rx`/`ry` scale by the resulting ratio). Verified against
+this device's own real numbers: reproduces production's documented ratio
+exactly (0.871). **Deliberately does NOT port production's `cy=0.34`/
+`rx=0.11`/`ry=0.13` overrides for camera "2"** — those are real, but
+empirical calibration for one specific device's own physical lens
+mounting, not a portable formula; blindly reusing them on a different
+phone's different macro lens would silently introduce a new wrong
+assumption, the exact failure mode multi-device testing exists to catch.
+`cx`/`cy` stay at 0.5 (matching what production itself falls back to for
+any camera it has no per-device calibration for). Falls back to the old
+unmodified-front-guide approximation, with the same loud runtime warning,
+whenever `cameraLensInfo` is absent — every capture before this field
+existed, and any device/build that doesn't record it.
+
+**No premise check has been run on real macro data yet** — no fusion_v1
+capture with `macroShots` exists so far. Per this track's own Phase 0
+discipline, whether macro is worth fusing at all (does it register onto
+the front anchor and land in genuinely new territory, the way tilt/sweep
+were confirmed to) is unmeasured, not assumed positive. There is also a
+real, specific reason for caution distinct from tilt/sweep's own history:
+macro's guide is deliberately a *tighter, closer* crop of roughly the
+same region the front burst already sees, unlike tilt/sweep's off-axis
+framing built to reveal edge content the front guide can't — so it may
+mostly fail Stage A/`phase3f`'s own `1 - anchor_coverage` gate regardless
+of its intrinsic quality. Flagged as the first real thing to check once
+capture data exists, not built on top of yet.
 
 ## The real blocker, stated plainly
 

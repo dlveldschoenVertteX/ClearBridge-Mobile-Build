@@ -1,0 +1,22 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "arm": "tps_avg",
+  "use_tps": true,
+  "combine": "avg",
+  "sides_used": 3,
+  "control_minutiae": 135,
+  "mosaic_minutiae": 90,
+  "scores": {
+    "control": {
+      "ink_scan": 5,
+      "macro_round32": 24,
+      "macro_round35": 27
+    },
+    "tps_avg": {
+      "ink_scan": 6,
+      "macro_round32": 16,
+      "macro_round35": 22
+    }
+  },
+  "composite_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_p6_tps_avg.png"
+}

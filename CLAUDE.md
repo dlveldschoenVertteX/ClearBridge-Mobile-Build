@@ -1,5 +1,1749 @@
 # ClearBridge Mobile — persistent context
 
+## Real matchability check: does the A55 genuinely improve matching? Real data says NO, at this sample size -- and surfaced a real, untested mirroring question for the new fusion_capture pipeline (2026-09-04)
+Direct CTO ask, after several rounds of camera-identity/masking fixes that all
+looked good on NFIQ2: check real matchability (SourceAFIS, this project's own
+established gate -- never NFIQ2) rather than assume the A55 fixes translate
+into better real matching. Built both matchers fresh in a clean sandbox
+(mindtct/bozorth3 from the vendored NBIS source, SourceAFIS 3.18.1 cloned +
+built from `robertvazan/sourceafis-java` via Maven -- both real, local,
+reproducible builds, not assumed).
+
+**Real genuine pool**: 8 real `fusion_capture` A55 captures spanning this
+project's whole A55 testing window (2026-09-02 through today), rendered via
+the same `afis_print.generate()` pipeline this project always uses for this
+test -- all one physical thumb (this project's single tester), so every
+cross-capture pair is a genuine same-finger comparison, same convention as
+every prior real matchability round.
+
+**Real result: genuine cross-session mean 0.54 (max 4.91) via SourceAFIS** --
+essentially indistinguishable from this project's own already-established
+real impostor noise floor (mean 0.07, max 5.6, from 55 real distinct-subject
+fingerphotos, see the PRIME DIRECTIVE section's "External impostor check").
+Compared directly against this project's own documented OLD-device numbers
+(same section, 2026-08-13 sweep-vs-front_only_v1 test): OLD front_only_v1
+scored genuine mean 1.06 (0/45 ever beat a real impostor's max) -- the SAME
+order of magnitude as this A55 sample, not better. OLD sweep was the one
+real positive result ever recorded in this project (genuine mean 13.65, real
++10.57 separation from impostors, 15% beat impostor max) -- but sweep on the
+A55 has had real, documented focus/masking bugs through nearly this entire
+testing window (only fixed this same week), so this sample has no fair
+sweep-vs-sweep counterpart to compare against yet.
+
+**Real, previously-untested confound found and checked**: mirroring. This
+project's OLD architecture (front_only_v1/oscillating) has a long-documented,
+never-fully-resolved mirroring question (thumb-twist capture geometry) --
+`fusion_capture` (the architecture behind every A55 fix this week) had never
+been checked for the same thing. Testing best-of(normal, probe-mirrored)
+across all 28 real pairs raised the mean to 1.29 (max 9.53) -- a real,
+non-trivial, previously-undiscovered effect on several specific pairs
+(one pair jumped 1.70 -> 9.53), but NOT uniform (several pairs got WORSE
+mirrored), and even the best-of ceiling stays inside the noise-floor range
+this project's own data already established for genuine matching before any
+correction (5.6-14.2) -- nowhere near SourceAFIS's own ~40 practical match
+threshold either way.
+
+**Honest verdict, not spun either direction**: this real data does NOT show
+the A55 has increased matchability -- it sits at or below the old device's
+already-weakest real result, not anywhere near its best. This is not
+necessarily an indictment of the hardware itself: n=8 real captures (28
+pairs) is a small, mixed-architecture sample (front/macro/tilt candidates,
+not a clean single-architecture comparison) spanning several different, some
+genuinely broken, pipeline versions across one week of active development:
+half of this pool (`cap01`-`cap05`) predates this week's camera-identity fix
+entirely. No fresh external impostor population was recomputed this round
+(this sandbox has no AWS/S3 credentials configured and GitHub's API is
+blocked here, both previously used for real impostor pulls) -- this result
+is anchored against the project's own already-validated impostor noise
+floor, not a newly-measured one. **Real next step, not yet done**: a
+controlled same-architecture (front-vs-front, or once sweep is solid,
+sweep-vs-sweep) genuine comparison on fully-fixed A55 code only, plus
+resolving whether `fusion_capture`'s own capture geometry needs the same
+mirror-correction investigation the old architecture never fully closed out.
+
+## Second correction the same day: camera "1" is ALSO front-facing on this device -- there is no rear macro camera id, macro now routes through camera "0" (2026-09-02)
+Direct real-device follow-up on the previous fix. CTO tested the very next
+build and reported "front cam is still connected" while capturing -- flagged
+as possibly a stale build. Checked first before assuming either: the capture
+this produced (`90ab8139`) carries `macroCameraName: "1"` and
+`macroCameraFocalLengthMm: 3.72` in its own `fusionDebug` -- this is
+unambiguously the current build (CI run #501, `b6b4504`), not a stale
+install.
+
+**Downloaded and visually inspected `macro_fl_0.jpg` from this exact real
+capture -- decisive, first-hand evidence, not inference.** The frame is a
+photo of the CTO's own face and shirt, with his thumb held up near the
+lens. **Camera "1" is a front-facing sensor on this device.** Confirmed by
+its own `cameraLensInfo['1'].lensFacing == 0` (FRONT) -- and critically,
+that same field correctly reports camera "0" and "2" as BACK on every
+capture this session, so there is no reason to distrust it here; it was
+simply never cross-checked against real captured content before this
+fix shipped.
+
+**The earlier "camera 1 is the remaining rear camera, by elimination"
+reasoning was wrong, and the error was available in this project's own
+prior history the whole time**: an earlier round ("Camera '3' ported into
+the sweep architecture") had ALREADY found and recorded that "camera '1'
+ALSO reports FRONT on the same real capture, which is physically
+impossible on a device with one selfie camera" -- and resolved that
+contradiction by elimination + sensor-size fit, assigning camera "1" to
+selfie and camera "3" to ultra-wide. The later round (this same day, the
+ultra-wide/macro relabel) silently re-litigated that same elimination
+puzzle from scratch, this time assigning camera "1" to macro and camera
+"3" to selfie (on CTO's direct visual confirmation for "3"), without
+re-checking "1"'s own already-recorded FRONT self-report against the new
+conclusion. A real lesson repeating this file's own standing warning about
+carrying an unverified label forward -- this time the unverified label was
+my own, from earlier the same day.
+
+**Real, concrete finding for where macro capability actually lives on this
+device**: camera "0" (main)'s own `afAvailableModes` is the only one on
+the device that includes `MACRO` (`OFF, AUTO, MACRO, CONTINUOUS_VIDEO,
+CONTINUOUS_PICTURE`) -- every other camera reports `[OFF]` only. On a
+device where the macro lens isn't exposed as its own top-level Camera2 id
+(confirmed: `cameraManager.cameraIdList` in `MainActivity.kt` is the full,
+unfiltered list, and it returns exactly 4 ids -- 0/2 back, 1/3 front, no
+fifth rear id anywhere), this is the standard real mechanism: macro range
+is folded into the main sensor's own AF rather than switched to a separate
+physical camera.
+
+**Fixed**: `_macroCameraName` '1' -> **'0'**. The macro phase now reuses
+the main camera (already open earlier the same capture for front/tilt/
+sweep) with the guide grown 20% to pull the user physically closer than
+the front phase's own working distance, real full AF (not the peak-search
+workaround built for a motorless lens, though that same polling mechanism
+is left in place since it is agnostic to whether an AF motor or hand
+motion drives the sharpness rise -- and now genuinely benefits from a real
+motor actively hunting instead of only reflecting user movement).
+`_macroFocusTargetCy` stays 0.37 -- exact now, not an estimate, since this
+is literally the same camera and same guide the front phase already uses.
+The per-device `_cam2FocalLengthCalibratedCy` table (keyed by macro-lens
+focal length, 1.74mm/2.37mm) safely falls through to the 0.37 default for
+camera "0"'s real 5.54mm focal length -- no change needed there, it was
+already built to no-op on an unrecognized focal length.
+
+**Camera "3" remains unresolved and disabled** (`_cam3Enabled = false`,
+unchanged) -- also self-reports FRONT, also CTO-visually-confirmed showing
+his own face in an earlier round. Two of four ids reporting front on one
+physical device with one selfie camera is still a real, standing
+oddity -- not re-investigated this round since camera "3" isn't on the
+live capture path (only feeds the disabled single-shot phase and the
+ultra-wide-sweep phase, which correctly uses camera "2" instead).
+
+**Also confirmed while investigating, unrelated to the fix**: the
+ultra-wide sweep phase (`_runUltrawideSweepPhase`, camera "2") IS working
+correctly -- its frames (tagged `cam3_sweep_*` for Firestore-bucket-reuse
+reasons only, not a camera-identity signal) show the real 116-degree
+whole-room fisheye view, consistent with confirmed ultra-wide optics, not
+a face. No collision with the disabled `_runCam3Phase`'s own `cam3_*`
+tags (different tag names, `cam3_amb_0` vs `cam3_sweep_*`).
+
+**Real, separate finding from this same capture, not yet actioned**: every
+sweep zone (both main-camera `sweep_*` and ultra-wide `cam3_sweep_*`)
+recorded `readyDetected: false`, with `absAtFire` sitting well below
+`absFloor` (1929.2) in 5 of 6 zones -- the new absolute-floor sweep gate
+never resolved on this capture and every zone fired only via its bounded
+timeout, not a genuine focus-on-thumb detection. Worth watching on the
+next real capture now that macro is no longer confounding the picture,
+but not touched this round -- one variable at a time.
+
+**Not yet device-tested.**
+
+## THE macro root cause, finally: camera "2" is the ULTRA-WIDE, not the macro lens -- the whole round-31-through-52 macro thread was aimed at the wrong camera (2026-09-02)
+Third consecutive real device test reporting the same thing ("Macro still
+does not focus on thumbprint at all, the background is more crisp"). This
+time the answer is decisive, and it invalidates the premise every previous
+macro round was built on.
+
+**Real optics, computed from this capture's own `cameraLensInfo`
+(`1117a364`):**
+
+| cam | focal | sensor | diagonal FOV | afModes | real role |
+|---|---|---|---|---|---|
+| 0 | 5.54mm | 8.16x6.12mm | 85.3° | full AF | main (50MP) |
+| 1 | 3.72mm | 5.22x3.92mm | 82.5° | OFF | **MACRO (5MP)** |
+| 2 | 1.74mm | 4.48x3.36mm | **116.3°** | OFF | **ULTRA-WIDE** |
+| 3 | 3.72mm | 4.61x3.17mm | 73.9° | OFF | selfie (CTO-confirmed) |
+
+**116 degrees is not a macro lens.** It matches the A55's published
+123-degree ultra-wide. And camera "2"'s own raw "macro" frame confirms it
+visually beyond argument: the frame shows the ENTIRE ROOM -- ceiling
+slats, far wall, floor, window -- with the background razor-sharp and the
+thumb a smooth featureless blur. That is a fixed-hyperfocal ultra-wide
+behaving exactly as designed. **No AF timing, drift threshold, crop
+calibration, EV curve or peak-search could ever have fixed it**, which is
+why rounds 31-52 of macro work never landed: the lens was physically
+incapable of the shot being asked of it.
+
+**Round 40 actually reached this same conclusion** ("camera 2 is not
+optically a macro lens... it is the ultrawide sensor") from minimum-focus
+distance -- but the NAME stuck, and every later round kept treating it as
+the macro camera anyway. A real lesson about carrying an unverified label
+forward: the evidence was already in this file, and got argued past.
+
+**Direct confirmation the peak-search shipped last round was correct code
+pointed at the wrong lens**: this capture's `macroDebug` ran the full 6s
+window with `baseline == maxSample` (109.1) and `finalSample` 79.7 --
+sharpness only ever DECLINED as the thumb approached, never peaked.
+Against a hyperfocal lens that is the right answer: moving closer walks
+the pad further OUT of the only focal plane it has. The same mechanism
+pointed at a real macro module (fixed at ~4cm) should behave the opposite
+way.
+
+**Fixed**: `_macroCameraName` '2' -> **'1'** (the remaining rear camera,
+82.5° FOV, by elimination the 5MP macro). Its AF target defaults to the
+main guide's own cy (0.37) rather than the 0.34 that was real-measured on
+a different device's ultra-wide and has no bearing on this lens. New
+`macroCameraName`/`macroCameraFocalLengthMm` debug fields so the next
+capture confirms which lens actually opened without another round of
+inference. **Camera "1" has never been captured from by any build** --
+if its frames come back wrong, that one constant is all that changes.
+
+**Also fixed: the ultra-wide sweep was pointed at the selfie camera.** My
+camera-"3" identification last round was wrong -- the CTO's test settled
+it directly (its sweep frames came back as a photo of his face, confirmed
+visually). `_uwSweepCameraName` '3' -> **'2'**, the real ultra-wide. So
+the ultra-wide was being captured all along, just under the wrong name and
+aimed at a shot it cannot take; this phase now uses it at the normal
+working distance its hyperfocal plane actually suits.
+
+## Sweep focused on the background every time, and its readiness gate could never have caught it (2026-09-02)
+Same device test: "Sweep was blurry no focus on foreground at all but
+background was crisp." Confirmed visually on this capture's own
+`sweep_center_amb` frame -- wall planks and floor razor-sharp, thumb and
+hand blurred. Two real, independent code causes, both found by reading the
+sweep loop rather than guessing:
+
+1. **The sweep never pointed autofocus at the thumb at all.** No
+   `setFocusPoint` call anywhere in the zone loop -- it simply inherited
+   whatever the front phase left behind (deliberately unlocked, on
+   continuous AF, see `_fireFrontBurst`'s own 2026-08-27 reasoning) and
+   let the lens meter the whole scene. Against a textured wall and a
+   smooth low-contrast thumb, continuous AF picks the wall essentially
+   every time. Fixed: each zone now retargets AF to that zone's own guide
+   centre and converges (`_retargetAndConvergeMacro`, main camera only --
+   every other camera reports `afAvailableModes: [OFF]`), with
+   `lockAfter: false` to respect the front phase's own hard-won finding
+   that locking pins a burst to one mediocre point.
+
+2. **The readiness gate was structurally incapable of detecting it.**
+   `_focusValue` is `abs / _focusPeak` -- peak-NORMALISED -- and
+   `_focusPeak` is reset to 0 at the top of every zone, so the very first
+   sample sets the peak and the ratio is 1.0 immediately. Every zone of
+   every capture duly recorded `readyDetected: true` while imaging a sharp
+   wall. This file's own front-phase docs already spell the trap out
+   ("reaches 1.0 at ANY absolute sharpness level. A uniformly
+   out-of-focus hold satisfies that gate perfectly") -- it was simply
+   never applied to the sweep gate. Fixed with an ABSOLUTE floor
+   (`_sweepFocusFloorRatio = 0.5`) referenced against
+   `_frontFocusPeakAbs`, the peak sharpness the front hold itself observed
+   on this thumb, this device, this light -- a real session-local
+   reference rather than a guessed constant. Deliberately permissive (the
+   sweep images the pad off-centre and at an angle, so it should not be
+   held to the front hold's face-on peak): this is a floor against
+   "focused on the far wall", not a quality bar. Bounded by the existing
+   max-wait, so a zone that never clears still fires and records that it
+   did.
+
+**Third real bug found in the same loop**: `_scoreRoi` was hardcoded to
+`PadSilhouetteShape.defaultShape` -- the CENTRE guide position -- while
+the sweep translates the guide to cx 0.35/0.50/0.65. So for the left and
+right zones, every live reading (sharpness, coverage, the gate itself) was
+sampled from a region the thumb was no longer in. Fixed with
+`_liveRoiOverride`, set per zone and cleared in both sweep phases'
+`finally` blocks so no later phase inherits it.
+
+**None of this is device-tested yet.**
+
+## Masking-guard audit's own flagged next step, completed: the exposure guard is correctly calibrated -- no mask fix needed, the 4 sampled captures are just genuinely soft (2026-09-02)
+Direct follow-up, completing the "real next step" the masking-reliability
+audit (below) left open: determine whether the 4 real guard-failing
+front_only_v1 captures (`181e8cd8`, `4ae6d13c`, `474b4d6a`, `c4dd4b24`) trip
+`_FLASH_DIFF_MIN_FLASH_LAPLACIAN` because the flash frame is over-exposed
+(the guard's own docstring assumption) or under-exposed (the direction
+already confirmed for macro) -- before touching either candidate lever.
+
+**Real pixel measurement on all 16 real ambient/flash pairs across the 4
+captures: neither.** Clipped-white fraction is ~0.000% in every single
+pair (max 0.039%) -- zero evidence of blowout anywhere. Mean brightness
+(88-144/255) and clipped-black fraction (also ~0%) rule out the macro
+precedent's dramatic underexposure (mean 51.5, 14.2% near-black) too. These
+flash frames are neither blown out nor dark -- they are simply
+low-local-contrast at an otherwise normal brightness, a condition the
+guard's own docstring never anticipated.
+
+**Checked whether the threshold itself is miscalibrated before touching
+it, per this project's own standing discipline** -- pulled 8 real captures
+that DID pass the guard (`afisMask: guide+flashdiff`) and measured the
+actual passing pair's `flash_lap`. **Real, clean, wide separation**: every
+passing pair measured **142.8-888.9**; every one of the 16 failing pairs
+measured **6.9-37.4**. A real empirical gap of over 100 points with zero
+observed data on either side of the 50.0 threshold -- it is not clipping
+into legitimate content, and lowering it would not have helped any of
+these 4 captures reach it (the closest failing value, 37.4, is still 3.8x
+below the lowest real passing value).
+
+**Conclusion: the guard is doing its job correctly.** The 4 sampled
+captures are genuinely, substantially softer than every real passing
+example (4-10x lower Laplacian variance) -- not a masking-code defect, not
+a miscalibrated threshold, and not fixable by adjusting exposure/EV (there
+is no exposure problem to fix). In 3 of 4 captures the AMBIENT frame is
+similarly low (7.9-23.2), meaning the whole burst was soft, not just the
+flash half -- consistent with a general capture-quality issue (the kind
+the separate focus-lock-to-shutter-gate work targets) rather than anything
+masking-specific. Falling back to bare `guide` on these 4 captures is the
+correct, safe behavior, not a bug to route around.
+
+**Resolves the audit's own open decision point with a real answer: neither
+candidate lever (relax the guard vs. fix the exposure that trips it) is
+warranted.** No code change made -- a real "no fix needed" finding, not a
+gap left unaddressed. One real methodology caveat recorded rather than
+glossed over: one of the 8 passing-sample captures (`2a85bb36`, recorded
+`afisMask: guide+flashdiff`) showed all 4 of its own pairs BELOW the guard
+under this same replay (23.0-32.5) -- most likely this test harness's
+simple ambient/flash zip-by-storage-order doesn't exactly reproduce
+production's real pairing, not a sign the guard behaves differently live;
+flagged for whoever next needs exact pair-order fidelity, not investigated
+further since it doesn't change the 7-of-8 result above.
+
+## Real device test found the tested APK predated both new features, PLUS a genuine tilt-reference gyro bug fixed along the way (2026-09-02)
+CTO tested a fresh capture and reported: "Macro still did not focus on
+thumb ridges"; "Gyro did not calibrate correctly during sweep, I was
+struggling to lock into angle even tho I was moving the phone." Pulled the
+real capture (`49d21adf`) before assuming either report was about the
+code just shipped.
+
+**Real, decisive evidence this specific capture ran on an OLDER build,
+predating both today's macro-peak-search fix and the ultra-wide-sweep
+port.** `fusionDebug.macroDebug` on this capture has the OLD field shape
+(`maxSample`/`lockedAfter`/`driftRetried`/`sharpness`) -- `_waitForMacroFocusPeak`
+writes a completely different shape (`baseline`/`finalSample`/
+`peakHoldStreak`/`peakFound`/`waitedMs`), which is nowhere in this
+document. `fusionPhases` is also missing the `uwSweep` key entirely (added
+in the same commit as the macro fix), and there's no `cam3Shots` field and
+no `uwSweep*` debug key of any kind -- not even a self-skip flag. Both are
+airtight: this capture cannot have run today's code. Very likely an
+already-installed APK from an earlier build in this same session was
+reused rather than the freshly-published one. **Not yet re-tested on the
+actual current build** -- asked the CTO to grab the latest release link
+again before drawing any conclusion about whether the macro fix works.
+
+**"Gyro did not calibrate correctly" -- investigated anyway, and found a
+real, separate, pre-existing bug independent of which build was tested.**
+Sweep itself has no angle-based mechanic at all (confirmed: no `calib`/
+angle-tracking code path in the sweep phase) -- the tilt phase (2 of 5,
+immediately before sweep) is the one with a live angle target, so the
+report is almost certainly describing tilt, referenced loosely as "sweep."
+
+Root cause, found by comparing this file's own `_orientation.captureReference()`
+call against the exact mechanic it was ported from
+(`oscillating_capture_controller.dart`). That source has its OWN
+documented history of this precise failure class: an earlier version
+zeroed the reference only 50ms after the phone was first raised into
+position, and the sensor hadn't settled -- "biasing the whole session's
+'0° = FRONT' zero point by several degrees," fixed there with a flat
+500ms pause before `captureReference()`. This file's own port carried a
+comment claiming "the same timing oscillating_capture_controller.dart
+uses" -- checked directly, and that claim doesn't hold: oscillating zeroes
+at session START with an explicit 500ms settle wait; this file zeroes
+right after the front HOLD completes, with **no settle wait of any kind**.
+Worse than the original bug's own conditions: `_awaitHold`'s own on-target
+check gates only on focus+coverage, never on gyro steadiness (the
+steadiness signal IS computed live elsewhere in this file, just never
+consulted here) -- so the hold can complete, and the reference used to
+zero, while the phone is still being actively moved. That is a direct,
+literal match for "struggling to lock into angle even though I was moving
+the phone": every later tilt target is measured against a zero point that
+was captured mid-motion.
+
+**Fixed**: right before `captureReference()`, now waits (bounded
+`_tiltReferenceSettleMaxMs=800ms`) on the SAME live
+`_gyroMagnitudeDegPerSec < _maxSteadyDegPerSec` signal this file already
+tracks continuously via its own gyroscope subscription, not a blind delay
+-- a fixed pause can't help if the user is still adjusting grip past it,
+which a real steadiness check can. Bounded so a genuinely unsteady hold
+still zeroes eventually rather than hanging. New `tiltReferenceSettleMs`/
+`tiltReferenceSettledSteady` debug fields record whether the wait
+actually resolved on real steadiness or hit the bound, for the next real
+capture to confirm. **Not yet device-tested.**
+
+## Two direct CTO asks built together: a real live focus-search for macro (no AF motor, so the user's own approach becomes the search) + camera "3" ported into the sweep architecture (2026-09-02)
+Direct follow-up to the "camera 2 has no real AF" finding immediately below.
+CTO's two asks: (1) "fix this focus issue on Macro, perhaps bringing the
+thumbprint closer will lock it automatically, just make it catch focus on
+the ridge pattern" -- i.e. don't fight the hardware limitation, work with it;
+(2) "The A55 has 3 cameras on the back, port the UltraWide cam into the
+sweep architecture, I want to see how that pans out." Both built in
+`fusion_capture_controller.dart`, **neither device-tested yet** -- same
+standing discipline as every other capture-side change this project.
+
+**Macro fix: a real peak-search replaces the broken stability check.** The
+OLD convergence loop (`_retargetAndConvergeMacro`, still correct and still
+used for the FRONT camera, which DOES have real AF) declared "converged" the
+moment its relative-stability check was satisfied -- trivially true almost
+immediately against a signal from a lens with no motor to hunt with. That's
+the actual mechanism behind "extremely short": it was never converging fast,
+there was never anything to converge. Since there's no AF to drive, the fix
+makes the USER's own hand motion the focus search instead: a fixed-focus
+lens still has one real plane of sharpest focus, and `_liveAbsSharpness`
+genuinely rises approaching it and falls again past it, independent of any
+AF mechanism. New `_waitForMacroFocusPeak()`: polls that signal, live-guides
+the user via a `distanceHint` banner ("Bring thumb closer" / "Hold there" /
+"Pull back slightly"), and only allows the shutter once the signal holds
+near its own observed running peak (`_macroPeakHoldRatio=0.85`, deliberately
+tighter than the existing `_macroDriftAcceptRatio=0.6` rejection bar
+elsewhere in this file, since this is a POSITIVE "found it" bar not a
+"not obviously worse" one) for a real streak, or a bounded 6s window elapses
+(`_macroPeakSearchMaxMs`, widened from the old 2400ms AF-search bound since
+this now has to cover real human movement time -- a deliberate, stated
+cost). Deliberately does NOT require a % rise over the starting sample --
+a user already well-positioned at the start should converge fast and
+correctly, not be forced to manufacture an "improvement" that was never
+there. New `macroDebug` fields (`baseline`/`maxSample`/`finalSample`/
+`peakHoldStreak`/`peakFound`/`waitedMs`) replace the old `lockedAfter`/
+`driftRetried` shape -- the real next-capture data that shows whether 0.85
+is right, too loose, or too tight, and whether "closer" genuinely resolves
+the softness the way the CTO's own hypothesis expects.
+
+**Camera "3" ported into the sweep architecture, real camera-identity
+puzzle resolved by elimination, not guessed.** This capture's own
+`cameraLensInfo` shows camera "3" self-reporting `lensFacing: 0` (FRONT) on
+the A55 -- the same "camera-ID-to-role isn't stable across devices" gotcha
+already in this project's history. But camera "1" ALSO reports FRONT on the
+same real capture, which is physically impossible on a device with one
+selfie camera. Resolved by elimination + sensor-size fit, not a coin flip:
+the A55's real hardware lineup is exactly 4 cameras (main/ultrawide/macro/
+front, no depth sensor); "0"=main and "2"=macro are already established
+from earlier rounds, leaving only "1" and "3" for front/ultrawide. Camera
+"1"'s sensor (5.22x3.92mm, ~6.53mm diagonal) matches a 32MP 1/2.8"-class
+selfie sensor; camera "3"'s (4.61x3.17mm, ~5.59mm diagonal) matches a 12MP
+1/3.06"-class ultra-wide, matching the A55's published spec -- and matches
+this project's OWN earlier note that singled out camera "3" specifically as
+the anomaly (camera "1" was never flagged, i.e. its FRONT reading was never
+surprising). **UNCONFIRMED until the next real capture's frames are
+visually reviewed** -- if wrong, only the `_uwSweepCameraName` constant
+needs to change.
+
+Built as a real 6th phase (`_runUltrawideSweepPhase`), reusing the EXACT
+sweep zone-loop mechanic (`_runSweepStations`, now parameterized to accept
+a station list + camera override rather than duplicated) instead of a
+second copy that could drift from it -- the same real bug class
+(`sweepShots` corruption) this file's own tag-routing already guards
+against elsewhere. Purely additive: shots tag `cam3_sweep_*`, landing in
+the SAME `cam3Shots` Firestore bucket `_runCam3Phase` already writes to, no
+new field, no upload-routing changes. Self-skips cleanly if the camera
+can't be opened, bounded by its own outer timeout (75s, deliberately larger
+than the zone loop's own 60s inner bound rather than reusing the same
+value, which would race on which fires first with no real margin between
+them).
+
+**Two real, necessary fixes found and made along the way, not just new
+feature code:**
+- `_runSecondaryCameraPhase`'s own camera lookup filtered on
+  `lensDirection == .back` -- which would have silently skipped camera "3"
+  outright on the A55 (it self-reports FRONT), independently breaking
+  `_runCam3Phase` too if it's ever re-enabled. Changed to match by NAME
+  only; camera "2" (macro) already reports back correctly, so this is
+  strictly more permissive there, not a behavior change.
+- The ambient/flash shutter pair inside `_runSweepStations` used to
+  unconditionally drive `_flash` (the `AdaptiveFlashController` bound ONLY
+  to the main camera) -- for camera "3" this would have silently toggled
+  the WRONG camera's torch. Now branches: main camera keeps the existing
+  adaptive controller unchanged, a camera override drives its own torch +
+  a real EV pulldown directly, same pattern `_runSecondaryCameraPhase`'s
+  macro/cam3 shutter pair already uses.
+- `_guideRegionFor()` (needed per zone, for the first time on a non-main
+  camera) reads `_previewSize`, set once for the main camera in `start()`
+  and never refreshed on any later camera swap -- macro/cam3's own
+  single-shot phase never needed it (fixed ROI + backend fallback only).
+  Refreshed to camera "3"'s own preview size before the zone loop runs,
+  restored to the main camera's afterward.
+
+## Camera "2" macro on the A55 has NO real autofocus at all -- decisive, visually confirmed answer, closes the round-31-through-45 macro-blur thread (2026-09-02)
+First real A55 capture (`24a2e023`) on the build carrying the `afAvailableModes`
+diagnostic added specifically to answer this. CTO report on the live test:
+"Macro capture was extremely short, there is definitely a issue, it could be
+focused on the background instead of foreground." Both halves of that report
+are now directly confirmed, not inferred.
+
+**The decisive number, straight from this real capture's own `cameraLensInfo`**:
+
+| cam | afAvailableModes | focusDistanceCalibration |
+|---|---|---|
+| 0 (main) | `OFF, AUTO, MACRO, CONTINUOUS_VIDEO, CONTINUOUS_PICTURE` | CALIBRATED |
+| 1 | `OFF` only | UNCALIBRATED |
+| **2 (macro)** | **`OFF` only** | UNCALIBRATED |
+| 3 | `OFF` only | UNCALIBRATED |
+
+**Camera "2" has no autofocus mode at all on this device -- it is fixed-focus
+hardware.** Only camera "0" (the main sensor) has real AF on the A55; every
+other camera reports `OFF` exclusively. This settles round 33's "secondary,
+unconfirmed hypothesis" and this session's earlier `afAvailableModes`
+diagnostic add cleanly: it isn't a timing/threshold problem, and it isn't the
+crop/AF-target calibration (already fixed and confirmed correctly framed,
+previous entry) -- the lens physically cannot rack focus to macro range,
+regardless of anything client- or backend-side.
+
+**Visually confirmed on this exact capture's own raw macro frame**: the
+background (wood floor boards, a threshold strip) shows crisp, detailed grain
+texture, while the thumb pad occupying the centre of the same frame is a
+smooth, essentially featureless blur with zero visible ridge structure --
+unambiguous, direct confirmation of the CTO's own "focused on the background
+instead of foreground" read, not focused-but-still-soft.
+
+**Mechanism behind "extremely short," found by re-reading
+`_retargetAndConvergeMacro`'s own code, not guessed**: it calls
+`cam.setFocusMode(FocusMode.auto)` then polls `_liveAbsSharpness` for
+relative-stability (`stableStreak`) before locking. Against a lens whose only
+real mode is `OFF`, the `FocusMode.auto` request has nothing to act on -- the
+lens never physically moves, so the sharpness reading never meaningfully
+changes between polls. A signal that was never going to move looks "stable"
+from the very first sample, so the loop satisfies its own stability
+requirement and exits at (or near) `_macroFocusMinMs`, the bare floor, instead
+of genuinely searching. This exactly matches "extremely short": it isn't
+failing to converge, there was never anything to converge.
+
+**Real, decisive scoring result on this capture (full variant pool, all four
+phases, real NFIQ2)**: front wins outright, `freqNorm` at **73** -- clean,
+sent to CTO. Macro's own best candidate (flash-base) scored only **47**,
+sweep 45-49, tilt 41-52 -- consistent with a hardware ceiling on macro/cam3/
+cam1, not a software gap.
+
+**Not actioned unilaterally -- a real product-scope call, not a code fix.**
+No further AF-timing, drift-threshold, or crop-calibration work on camera "2"
+(or "1"/"3") can fix a lens with no autofocus mechanism -- that thread is now
+closed with a definitive answer, not another guess. The real remaining
+question is what to do about it: drop camera "2"/macro from this device's
+capture flow entirely (since it can never contribute real ridge detail at
+macro range), keep it only as a coarse diversity candidate the way the
+already-established max-of-variants selection already discounts a weak
+source, or check whether OTHER devices' camera "2" report real AF modes
+before generalizing this as a cross-device conclusion. Flagged for explicit
+direction rather than acted on solo, same standing discipline as every other
+product-scope decision this project.
+
+## Focus-lock-to-shutter softness gap: BOTH candidate fixes shipped together, direct CTO call (2026-09-02)
+Direct follow-up to the entry immediately below. CTO's answer to the two
+candidate fixes laid out there: "a - Yes" (shorten the lock-to-shutter
+window) AND "b - Yes keep active, but burst should only fire once
+laplacian variance is at a high enough threshold" -- both, not a choice
+between them, with (b) specified precisely enough to build directly (a
+real pre-shutter sharpness gate, not just "keep AF active longer").
+
+**Built in `front_capture_controller.dart` (clearbridge_beta), not yet
+device-tested -- same standing discipline as every other capture-side
+change this project:**
+
+- **(a) `_holdDurationMs` shortened 1500ms -> 900ms.** This is the dwell
+  window between `_refocus()` locking AF (`FocusMode.locked`, well before
+  this timer starts) and the burst firing -- shortening it directly
+  shrinks how long the thumb has to drift against the now-fixed focal
+  plane before capture. A single deliberate reduction, not swept against
+  real data; justified because (b) below now does the actual verification
+  work this dwell was implicitly leaning on.
+- **(b) `_waitForShutterSharpness()`, a new real, bounded gate fired right
+  before the shutter.** Does NOT re-issue autofocus (so it can't
+  reintroduce the AF-hunting risk early-locking exists to prevent) --
+  it only delays WHEN the already-locked burst fires. Polls the same
+  `_liveAbsSharpness` signal `_refocus()` itself already trusts, checked
+  against the SAME peak sharpness observed at lock time
+  (`_lockPeakSharpness`, newly captured from `_refocus()`'s own
+  `maxSample`) using the SAME `_refocusDriftAcceptRatio=0.6` threshold
+  `_refocus()`'s own drift-retry check already relies on -- reusing an
+  already-validated number rather than inventing a new one, per this
+  project's standing discipline. Bounded at `_shutterSharpnessMaxWaitMs=
+  900ms`: fires anyway once the bound is hit, same "never block
+  indefinitely" pattern as every other real-time gate in this file (e.g.
+  `_wavelengthOnlyBlockMaxMs`). A capture whose `_refocus()` never got a
+  usable peak sample is treated as already-cleared, so this gate can only
+  ever add a bounded wait on top of an already-working hold, never block
+  one that would otherwise have succeeded.
+- New `shutterSharpnessGate` telemetry checkpoint (`peakAtLock`,
+  `sampleAtGateStart`, `sampleAtFire`, `cleared`, `waitedMs`,
+  `clearedAtMs`) -- the real next-capture data that answers whether this
+  actually catches a drift case (a capture where `cleared` only resolves
+  late, or never, inside the bound) versus clearing near-instantly on
+  every normal hold (the expected common case).
+- New `_shutterPending` guard, needed because the async gate can now take
+  up to 900ms and `_onFrame` keeps running during that window -- without
+  it, the shortened `_holdDurationMs` could elapse a second time before
+  the first gate resolves and fire a second, overlapping gate/burst
+  attempt. Reset in a `finally` so a disposed/errored gate can't
+  permanently strand a later hold.
+
+**Real, deliberate cost, stated plainly**: worst case this adds
+`_shutterSharpnessMaxWaitMs` (900ms) to the capture sequence beyond the
+new, shorter hold -- in the common case (sample already at/above 60% of
+peak, the expected steady-state reading) it resolves in well under one
+poll interval and costs almost nothing. Not yet confirmed on a real
+device; the next real capture with `captureTelemetry` data is what shows
+whether `474b4d6a`'s specific failure mode (`shotFired` still soft
+despite a healthy `holdComplete` reading) actually stops recurring, or
+whether the gate's threshold/bound need a further real-data-driven
+adjustment.
+
+## Focus-lock-to-shutter softness gap found on 2 of 4 real masking-guard-failure captures -- real, not yet actioned, needs a product call (2026-09-02)
+Direct follow-up to the exposure-guard audit below ("yes go there next" --
+does the live focus signal at hold-complete actually predict the
+sharpness of the frames that get delivered). Pulled the real
+`captureTelemetry` docs (per-hold `liveAbsSharpness` samples timestamped
+against `refocusLocked`/`holdComplete`/`shotFired` checkpoints, built
+specifically for this question) for the 4 real captures already flagged
+by the exposure-guard audit as guard-failing.
+
+**Real, mixed result across the 4 -- two different failure mechanisms,
+not one.** `4ae6d13c`: live signal was already low (28-30) at BOTH
+`refocusLocked` and `holdComplete` -- a genuine poor-AF-convergence case
+(the lens itself never found a sharp lock), correctly caught by the guard
+downstream. `c4dd4b24`: no `captureTelemetry` doc exists for this capture
+(404) -- can't be assessed either way.
+
+**`474b4d6a` is the real, concerning case.** Live signal reads healthy and
+STABLE the whole hold: 106.58 at `refocusLocked`, 103.69 at
+`holdComplete` (1.5s later) -- a clean, converged lock that never drifts.
+But the backend-measured delivered still frames from this same capture's
+burst scored only Laplacian **12-23** -- a 5-9x gap. Checked against
+`181e8cd8` (a non-guard-failing capture) as a baseline for how much
+live-vs-still domain scaling alone should explain: that capture's own
+live-to-still ratio is a much milder ~2.6x. `474b4d6a`'s 5-9x gap is not
+explained by the same normal domain-scaling factor.
+
+**Mechanism, reasoned not guessed**: focus is locked (`FocusMode.locked`)
+immediately once `_refocus()` converges, BEFORE the hold-duration wait
+even begins -- so by the time the burst fires, AF has been sitting fixed
+on one focal plane for the whole hold. Active AF-hunting during the burst
+itself is therefore not the likely explanation (there's nothing left to
+hunt -- the lens is locked). The more plausible mechanism is the thumb
+itself moving slightly relative to that now-fixed focal plane during the
+hold+burst window -- a real, physically plausible failure mode gyro
+telemetry cannot see (gyro measures phone motion, not thumb-to-lens
+distance), and one the current live-sharpness signal also can't see,
+since it's only ever sampled up to `holdComplete`, not through the burst
+itself.
+
+**Not actioned -- this is a real architectural trade-off, not a one-line
+fix.** Locking focus early exists specifically to prevent AF-hunting
+during the burst; the candidate fixes are: (a) shorten the lock-to-shutter
+window (fire the burst sooner after lock, giving the thumb less time to
+drift) -- lower risk, but doesn't address a thumb that moves during the
+now-shorter window; or (b) keep AF continuously active later into the
+sequence (re-verify/re-lock closer to shutter, or extend live-sharpness
+sampling through the burst itself as a real post-hoc quality signal) --
+more thorough, but reintroduces some AF-hunting risk right before the
+shot, the exact risk early-locking was built to avoid. **n=1 real
+confirmed case (474b4d6a), n=1 inconclusive (c4dd4b24, no telemetry)** --
+same standing "don't act on a single data point" discipline as everywhere
+else in this project; the honest next step is watching whether this
+recurs on the next several real captures with `captureTelemetry` data
+before picking a fix, not committing to (a) or (b) off one case. Recorded
+here rather than acted on, pending explicit product direction on which
+trade-off to take.
+
+## Real audit: 34% of ALL real front_only_v1 captures ship with zero content-aware masking -- the exposure guard is the dominant, cross-architecture cause (2026-09-02)
+Direct follow-up to the CTO's masking-correlation question above ("why
+doesn't the backend mask match the on-screen guide") and the standing
+priority that masking must be impeccable. Confirmed first, not assumed:
+the backend mask IS already anchored to and clipped within the exact
+`guide_region` the user held their thumb inside — refinement (flash-diff/
+U-Net) only ever narrows within a dilated version of it, never operates
+independently, and falls back to the bare guide if refinement looks
+untrustworthy. So the real question is how OFTEN that fallback fires.
+
+**Real aggregate rate, the FULL real front_only_v1 population (132
+captures, 120 with a recorded mask — this is not a sample, front_only_v1
+production volume stopped after 2026-08-21 when testing moved to
+fusion_capture, so this is the complete real history)**:
+
+| result | count | % |
+|---|---|---|
+| `guide+flashdiff` (refined) | 44 | 36.7% |
+| `guide+unet` (refined) | 33 | 27.5% |
+| **`guide` (bare, zero refinement)** | **41** | **34.2%** |
+
+**Flat, not improving**: July 37% bare, August 32% bare — no real trend
+across the whole history. Matches round 45's own earlier snapshot (34%)
+almost exactly, confirming this hasn't moved.
+
+**Sampled 8 of the 41 bare-guide captures and replayed each through the
+CURRENT masking code (not just re-reading the stale recorded reason) to
+find the real mechanism**:
+
+| cause | count |
+|---|---|
+| Blowout/underexposure guard fires on all 4 real ambient/flash pairs | **4/8 (50%)** |
+| Would actually be ACCEPTED under current code (stale — fixed by later real changes, not a live bug) | 2/8 (25%) |
+| Genuine current accept-gate rejection (detected region only 17% of guide area — too small) | 1/8 (12.5%) |
+| `_flash_diff_mask` returns None even though every pair passes the guard (not yet root-caused) | 1/8 (12.5%) |
+
+U-Net rescued 0/8 of these — consistent with round 45's own 31% U-Net
+failure rate; it isn't picking up the slack here.
+
+**The real, decisive finding: this is not a macro-only problem.** The
+exact same `_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0` guard that self-skipped
+the A55 macro shot (round above) is the single biggest cause of FRONT
+captures losing all masking too — half of this sample, hitting all 4
+burst pairs simultaneously on a real production capture, not an edge
+case. A real, cross-architecture lever, not something specific to one
+camera or one device.
+
+**Not actioned yet — a real decision point, not a blind fix.** Two
+candidate levers, deliberately not chosen between without more data:
+relax the guard threshold itself, or fix whatever exposure behavior is
+tripping it in the first place (matches this session's macro finding,
+where the cause turned out to be underexposure, not blowout, despite the
+guard's own docstring only describing blowout). Real next step: determine
+which direction (over- or under-exposed) each of the 4 guard-failing
+front captures actually falls on, the same underexposed-not-blown-out
+check already done for macro, before touching either lever.
+
+## Consistent 3-2-1 countdown added to sweep and macro/cam3 (2026-09-02)
+Direct CTO ask: the same numeral countdown front_v1 (and tilt) already use
+should appear at the start of every capture phase, not just some of them.
+Checked before touching anything: sweep and macro/cam3 genuinely had none.
+
+**Sweep** deliberately removed its own countdown in an earlier round
+(2026-08-22) in favor of a content-driven readiness gate + a visual green-
+flip cue -- a real, validated mechanism (the gate only proceeds once the
+live sharpness signal genuinely converges, not a fixed timer). Restoring a
+plain fixed-timer countdown INSTEAD of that gate would be a real regression
+of an already-validated design. Layered the countdown ON TOP of it instead:
+the readiness gate still decides *when* it's safe to capture; once it
+clears, the same `_runCountdown()` front/tilt already use now runs before
+the shutter fires, giving the same visual/audible warning every other phase
+gives, without touching the underlying quality check.
+
+**Macro/cam3** (`_runSecondaryCameraPhase`, shared by both) had no
+countdown and no equivalent visual cue at all -- added `_runCountdown()`
+right after focus convergence, before the ambient/flash shutter pair.
+
+**Real, deliberate cost, not hidden**: ~2.35s per sweep zone (3 zones →
+~7s added to that phase) and ~2.35s added to the macro shot. A genuine
+UX-consistency trade the CTO asked for directly, not a free change.
+
+Not yet device-tested -- same standing discipline as every other capture-
+side change this project.
+
+## First real A55 test of the corrected macro crop: framing fix CONFIRMED working, but the pad itself is genuinely soft -- a real, separate AF problem (2026-09-02)
+First real device test of the crop/AF-target fix above (capture
+`086fc79c`). CTO report: "the macro capture is still not focused on the
+thumb it's blurry... AF may not be working correctly... macro may not even
+be in the same camera location as the old model it may be a different
+cam."
+
+**Framing fix confirmed real and working.** `fusionDebug.macroCalibratedFocusTargetCy:
+0.49` is written to this real capture's doc — direct proof the per-device
+lookup matched this device's real reported focal length and applied the
+corrected A55 value, not the old device's 0.34. Pulled the actual raw
+macro frame and overlaid the current crop region: it now sits tightly on
+the real thumb pad, matching the offline verification from the previous
+entry. The crop/framing half of this bug is closed.
+
+**Softness is real and separate, confirmed visually, not a framing
+artifact.** The pad itself shows no ridge detail — a smooth, featureless
+blob — while everything else in the SAME frame (wrist skin, sleeve fabric,
+background floor/bannister) is visibly sharp. Since the guide/crop now
+correctly targets the pad, this rules out "AF was aimed at the wrong
+region" as the remaining explanation — it genuinely isn't reaching focus
+on the pad.
+
+**Checked whether "camera 2 has no real autofocus" (the CTO's own
+hypothesis) is likely, not assumed either way.** `minFocusDistanceDiopters`
+reads `null` for every camera on this device — but that's NOT decisive
+either way: a genuinely fixed-focus lens reports exactly `0.0` there per
+Android's own CameraCharacteristics spec, not `null` — `null` more likely
+means the native query simply found nothing, the same ambiguity as always.
+Added a new, more direct diagnostic (`afAvailableModes`, `MainActivity.kt`)
+that reads `CONTROL_AF_AVAILABLE_MODES` — the field that actually answers
+this: a fixed-focus lens reports only `OFF`; a lens with real autofocus
+reports `AUTO`/`CONTINUOUS_PICTURE`/etc. alongside it. Same safe, read-only
+pattern as every other `cameraLensInfo` field. Answers definitively on the
+next real capture rather than guessing.
+
+**Checked whether the drift-retry threshold is the fix — real evidence
+found, but it does NOT support changing it.** `macroDebug` on this capture:
+`maxSample=172.74`, settled `sharpness=131.37` — 76% of its own peak, a
+real, meaningful excursion-then-drift (not flat, which argues against a
+fixed-focus lens too — a truly fixed-focus camera wouldn't show this
+pattern at all). `driftRetried: false` because `_macroDriftAcceptRatio=0.6`
+only fires below 60% of peak, and 76% clears that bar. Before touching this
+threshold, checked whether it's actually mis-tuned: it isn't a local guess
+— it's the exact same value as `clearbridge_beta`'s own already-validated
+`_refocusDriftAcceptRatio` (unchanged since round 26, used for the main
+front-hold's identical drift-retry mechanism project-wide). Front's OWN
+convergence on this same device settled to 95-97% of peak
+(`frontFocusDebug`), well clear of this bar — so the bar itself isn't
+obviously wrong; camera "2"'s AF is genuinely converging worse than the
+main camera's, which is a real, different question the AF-modes diagnostic
+above is what should actually answer. **Not touching
+`_macroDriftAcceptRatio` on this evidence** — same standing discipline
+against tuning a threshold off n=1 when a more direct diagnostic is
+available instead.
+
+**Not yet resolved**: whether camera "2" has real AF at all on this
+device. The next real macro capture (once this diagnostic build lands)
+answers it directly.
+
+## First real Samsung A55 capture: macro crop was ~70% background -- real per-device calibration table built to replace the single hardcoded old-device constant (2026-09-02)
+CTO's A55 arrived, first real `fusion_v1` capture (`73c86c41`) pulled and
+manually scored (production trigger is off for this experimental mode).
+Two direct CTO observations from watching the live capture, both
+investigated and confirmed real: "the macro capture path was blurry... I
+do not believe it has been tweaked for real macro at its specific
+aperture" and "the captures I saw live showed really defined ridge
+structure on front v1 only."
+
+**Real device-hardware difference, checked first, not assumed**: A55's
+main camera has a meaningfully bigger sensor (8.16x6.12mm vs the old test
+device's 5.98x4.49mm) and real optical stabilization (the old device has
+none), plus CALIBRATED focus-distance reporting vs the old device's
+UNCALIBRATED. One real gotcha: camera "3" is FRONT-facing on the A55
+(`lensFacing: 0`) vs REAR on the old device — direct, concrete
+confirmation of round 40's own standing warning that camera-ID-to-
+physical-role isn't stable across devices. Camera "2" (used for macro) is
+still rear-facing here, so unaffected.
+
+**Macro: confirmed real, root-caused, and fixed.** Visual inspection of
+the actual raw A55 macro frame with the existing hardcoded crop overlaid
+showed the crop landing ~70% on background floor/wall, with only its left
+third touching the thumb at all — and the visible thumb content itself
+looked soft, no ridge detail. Root cause, confirmed in code, not guessed:
+`_sec_cx=0.66/_sec_cy=0.50/_sec_rx=0.13/_sec_ry=0.11` (`main.py`) and
+`_macroFocusTargetCy=0.34` (`fusion_capture_controller.dart`) were BOTH
+flat literals real-measured on the ORIGINAL test device only (rounds
+31-34), applied unconditionally to every device regardless of camera "2"'s
+actual optics. The A55's camera "2" has meaningfully different hardware
+(1.74mm focal length / 4.48x3.36mm sensor vs the old device's 2.37mm /
+3.92x2.94mm) — different FOV, different real pad framing at the same
+guide-scale instruction. Same root-cause class the `frontFocusDebug`/
+`macroDebug` diagnostics independently corroborated on this capture:
+front converged to 95% of its own self-relative peak sharpness, macro only
+82% — consistent with AF measuring the wrong (mostly-background) ROI.
+
+**Real per-device calibration table built** (`_CAM2_CALIBRATION` in
+`main.py`, `_cam2FocalLengthCalibratedCy` in
+`fusion_capture_controller.dart` — MUST be kept numerically in sync,
+same cross-boundary duplication-risk class as `_sec_cy`/
+`_macroGuideScaleFactor` elsewhere in this project), keyed by camera "2"'s
+own reported focal length (a stable hardware signature, matched with a
+0.05mm tolerance for float jitter):
+- old test device (2.37mm): `cx=0.66, cy=0.50, rx=0.13, ry=0.11` (rounds
+  31-34's own real values, byte-identical — zero behavior change for this
+  device)
+- A55 (1.74mm): `cx=0.61, cy=0.49, rx=0.11, ry=0.09` — refined THREE times,
+  same session, each pass driven by real evidence rather than more
+  guessing. Pass 1 (`cx=0.54, cy=0.45, rx=0.14, ry=0.07`) was my own
+  grid-overlay visual estimate off the raw frame, same discipline as round
+  31's original old-device measurement — real improvement (box went from
+  ~30% pad content to ~75-80%) but still undershot toward the tip per
+  direct CTO feedback: sent the rendered overlay, CTO annotated a photo
+  showing exactly where the real print sits, which turned out to be my own
+  overlay image auto-rotated 90° CCW by their photo viewer (confirmed by
+  reproducing that exact rotation locally and matching it pixel-for-pixel
+  against their background/pose). Pass 2 (`cx=0.61, cy=0.46, rx=0.11,
+  ry=0.12`) mapped that annotated region back through the rotation to
+  landscape still-space. CTO caught a remaining real defect in pass 2's
+  own rendered result: a visible strip of background still clipped inside
+  one edge of the box (screenshotted and annotated again, red highlight on
+  the specific edge) — traced that edge back through the same rotation
+  math to the `cy`/`ry` pair specifically (the flagged edge mapped to the
+  box's y0 boundary in landscape space, not cx/rx), tightened it, and
+  re-rendered. Visually confirmed pass 3 wraps the pad tightly with
+  minimal background on any edge — a real, CTO-verified correction across
+  two full annotation-and-tighten rounds, not a single guess.
+- any OTHER device's camera "2" (focal length matching neither entry):
+  falls back to the existing ratio-derived formula (the same mechanism
+  camera "3" already uses) instead of silently reusing a wrong device's
+  numbers — an honest, physics-based estimate for any future unmeasured
+  hardware, not a guess, and a real improvement over today's behavior
+  regardless of how many devices ever get their own calibrated entry.
+
+**Client-side mechanism note**: this required awaiting
+`_cameraLensInfoFuture` (the background future introduced earlier this
+session's start-lag fix) INSIDE `_runSecondaryCameraPhase`, before
+computing the AF-target/ROI — previously that future was only ever awaited
+at upload time, well after the macro phase had already run and picked its
+(uncorrected) target. By the time the macro phase runs (phase 4 of 5),
+the future has almost certainly already resolved in the background, so
+this costs nothing in practice while making the dependency correct rather
+than accidental.
+
+**Sweep: investigated, NOT confirmed as a calibration issue.** Real
+diagnostic data on this same capture argues against the same class of bug:
+all 3 sweep zones show `readyDetected: true` — the readiness gate is
+self-relative (peak-normalized against its own live signal, not an
+absolute hardcoded position), and it genuinely triggered on real
+convergence, not a timeout. So sweep's live-preview quality signal is, by
+construction, portable across devices in a way macro's fixed AF-target
+constant never was. The CTO's live impression of weaker ridge definition
+on sweep vs front is more likely explained by something else (front's
+dedicated hold gets more real convergence time than a fast zone-transition
+loop; a live-preview-vs-delivered-still domain gap already seen elsewhere
+in this project's history with the wavelength estimator; or plain n=1
+capture variance) — **not actioned, not enough evidence yet** to identify
+a specific fix, unlike macro's clear-cut hardcoded-constant bug. Worth
+watching on the next several real A55 captures before concluding anything
+sweep-specific needs to change.
+
+**Also confirmed, separate finding this same capture**: flash-diff mask
+refinement failed on macro and all 3 sweep zones (bare `guide`, no
+background exclusion) — but NOT via the exposure-guard mechanism found on
+the previous device's macro capture (round above, 2026-08-30): here,
+ambient and flash brightness are nearly identical with zero clipping
+either direction, and the guard fails purely because this device's
+backend-decoded Laplacian readings run substantially lower across the
+board (even on the front burst: 27-86 vs the old device's typical
+600-900+) — a real, capture-domain difference not yet root-caused, flagged
+for the next several real A55 captures rather than acted on from n=1.
+
+**Not yet device-tested** — same standing discipline as every other
+capture-side change this project. The corrected macro crop and AF target
+are committed but need a real fresh A55 macro capture to confirm the fix
+holds live, not just on offline replay of the frame that diagnosed it.
+
+## IDEA, SAVED NOT BUILT: color/chrominance as an additional thumb-vs-background segmentation lever (2026-08-31)
+CTO proposal, explicitly asked to be saved for a future revisit rather than
+built now — priority right now is masking RELIABILITY (see entry below),
+not adding a new lever on top of an already-imperfect mask.
+
+**The premise, confirmed in code first, not assumed**: color is discarded
+on the CLIENT, before upload, not just before masking on the backend.
+`decodeStillJpegToLuma` (`packages/mac_capture/lib/src/
+still_jpeg_downscaler.dart`, used by every capture path in this project --
+front_capture_controller, fusion_capture_controller, arc_sweep) decodes the
+real color JPEG, converts to single-channel luma via a BT.601 weighted sum
+(`77*R + 150*G + 29*B`), and only the luma bytes get re-encoded and
+uploaded. The backend's `cv2.imdecode(..., IMREAD_COLOR)` calls always
+return a 3-channel array, but R=G=B in every pixel -- there is no real
+chrominance anywhere past the moment of capture, confirmed by reading the
+actual decode function, not inferred.
+
+**The idea**: upload real color (not luma-only) and use skin chrominance
+(YCbCr/HSV-style skin thresholding) as an additional, genuinely orthogonal
+segmentation cue alongside flash-diff's illumination-falloff mechanism and
+the U-Net. A real, different signal axis, not a duplicate of what already
+exists.
+
+**Real considerations flagged before building, for whoever picks this up**:
+- This project has already tried several "extra segmentation/pre-pass"
+  ideas (pyfing, NNS, coherence-diffusion, masked ECC, pad-only correlation
+  gate) -- every one either didn't help or measurably hurt real
+  matchability once tested. A plausible-sounding new lever still needs a
+  real A/B, not just intuition, before being trusted.
+- Real risk specific to color: this project has already documented capture
+  sessions with strong color casts that would directly confuse a naive
+  skin-color classifier -- a red ambient-light cast, and worse, direct
+  sunlight TRANSILLUMINATING the fingertip (making the whole pad read
+  bright monochromatic red from within, not from surface reflection). A
+  chrominance-based classifier is exactly the mechanism most exposed to
+  that already-observed failure mode.
+- Real cost: requires a client-side capture change (color JPEGs instead of
+  luma-only), which multiplies per-frame upload size -- this project has
+  hit real "looks hung" upload-time bugs before from oversized frames
+  (round 21's raw-bytes-no-decode bug).
+- Real scope limit: color could only ever improve the MASK. The Gabor
+  enhancement/binarization chain stays grayscale-based regardless, so this
+  targets "is background excluded," not ridge continuity/enhancement
+  quality directly -- those are the CTO's own established separate axes
+  (round 45: content-aware masking correctness and print quality don't
+  move together).
+
+**Not actioned.** Revisit once mask reliability (see below) is solid and/or
+once there's a concrete real failure case where flash-diff/U-Net both miss
+and a chrominance-based fallback plausibly would have caught it.
+
+## Standing priority, restated by the CTO directly (2026-08-31): the mask must be impeccable before enhancement work continues
+Direct CTO framing: "my main concern is the mask needs to be impeccable and
+always find only the thumbprint, this is the only way I can ensure I build
+for enhancement in the correct way." This reprioritizes ongoing work --
+masking CORRECTNESS/RELIABILITY (does the mask reliably find only the pad,
+every capture, every zone, every camera) is the blocking prerequisite for
+any further enhancement-quality (ridge continuity) work, not a parallel
+concern. Consistent with round 45's own finding that masking correctness
+and print quality are separate axes -- but the CTO's direction makes clear
+masking reliability is the one to lock down FIRST, since unreliable/
+inconsistent masking makes it impossible to attribute an enhancement
+change's effect correctly (can't tell if a print got better/worse from the
+enhancement tweak or from a differently-behaving mask underneath it).
+
+Real, current known gaps in mask reliability, from this same session's
+work, worth prioritizing over new enhancement ideas: macro's flash-diff
+self-skip on borderline over/under-exposed flash frames (round above, one
+real capture, `_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0` guard); the seeded-
+label U-Net retrain's real false-match risk (round 51, held); U-Net's
+remaining real mis-location failures even post-retrain (round 50: 3/24
+still fail, 2 via no-detection at all).
+
+## New test device incoming: Samsung A55 (2026-08-31)
+CTO's real device arrives tomorrow. Real, concrete opportunity once it
+does: `cameraLensInfo`/`rawSensorSupport` (already wired, `fusion_capture`'s
+`getCameraLensInfo`/`getRawSensorSupport` MethodChannel, see round 40's own
+real 4-camera table for the CTO's current device) gives a full real-camera-
+hardware readout from a single capture -- worth pulling immediately on the
+first A55 capture to know whether this device's cameras differ meaningfully
+(sensor size, focal length, real macro-lens minFocusDistance) from the
+current test device before drawing conclusions from A55 data that assume
+the same hardware.
+
+## fusion_capture round: capture-start lag fixed; macro flash-diff self-skip traced to underexposure, not blowout (2026-08-30)
+Real fusion_v1 test capture (`81ed8492`), manually scored offline (production
+trigger is off for this experimental mode). CTO reported both a real lag at
+capture start and background contamination in the superprint I first sent.
+
+**Capture-start lag, real and fixed.** `FusionCaptureController.start()`
+awaited two read-only camera-capability queries
+(`getCameraLensInfo`/`getRawSensorSupport`, each looping all 4 cameras via a
+full MethodChannel round-trip) sequentially, directly between camera-open
+and the front phase's hold beginning — despite neither value being consumed
+until `_finishAndUpload()` writes the Firestore doc, minutes later. Now
+kicked off as background futures in parallel with camera init and only
+awaited at their actual point of use, removing two avoidable native
+round-trips from the user-visible time-to-first-hold-frame. Client-only,
+pushed, not yet device-tested.
+
+**Background contamination: real, but the cause was my own test script, not
+a pipeline regression.** The first superprint I sent (`sweep_right`, NFIQ2
+65) rendered with `afisMask: "guide"` — zero content-aware refinement —
+because my manual-scoring harness never passed the sweep/tilt/macro zones'
+single ambient/flash pair as `ambient_burst`/`flash_burst`
+(`_flash_diff_mask` reads those specific params, not `ambient_frames`/
+`flash_frames`), so flash-diff never got a chance to engage on those
+candidates. Fixed the harness and re-scored: every sweep/tilt candidate now
+correctly resolves to `guide+flashdiff`, background properly excluded.
+Expected, already-documented side effect: NFIQ2 DROPPED on every
+newly-refined zone (sweep_right 65→42, tilt_tip 64→39) — the same
+NFIQ2-rewards-raw-area-not-correctness pattern this project has found
+repeatedly (round 45 et al.), not a quality regression. New honest best
+candidate: front freqNorm, NFIQ2 60, `guide+flashdiff`.
+
+**Macro still self-skips flash-diff — root cause found, not a bug.**
+`_flash_diff_mask`'s blowout guard (`_FLASH_DIFF_MIN_FLASH_LAPLACIAN=50.0`)
+skipped the macro flash frame at Laplacian variance 49.17 — a ~2% miss.
+Checked the actual pixel content rather than assuming blowout: this frame
+is NOT saturated (0.04% of pixels clipped white) — it's **underexposed**
+(mean 51.5/255, 14.2% of pixels near-black). Both overexposure and
+underexposure genuinely destroy the local gradient the torch-falloff cue
+needs, and the guard's variance check correctly catches either direction
+even though its docstring only describes the blowout case. This is a new,
+previously undocumented failure direction for the macro path: round 34's
+`-1.0` EV pulldown before the macro flash shot was built specifically to
+prevent OVEREXPOSURE at close macro range; this capture shows the same path
+can also land underexposed instead. Macro only ever fires one ambient/flash
+pair (no burst fallback), so one weak frame is enough to sink that
+candidate's masking entirely, falling through to bare `guide`. **Not
+actioned** — n=1, borderline miss, same "don't retune a threshold off one
+data point" discipline as everywhere else in this project. Worth watching
+on future macro captures; if it recurs, the EV pulldown (not the guard
+threshold) is the more likely correct lever, since it's the value actually
+targeting macro-range exposure.
+
+## Round 50 follow-up: real matchability test on the seeded-label U-Net found a real false-match risk -- recommendation strengthened from "held" to "do not pursue without a real fix" (2026-08-29, round 51)
+Direct CTO ask, same session as round 50: test matchability (SourceAFIS),
+not just NFIQ2, before treating the retrain as promising. Used two real
+genuine cross-session pairs that exist inside the 13-capture unet-routed
+population itself (same `userId`, two real captures each): `4ae6d13c` x
+`5363a49b` (one of round 50's own localization-fixed captures) and
+`1d186afc` x `b615f37b` (`1d186afc` is one of the two still-failing
+captures). Rendered each capture's best-of-variant-pool print (not just
+`native` -- round 50's own NFIQ2 secondary check had understated the real
+achievable quality per capture, caught directly by the CTO asking why one
+capture's best print looked worse than an unrelated one sent earlier;
+re-verified: `80a994ca` reaches real NFIQ2 78 via `deepFuse` once the
+correctly-located mask feeds the full variant pool, not just 32 via
+`native` alone) under old vs new model, scored genuine pairs and an 8-real-
+capture impostor pool via SourceAFIS.
+
+**Genuine matching: no real gain, both pairs stay in the noise floor.**
+`4ae6d13c`x`5363a49b`: 0.62 -> 0.71. `1d186afc`x`b615f37b`: 0.00 -> 9.74 (a
+real increase, but nowhere near SourceAFIS's own ~40 "reliable match"
+threshold either way).
+
+**The real finding is a false-match risk, not a genuine-match gain.**
+`b615f37b`'s impostor max jumped **2.14 -> 71.55** -- nearly 2x
+SourceAFIS's own recommended threshold -- against one specific real
+impostor (`01662ffb`). Isolated to that single pairing and visually
+confirmed: these are two clearly different real fingers (different core/
+delta placement, different overall pattern), yet the new model's rendering
+of `b615f37b` scores as a strong match against an unrelated real identity.
+`b615f37b` was not even one of the localization-fixed captures -- its mask
+was already correctly accepted under both models -- but swapping the U-Net
+changed which variant wins selection for it (`fuseMaxc`@74 old ->
+`freqNorm`@60 new), and that different print carries real cross-identity
+risk. The other two test captures' impostor risk moved only mildly
+(2.26->3.51, 2.56->3.85).
+
+**Recommendation strengthened**: round 50 held this on a net-negative
+NFIQ2 result alone, which left the door open to "worth it once a better
+reference exists." This round's finding is a stronger, independent reason
+to hold: a biometric identity system trading a real mis-location fix for
+even one demonstrated real cross-identity false-match risk is the wrong
+trade regardless of what NFIQ2 or a better scanner reference would show.
+Needs a real fix (more/better training data, a different loss term, or at
+minimum evaluating a much wider set of genuine/impostor pairs to know how
+common this specific failure mode is) before being reconsidered at all --
+not just a stronger ground-truth reference. Full detail appended to
+`fusion_brain/results/THUMB_SEG_RETRAIN_FINDINGS.md`.
+
+## Layer 3 follow-up: U-Net retrained on correctly-seeded flash-diff labels -- real, safe localization win, held on real net-negative NFIQ2 (2026-08-29, round 50)
+Executed round 45's own named root-cause fix: `ml/thumb_seg/build_dataset.py`
+generated this model's training labels via unseeded (pre-round-16)
+flash-diff, so the U-Net learned "near-camera blob near frame centre"
+instead of "the guided pad" -- a 31% (4/13) real mis-location rate. Fixed
+`build_dataset.py` to seed from each capture's real `guideRegion` (same
+formula `afis_print._flash_diff_mask` already uses in production);
+regenerated the dataset (107 real captures, 610 images); visually spot-
+checked 6 random new labels against raw photos (all correctly on the pad).
+Retrained on real SageMaker GPU (`ml.g4dn.xlarge`, same architecture/
+hyperparameters, no tuning, 80 epochs, best val loss 0.1693); exported to
+ONNX matching the exact production I/O contract.
+
+**Real A/B, localization (primary gate), same 24-capture population as
+round 45**: fail rate **33% -> 12%** (8/24 -> 3/24), **zero regressions** --
+every previously-passing capture still passes. 5/8 previously-failing
+captures fixed, including 2 of round 45's own 4 named failures
+(`4ae6d13c` 5.5%->84.1% guide overlap, `80a994ca` 22.8%->84.7%). The other
+2 named failures (`474b4d6a`, `1d186afc`) still fail, now via no-detection
+rather than a wrong-location blob -- real, substantial, safe, but not the
+0/13 target.
+
+**Real A/B, end-to-end NFIQ2 (secondary), 13 real captures that actually
+route to the U-Net in production**: mean delta **-2.46**, 3 better / 7
+worse / 3 tied, including two real double-digit regressions (`1c019820`
+-14, `eacb0b2c` -18). Both localization-fixed captures scored LOWER NFIQ2
+despite objectively better mask placement (-6, -2) -- the same NFIQ2-
+doesn't-reward-fidelity pattern layers 3/4/5 of this pass already found
+independently, now confirmed a fourth time on a genuinely different
+mechanism (a retrained detector, not a measurement-restriction flag).
+
+**Held, not swapped into production** -- real, useful progress (correctly-
+seeded dataset, a validated, safe localization improvement, a ready
+checkpoint) but doesn't cross the spec's own stated bar and costs real
+NFIQ2 on average, same standing need for a real >=500-DPI scanner
+reference as every other correctness fix in this pass. Checkpoint/ONNX
+kept local (gitignored, same convention as every other model binary this
+project produces); code (dataset fix, SageMaker launcher, ONNX exporter,
+both A/B scripts) committed and reusable. Full detail:
+`fusion_brain/results/THUMB_SEG_RETRAIN_FINDINGS.md`.
+
+## Layer-by-layer architecture pass, layer 7 (variant selection): main.py's own fusion-selection guard measured the whole frame, not the pad -- fixed, low-risk, SHIPPED (2026-08-28, round 49)
+Seventh layer of the pass. `main.py` carries its OWN, separate fusion-
+selection sharpness guard (`_fusion_guarded`, built 2026-07-23 after real
+capture `913758cf` showed a fusion variant winning selection despite its
+flash frames being badly blown out relative to ambient) -- distinct from
+layer 6's `_FUSE_FLASH_SOFTNESS_GUARD` inside `afis_print.py`, which gates
+whether a pair gets fused AT ALL; this one gates whether an ALREADY-fused
+candidate needs to beat `native` by a `+3.0` NFIQ2 margin before it can win
+production selection. Its trigger computed ambient:flash sharpness ratio
+over the WHOLE frame (`cv2.Laplacian(ambient_frames[0]).var()` /
+`...flash_frames[0]...`, no masking) -- predating
+`flash_pair_sharpness_ratio` (2026-08-12), whose own docstring already
+states why that's wrong: "a whole-frame Laplacian is dominated by
+background texture." Same background-contamination pattern already found
+independently in layers 3/4/5/6 of this pass, just never checked in this
+second, separate guard.
+
+**Diagnostic, 24 real captures** (`fusion_brain/
+diag_fusion_guard_wholeframe.py`): 3/24 (12.5%) disagree on whether the
+guard's own 4.0 threshold fires, ALWAYS in the direction of whole-frame
+under-detecting (background dilutes a real blowout signal that the pad
+crop shows clearly) -- zero cases the other way, so restricting to the pad
+can only add newly-detected real cases, never remove one.
+
+**Tested whether it matters, not assumed**: on the 3 disagreement
+captures, `deepFuse`'s real margin over `native` was +3.0/+17.0/+33.0 --
+already clearing the guard's own +3.0 requirement regardless of which
+measurement triggers it. Honest result: a real correctness fix with no
+demonstrated change to the delivered print on this evidence, only to the
+guard's own internal accuracy. Secondary fix caught along the way: the OLD
+code gated the check on `_fl_lap > 0`, so a flash frame with LITERALLY
+ZERO variance (the most suspicious case of all) was treated as not
+guarded; `flash_pair_sharpness_ratio` correctly returns `inf` there,
+closing that edge case too.
+
+**Shipped, no flag needed** -- reuses `flash_pair_sharpness_ratio`
+verbatim (the same already-shipped, already-tested function layer 6 relies
+on), so there's no new untested code path to gate, and the guard's own
+action when triggered is a bounded safety margin, never a hard block.
+**Honest limit**: only `deepFuse` was tested end-to-end on the 3
+disagreement captures; `fuseMaxc`/`fuseSoft`/`deepMaxc` weren't separately
+checked (`fuseAvg` already self-forfeited via layer 6's own guard on all
+3). Full detail: `fusion_brain/results/FUSION_GUARD_PAD_CROP_FINDINGS.md`.
+
+## Layer-by-layer architecture pass, layer 6 (fusion): sweep's flash-softness guard ported to front_only_v1 -- first net-positive fix in this pass, SHIPPED (2026-08-28, round 48)
+Sixth layer of the step-by-step architecture pass (layers 2-5: guide geometry,
+masking, wavelength measurement, Gabor enhancement -- see their own round
+entries below). `flash_pair_sharpness_ratio`/`_FLASH_PAIR_MAX_SHARPNESS_RATIO
+=2.0` was built and calibrated 2026-08-12 on real **sweep** captures: every
+zone whose ambient+flash pair actually fused scored LOWER than that zone's
+plain ambient frame (5/5 zones, 2/2 mosaics, up to -13 NFIQ2, zero
+counter-examples) once flash ran softer than ~2.8x ambient's own sharpness --
+the same torch-blowout signature already documented on the main front burst
+elsewhere in this project (round 42: ambient Laplacian ~3.4x flash's). That
+guard was wired ONLY into the sweep zone-fusion path (`main.py`) -- confirmed
+via `grep` that `front_only_v1`'s own fuse family (`fuseAvg`/`fuseMaxc`/
+`fuseSoft`/`deepFuse`/`deepMaxc`/`deepSoft`/`deepAmbBestFl`, the path nearly
+every real production capture routes through) never got it, despite fusing
+ambient/flash pairs through the identical `_fuse_flash_ambient` mechanism.
+
+**Fixed, gated behind `_FUSE_FLASH_SOFTNESS_GUARD`**: wired into all three
+real call sites in `afis_print.py` that build a fused candidate from an
+ambient/flash pair -- the deep-family stack-then-fuse path (falls back to
+plain ambient stack, never to nothing), the single-pair candidate loop
+(skips an over-ratio pair, tries the next), and the 2026-07-24 burst-fallback
+loop (same per-pair gate). Backward compatible in every branch when the
+guard doesn't fire.
+
+**Real test, 12 captures (9 guard-firing + 3 controls, narrowed from the
+full 24-capture library via a cheap Laplacian-ratio pre-pass -- full-res ECC
+in `_fuse_flash_ambient` makes an exhaustive 24x2-arm run impractical, same
+narrowing technique as round 45), real shipped `generate(fuse='avg', ...)`
+run twice per capture with production's own argument shape (including
+`ambient_burst`/`flash_burst` -- an earlier draft of this test omitted them
+and made the guarded arm look artificially worse; caught and fixed before
+drawing any conclusion, since production always passes the full burst)**:
+
+**Controls (ratio<=2.0): exact no-op on all 3** (+0/+0/+0) -- confirms the
+gate only changes behavior when it should. **Guard-firing, non-forfeit
+subset (3 of 9)**: +13 / -1 / -3, mean +3.0 -- real, mixed but net positive.
+**Guard-firing, forfeit subset (6 of 9, 67%)**: every pair in the WHOLE
+burst (not just the pre-selected one) exceeds the ratio threshold, so
+`fuse='avg'` in isolation returns `None` entirely -- in real production this
+is not a regression on its own, since `main.py`'s variant loop is max-of-
+variants and a `None` result just forfeits that one candidate while
+`native`/`freqNorm`/other fuse modes/`deepFuse` still compete normally.
+Mechanistically consistent with, not contrary to, the validated sweep
+finding: trusting none of a uniformly-blown-out burst's pairs is the
+behavior the sweep data already showed correct. **Paired mean across all 6
+non-forfeit comparisons: +1.50.**
+
+**Decision: SHIP ENABLED (`_FUSE_FLASH_SOFTNESS_GUARD = True`)** -- the
+first fix in this round's layer-by-layer pass (layers 2-6) that is not a net
+negative. Layers 4/5's boundary/measurement fixes were both correctly-more-
+faithful and both measurably worse on real NFIQ2; this one ports an
+already-validated mechanism from a sibling capture mode, shows zero
+regression where it shouldn't fire, and a net-positive real delta where it
+fires and can still produce a candidate. **Honest limits**: only 3 of 12
+real comparisons are non-trivial (thinner evidence than the sweep's own
+5/5+2/2), and only the single-pair family was tested end-to-end -- the
+deep-family path (`deepFuse`/`deepMaxc`/`deepSoft`, this project's own
+higher win-rate/higher-mean-quality variants per round 29) shares the
+identical gate mechanism but wasn't separately validated here; worth a
+dedicated check if revisited. Full detail:
+`fusion_brain/results/FUSE_SOFTNESS_GUARD_FINDINGS.md`.
+
+## Crease trim fixed (a real circularity in my own detector); NNS enhancer's streaking root-caused and fixed; super-resolution ruled out with data (2026-08-27, round 43)
+Direct CTO report with an annotated print: below-crease content bleeding
+into a delivered superprint, plus visible diagonal streaking through an
+enhanced print, asking whether either was one image or the pipeline. Then,
+separately: "Have we ever tried to optimize the legacy NNS enhancer?" and
+"look into super resolution optimizations."
+
+**Crease trim: pipeline-wide (~1 capture in 5), and the cause was my own
+detector reading its own output.** Across 24 real captures since crease
+trim shipped, it fired on 19 and never fired on 5. `_trim_base_crease`
+decided "is this row a crease" from ridge-orientation uniformity measured
+on the BINARIZED print -- i.e. AFTER the Gabor bank ran, and this project
+has already documented that bank "will impose ridge-like structure on any
+input with enough local contrast". The crease reached the detector already
+wearing plausible ridge flow it never had. Measured on the real failure
+(`b615f37b`): base-half circular variance 0.506 post-Gabor vs **0.181**
+pre-Gabor; longest qualifying run 27px (below the 29px bar) vs **162px**.
+Fixed by threading the pre-Gabor normalized grayscale through as the
+orientation source, rotated through the same `_upright_from_tip` call.
+**Validated on 8 real captures**: the target failure went from 0.0% trimmed
+(NFIQ2 59) to 24.0% trimmed (NFIQ2 76); mean delta across all 8 was +0.88
+(3 up / 4 down / 1 same) -- neutral elsewhere, visually confirmed clean on
+both. Honest limit: on captures where the trim already worked, the new
+measure trims 1-4 points less (once 15.6) -- a real behaviour change, not
+obviously an improvement there. **Pushed.**
+
+**NNS enhancer's streaking: two real bugs in the same function, only one of
+which mattered.** `enhance()`'s Stage-3 path (`_ridge_pass`, confirmed
+active on every production capture via `enhancementParams.nnsStage: 3`)
+derives frequency AND a single dominant orientation from the highest-
+contrast quadrant of the WHOLE 512x512 scene, then stamps one Gabor kernel
+at that value across the entire image. (1) Frequency is pinned at its own
+50px clamp on every capture tested (n=10) -- the radial FFT spectrum is
+dominated by 1/f illumination falloff, never ridge structure. (2)
+Orientation locks onto whatever that quadrant contains, usually background.
+**Isolating the filter alone (`unet_weight=0`) on a real streaked capture
+reproduced the CTO-reported diagonal streaking almost exactly; isolating
+the UNet alone (`unet_weight=1`) did not** -- orientation, not frequency, is
+the dominant mechanism (fixing frequency alone on the full scene moved
+NFIQ2 only +0.50, noise, since the filter carries just 0.35 weight against
+the UNet's 0.65). **Guide-crop-as-whole-input tested first and refuted**
+(-4.00 mean, loses CLAHE/UNet context) -- that negative result is what led
+to separating "where is the pad measured" from "what does the enhancer
+see". Fix: `enhance()` gained `roi_box`, restricting ONLY where frequency/
+orientation are measured (CLAHE, UNet, and the final filter still run on
+the whole frame); `main.py` computes it from the same `guideRegion` AFIS
+already uses, front_only_v1 only. **Real result, 12 captures: NFIQ2 21.17
+-> 23.67 (+2.50, 8 better / 3 worse / 1 same).** Visually confirmed on the
+motivating capture: the pad goes from a near-featureless grey oval to real
+curved ridge flow, background no longer forced into the deck's diagonal.
+Recorded honestly where it didn't help: one capture's raw pad content was
+independently soft and NFIQ2 dropped there (16->11) -- no orientation fix
+recovers detail the optics never captured. **Pushed.**
+Full detail: `fusion_brain/results/CREASE_TRIM_FINDINGS.md`,
+`results/NNS_ORIENTATION_FINDINGS.md`.
+
+**Super-resolution: ruled out with data, not opinion.** Native ridge period
+across 65 real production captures is a median of **28px** in the full
+frame -- 100% of captures sit at or above the pipeline's own 9px target,
+91% at or above 2x oversampled. The AFIS path already *downsamples* toward
+9px. SR would add pixels where there is already a 3x surplus, and
+single-image SR cannot add information the optics didn't capture -- it
+hallucinates ridge structure, which this project has repeatedly shown fools
+NFIQ2 without improving matchability. The honest lever is the one the
+frame-selection/NNS work above already targets: this pipeline is blur- and
+noise-limited (30-40ms exposures at ISO 291-767, ~3.2px motion smear), not
+resolution-limited. Not built -- multi-frame SR from burst jitter is the
+only form that would add real information, and at 3x oversampling its
+payoff is the same noise-averaging stacking already attempts, which this
+same round measured losing to the burst's best single frame on 8 of 10
+captures.
+
+## Layer 5 (enhancement): two-model architecture confirmed sound; a real boundary-leak fix, also held (2026-08-28, round 47)
+Fifth layer. Two parts.
+
+**Architecture question, answered with real data**: `main.py` picks the
+delivered print from whichever of two independent pipelines scores higher
+real NFIQ2 -- AFIS binarized Gabor (`nfiqSource: afis`) or NNS continuous-
+tone (`nfiqSource: cylindrical`). Across 120 real `front_only_v1` captures,
+**AFIS wins 119/120 (99%)**; NNS wins exactly 1, by a real +10.4 margin
+when it does (34.0 vs 44.4). A legitimate rare-but-real fallback, not dead
+weight -- same max-of-variants philosophy as the rest of this pipeline. Not
+recommending removing it.
+
+**New hypothesis, tested**: does the default `enhance='gabor'` path (every
+production variant that has ever won selection routes through this) leak
+background into real pad content near the mask edge? `_orientation_field`
+(boxFilter 16px + Gaussian sigma 15) and `_gabor_enhance` (kernel radius
+~18-39px at wl 9-20) both run on the FULL unmasked frame -- `binimg[mask==0]
+=255` only discards the OUTPUT afterward, it can't undo a boundary-adjacent
+pad pixel's response having been computed partly from background within
+kernel reach. `_FADE_INSET_PX=25` (the band that keeps some Gabor output
+near the edge) overlaps that same reach. A different mechanism from the
+already-refuted Phase 7-8 "mask-aware `_normalize`" (byte-identical there,
+since `_normalize` is a pure affine map; orientation/Gabor respond to local
+gradient content directly, which affine invariance doesn't cover).
+
+**Fix**: replace background with the in-mask mean, feathered narrowly
+(8px sigma, deliberately much narrower than `_FADE_INSET_PX=25`) so it
+can't manufacture the "ridge terminating on one curve" artifact that
+constant exists to avoid. Gated behind `_GABOR_BOUNDARY_FEATHER` (default
+`False`).
+
+**Result, n=24, real NFIQ2, same production `freq_normalize=True` path**:
+feathered mean 66.79 vs production 69.58 (**-2.79**). Better on 8, worse on
+16, tied on 0 -- stable across the whole run, never crossed net-positive at
+any checkpoint. Same shape as rounds 43/45/46: removing real background
+influence from where the pad reconstruction actually happens, and NFIQ2
+scores it worse more often than not. **Held, not shipped** --
+`_GABOR_BOUNDARY_FEATHER` stays `False`, production unchanged. Needs the
+standing >=500dpi matchability reference to know whether the feathered
+version is a genuinely better print NFIQ2 can't see, or a real regression
+from the narrow feather itself. Full detail:
+`fusion_brain/results/GABOR_BOUNDARY_FINDINGS.md`.
+
+## Layer 4 (pre-processing/normalization): a real measurement leak, gated off because the correct fix costs real NFIQ2 (2026-08-27/28, round 46)
+Fourth layer of the architecture pass. `_ridge_wavelength` (and its
+diagnostic companion `_ridge_wavelength_robust`) -- the estimator that
+decides `freq_normalize`'s resample scale for the whole Gabor bank on every
+production variant -- never had a mask parameter at all. It scans the FULL,
+un-cropped frame in 32x32 blocks, keeping any block with local contrast
+above a bare threshold.
+
+**Measured on 24 real recent `front_only_v1` captures**: the guide occupies
+only ~3% of frame area, and **96% of every block that ever contributes a
+frequency sample sits OUTSIDE the guide**. Same failure MODE as round 42's
+NNS `_ridge_pass` fix (measuring frequency from "the highest-contrast
+quadrant of the WHOLE scene"), but a different function on the path every
+production variant actually runs -- and a genuinely different mechanism from
+the already-closed Phase 7-8 "mask-aware `_normalize`" experiment (refuted
+there because `_normalize` is a pure affine map; block SELECTION by
+std/periodicity is not affine-invariant the same way). On 11/23 captures
+with real in-mask signal, restricting to the pad moves the reported
+wavelength by >=1px (mean 2.2px, max 9px).
+
+**Fixed, additive and gated**: `_ridge_wavelength` gained an optional `mask`
+param -- every existing call site is byte-for-byte unaffected; when passed,
+falls back to the full unmasked population if zero in-mask blocks qualify,
+so it can only narrow toward better-targeted content, never regress a
+capture with no real pad signal. Wired into `generate()` behind
+`_WAVELENGTH_MASK_RESTRICT` (default `False`).
+
+**Verified against the shipped code with the real NFIQ2 binary, n=24, same
+production `freq_normalize=True` path**: masked mean 68.04 vs production
+69.58 (delta -1.54). **Masked better on 0, worse on 3, tied on 21** -- the
+three real deltas (-14, -6, -17) are not noise. Mechanism: `_FREQ_SCALE_MIN
+=0.7` clamps the scale for any wavelength >=~12.9px; the contaminated
+estimate lands there on 21/24 captures (background reads coarser than the
+pad), while the corrected estimate sometimes escapes the floor to a milder
+0.72-0.82 -- and every time it does, the milder, more-accurate correction
+scores WORSE on real NFIQ2. Same shape as round 43's crease-trim and round
+45's masking control: a measurably more correct measurement, and NFIQ2
+doesn't reward it. **Held, not shipped** -- `_WAVELENGTH_MASK_RESTRICT`
+stays `False`; production is unchanged. Needs the standing >=500dpi
+matchability reference to resolve honestly, not more NFIQ2 tuning.
+
+**Secondary finding, checked and NOT acted on**: `_liveWavelengthTooHighPx=
+35.0` (round 17's client-side distance gate) was calibrated off
+`afisWavelengthPxRaw`, which has the identical unmasked defect --
+per-capture values swing wildly once masked (28->10.8, 29->9.0, 15->30.0),
+more than half the population moves by double digits. But the AGGREGATE
+statistic the threshold was derived from barely moves (mean+2sd 37.4 ->
+36.8, both round to ~35) -- per-capture noise cancels at the population
+level. Not recommending a recalibration on this evidence; the number this
+data would justify is essentially the one already shipped. Full detail:
+`fusion_brain/results/WAVELENGTH_LEAK_FINDINGS.md`.
+
+## Layer 3 (masking): the control this layer never had -- refinement ON vs OFF, on real captures (2026-08-27, round 45)
+Third layer of the step-by-step architecture pass. Every prior masking round
+compared the two content-aware detectors against EACH OTHER (rounds 16, 20,
+21). None had run the more basic control: does content-aware refinement beat
+the bare guide at all. Ran it, on 132 real `front_only_v1` captures' population
+and 24 recent ones scored end to end with the real NFIQ2 binary.
+
+**Population**: `guide+flashdiff` 37%, bare `guide` 34%, `guide+unet` 28% --
+a third of production already ships with no refinement at all.
+
+**Two of my own hypotheses refuted before shipping.** (1) "The U-Net over-
+segments and the area-only accept gate mislabels the result" -- false; every
+accepted mask cuts 36-78% of the bound (median 48%), zero cases under 10%. My
+own earlier contrary numbers were measurement error: that set included
+`front_focuszone_*` diagnostic stills the mask path never runs on. (2) "Guide-
+seeded component selection fixes the U-Net" -- as a straight swap it's a wash,
+9/13 either way (recovers one capture, loses another to the 3% area floor).
+
+**What is real: the detectors are not equally reliable.** flash-diff located
+the pad on 11/11 real recent captures; the U-Net failed on 4/13 (31%), and
+every failure is MIS-LOCATION (0/3/10/13% of the bound survives), never over-
+or under-segmentation. Traceable cause: `ml/thumb_seg/build_dataset.py`
+generates this model's pseudo-labels via `_segment_via_flash_diff` called with
+NO seed -- the exact pre-round-16 frame-centre seed, the 555px error round 16
+fixed in production but never regenerated training labels for. The model was
+distilled from a detector aimed at the wrong point.
+
+**The control that changes the recommendation, n=24 real captures, identical
+inputs, only the masking decision varied:**
+
+| arm | mean NFIQ2 |
+|---|---|
+| production refinement | 69.58 |
+| **bare guide, no detector** | **72.50** |
+| dilated guide, no detector | 60.67 |
+
+Refinement costs **-2.92** (worse on 13/24), the same for both detectors
+(-3.5 flashdiff, -3.6 unet) -- so which detector runs isn't the variable.
+**Ruled out the area confound rather than waving at it**: refinement changes
+mask area 0.53-1.08x, and NFIQ2 partly rewards area, but correlation(area
+ratio, dNFIQ2) is only r=+0.317 (~10% of variance) and the two most
+informative points run the WRONG way for area -- the biggest shrink (0.37x)
+scored the best delta (+8), an area-neutral mask (0.96x) scored -9. Shape,
+not size. **Confirmed a third way**: the dilated guide (biggest mask, zero
+detector) is the WORST of all three arms -- rules out "more area helps" in
+either direction.
+
+**Held, not shipped.** The additive guide-seeded U-Net fix (prefer the
+component under the guide centre, fall back to `argmax(area)` when unusable --
+10/13 vs 9/13, +3 on the one capture it changes, others byte-identical,
+verified in the shipped code path) is implemented but gated OFF
+(`_UNET_GUIDE_SEED_ENABLED = False`). If refinement is net-negative, making
+the U-Net succeed more often makes a losing mechanism fire more often -- the
++3 would be a coin flip that happened to land well. Same reasoning shelves the
+bigger item: retraining the U-Net against correctly-seeded labels is NOT
+justified until refinement itself is shown to be worth having.
+
+**Not recommending refinement be disabled either**, on this same evidence.
+NFIQ2 cannot distinguish "removed useful ridge area" from "removed non-pad
+content NFIQ2 was happy to count" -- round 43's crease-trim result is the
+standing proof it gets that distinction wrong here. This is the single
+highest-value thing to re-run the moment a real >=500-DPI scanner reference
+exists. Full detail: `fusion_brain/results/MASKING_FINDINGS.md`.
+
+## Layer 2 (guide geometry): the secondary-camera guide was left in a coordinate space round 36 removed (2026-08-27, round 44)
+Second layer of the step-by-step architecture pass the CTO asked for. Audited
+for coordinate-space CORRECTNESS, not tuning -- this is the layer with the
+worst bug history in this project (BoxFit.cover mis-mapping, mirrored prints,
+macro offset, the `_isolate_thumb_lobe` frame-centre seed), and every one of
+those was caught only after it had corrupted something two layers downstream.
+
+**Checked and CORRECT, recorded so a later round doesn't re-litigate**: the
+BoxFit.cover + rotation transform (screen `rx=0.134604` -> still `ry=0.08298`,
+ratio 0.6164 = exactly the 0.4615/0.75 aspect crop), and `_scoreRoi` /
+`_focusPointScreenSpace` both now deriving from `_guideCx/_guideRy` at runtime
+with no copy left to drift.
+
+**Fix 1 -- fusion sweep stations had literally 0.0% overlap.** `cx = 0.2 +
+0.6*progress` put the stations perfectly disjoint on all three adjacent pairs
+(coverage 3.00x) against production sweep geometry's 35.9%. Mosaicking wants
+30-50%; with zero there is no shared content for registration to lock onto --
+a structural reason the sweep sources never registered well, not a tuning one.
+Swept about the guide's own centre with a 0.15 half-span. Coverage 3.00x ->
+2.28x is the deliberate trade: rounds 37-41 established unregisterable coverage
+is actively HARMFUL via the template-density penalty, not merely wasted.
+
+**Fix 2 -- `_sec_guide`'s constants outlived the frames they were measured on.**
+`main.py` used `cx=0.50, cy=0.34, rx=0.11, ry=0.13` for camera "2". Those were
+real measurements (rounds 31 and 33, off real frames) -- but off frames in a
+convention round 36 then changed and never came back to re-derive against.
+
+Confirmed, not assumed: both cached camera-"2" macro frames (`f4cb3ba5`,
+`b615f37b` -- the exact captures rounds 31/33/35 measured on) decode via plain
+`cv2.imdecode`, the same call this backend makes, to **2448x3264, PORTRAIT**,
+while every other frame in the request is 4266x3200 landscape. That mismatch IS
+the sideways bug round 36 diagnosed, and its fix (`_normalizeMacroFrame`) now
+routes this path through `decodeStillJpegToLuma`, which rotates 90 deg CW into
+landscape. **Round 36's own note records it was never device-tested**, so no real
+capture ever surfaced the leftover.
+
+Rotation read off the decoder's own indexing rather than its docstring
+(`rotated[y*dstW+x] = luma[(h-1-x)*w + y]`): `(u,v) -> (1-v, u)`, radii swapping
+axes. `portrait (0.500, 0.340) -> landscape (0.660, 0.500)`; `rx 0.11 / ry 0.13
+-> rx 0.13 / ry 0.11`.
+
+**Independent corroboration**: the MAIN guide's own real still-space position,
+measured off a real capture in round 16, is `cx=0.63 / cy=0.50`. The macro
+measurement rotates to `(0.66, 0.50)` -- 0.03 away on both axes, which is what it
+should be, since both shots aim at the same on-screen guide and the macro guide
+is only scaled 1.2x. Two numbers from completely different real data landing on
+the same spot is much stronger than either alone.
+
+**Measured on real data with the real NFIQ2 binary** (`test_sec_guide_rotation.py`
+applies the exact client rotation to reconstruct what the backend will receive):
+
+| frame the backend receives | constants | f4cb3ba5 | b615f37b |
+|---|---|---|---|
+| portrait (pre-round-36) | OLD | 62 | 59 |
+| landscape (post-round-36) | **OLD -- ships today** | 58 | 57 |
+| landscape (post-round-36) | **NEW -- rotated** | **67** | **72** |
+
+**+9 and +15** on the frames the pipeline will actually receive. On `b615f37b`
+the mask also moves from bare `guide` to `guide+unet` -- the content-aware
+refinement now finds a real pad to refine, which it could not on the OLD crop.
+That is mechanistic corroboration independent of the score.
+
+**Honest limit on the top row**: it is NOT a faithful reproduction of history --
+`b615f37b` scored a real production 75 via `afisMask: guide+flashdiff`, and this
+harness feeds a single frame so flash-diff can never engage. Absolute numbers are
+not comparable to production and no claim is made of beating it. The valid claim
+is the within-harness comparison: identical inputs, only constants and frame
+orientation vary.
+
+**Camera "3" fixed too, though unreachable today.** Its `cy=0.37` was never
+measured -- it was copied from `PadSilhouetteShape.cy`, a SCREEN-space constant,
+and used as a still-space `cy`. Round 27's audit listed "`defaultShape.cy` 0.37 ==
+`main.py`'s `_sec_cy`" among constants that AGREE; they agree numerically while
+living in different spaces, which is the actual defect. Corrected to the same
+rotation the main guide gets, `(0.5, 0.37) -> (0.63, 0.50)`. `_captureSecondaryBurst`
+was removed client-side 2026-08-03 so only camera "2" is captured -- fixed anyway
+because round 40 named camera "3" the better-evidenced diversity candidate if
+secondary cameras are revived. Full detail:
+`fusion_brain/results/GUIDE_GEOMETRY_FINDINGS.md`.
+
+**Not device-tested**; the backend half needs its own deploy go-ahead.
+
+## Frame selection was the biggest single lever in the whole pipeline, and it was measured wrong (2026-08-27, round 42)
+CTO ran the fusion APK and reported "the ambient shots are extremely blurry
+... image stabilization is a real flaw, OIS will definitely improve my
+captures", then asked to fix frame selection, look into ambient frames
+resolving better ridge content, and test their guess that "stacking ambient
+frames on noise explains why the stacking function performed so badly."
+
+**Method, chosen to avoid this session's own earlier mistake**: render EVERY
+burst frame of 18 real **production** `front_only_v1` captures as
+`generate()`'s primary and score each with the real NFIQ2 binary, holding
+`ambient_burst`/`flash_burst` -- and therefore every masking decision --
+identical. That makes the best possible choice known rather than assumed,
+and turns policy comparison into an offline question over recorded numbers.
+Deliberately NOT the `fusion_v1` population: earlier the same session a
+backend change looked behaviour-neutral on three captures that were all
+`fusion_v1`, and would have broken 57% of production.
+
+**Result: production picks the best frame in the burst 2 times in 18.**
+
+| policy | mean NFIQ2 | vs prod | worst case | picks best frame |
+|---|---|---|---|---|
+| prod (sharpest ambient, client laplacianScore) | 62.22 | -- | -- | **2/18** |
+| swap to flash, guide-region Laplacian | 65.50 | +3.28 | **-16** | 6/18 |
+| **additive: prod + best-flash candidate** (shipped) | **68.83** | **+6.61** | **0** | 8/18 |
+| additive + best-ambient too | 69.89 | +7.67 | 0 | 9/18 |
+| ORACLE (unknowable live) | 74.78 | +12.56 | -- | -- |
+
+**Two measured confounds, neither a tuning problem.**
+1. **ISO.** Across 63 production captures, ambient frames run **ISO 291**
+   median against flash's **140** -- and both sit at the SAME 30ms (1/33s)
+   AE ceiling (79% / 71% of frames). The torch never shortens the exposure;
+   the sensor spends the light on dropping ISO. Laplacian variance rewards
+   the broadband noise ambient carries twice as much of. Per frame inside
+   the guide: client Laplacian ambient 144.0 vs flash 57.5 (0.40x), but
+   ridge-band energy 0.350 vs 0.466 (**1.33x**) and orientation coherence
+   0.220 vs 0.369 (**1.68x**). Laplacian says ambient is 3.4x sharper; every
+   ridge-specific measure says flash is better. That is the CTO's own visual
+   report, quantified.
+2. **Framing.** `generate()`'s internal `_ridge_energy` ranks frames on a
+   centre-half crop of the frame, and the guide occupies only **12.5%** of
+   that crop on real captures -- 87.5% of what it ranks on is background.
+   This ranking also orders the `stack`/`focusStack` pool.
+
+**Shipped as ADDITIVE, not a swap.** `main.py` already carried a note that a
+2026-07-24 flash-preference experiment was refuted; that one REPLACED the
+primary using the client's whole-preview proxy. The swap rows above
+reproduce its failure from a different direction (-16 on individual
+captures). `_download_front_only_frames` now also returns the sharpest
+torch-lit frame ranked inside the guide, scored as one more `native`+
+`freqNorm` candidate -- same bounded-cost pattern as the second-burst block,
+worst case structurally 0.
+
+**A confound in my OWN comparison, found and corrected.** Checking against
+the `nfiq2Score` production actually delivered reported +18.50 -- but the
+five captures carrying nearly all of it (+64/+57/+56/+53/+41) were taken
+2026-07-24 to 2026-08-05 and delivered 5-10 via `secondary_3`/
+`minutiae_left`/`detailZoom`, selection paths since changed outright. That
+delta is three weeks of pipeline fixes. Restricted to comparable vintage
+(2026-08-17 onward, n=6): **+3.33 mean, improves 2 of 6, regresses 0, max
+single gain +14** -- the honest figure for what shipping this buys.
+
+**On OIS, since a Samsung A54 is about to be bought for it**: estimated
+motion smear from the recorded gyro rate at the 30ms exposure is 3.2px
+median / 4.7px p90, against a 9-15px ridge period. Across 52 scored
+captures, shutter, ISO and gyro all correlate with real NFIQ2 at |r| < 0.17.
+Captures with >=75% of frames pinned at the AE ceiling average 60.7 vs 64.0
+for those below 25% -- inside this project's own noise floor. OIS should
+help and a sensor that holds a shorter exposure would help more, but this
+data does not make stabilisation the dominant term; the ISO penalty is
+larger and it is fixable in software.
+
+**The stacking hypothesis: refuted, with a bigger reason found behind it.**
+Four pool arms on 12 real production captures, masking identical
+(`stack_policy_test.py`): production's own pool 63.70/65.80
+(stack/focusStack); re-ranked mixed -2.40/-1.78; **ambient-only -2.56/-4.00
+(the WORST arm of the four)**; flash-only -2.33/-3.62. Deliberately doing
+the thing the hypothesis warns against is what performs worst. The real
+reason, from the same captures' per-frame renders: **best single frame 74.5
+vs focusStack 65.8, stack 63.7, production's own primary 61.7.** Stacking
+beats production's CHOSEN frame 5-6/10 -- which is why it wins variants
+today -- but beats the burst's BEST frame only **2/10**. Its apparent value
+is largely a symptom of the bad primary-frame choice, not a gain of its own.
+Also: **21% of stack arms (20/96) failed ECC alignment outright**,
+concentrated on 4 of 12 captures. Not actioned -- these are additive
+candidates that still win 2/10, and the case for reclaiming their budget
+should be made after the new candidate has real data, on matchability rather
+than NFIQ2. Full detail: `fusion_brain/results/FRAME_SELECTION_FINDINGS.md`
+and `results/STACK_POOL_FINDINGS.md`.
+
+**Camera "3" disabled in `fusion_capture` (round 41's own recommendation,
+refuted by its first real capture).** I had recommended it as a diversity
+source from NFIQ2 win-rate stats measured in `front_only_v1` framing; those
+did not transfer to fusion's closer distance. Real first frames: Laplacian
+5.3, ridge score 0.15, featureless grey blur. `_cam3Enabled = false`.
+
+**Open bug, now diagnosable rather than fixed.** The ported
+`ThumbOrientationClassifier` recorded `orientationDebug.samples = 0` on the
+first real fusion capture, while `padClipDebug` -- measured in the SAME
+`_onFrame` callback -- had real values (`maxPadClipFracSeen` 0.52). So the
+callback fired repeatedly and every `classify()` returned null. Checked
+Firestore history: no capture in this project has ever recorded a successful
+classification (the old multi-angle flow wrote no CV debug at all), so it is
+entirely possible this model has never loaded on any real device -- it fails
+silently by design, callers falling back to IMU. Without device logs the
+cause is not determinable, so instead: `modelReady`/`modelAsset`/`initError`/
+`classifyError` are now recorded in `orientationDebug` on BOTH apps, and the
+package-scoped asset key is tried alongside the bare one. The next real
+capture answers it directly.
+
+## Camera "2" is NOT a macro lens -- real device specs settle a standing assumption (2026-08-26, round 40)
+CTO asked directly, before buying a test phone: "are you actually using
+camera_index_macro or just cropping the main sensor output? ... if macro is
+this far the best captures we have on matchability and NFIQ2, would the
+entire fusion architecture benefit from being macro based?" Both halves
+checked against real code and real data rather than answered from the
+project's own accumulated framing.
+
+**Half 1 -- yes, it is a real separate camera.** `fusion_capture_controller
+.dart`'s `_runMacroPhase()` calls `initializeCamera(cameraDescription:
+macroDesc)` where `macroDesc` is matched on `c.name == '2'` among
+`getAvailableCameras()`. That is a genuine hardware camera switch, not a
+crop of the main sensor's output. Production's `_captureMacroShot` does the
+same thing.
+
+**Half 2 -- but that camera is not optically a macro lens.** Real
+device-reported `cameraLensInfo` (capture `1d186afc`, all four cameras):
+
+| cam | focal | sensor | minFocusDistance | note |
+|---|---|---|---|---|
+| 0 (main) | 4.15mm | 5.98x4.49mm | **50mm** | |
+| 1 (front) | 3.81mm | 5.98x4.49mm | -- | |
+| 2 ("macro") | **2.37mm** (shortest) | **3.92x2.94mm** (smallest) | **50mm** | |
+| 3 | 3.96mm | **6.64x4.97mm** (largest) | 50mm | |
+
+**The defining property of a macro lens is a minimum focus distance closer
+than the main camera's. Camera "2" has exactly the same 50mm floor as
+cameras 0 and 3.** It cannot focus closer than the main camera; it is the
+ultrawide sensor (shortest focal length = widest FOV, smallest sensor)
+being driven closer by a 1.2x-enlarged guide -- which is precisely how
+budget phones implement a "Macro" mode tile. This CONFIRMS round 33's own
+flagged-but-unconfirmed hypothesis ("~54mm working distance ...
+uncomfortably close to camera 2's own real minFocusDistanceDiopters: 20.0,
+a hard 50mm minimum") and explains the softness complaint that round 33's
+AF-target fix never fully resolved: there was never a macro optical
+advantage to recover.
+
+**Half 3 -- "macro is by far the best" is not supported by the real data.**
+Across 136 real scored captures (real `nfiq2Score` + `superprintParams
+.afisSource`):
+
+| winning source | wins | mean | max |
+|---|---|---|---|
+| `frame` (main camera) | **91** | 48.2 | **99** |
+| `secondary_3` | 4 | 30.5 | 72 |
+| **`secondary_2` (macro)** | **2** | 72.0 | 75 |
+
+and as CANDIDATES regardless of whether they won (`secondaryCamScores`):
+camera "3" mean **71.4** / max 76 (n=10) vs camera "2" mean **60.5** /
+max 75 (n=8) -- **camera 3 beats camera 2 on both.** Camera "2" won 1.5% of
+real captures. Where the "macro is best" impression most plausibly comes
+from: (a) rounds 32/35 celebrated camera 2's first-ever wins (69, then 75)
+as genuinely notable milestones, which they were -- but they are 2 data
+points; (b) `fusion_brain` uses `macro_round32`/`macro_round35` as bozorth3
+REFERENCES, which makes them structurally central to every score table in
+that track without implying the macro CAMERA scores best.
+
+**One real nuance that cuts the other way, stated rather than buried**: on
+a real paired capture, camera 2's own pad crop measured a LARGER ridge
+period (89.7px vs main's 58.9px) and much higher local contrast (Laplacian
+156.2 vs 28.0) -- because the 1.2x guide really does pull the user closer
+than the main camera's own distance calibration does. So camera 2 does
+deliver physically bigger ridges in practice, just not because of macro
+optics. n=1, measured with a purpose-built radial-FFT estimator (afis_print's
+own clipped `_ridge_wavelength_robust` returns nan on raw unenhanced crops),
+so treat as suggestive, not settled.
+
+**Recommendation: do NOT rebase the fusion architecture on camera "2".**
+Three independent reasons: no optical macro advantage (same focus floor,
+lower magnification per unit distance, smallest sensor); it loses to both
+camera 3 and the main camera on real measured scores; and the tilt/sweep
+brackets exist specifically to resolve ridges at pad EDGES rotating into
+view, for which the widest-FOV/smallest-sensor camera is the worst
+available tool. Camera "2"'s real demonstrated value is DIVERSITY -- both
+its wins came on captures where the main burst was independently weak (round
+35: main variants scored 33/64/39) -- i.e. it rescues a bad capture rather
+than out-resolving a good one. **If camera diversity is worth adding to
+fusion, camera "3" is the better-evidenced candidate** (largest sensor of
+all four, best secondary mean), and it is currently unused by
+`fusion_capture` entirely.
+
+**For the phone-buying decision (A35/S21/etc.), the one spec that matters
+is already measurable in 30 seconds**: whether the candidate phone has a
+rear camera whose `minFocusDistanceDiopters` implies a CLOSER minimum focus
+distance than its own main camera. `getCameraLensInfo` (MainActivity.kt,
+already ported into `fusion_capture`) reports exactly that, and
+`fusion_capture` already writes it to Firestore as `cameraLensInfo` on
+every capture. This makes the CTO's own cell-phone-store idea considerably
+more valuable than first assessed: a single capture per handset yields the
+full four-camera table above and answers "does this phone have real macro
+hardware" definitively, before any money is spent.
+
 ## ACTIVE TRACK: fusion_brain — the "brain" that fuses all architectures into one superprint (2026-08-22, round 37)
 **Read `fusion_brain/README.md` first — it carries the full live roadmap and
 per-stage status.** This section is the short pointer so the track is not
@@ -53,9 +1797,154 @@ this project already flagged as an unbuilt gap on 2026-07-17
   pattern (`ml/mosaic_register`, `ridgeRestoreHybrid` v2). Live version:
   a **learned per-minutia reliability model** (which candidates are worth
   merging). Gated on real scanner references for labels.
-- Stage C — compositing template → actual superprint IMAGE.
-  `tps.warp_image` built; blend via `sfm_pipeline._multiband_combine()`
-  (already built, unused). Not started.
+- Stage C — compositing template → actual superprint IMAGE. `tps.warp_image`
+  + `sfm_pipeline._multiband_combine()`, restricted to Stage A's own
+  selectively-kept minutiae, weighted by the same coherence-confidence
+  check `_fuse_flash_ambient` uses. **DONE (2026-08-24) — hard-edge and
+  phase-correlation-corrected compositing of already-binarized content are
+  both real, decisive negatives** (0/2 informative real references both
+  times; a real phase-correlation measurement at the genuine anchor/source
+  overlap found TPS position was already correct there — sub-pixel
+  residuals against a ~9px ridge period — ruling out "a small hidden
+  translational offset" as the mechanism). Visually confirmed why hard/
+  feathered compositing fails: TPS corrects minutia POSITION, not ridge
+  PHASE, so a composited boundary still manufactures spurious ridge
+  structure. **Follow-up found the first real positive result in this
+  track's whole history**: compositing SOFTENED (not hard-binary) content
+  and binarizing once at the end, at a moderate selective-merge cap
+  (`max_added` in roughly 12-17, `phase3c_continuous_blend.py`), beats
+  anchor-alone on BOTH informative real references — a real, replicated
+  dose-response across 3 tested values, not one lucky point, bracketed by
+  real losses on both sides (max_added=5 and =20). Full detail:
+  `fusion_brain/results/PHASE3_COMPOSITE_FINDINGS.md`. **Promising, not
+  validated** — n=1 capture, same standing caveat as everything else in
+  this track; needs more real captures before this becomes a trusted
+  parameter. Minutiae-space fusion (Stage A/B) remains the independently
+  validated approach regardless of how this develops further.
+- **Round 38 (2026-08-26) — resolved "why isn't it one coherent print",
+  with real numbers, and corrected one of my own earlier wrong
+  conclusions.** The composite never was visually coherent (a core print
+  plus disconnected blobs) because `_keep_mask` draws independent 24px
+  discs per kept minutia. Naive merging of those discs LOOKS right but
+  costs real matchability (40→31, 29→20 across two captures). Real
+  mechanism, measured: sources present **119-134 UNVALIDATED minutiae**
+  inside their contributing coverage against only **15 validated** ones,
+  so merging pastes ~38 unvetted feature points to gain 15 vetted ones,
+  and Stage A's already-documented template-density penalty does the
+  rest. Fix that works (`phase3f_validated_merge.py`): bridge two
+  validated points only when the corridor between them contains no
+  unvalidated minutia — **matchability-neutral on all 3 real captures**
+  (matches the best blob score exactly: 40/30, 29/17, 21/19) while adding
+  real contiguity, with a clean dose-response when the gate is relaxed
+  (6 extra bridges → 3 extra minutiae → −6 and −4 points). Honest limit:
+  the gate is strict enough that it barely changes the picture, because
+  the blobs are very nearly the entire region this data can support — a
+  seamless merged print is not reachable by compositing policy alone.
+  Two real errors of mine are recorded there rather than quietly fixed:
+  (1) `phase3d`'s conclusion came from a conflated test (it changed the
+  merge AND swapped per-source masks for one global mask, manufacturing
+  the very overlap it then blamed); (2) weight attenuation CANNOT remove
+  content from `_multiband_combine`, which normalizes by total weight, so
+  a lone source survives at any nonzero weight (measured: 1 px of 176,710
+  changed). The new deliberately-sunlit capture (`5181d451`) processed
+  cleanly with no sunlight-specific failure in registration, gating or
+  compositing; its anchor scores are lower across the board (16/21 vs
+  34/29), consistent with this project's documented sunlight capture
+  problems — a capture-side effect, not a fusion one.
+
+- **Round 39 (2026-08-26) — hierarchical per-bracket fusion (CTO's
+  proposal): premise SUPPORTED, architecture REFUTED.** Build a superprint
+  per architecture (front / tilt / sweep), then fuse those three. Premise
+  tested first per this track's own Phase 0 discipline, across 126 real
+  registrations on all 3 real captures: intra-bracket pairs DO register
+  better than cross-bracket (42.47 vs 40.69 mean inliers, 100% vs 96.7%
+  gate pass) -- real, but only ~4%. Image-level hierarchy scored 0/2: it
+  COMPOUNDS the template-density penalty, because compositing an image
+  always yields more extracted minutiae than the merge validated (Stage 1
+  injected 36 and 22 unvetted points, which Stage 2 then trusted as
+  sources). Template-level hierarchy -- same architecture, intermediate
+  changed from picture to minutiae template, zero unvetted additions --
+  recovered most of that (1/2, 35/28) but still trailed the flat merge.
+  Raising the Stage 1 budget 25->50->100->999 (saturating; 999 identical
+  to 100) never closed the gap: Stage 2 took exactly 15 points from
+  `tilt_sp` and 0 from `sweep_sp` at EVERY budget, best case 34/30 against
+  flat's 40/30. **Mechanism**: hierarchy points take an extra registration
+  hop (member -> bracket anchor -> front) vs flat's single hop, and every
+  transform adds positional error that a 4% pose-family edge cannot pay
+  for -- which is exactly why a genuinely true premise can still yield a
+  losing architecture. **Conclusion: flat selection across all sources at
+  once (`fm.fuse` picking the global top-N over all six raw sources) is
+  already near-optimal for this data**; not recommending the bracket
+  hierarchy. One real diagnostic bug fixed en route: Stage 1's fused
+  minutiae kept their original member tags, and `fm.fuse` recounts per
+  source by `m.source`, so Stage 2 reported `contributed=0` for both
+  brackets while genuinely merging 15 points (selection was always
+  correct; only the accounting read zero). Full detail:
+  `fusion_brain/results/PHASE4_HIERARCHY_FINDINGS.md`.
+
+- **Rounds 40-41 (2026-08-26) — raw-domain fusion tested to exhaustion;
+  the INSTRUMENT was the real problem, and fixing it did not rescue
+  fusion.** Phase 5 built raw-domain fusion (composite grayscale BEFORE
+  enhancement, so one orientation field and one Gabor pass span the whole
+  print — continuity by construction). It produced the most coherent print
+  this track has made; the CTO's own read was "the closest to my print I
+  have ever seen". Its first negative verdict turned out to be a
+  **confound of mine**: it compared a mosaic-via-crop against an
+  anchor-via-full-frame. The missing control scored 24/27, so against the
+  correct baseline the mosaic actually WINS round32.
+  - **Phase 6 (2x2: ECC vs ECC+TPS x average vs max-coherence)**: no arm
+    beats the control on both references; `ecc_avg` stays best at 1/2.
+    **TPS answered: measurably worse**, though the residual it corrects is
+    real (median local misregistration 1.1-11.1px after ECC). **Max-
+    coherence REFUTED** — an interim positive was measured against
+    unregistered sides and did not survive the fix. `tps_maxc` doubles
+    extracted minutiae (273 vs 135) and still loses — the template-density
+    penalty again. Three real bugs of mine recorded in
+    `results/PHASE6_TPS_MAXC_FINDINGS.md`: the ECC arm did no registration
+    at all; the first TPS arm tested a print-space→crop-space coordinate
+    bridge rather than TPS; and `tps.py`'s `warp_image` OOM-killed the
+    process at raw-crop resolution (fixed by row-chunking, verified
+    byte-identical).
+  - **The CTO's own question — "cam 2 is weaker than main, does that not
+    give us an unbalanced result?" — was right, and is now measured.**
+    `ref_macro_round32` covers a 52,866 bbox against the anchor's 103,016;
+    only 56 of a wide composite's 273 minutiae (20%) fall where it can see
+    them, while the other 79% still pay the density penalty. Real,
+    directional bias against exactly what fusion does. **But two tests say
+    it was not hiding a win**: restricting probes to the reference's own
+    extent moved fusion 0 to +2 while moving the CONTROL −5/−7; and
+    building better main-camera references (`build_main_refs.py`,
+    `ref_main_round32` = 161 minutiae over 106,673) raised the ANCHOR most
+    (34→44) with every fusion arm still losing.
+  - **Phase 7-8 (`results/PHASE8_CROPPATH_FINDINGS.md`)**: chasing a
+    17-point gap that should not have existed found the crop RENDER path
+    costs real score. Mask-aware `_normalize` **refuted** (byte-identical:
+    it is a pure affine map and everything downstream is affine-invariant
+    — do not re-attempt). **CLAHE tile scale is the real mechanism** —
+    `tileGridSize=(8,8)` is relative to the IMAGE, so the same pad gets
+    533x400px tiles full-frame vs 308x320px cropped — but forcing a common
+    physical tile made both paths worse, so it is a real SENSITIVITY, not
+    a change to make. Worth knowing regardless: **pad contrast enhancement
+    currently scales with framing and camera resolution rather than with
+    the finger**, a genuine cross-session inconsistency source. The fix
+    that works (register in crop space, render full-frame) **beats the crop
+    render on 3/4 references but is 0/4 against the plain anchor** — right
+    order of fix, wrong order of magnitude (~3-4 points against a 23-point
+    gap).
+  - **Where this leaves it**: pixel-domain fusion is now tested across
+    registration (ECC, ECC+TPS), combine rule (average, max-coherence),
+    render framing (crop, full-frame) and reference quality (macro,
+    main-camera), against a correct control every time. **`anchor_fullframe`
+    — the plain single-frame anchor, no fusion at all — remains the best
+    print this pipeline produces** (44/31 on the main-camera references).
+  - **PAUSED by CTO decision pending a real scanner reference.** When it
+    arrives, do this FIRST, before any new fusion work: add it via
+    `MACRO_REFS`/`build_main_refs.py`'s pattern and re-run
+    `diag_reference_power.py` + `phase8_fullframe_render.py`. Every
+    negative in rounds 37-41 is measurement-bound, not method-bound — the
+    open question is not "which fusion technique" but "can any reference
+    we own actually resolve the difference", and only a real >=500-DPI
+    full-pad scan answers it.
 
 **Standing blocker this track keeps hitting, same one as the prime
 directive:** a real ≥500-DPI full-pad scanner reference. Without it, 80%+

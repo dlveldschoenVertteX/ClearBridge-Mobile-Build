@@ -69,13 +69,42 @@ def _download(path: str) -> Optional[np.ndarray]:
     return cv2.imread(local)
 
 
-def _render(img: np.ndarray, guide: dict, tag: str) -> Optional[np.ndarray]:
-    cached = os.path.join(CACHE, f'print_{tag}.png')
+def _render(img: np.ndarray, guide: dict, tag: str,
+           flash_pair: Optional[Tuple[np.ndarray, np.ndarray]] = None
+           ) -> Optional[np.ndarray]:
+    """Render one source through generate().
+
+    REAL GAP found + fixed 2026-08-27: every call to this function across
+    this ENTIRE track, from Phase 3 through Phase 8, passed no
+    ambient_burst/flash_burst -- so `_flash_diff_mask` could never engage,
+    and on the one capture this was checked against, the `_unet_mask`
+    fallback also returned a region with ZERO overlap with the guide (a
+    real, separate anomaly, not yet explained). Every image and every
+    bozorth3 score in this track was therefore computed against the bare
+    geometric guide oval only, with no content-aware background exclusion
+    at all -- confirmed as the direct cause of a real, CTO-observed
+    background bleed in the rendered prints.
+
+    `flash_pair`, when supplied, threads a real (ambient, flash) frame
+    pair from the SAME source through to generate() as single-element
+    ambient_burst/flash_burst lists, letting flash-diff masking engage the
+    way production's own front_only_v1 pipeline already does. Optional and
+    backward compatible -- every existing 3-arg call site is unaffected
+    and keeps rendering with the bare guide, exactly as before this fix.
+    Cache key includes a 'masked' suffix when a pair is supplied, so a
+    fixed and an unfixed render of the same source can never collide.
+    """
+    suffix = '_masked' if flash_pair is not None else ''
+    cached = os.path.join(CACHE, f'print_{tag}{suffix}.png')
     if os.path.exists(cached):
         return cv2.imread(cached, cv2.IMREAD_GRAYSCALE)
+    kwargs = {}
+    if flash_pair is not None:
+        kwargs['ambient_burst'] = [flash_pair[0]]
+        kwargs['flash_burst'] = [flash_pair[1]]
     try:
         out, _ = ap.generate([img], [0.0], [None], guide_region=guide,
-                             freq_normalize=True, stack_cache={})
+                             freq_normalize=True, stack_cache={}, **kwargs)
     except Exception as e:
         print(f'    render failed {tag}: {e}')
         return None
@@ -85,8 +114,123 @@ def _render(img: np.ndarray, guide: dict, tag: str) -> Optional[np.ndarray]:
     return out if out.ndim == 2 else cv2.cvtColor(out, cv2.COLOR_BGR2GRAY)
 
 
+def _flash_pair_for(doc: dict, source: str
+                    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
+    """A real (ambient, flash) frame pair for one named source, for the
+    flash-diff masking fix above. Returns None (self-skip, same contract
+    as _flash_diff_mask itself) when the capture doesn't have both halves
+    for that source -- a caller passing None to `_render` just gets the
+    pre-fix bare-guide behaviour, never a crash.
+    """
+    if source == 'front_v1':
+        frames = doc.get('frames') or []
+        amb = [f for f in frames if not f.get('flashOn')]
+        fl = [f for f in frames if f.get('flashOn')]
+        if not amb or not fl:
+            return None
+        a = _download(max(amb, key=lambda f: f.get('laplacianScore') or 0)['path'])
+        b = _download(max(fl, key=lambda f: f.get('laplacianScore') or 0)['path'])
+        return (a, b) if a is not None and b is not None else None
+
+    if source in ('macro', 'cam3'):
+        shots = doc.get('macroShots' if source == 'macro' else 'cam3Shots') or []
+        amb = next((m for m in shots if not m.get('flashOn')), None)
+        fl = next((m for m in shots if m.get('flashOn')), None)
+        if amb is None or fl is None:
+            return None
+        a = _download(amb['path'])
+        b = _download(fl['path'])
+        return (a, b) if a is not None and b is not None else None
+
+    # tilt_*/sweep zone names: group the same per-station/zone tags
+    # collect_sources() itself already parses, but keep BOTH halves this
+    # time instead of only the ambient-preferred pick.
+    for field in ('tiltShots', 'sweepShots'):
+        items = doc.get(field) or []
+        grouped: Dict[str, Dict[str, dict]] = {}
+        for it in items:
+            tag = it.get('tag', '')
+            if '_' not in tag:
+                continue
+            station, kind = tag.rsplit('_', 1)
+            grouped.setdefault(station, {})[kind] = it
+        if source in grouped:
+            kinds = grouped[source]
+            amb, fl = kinds.get('amb'), kinds.get('fl')
+            if amb is None or fl is None:
+                return None
+            a = _download(amb['path'])
+            b = _download(fl['path'])
+            return (a, b) if a is not None and b is not None else None
+    return None
+
+
 def _coverage(print_img: np.ndarray) -> np.ndarray:
     return (print_img < 240).astype(np.uint8)
+
+
+# Morphological closing radius used to turn ink into a solid footprint.
+# Must exceed the widest ridge-to-ridge VALLEY so gaps close, while staying
+# far below the print's own scale so the outer boundary is not inflated.
+# Real ridge period on these renders is ~9px (this project's own
+# _TARGET_PERIOD), so a 25px kernel spans roughly 2.5 periods -- comfortably
+# more than any single valley, comfortably less than the print.
+_FOOTPRINT_CLOSE_PX = 25
+# Second, larger close applied to the single largest component only, to
+# seal the remaining concavities a ridge-scale kernel cannot reach.
+_FOOTPRINT_SEAL_PX = 45
+
+
+def _footprint(print_img: np.ndarray) -> np.ndarray:
+    """Region this source actually IMAGED -- ink AND the valleys between it.
+
+    REAL BUG this exists to fix, found 2026-08-26 by tracing a visible
+    artifact (thick/tangled "smudge" patches inside the anchor's own print
+    on capture 5181d451) back to its source, rather than guessing at it.
+
+    `_coverage()` above returns INK pixels only (`print < 240`). That is the
+    right question for "where are this print's ridges", and the WRONG
+    question for "what territory does this source cover" -- which is what
+    both real consumers of it actually ask:
+
+      1. `1 - anchor_coverage` gates where a source may composite. With
+         ink-based coverage, HALF the anchor's own print (measured: 58,459
+         of 117,015 footprint px, 50.0%) -- every white valley between its
+         ridges -- reads as "territory the anchor does not cover", so a
+         source is free to draw ITS ridges into the gaps between the
+         anchor's ridges. That is precisely the observed artifact:
+         locally doubled ridge density, reading as a thick tangled smudge.
+         Confirmed visually (diag_source_attribution.py's own contribution
+         map puts sweep_left's region squarely inside the anchor print).
+      2. `fuse_minutiae.classify()` uses the same masks to decide
+         `unique_new_coverage` vs `unique_in_overlap`. A candidate minutia
+         sitting in another source's VALLEY -- fully imaged territory --
+         is therefore mis-tagged as genuine NEW coverage, inflating the
+         candidate pool the selective merge draws from.
+
+    Fix: close ink into a solid footprint, keep the largest connected
+    component (a real print is one region; specks are segmentation noise),
+    then seal remaining concavities. Deliberately morphology rather than a
+    convex hull: a fingerprint's real outline is genuinely concave in
+    places, and a hull would claim un-imaged territory as covered -- the
+    opposite error, and a harder one to notice.
+    """
+    ink = (print_img < 240).astype(np.uint8) * 255
+    if not ink.any():
+        return np.zeros(print_img.shape[:2], dtype=np.uint8)
+    k1 = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_FOOTPRINT_CLOSE_PX, _FOOTPRINT_CLOSE_PX))
+    closed = cv2.morphologyEx(ink, cv2.MORPH_CLOSE, k1)
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(
+        (closed > 0).astype(np.uint8), 8)
+    if n <= 1:
+        return (closed > 0).astype(np.uint8)
+    biggest = max(range(1, n), key=lambda i: stats[i, cv2.CC_STAT_AREA])
+    foot = np.where(lab == biggest, 255, 0).astype(np.uint8)
+    k2 = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (_FOOTPRINT_SEAL_PX, _FOOTPRINT_SEAL_PX))
+    foot = cv2.morphologyEx(foot, cv2.MORPH_CLOSE, k2)
+    return (foot > 0).astype(np.uint8)
 
 
 def _warp_coverage(cov: np.ndarray, t: reg.Transform,
@@ -158,7 +302,99 @@ def collect_sources(doc: dict) -> Dict[str, Tuple[np.ndarray, dict]]:
         if img is not None:
             sources[zone] = (img, fgr.get(zone, guide))
 
+    # Macro (camera "2"): fusion_capture_controller.dart's macro phase
+    # captures exactly ONE dedicated close-up position (not multiple
+    # stations like tilt/sweep), tagged macro_amb_0 / macro_fl_0 -- so this
+    # reuses front_v1's own prefer-ambient-fall-back-to-flash selection by
+    # the `flashOn` field already on each entry, rather than tilt/sweep's
+    # tag-parsing/station-grouping logic, which does not apply here (there
+    # is no station to group by).
+    macro = doc.get('macroShots') or []
+    if macro:
+        amb_m = [m for m in macro if not m.get('flashOn')]
+        pick = amb_m[0] if amb_m else macro[0]
+        img = _download(pick['path'])
+        if img is not None:
+            sources['macro'] = (img, _secondary_guide(doc, guide, '2', 'macro'))
+
+    # Camera "3" diversity source (round 40). Added because real data said
+    # so, not for symmetry: across 136 real scored captures camera "3" beat
+    # camera "2" as a candidate on both mean (71.4 vs 60.5) and max
+    # (76 vs 75) real NFIQ2, and it has the largest sensor of all four
+    # cameras. Same FOV-correction formula, same self-skip contract -- a
+    # capture without `cam3Shots` (i.e. every capture before this landed)
+    # is unaffected.
+    cam3 = doc.get('cam3Shots') or []
+    if cam3:
+        amb_3 = [m for m in cam3 if not m.get('flashOn')]
+        pick3 = amb_3[0] if amb_3 else cam3[0]
+        img3 = _download(pick3['path'])
+        if img3 is not None:
+            sources['cam3'] = (img3, _secondary_guide(doc, guide, '3', 'cam3'))
+
     return sources
+
+
+def _secondary_guide(doc: dict, main_guide: dict, cam_id: str = '2',
+                     label: str = 'macro') -> dict:
+    """Crop region for the macro source -- real per-device correction when
+    possible, a loudly-flagged approximation otherwise.
+
+    `fusion_capture` now records `cameraLensInfo` (real Camera2
+    characteristics per camera id, ported 2026-08-26) the same way
+    `main.py`'s own secondary-camera scoring loop already does. When it's
+    present for both the main camera ("0") and camera "2", this applies
+    the SAME general FOV-correction formula production uses (main.py,
+    ~line 1637): angular field of view ~= sensorSize/focalLength, so
+    scaling rx/ry by (fl_sec/sensor_sec)/(fl_main/sensor_main) extracts
+    the equivalent physical pad region from the differently-framed
+    secondary lens.
+
+    Deliberately DOES NOT port production's cy=0.34/rx=0.11/ry=0.13
+    overrides for camera "2" -- those are real, but they are empirical
+    calibration measured against ONE specific device's own camera "2"
+    physical mounting (front_capture_controller.dart's round-31/33
+    history), not a portable formula. Blindly applying a Doogee-specific
+    offset to a different phone's different macro/auxiliary lens would
+    silently introduce a NEW wrong assumption -- exactly the failure mode
+    multi-device testing exists to catch, not repeat. cx/cy stay at the
+    generic 0.5 centre (matching what production itself uses for every
+    camera it has no per-device calibration for, e.g. its own camera "3").
+
+    Falls back to the main camera's own guide_region, unchanged, with a
+    loud runtime warning, whenever cameraLensInfo is absent (e.g. every
+    capture before this field existed) or incomplete.
+    """
+    lens_info = doc.get('cameraLensInfo') or {}
+    main_lens = lens_info.get('0') or {}
+    macro_lens = lens_info.get(cam_id) or {}
+    fl_main = main_lens.get('focalLengthMm')
+    fl_macro = macro_lens.get('focalLengthMm')
+    sw_main = main_lens.get('sensorWidthMm')
+    sh_main = main_lens.get('sensorHeightMm')
+    sw_macro = macro_lens.get('sensorWidthMm')
+    sh_macro = macro_lens.get('sensorHeightMm')
+    if (fl_main and fl_macro and sw_main and sh_main and sw_macro and sh_macro
+            and fl_main > 0 and sw_macro > 0 and sh_macro > 0):
+        rx_ratio = (fl_macro / sw_macro) / (fl_main / sw_main)
+        ry_ratio = (fl_macro / sh_macro) / (fl_main / sh_main)
+        print(f'    [{label}] cameraLensInfo-corrected crop: '
+              f'rx_ratio={rx_ratio:.3f} ry_ratio={ry_ratio:.3f} '
+              f'(fl {fl_main:.2f}->{fl_macro:.2f}mm, '
+              f'sensor {sw_main:.2f}x{sh_main:.2f}->{sw_macro:.2f}x{sh_macro:.2f}mm)')
+        return {
+            'cx': 0.5,
+            'cy': 0.5,
+            'rx': main_guide['rx'] * rx_ratio,
+            'ry': main_guide['ry'] * ry_ratio,
+            'tipAngleDeg': main_guide.get('tipAngleDeg', 0.0),
+            'n': main_guide.get('n', 2.5),
+        }
+    print(f'    [{label}] WARNING: no cameraLensInfo for this capture -- '
+          'cropped with the FRONT camera\'s unmodified guide_region, '
+          'unvalidated for this lens. Visually confirm the rendered '
+          'print before trusting this source.')
+    return main_guide
 
 
 def analyse(cap_id: str, doc: dict) -> Optional[dict]:

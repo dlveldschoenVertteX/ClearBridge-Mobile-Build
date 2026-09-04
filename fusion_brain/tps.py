@@ -263,7 +263,8 @@ def fit_from_correspondences(
 
 
 def warp_image(w: TpsWarp, img: np.ndarray, out_shape: Tuple[int, int],
-               blend_to_identity: bool = True) -> np.ndarray:
+               blend_to_identity: bool = True,
+               max_grid_pts: int = 400_000) -> np.ndarray:
     """Dense image warp under the same TPS, for Stage C compositing.
 
     Builds the INVERSE sampling grid the honest way for a scattered-data
@@ -272,6 +273,17 @@ def warp_image(w: TpsWarp, img: np.ndarray, out_shape: Tuple[int, int],
     analytically (it has no closed-form inverse), this fits a second TPS in
     the opposite direction from the same control pairs -- standard practice,
     and exact at the control points themselves.
+
+    Real bug found + fixed 2026-08-26: this used to build the WHOLE
+    out_shape grid at once and hand it to `_apply_tps`, whose O(M*N)
+    intermediates (`diff`/`r2`/`U`/`basis`, each M x N float64) are fine at
+    print-space resolution (Stage C's original use case) but OOM outright
+    on a full raw-sensor crop -- confirmed via a real kill: a 2563x2464
+    grid (~6.3M points) drove RSS to ~14GB and the memcg OOM killer took
+    the process. Chunking by rows bounds peak memory to `max_grid_pts`
+    regardless of image size and changes NOTHING about the numeric result
+    -- each chunk is the exact same `_apply_tps` call on a subset of the
+    same grid, just not all at once.
     """
     import cv2
     inv = fit_tps(_apply_tps(w, w.control_src, blend_to_identity=False),
@@ -279,11 +291,16 @@ def warp_image(w: TpsWarp, img: np.ndarray, out_shape: Tuple[int, int],
     if inv is None:
         return np.full(out_shape, 255, dtype=img.dtype)
     h, w_out = out_shape
-    yy, xx = np.mgrid[0:h, 0:w_out]
-    grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float64)
-    src_pts = _apply_tps(inv, grid, blend_to_identity=blend_to_identity)
-    map_x = src_pts[:, 0].reshape(h, w_out).astype(np.float32)
-    map_y = src_pts[:, 1].reshape(h, w_out).astype(np.float32)
+    map_x = np.empty((h, w_out), dtype=np.float32)
+    map_y = np.empty((h, w_out), dtype=np.float32)
+    rows_per_chunk = max(1, max_grid_pts // max(1, w_out))
+    for y0 in range(0, h, rows_per_chunk):
+        y1 = min(h, y0 + rows_per_chunk)
+        yy, xx = np.mgrid[y0:y1, 0:w_out]
+        grid = np.stack([xx.ravel(), yy.ravel()], axis=1).astype(np.float64)
+        src_pts = _apply_tps(inv, grid, blend_to_identity=blend_to_identity)
+        map_x[y0:y1, :] = src_pts[:, 0].reshape(y1 - y0, w_out).astype(np.float32)
+        map_y[y0:y1, :] = src_pts[:, 1].reshape(y1 - y0, w_out).astype(np.float32)
     return cv2.remap(img, map_x, map_y, interpolation=cv2.INTER_LINEAR,
                      borderMode=cv2.BORDER_CONSTANT, borderValue=255)
 

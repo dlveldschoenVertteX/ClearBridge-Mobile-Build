@@ -9,7 +9,7 @@ import 'package:cloud_functions/cloud_functions.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:firebase_storage/firebase_storage.dart';
 import 'package:flutter/foundation.dart';
-import 'package:flutter/services.dart' show HapticFeedback;
+import 'package:flutter/services.dart' show HapticFeedback, MethodChannel;
 import 'package:mac_capture/mac_capture.dart';
 // Taken transitively via mac_capture (pins ^4.0.2), same as
 // clearbridge_beta's own front_capture_controller.dart -- not declared
@@ -28,6 +28,7 @@ enum FusionPhase {
   frontBurst,     // phase 1: 8-shot alternating ambient/flash
   tilt,           // phase 2: small-angle left / tip / right
   sweep,          // phase 3: guide translated across zones
+  macro,          // phase 4: dedicated close-up shot, camera "2"
   uploading,
   complete,
   error,
@@ -245,21 +246,79 @@ const int _kStillDecodeTargetWidth = 3200;
 ///
 /// Returns the original bytes unchanged on any failure: a decode problem
 /// should cost upload size, never the frame itself.
-Future<Uint8List> _shrinkForUpload(Uint8List jpeg, int sensorOrientation) async {
+Future<_Shrunk> _shrinkForUpload(Uint8List jpeg, int sensorOrientation) async {
   try {
     final decoded = await decodeStillJpegToLuma(
       jpeg,
       sensorOrientation,
       targetWidth: _kStillDecodeTargetWidth,
     );
-    if (decoded == null) return jpeg;
-    return await compute(
+    if (decoded == null) return _Shrunk(jpeg, null);
+    final sharp = _lumaSharpness(decoded);
+    final bytes = await compute(
       _encodeIsolate,
       _EncodeArgs(decoded.luma, decoded.width, decoded.height),
     );
+    return _Shrunk(bytes, sharp);
   } catch (_) {
-    return jpeg;
+    return _Shrunk(jpeg, null);
   }
+}
+
+class _Shrunk {
+  const _Shrunk(this.bytes, this.sharpness);
+  final Uint8List bytes;
+  /// Null when the decode failed and the original bytes are being passed
+  /// through unchanged -- there is nothing to measure in that case.
+  final double? sharpness;
+}
+
+/// Laplacian variance over the DECODED, about-to-be-uploaded luma.
+///
+/// Deliberately measured here rather than copied from the live preview the
+/// way clearbridge_beta's `laplacianScore` is. That field is a whole-preview
+/// proxy sampled before the shutter fired, and this project measured it
+/// wrong twice: it reads identical across a burst, and on real captures it
+/// ranks a visibly blurry ambient frame ABOVE a torch-lit one because
+/// Laplacian variance rewards the broadband ISO noise a dark frame carries.
+/// Measuring the real uploaded pixels at least removes the first problem.
+///
+/// Still a whole-frame number, so it inherits the second: on real captures
+/// the guide occupies a minority of the frame, and this cannot tell ridge
+/// detail from background texture. It is recorded as a DIAGNOSTIC so the
+/// offline harness can compare it against guide-restricted measures on
+/// fusion captures the way it already can on production ones -- not as a
+/// selection signal.
+///
+/// Strided so this stays cheap on a budget phone: every 4th pixel in each
+/// direction, which is ~1/16 the work and leaves tens of thousands of
+/// samples at this decode width.
+double _lumaSharpness(DecodedStillLuma d) {
+  const stride = 4;
+  final w = d.width, h = d.height;
+  final px = d.luma;
+  var n = 0;
+  var sum = 0.0;
+  var sumSq = 0.0;
+  for (var y = stride; y < h - stride; y += stride) {
+    final row = y * w;
+    for (var x = stride; x < w - stride; x += stride) {
+      final i = row + x;
+      // 4-neighbour Laplacian at the sampled spacing.
+      final lap = (px[i - stride] +
+              px[i + stride] +
+              px[i - stride * w] +
+              px[i + stride * w] -
+              4 * px[i])
+          .toDouble();
+      sum += lap;
+      sumSq += lap * lap;
+      n++;
+    }
+  }
+  if (n == 0) return 0.0;
+  final mean = sum / n;
+  return (sumSq / n) - (mean * mean);
 }
 
 class _EncodeArgs {
@@ -278,12 +337,21 @@ class _Shot {
     required this.tag,
     required this.flashOn,
     this.exif,
+    this.gyroMagnitudeDegPerSec,
   });
   Uint8List jpeg;          // replaced in-place by _shrinkCaptured()
   bool shrunk = false;
   final String tag;        // storage/Firestore key, e.g. 'tilt_left_fl'
   final bool flashOn;
   final JpegExposureExif? exif;
+  /// Device rotation rate at the moment the shutter fired. Recorded because
+  /// this app's own real captures run a 40ms exposure at ISO 700+, where
+  /// hand motion is a plausible blur term -- and without a per-frame value
+  /// there is no way to test that against anything.
+  final double? gyroMagnitudeDegPerSec;
+  /// Set by _shrinkForUpload from the decoded luma; null if the decode
+  /// failed and the original bytes were passed through.
+  double? sharpness;
 }
 
 /// Three-phase fusion capture.
@@ -337,6 +405,22 @@ class FusionCaptureController extends ChangeNotifier {
   static const bool _frontEnabled = true;
   static const bool _tiltEnabled = true;
   static const bool _sweepEnabled = true;
+  static const bool _macroEnabled = true;
+
+  // Direct CTO ask (2026-09-03): apply the same "pull the user physically
+  // closer" principle the camera-0 macro fix uses to the tilt phase too --
+  // real full AF on camera 0 gets meaningfully more ridge magnification at
+  // a closer working distance for the same sensor resolution (confirmed:
+  // macro's own real NFIQ2 matched front's best variant on the first real
+  // camera-0 capture, 71 vs 71). More conservative than macro's own 1.2x
+  // on purpose: tilt's whole point is exposing the pad EDGE as it rotates
+  // into view, and a closer guide shrinks the real margin before that edge
+  // clips out of frame at the tilted stations (unlike macro/front, which
+  // stay face-on the whole time). 1.1x is a first cut, not swept against
+  // real data -- the next real capture's tilt-zone NFIQ2/visual review is
+  // what confirms whether this is worth its own real cost (one more
+  // real AF reconvergence at phase start) without losing edge coverage.
+  static const double _tiltGuideScaleFactor = 1.1;
 
   /// Whether to invoke the deployed production Cloud Function on this
   /// capture. OFF on purpose.
@@ -404,6 +488,18 @@ class FusionCaptureController extends ChangeNotifier {
   /// (GAME_ROTATION_VECTOR), so this does not need a live camera frame to
   /// sample, unlike oscillating's own per-camera-frame sampling.
   static const int _tiltPollMs = 60;
+  // Real, bounded wait for gyro steadiness right before the tilt
+  // reference is zeroed -- see the call site's own docs (CTO report,
+  // 2026-09-02: "Gyro did not calibrate correctly... struggling to lock
+  // into angle even though I was moving the phone"). Not a guessed
+  // number: oscillating_capture_controller.dart's own history already
+  // found insufficient sensor settle time before captureReference()
+  // biases the whole session's zero point by "several degrees" (its own
+  // fix was a flat 500ms pause). Bounded here rather than a blind delay,
+  // since the front hold's own on-target check never gates on gyro
+  // steadiness at all (focus+coverage only) -- a flat delay can't help if
+  // the user is still adjusting grip past it.
+  static const int _tiltReferenceSettleMaxMs = 800;
 
   // ---- phase 3: sweep stations ----
   // Real device feedback (2026-08-22): this phase should look exactly like
@@ -427,6 +523,365 @@ class FusionCaptureController extends ChangeNotifier {
   static const int _sweepZoneReadyMinWaitMs = 300;
   static const int _sweepZoneReadyMaxWaitMs = 1400;
   static const int _sweepPhaseTimeoutMs = 60000;
+  /// Fraction of the front hold's own observed peak sharpness
+  /// (`_frontFocusPeakAbs`) that a sweep zone's live reading must reach
+  /// before it is treated as genuinely focused ON THE THUMB.
+  ///
+  /// REAL BUG this fixes, 2026-09-02 (CTO: "Sweep was blurry no focus on
+  /// foreground at all but background was crisp"). The readiness gate used
+  /// `_focusValue >= _focusThreshold` -- but `_focusValue` is
+  /// `abs / _focusPeak`, peak-NORMALISED, and `_focusPeak` is reset to 0
+  /// at the top of every zone. The very first sample therefore SETS the
+  /// peak and the ratio is 1.0 immediately, so the gate passed instantly
+  /// no matter what the lens was actually focused on. This file's own
+  /// front-phase docs already spell the trap out ("normalised against the
+  /// running peak, so it reaches 1.0 at ANY absolute sharpness level. A
+  /// uniformly out-of-focus hold satisfies that gate perfectly") -- it was
+  /// simply never applied to the sweep gate. Every zone of every capture
+  /// duly reported `readyDetected: true` while imaging a sharp wall and a
+  /// blurred thumb.
+  ///
+  /// 0.5 is deliberately permissive: the sweep images the pad at an angle
+  /// and off-centre, so it should not be held to the front hold's own
+  /// face-on peak. This is a floor against "focused on the far wall", not
+  /// a quality bar. Bounded by `_sweepZoneReadyMaxWaitMs` like every other
+  /// real-time gate in this file -- if it never clears, the zone still
+  /// fires and records that it did.
+  static const double _sweepFocusFloorRatio = 0.5;
+
+  // ---- phase 4: macro (camera "2") close-up ----
+  // Ported from clearbridge_beta's own front_capture_controller.dart
+  // `_captureMacroShot` -- real, already-validated capture logic (rounds
+  // 24-37: real ambient/flash-pair engagement, real focus-target
+  // correction, real orientation fix), not a fresh design. Values kept
+  // identical to that file's own constants, not re-derived, since they
+  // were each calibrated against real device data specific to this exact
+  // lens (camera "2"'s own measured pad offset/focus behaviour) that this
+  // app has no independent way to re-measure.
+  //
+  // Real, direct motivation for porting this at all: fusion_brain's own
+  // Phase 0/0b findings (tilt contributes real, non-redundant minutiae
+  // that a face-on control does not) establish that DIFFERENT capture
+  // geometry is what makes a source worth fusing. Macro is a third,
+  // qualitatively different geometry -- closer working distance, a
+  // physically different lens -- untested by this app until now. Per this
+  // track's own standing discipline (fusion_brain/README.md, "why minutiae
+  // space, not pixel space"), whether it is WORTH fusing is a premise to
+  // measure once real capture data exists, not to assume -- this only
+  // ports the CAPTURE, it does not change how fusion_brain treats it.
+  // CAMERA IDENTITY CORRECTED 2026-09-02, and this is the root cause of
+  // every "macro is blurry / focused on the background" report from round
+  // 31 onward. Camera "2" is NOT the macro lens -- it is the ULTRA-WIDE.
+  //
+  // REVISED 2026-09-02, second correction the same day: camera "1" was
+  // never device-tested when it was picked as "the remaining rear camera"
+  // (see the superseded reasoning further down in git history) -- the
+  // first real capture from it (90ab8139) shows the raw macro frame is a
+  // photo of the user's own face and shirt, with the thumb held up near
+  // the lens. Camera "1" is a FRONT-facing sensor on this device
+  // (cameraLensInfo['1'].lensFacing == 0, confirmed correct here, not a
+  // misreport -- the same field already correctly identified camera "0"
+  // and "2" as BACK-facing on every capture this session). The earlier
+  // "elimination" argument assumed the A55 exposes 3 distinct rear camera
+  // IDs (main/ultrawide/macro) plus 1 front -- real data says otherwise:
+  // of ids 0-3, exactly two report BACK (0 = main, 2 = confirmed
+  // ultra-wide) and two report FRONT (1, and 3 -- CTO already visually
+  // confirmed 3 shows his own face in an earlier round). There is no
+  // fourth, distinct rear ID for a macro module anywhere in this device's
+  // standard Camera2 enumeration (`cameraManager.cameraIdList`, verified
+  // in MainActivity.kt to be the full unrestricted list, not a filtered
+  // one).
+  //
+  // The real, concrete clue for where macro actually lives on this
+  // device: camera "0" (main)'s own `afAvailableModes` explicitly
+  // includes `MACRO` alongside AUTO/CONTINUOUS_PICTURE -- the only camera
+  // on this device with that mode at all. On phones where the macro
+  // lens isn't exposed as its own top-level Camera2 id, this is the real,
+  // standard mechanism: macro range is folded into the main sensor's own
+  // continuous/auto AF rather than switched via a separate physical
+  // camera. Routing this phase through the MAIN camera (already proven,
+  // real full AF, used by the front/tilt/sweep phases all session) at a
+  // pulled-in guide scale is the correct redirect given that constraint --
+  // not a new hardware assumption, just no longer assuming a rear macro
+  // id exists when the device's own enumeration says it doesn't.
+  //
+  // This also directly explains the CTO's live "front cam is still
+  // connected" report on the very capture that surfaced this: it was
+  // literally true, camera "1" IS the front camera, confirmed by its own
+  // photographed output, not a stale-build artifact.
+  static const String _macroCameraName = '0';
+  static const double _macroGuideScaleFactor = 1.2;
+  // 0.37 = PadSilhouetteShape.defaultShape.cy, the main guide's own
+  // position. Now genuinely exact rather than an estimate: this phase
+  // routes through camera "0" itself (2026-09-02 fix), the same camera
+  // and same guide the front phase already uses -- there is no separate
+  // lens geometry to correct for any more.
+  static const double _macroFocusTargetCy = 0.37;
+
+  /// Real per-device AF-target calibration for macro-class secondary
+  /// cameras, keyed by the camera's own reported focal length -- a stable
+  /// hardware signature, since this lens differs meaningfully device to
+  /// device (2026-09-02: the original test device's camera "2" is 2.37mm;
+  /// a Samsung A55's camera "2" is 1.74mm, with a real, differently-
+  /// measured pad position). MUST be kept numerically in sync with
+  /// `main.py`'s own `_CAM2_CALIBRATION` table -- the same duplication-risk
+  /// class already documented elsewhere in this project (`_sec_cy`,
+  /// `_macroGuideScaleFactor`), not a new design choice, just the
+  /// established pattern for constants shared across this client/backend
+  /// boundary. Returns null (caller keeps its own default) when the
+  /// reported focal length doesn't match any calibrated device -- can only
+  /// ever correct a known-wrong default, never regress an unrecognized one.
+  static double? _cam2FocalLengthCalibratedCy(double? focalLengthMm) {
+    if (focalLengthMm == null) return null;
+    const calibrations = <List<double>>[
+      [2.37, 0.34], // original test device, rounds 31-34
+      [1.74, 0.49], // Samsung A55, refined twice 2026-09-02 against the
+      // CTO's own direct annotations of where the real print sits (must
+      // match main.py's own _CAM2_CALIBRATION cy exactly)
+    ];
+    for (final c in calibrations) {
+      if ((focalLengthMm - c[0]).abs() <= 0.05) return c[1];
+    }
+    return null;
+  }
+  static const int _macroFocusMinMs = 1200;
+  static const int _macroFocusMaxMs = 2400;
+  static const int _macroCaptureTimeoutMs = 60000;
+  // Real convergence-poll constants, identical to clearbridge_beta's own
+  // _refocusPollIntervalMs/_refocusStableRatio/_refocusStableStreakRequired/
+  // _refocusDriftAcceptRatio/_zoneFocusCallTimeout -- this app has no prior
+  // need for a peak-tracking focus-convergence poll (its other phases rely
+  // on continuous AF on one already-locked camera), so these did not exist
+  // here before this port.
+  // Front-phase AF convergence bounds. Deliberately clearbridge_beta's own
+  // _refocusMinMs/_refocusMaxMs (600/1200), NOT the macro camera's longer
+  // 1200/2400: this is the main camera at its normal working distance, the
+  // exact case those production values were tuned for. The macro bounds are
+  // doubled specifically because camera "2" focuses slowly at close range.
+  static const int _frontFocusMinMs = 600;
+  static const int _frontFocusMaxMs = 1200;
+  static const int _macroPollIntervalMs = 150;
+  static const double _macroStableRatio = 0.12;
+  static const int _macroStableStreakRequired = 2;
+  static const double _macroDriftAcceptRatio = 0.6;
+  static const Duration _macroFocusCallTimeout = Duration(seconds: 3);
+
+  // Real, decisive finding 2026-09-02 (CLAUDE.md): camera "2" reports
+  // `afAvailableModes: [OFF]` on the A55 -- and cameras "1"/"3" do too. It
+  // has no autofocus mechanism at all; `setFocusMode(FocusMode.auto)` is a
+  // harmless no-op against it, not a real focus request. The OLD
+  // convergence loop (`_retargetAndConvergeMacro`, still correct and still
+  // used for the FRONT camera below, which DOES have real AF) declares
+  // "converged" the moment its own relative-stability check is satisfied
+  // -- trivially true almost immediately against a signal that can never
+  // change, since there is no lens motor to hunt with. That is the real
+  // mechanism behind "macro capture was extremely short": it wasn't
+  // converging fast, there was never anything to converge. Visually
+  // confirmed on a real capture: background sharp, thumb pad a
+  // featureless blur.
+  //
+  // Direct CTO product call, same round: since there is no lens motor,
+  // let the USER's own hand motion be the focus search. A fixed-focus
+  // lens still has one real plane of sharpest focus -- `_liveAbsSharpness`
+  // genuinely rises as the thumb approaches it and falls again once past
+  // it, independent of any AF mechanism. `_waitForMacroFocusPeak` (below)
+  // replaces the stability check with a genuine peak search for this
+  // camera specifically: live-guides the user closer via `distanceHint`
+  // while the signal is still climbing, and only allows the shutter once
+  // it holds near its own observed running peak for a real streak.
+  //
+  // Widened well past `_macroFocusMaxMs` (2400ms, sized for an AF SEARCH,
+  // irrelevant here): this window has to cover real human reaction and
+  // movement time to physically approach through the focal plane. A real,
+  // deliberate cost, stated plainly -- worst case this phase now takes
+  // several seconds longer than before, not hidden in a "converged" log
+  // line that used to lie about what happened.
+  static const int _macroPeakSearchMinMs = 1200;
+  static const int _macroPeakSearchMaxMs = 6000;
+  // How close the live signal must sit to its own observed running peak,
+  // sustained for `_macroStableStreakRequired` samples, before this is
+  // treated as "found the focal plane" and the shutter is allowed to
+  // fire. Deliberately TIGHTER than `_macroDriftAcceptRatio` (0.6, a
+  // rejection/retry bar elsewhere in this file) -- this is a POSITIVE
+  // "we are basically at the best position" bar, not just "not obviously
+  // worse than the peak". A first-cut number, not yet swept against real
+  // data; the next real capture's `fusionDebug.macroDebug` (peakHoldStreak/
+  // peakFound/maxSample/baseline) is what confirms
+  // whether 0.85 is right, too loose, or too tight.
+  static const double _macroPeakHoldRatio = 0.85;
+
+  // ---- camera "3" diversity source (round 40) ----------------------
+  // Added on the strength of a real measurement, not symmetry with the
+  // macro port. Across 136 real scored captures, camera "3" beat camera
+  // "2" as a candidate on BOTH mean (71.4 vs 60.5) and max (76 vs 75)
+  // real NFIQ2, and real device-reported `cameraLensInfo` shows it has
+  // the LARGEST sensor of all four cameras (6.64x4.97mm -- bigger than
+  // the main camera's own 5.98x4.49mm). It was nonetheless the only back
+  // camera this app never captured from.
+  //
+  // Deliberately NOT given the macro guide's 1.2x growth. That growth
+  // exists to pull the thumb closer to camera "2", and round 40 also
+  // established camera "2" is not optically a macro lens at all (same
+  // 50mm minimum focus distance as every other back camera), so the
+  // growth is already doing less than intended there. Camera "3" has a
+  // WIDER field of view than the main camera (sensorW/focal 1.677 vs
+  // 1.441, i.e. ~16% wider), so the pad lands SMALLER in its frame at the
+  // same working distance -- growing the guide on top of that would push
+  // the user closer for no optical gain and risk the same softness camera
+  // "2" has a documented history of. Standard guide, standard distance.
+  // DISABLED 2026-08-27 after its first real capture (ed242f1c). I
+  // recommended adding camera "3" on the strength of NFIQ2 win-rate
+  // statistics across 136 captures (it beat camera "2" on both mean and
+  // max, and has the largest sensor of all four). That recommendation was
+  // WRONG, and the first real frames from it say so unambiguously:
+  //
+  //   cam3_amb_0   Laplacian 5.3   ridge-band score 0.15
+  //   cam3_fl_0    Laplacian 5.7   ridge-band score 0.15
+  //   front_fl_7   Laplacian 341   ridge-band score 1.19
+  //
+  // Visually a featureless grey blur -- it cannot focus at this working
+  // distance at all. Both its frames are ~8x below the front camera on
+  // ridge content and carry no usable detail whatsoever.
+  //
+  // The NFIQ2 statistics that motivated this were measured on camera "3"
+  // acting as a SECONDARY capture in front_only_v1, at that flow's own
+  // framing -- not at fusion's closer guided distance. A win rate in one
+  // geometry did not transfer to another, which is exactly the sort of
+  // thing only a real capture can reveal.
+  //
+  // Kept as a flag rather than deleted: the code path is correct and
+  // costs nothing while off, and a phone whose camera "3" CAN focus this
+  // close would make it worth re-testing. Real cost saved while disabled:
+  // one camera open/close cycle, one focus convergence and two shutter
+  // presses per capture.
+  static const bool _cam3Enabled = false;
+  static const String _cam3CameraName = '3';
+  static const double _cam3GuideScaleFactor = 1.0;
+  // Matches main.py's own `_sec_cy` for camera "3" (0.37), which is in
+  // turn the main guide's own default cy -- one measured value, not a
+  // second independently-drifting copy. Same lesson this project has been
+  // burned by more than once (_scoreRoi/_focusPointScreenSpace).
+  static const double _cam3FocusTargetCy = 0.37;
+
+  // ---- phase 6 (experimental): ultra-wide sweep, camera "2" ---------
+  // Direct CTO ask, 2026-09-02: "The A55 has 3 cameras on the back, port
+  // the UltraWide cam into the sweep architecture, I want to see how that
+  // pans out." Purely additive -- runs after every existing phase, writes
+  // to its own tag prefix/Firestore field, and self-skips exactly like
+  // every other secondary-camera path in this file if the camera can't be
+  // opened.
+  //
+  // CAMERA CORRECTED 2026-09-02. My first pass pointed this at camera "3"
+  // on a sensor-size argument. That was wrong, and the CTO's own device
+  // test settled it: camera "3" is the SELFIE camera -- its sweep frames
+  // came back as a picture of his face. The real ultra-wide is camera "2"
+  // (116.3 deg diagonal FOV vs the main camera's 85.3 -- see
+  // _macroCameraName's own table), the camera this project has been
+  // mislabelling as "macro" since round 31. So the ultra-wide was already
+  // being captured all along, just under the wrong name and pointed at a
+  // shot it physically cannot take. This phase now uses it for what it is
+  // actually good for: a genuinely wider field over the same sweep zones,
+  // at the normal working distance its fixed hyperfocal plane suits.
+  static const bool _uwSweepEnabled = true;
+  static const String _uwSweepCameraName = '2';
+  // Same 3-zone stations as the main sweep, same progress fractions
+  // (0.0/0.5/1.0) -- the on-screen guide is screen-space and
+  // camera-agnostic (confirmed: PadSilhouetteShape.defaultShape.cy
+  // already equals _cam3FocusTargetCy, 0.37, so the guide the user sees
+  // needs no per-camera adjustment). Only the tag/key prefix differs, so
+  // these shots land in their own `uwSweepShots`-equivalent bucket
+  // (tags start with `cam3_`, the SAME existing bucket `_runCam3Phase`
+  // already writes to -- no new Firestore field or upload-routing code
+  // needed) instead of corrupting the main sweep's own `sweepShots`.
+  static const List<SweepStation> _uwSweepStations = [
+    SweepStation('cam3_sweep_left', 0.0),
+    SweepStation('cam3_sweep_center', 0.5),
+    SweepStation('cam3_sweep_right', 1.0),
+  ];
+  // Outer bound on the WHOLE phase (camera open/close + the zone loop),
+  // deliberately LARGER than _sweepPhaseTimeoutMs (60s, the zone loop's
+  // own inner bound) rather than reusing the same value -- two
+  // same-duration nested timeouts race on which fires first with no real
+  // margin between them. This one only matters if something OUTSIDE the
+  // zone loop (camera open/close, stream start/stop) hangs; the zone
+  // loop's own timeout is what handles the expected/normal case.
+  static const int _uwSweepPhaseOuterTimeoutMs = 75000;
+
+  // ---- camera capability probes (ported from clearbridge_beta) ----
+  // Two real, direct uses: (1) cameraLensInfo lets fusion_brain's own
+  // collect_sources() apply a per-device FOV-corrected crop to the macro
+  // source instead of the current unvalidated front-guide reuse -- see
+  // that file's own loud warning about why this matters; (2)
+  // rawSensorSupport is free, real hardware-survey data for whatever
+  // device this session happens to run on -- directly useful the moment
+  // this app runs on more than the one device it was built against.
+  // Read-only, no-capture, queried once per app process (not per session
+  // -- these are hardware constants that cannot change between captures
+  // on the same physical device) and attached to the capture doc.
+  static const _cameraCapabilitiesChannel = MethodChannel('clearbridge/cameraCapabilities');
+  static Map<String, Map<String, dynamic>>? _cameraLensInfoCache;
+  static bool _cameraLensInfoQueried = false;
+  static Map<String, bool>? _rawSensorSupportCache;
+  static bool _rawSensorSupportQueried = false;
+
+  static Future<Map<String, Map<String, dynamic>>?> _queryCameraLensInfo() async {
+    if (_cameraLensInfoQueried) return _cameraLensInfoCache;
+    _cameraLensInfoQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getCameraLensInfo');
+      if (result != null) {
+        _cameraLensInfoCache = result.map((k, v) => MapEntry(
+              k,
+              (v as Map).map((k2, v2) => MapEntry(k2 as String, v2)),
+            ));
+      }
+    } catch (e) {
+      debugPrint('[fusion] camera lens-info query failed (non-fatal): $e');
+    }
+    return _cameraLensInfoCache;
+  }
+
+  static Future<Map<String, bool>?> _queryRawSensorSupport() async {
+    if (_rawSensorSupportQueried) return _rawSensorSupportCache;
+    _rawSensorSupportQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getRawSensorSupport');
+      if (result != null) {
+        _rawSensorSupportCache = result.map((k, v) => MapEntry(k, v as bool));
+      }
+    } catch (e) {
+      debugPrint('[fusion] raw-sensor-support query failed (non-fatal): $e');
+    }
+    return _rawSensorSupportCache;
+  }
+
+  // Real, direct test (2026-09-02) of whether a physical macro sensor is
+  // hiding as a physical sub-camera under a logical multi-camera id (see
+  // MainActivity.kt's own `physicalCameraIdsByCameraId` docs) rather than
+  // being exposed as its own top-level id -- the concrete mechanism that
+  // would explain a device having 3 real rear lenses while
+  // `cameraManager.cameraIdList` only ever shows 2 rear top-level ids.
+  static Map<String, List<String>>? _physicalCameraIdsCache;
+  static bool _physicalCameraIdsQueried = false;
+
+  static Future<Map<String, List<String>>?> _queryPhysicalCameraIds() async {
+    if (_physicalCameraIdsQueried) return _physicalCameraIdsCache;
+    _physicalCameraIdsQueried = true;
+    try {
+      final result = await _cameraCapabilitiesChannel
+          .invokeMapMethod<String, dynamic>('getPhysicalCameraIds');
+      if (result != null) {
+        _physicalCameraIdsCache = result.map(
+          (k, v) => MapEntry(k, (v as List).map((e) => e as String).toList()),
+        );
+      }
+    } catch (e) {
+      debugPrint('[fusion] physical-camera-ids query failed (non-fatal): $e');
+    }
+    return _physicalCameraIdsCache;
+  }
 
   // ---- pre-shutter countdown (real device feedback, 2026-08-22): every
   // station/burst previously fired the instant positioning finished, with
@@ -475,6 +930,48 @@ class FusionCaptureController extends ChangeNotifier {
   Size? _screenSize;
   Size? _previewSize;
   int _sensorOrientation = 90;
+
+  // ---- thumb-orientation CV classifier (round 41 port) --------------
+  // Same port, same scope and rationale as clearbridge_beta's own copy of
+  // this block (front_capture_controller.dart) -- see that file's docs.
+  // Scoped to FusionPhase.frontHold only: the model's 4 trained classes
+  // ('front'/'right'/'top'/'left') match the discontinued multi-angle
+  // orbit's specific poses, not this app's tilt/sweep zone semantics, so
+  // only the front phase is a meaningful use of it. Diagnostic-only --
+  // never blocks the hold from completing.
+  // ---- pad highlight-clipping measurement (2026-08-27) --------------
+  // DIAGNOSTIC ONLY here, deliberately. Production (front_only_v1) has an
+  // EV-pulldown control loop this now feeds; this app has never had any
+  // exposure adaptation during the hold at all (only a fixed -1.0 EV for
+  // the macro flash shot), so adding an untested control loop here would be
+  // a much larger, unvalidated change. Measure first, act once real fusion
+  // captures show how bad it is -- the same discipline the wavelength
+  // estimator followed (telemetry first, gate later).
+  //
+  // Why it is worth measuring: on a real capture, 8.4% of the pad was
+  // pegged at exactly 255. Saturated pixels carry no gradient, so those
+  // ridges are gone at capture time -- verified unrecoverable across every
+  // CLAHE setting the backend uses.
+  double _lastPadClipFrac = 0.0;
+  double _maxPadClipFracSeen = 0.0;
+
+  final _orientationClassifier = ThumbOrientationClassifier();
+  static const int _cvClassifyThrottleMs = 90;
+  static const double _cvConfidenceThreshold = 0.45;
+  DateTime? _lastCvClassifyAt;
+  int _cvSamples = 0;
+  int _cvFrontSamples = 0;
+  double _cvConfidenceSum = 0.0;
+  double _cvMaxFrontConfidence = 0.0;
+  String? _cvLastAngleName;
+  double? _cvLastConfidence;
+
+  Map<String, Map<String, dynamic>>? _cameraLensInfo;
+  Map<String, bool>? _rawSensorSupport;
+  Map<String, List<String>>? _physicalCameraIds;
+  Future<Map<String, Map<String, dynamic>>?>? _cameraLensInfoFuture;
+  Future<Map<String, bool>?>? _rawSensorSupportFuture;
+  Future<Map<String, List<String>>?>? _physicalCameraIdsFuture;
   /// Set when a phase's outer timeout fires. `.timeout()` stops the caller
   /// WAITING but does not cancel the work behind the future -- without this
   /// an abandoned station loop keeps driving takePicture() while the NEXT
@@ -487,6 +984,11 @@ class FusionCaptureController extends ChangeNotifier {
   // live signals from the preview stream
   double _focusValue = 0.0;
   double _focusPeak = 0.0;
+  /// Peak absolute sharpness observed during the front hold's own AF
+  /// convergence -- the session's reference for a real, thumb-focused
+  /// reading. Null until the front phase has run. See
+  /// `_sweepFocusFloorRatio`.
+  double? _frontFocusPeakAbs;
   double? _liveAbsSharpness;
   double _coverage = 0.0;
   DateTime? _holdStart;
@@ -537,6 +1039,15 @@ class FusionCaptureController extends ChangeNotifier {
     _debug.clear();
     _guideRegions.clear();
     _captureId = const Uuid().v4();
+    _lastPadClipFrac = 0.0;
+    _maxPadClipFracSeen = 0.0;
+    _lastCvClassifyAt = null;
+    _cvSamples = 0;
+    _cvFrontSamples = 0;
+    _cvConfidenceSum = 0.0;
+    _cvMaxFrontConfidence = 0.0;
+    _cvLastAngleName = null;
+    _cvLastConfidence = null;
     _apply((s) => const FusionState().copyWith(
           phase: FusionPhase.initializing,
           statusText: 'Starting camera…',
@@ -545,6 +1056,7 @@ class FusionCaptureController extends ChangeNotifier {
         ));
 
     unawaited(_audio.init());
+    _orientationClassifier.initialize();
     _orientation.start();
     _gyroSteadyLast = true;
     _gyroSub ??= gyroscopeEventStream().listen((event) {
@@ -569,6 +1081,20 @@ class FusionCaptureController extends ChangeNotifier {
     });
 
     try {
+      // Kicked off in parallel with camera init, NOT awaited here. Real bug
+      // found 2026-08-30 (CTO report: "lag when the capture process
+      // starts"): these two read-only CameraCharacteristics queries (each
+      // a full MethodChannel round-trip that internally loops all 4
+      // cameras on the device) were previously awaited sequentially,
+      // directly between camera-open and the front phase's hold beginning
+      // -- yet neither value is consumed until _finishAndUpload() writes
+      // the doc, minutes later. Starting them here and only awaiting the
+      // futures at the point of actual use lets them resolve for free
+      // during the front-phase hold/burst instead of blocking it.
+      _cameraLensInfoFuture = _queryCameraLensInfo();
+      _rawSensorSupportFuture = _queryRawSensorSupport();
+      _physicalCameraIdsFuture = _queryPhysicalCameraIds();
+
       await _cameraService.initializeCamera();
       final cam = _camera;
       if (cam == null) {
@@ -602,6 +1128,17 @@ class FusionCaptureController extends ChangeNotifier {
         await _runSweepPhase();
       }
       if (_state.phase == FusionPhase.error) return;
+      if (_macroEnabled) {
+        await _runMacroPhase();
+      }
+      if (_cam3Enabled) {
+        await _runCam3Phase();
+      }
+      if (_state.phase == FusionPhase.error) return;
+      if (_uwSweepEnabled) {
+        await _runUltrawideSweepPhase();
+      }
+      if (_state.phase == FusionPhase.error) return;
       await _finishAndUpload();
     } catch (e) {
       _fail('Capture failed: $e');
@@ -615,7 +1152,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _runFrontPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.frontHold,
-          statusText: 'Phase 1 of 3 — Main capture',
+          statusText: 'Phase 1 of 5 — Main capture',
           detailText: 'Place thumb in the guide and hold still',
           guideShape: PadSilhouetteShape.defaultShape,
           overallProgress: 0.0,
@@ -626,11 +1163,34 @@ class FusionCaptureController extends ChangeNotifier {
           const Duration(milliseconds: _frontPhaseTimeoutMs));
       if (!held) _debug['frontHoldTimedOut'] = true;
       // Zero the tilt phase's orientation reference to whatever pose the
-      // phone is actually in right now -- the same timing
-      // oscillating_capture_controller.dart uses (captureReference() at its
-      // own FRONT calibration). This is the user's natural hold, so every
-      // later tilt target is measured relative to how THEY actually hold
-      // the phone, not an arbitrary app-launch orientation.
+      // phone is actually in right now. This is the user's natural hold,
+      // so every later tilt target is measured relative to how THEY
+      // actually hold the phone, not an arbitrary app-launch orientation.
+      //
+      // REAL FIX 2026-09-02 (CTO report: "Gyro did not calibrate
+      // correctly during sweep, I was struggling to lock into angle even
+      // tho I was moving the phone" -- the tilt phase, not sweep itself,
+      // is the one with any angle-based mechanic at all; sweep has none).
+      // The front hold's own on-target check (`_awaitHold` above) never
+      // gates on gyro steadiness -- only focus+coverage -- so the hold
+      // can complete, and this used to zero the reference immediately,
+      // while the phone was still being actively moved. Every later tilt
+      // target would then be measured against a biased zero point,
+      // exactly matching the report. oscillating_capture_controller.dart's
+      // own history already found this same class of bug (insufficient
+      // settle time before its own captureReference() call) and fixed it
+      // with a flat 500ms pause; done here as a real bounded WAIT on the
+      // live steadiness signal instead of a blind delay, since a fixed
+      // pause can't help if the user is still adjusting grip past it.
+      final refSettleSw = Stopwatch()..start();
+      while (_gyroMagnitudeDegPerSec >= _maxSteadyDegPerSec &&
+          refSettleSw.elapsedMilliseconds < _tiltReferenceSettleMaxMs) {
+        await Future<void>.delayed(const Duration(milliseconds: 60));
+        if (_disposed) break;
+      }
+      _debug['tiltReferenceSettleMs'] = refSettleSw.elapsedMilliseconds;
+      _debug['tiltReferenceSettledSteady'] =
+          _gyroMagnitudeDegPerSec < _maxSteadyDegPerSec;
       _orientation.captureReference();
       // The BURST needs its own bound too. Previously only the hold was
       // wrapped, leaving 8 raw takePicture() calls completely unprotected --
@@ -754,18 +1314,163 @@ class FusionCaptureController extends ChangeNotifier {
           detailText: 'Hold still — capturing',
           silhouetteState: PadSilhouetteState.capturing,
         ));
+    // Explicit AF convergence before the burst, added 2026-08-27 on a direct
+    // CTO report that the ambient frames were still blurry under artificial
+    // light -- confirmed from the capture's own pixels, not taken on faith:
+    // measured inside the guide on 996a22c8, the ambient frames' MID
+    // frequencies had collapsed (2-4px band 0.72-0.80 and 4-8px band
+    // 0.56-0.67, against the best flash frame's 2.02 and 1.13) while their
+    // pixel-scale band stayed high. Mid-frequency loss with pixel-scale
+    // energy intact is blur, not noise; noise alone would inflate the
+    // highest band without removing the middle ones.
+    //
+    // Root cause, and it is structural rather than a tuning miss. This
+    // phase had NO explicit focus convergence at all -- it relied purely on
+    // continuous AF, as this file's own _macroPollIntervalMs comment
+    // admitted ("this app has no prior need for a peak-tracking focus-
+    // convergence poll"). Worse, the hold gate it does have cannot catch a
+    // defocused session: `_focusValue` is `abs / _focusPeak`, normalised
+    // against the running peak, so it reaches 1.0 at ANY absolute sharpness
+    // level. A uniformly out-of-focus hold satisfies that gate perfectly.
+    //
+    // clearbridge_beta has exactly the same relative gate but pairs it with
+    // a real _refocus() -- peak-tracking with a one-shot drift retry when
+    // the lens settles well below a sharpness it already saw. This app
+    // already has that machinery (ported for the macro phase); it simply
+    // was never pointed at the front burst. Reused rather than reinvented,
+    // aimed at the guide centre, with production's own front-camera bounds.
+    //
+    // Runs BEFORE _stopStream() deliberately: the poll reads
+    // `_liveAbsSharpness`, which only updates while _onFrame is running.
+    final frontFocusDebug = <String, dynamic>{};
+    try {
+      await _retargetAndConvergeMacro(
+        cam,
+        // Not `const`: PadSilhouetteShape.defaultShape.cx is not a constant
+        // expression, a real build failure this file's sibling already hit
+        // and documented (_sweepGuideShapeForProgress's own note).
+        Offset(PadSilhouetteShape.defaultShape.cx,
+            PadSilhouetteShape.defaultShape.cy),
+        minMs: _frontFocusMinMs,
+        maxMs: _frontFocusMaxMs,
+        // DELIBERATELY not locked -- reversed 2026-08-27 after the first
+        // real capture with this convergence (5e68ed01) came back WORSE
+        // than the capture before it, on the CTO's report that even the
+        // flash frames were now blurry.
+        //
+        // The convergence itself behaved perfectly: it settled at 99.3% of
+        // its own observed peak with no drift retry. That is exactly the
+        // problem. Peak-tracking only detects drift AWAY from a peak it has
+        // already seen; it cannot tell that the peak itself was mediocre --
+        // the same "clean convergence against the wrong target proves
+        // nothing" trap this project already documented for the macro
+        // camera in round 33.
+        //
+        // Measured inside the guide, 2-4px band across the burst:
+        //   before (continuous AF)  0.20 - 2.02   <- one genuinely sharp frame
+        //   after  (converged+lock) 0.23 - 0.36   <- uniformly mediocre
+        // Locking removed the variance. Continuous AF kept hunting through
+        // the 8 shots and one of them landed well; the lock pinned all
+        // eight to a single mediocre point instead. With a backend that
+        // already selects the best frame of the burst, that variance is an
+        // asset, not noise to be eliminated.
+        //
+        // Keeping the convergence pass (it can only put the lens in the
+        // right region before the burst starts) but handing control back to
+        // continuous AF for the burst itself, which is what the earlier,
+        // better capture actually had.
+        lockAfter: false,
+        debugOut: frontFocusDebug,
+      );
+    } catch (e) {
+      frontFocusDebug['error'] = e.toString();
+    }
+    _debug['frontFocusDebug'] = frontFocusDebug;
+    // Remembered as the session's own reference for "what a real, in-focus
+    // reading on THIS thumb, on THIS device, in THIS light looks like" --
+    // the sweep readiness gate needs an ABSOLUTE reference and has never
+    // had one (see _sweepFocusFloorRatio). Measured during the front hold,
+    // which is the one phase that genuinely converges on the pad.
+    final frontPeak = frontFocusDebug['maxSample'];
+    if (frontPeak is num && frontPeak > 0) {
+      _frontFocusPeakAbs = frontPeak.toDouble();
+    }
+
     await _stopStream();
+
+    // Flash EV bracket, ported from clearbridge_beta 2026-08-27. This app
+    // previously applied NO exposure compensation to the front burst at all
+    // (only the macro shot had a fixed -1.0), which is a real gap: on this
+    // app's own first real capture the ambient frames ran 40ms at ISO 700
+    // and the flash frames 30ms at ISO 338 -- both pinned at the sensor's
+    // exposure ceiling with the torch light going entirely into gain
+    // reduction rather than shutter speed.
+    //
+    // Measured across 63 real production captures: the AE only converts
+    // light into a shorter exposure once ISO bottoms out (~50). Until then
+    // it holds the exposure ceiling and cuts gain. A deep negative EV is
+    // what walks it down to that crossover. See front_capture_controller
+    // .dart's _flashEvBracketMultipliers for the full measurement.
+    //
+    // Fixed multipliers rather than beta's adaptive curve: this app has no
+    // equivalent of _lastStableBrightness feeding an adaptive step, and
+    // inventing one here would be an untested control loop. A fixed -0.7 EV
+    // base matches the median step beta's own curve actually produced on
+    // real captures, so the rungs land in the same measured range.
+    // Shallow rungs are kept first so the burst always contains
+    // conventionally-exposed flash frames -- the flash-diff mask needs a
+    // real ambient/flash brightness delta, and a uniformly deep bracket
+    // would erode it.
+    // Retuned shallower 2026-08-27 after this app's own first real capture
+    // with the bracket (996a22c8) refuted the deep-rung hypothesis: the deep
+    // rungs did reach the ISO floor (161 -> 55) but the shutter never left
+    // 29999us, and ridge-band energy inside the guide fell monotonically
+    // with depth -- the shallowest rung (-0.35 EV) measured 0.993 against
+    // 0.106-0.128 for the deep ones. See front_capture_controller.dart's
+    // _flashEvBracketMultipliers for the full measurement and the confound
+    // in my original reading. Device clamps at -2.0 EV regardless.
+    const evBase = -0.7;
+    const evMultipliers = <double>[0.25, 0.5, 1.0, 1.5];
+    double? minEv, maxEv;
+    try {
+      minEv = await cam.getMinExposureOffset();
+      maxEv = await cam.getMaxExposureOffset();
+    } catch (_) {}
+    _debug['flashEvBase'] = evBase;
+    _debug['flashEvRangeMin'] = minEv;
+    _debug['flashEvRangeMax'] = maxEv;
+    final evApplied = <double>[];
+
     var wasFlashLastShot = false;
+    var flashShotIndex = 0;
     for (var i = 0; i < _burstFrameCount; i++) {
       if (_abortPhase || _disposed) break;
       final wantFlash = i.isOdd;
       try {
         if (wantFlash) {
           await _flash?.activate();
+          if (minEv != null && maxEv != null) {
+            final target = evBase *
+                evMultipliers[flashShotIndex % evMultipliers.length];
+            final applied = target.clamp(minEv, maxEv);
+            try {
+              await cam.setExposureOffset(applied);
+              evApplied.add(double.parse(applied.toStringAsFixed(3)));
+            } catch (_) {}
+          }
+          flashShotIndex++;
           await Future<void>.delayed(
               const Duration(milliseconds: _burstFlashSettleMs));
         } else {
           await _flash?.deactivate();
+          if (minEv != null && maxEv != null) {
+            // Ambient frames go back to the sensor's own metering -- they
+            // exist to give the flash-diff mask its unlit half, not to be
+            // exposure-hunted.
+            try {
+              await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
+            } catch (_) {}
+          }
           // Symmetric settle: the sensor needs time to re-converge coming
           // DOWN off the torch too, not just going up. Only pay it when the
           // previous shot actually fired the flash.
@@ -781,6 +1486,7 @@ class FusionCaptureController extends ChangeNotifier {
           tag: 'front_${wantFlash ? "fl" : "amb"}_$i',
           flashOn: wantFlash,
           exif: parseJpegExposureExif(bytes),
+          gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
         ));
         wasFlashLastShot = wantFlash;
       } catch (e) {
@@ -792,6 +1498,21 @@ class FusionCaptureController extends ChangeNotifier {
           ));
     }
     await _flash?.deactivate();
+    _debug['flashEvApplied'] = evApplied;
+    if (minEv != null && maxEv != null) {
+      try {
+        await cam.setExposureOffset(0.0.clamp(minEv, maxEv));
+      } catch (_) {}
+    }
+    // Belt and braces: the front convergence now passes lockAfter:false so
+    // the lens should already be in continuous AF, but the tilt and sweep
+    // phases both move the phone and depend on that being true. Asserting
+    // it explicitly costs one call and removes any path where a future
+    // change to the convergence helper silently defocuses every later
+    // station.
+    try {
+      await cam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);
+    } catch (_) {}
     // Front-only-v1's own visual confirmation the instant the burst
     // finishes ('✓ Captured' + a BRIGHT/FOCUS readout of the conditions it
     // was shot under) -- ported directly rather than leaving this phase's
@@ -828,12 +1549,15 @@ class FusionCaptureController extends ChangeNotifier {
   /// asked for -- the ask was the degree measure and hold-to-lock mechanic,
   /// which this delivers with the same live sensor oscillating itself uses.
   Future<void> _runTiltPhase() async {
+    final tiltShape = _tiltGuideScaleFactor == 1.0
+        ? PadSilhouetteShape.defaultShape
+        : PadSilhouetteShape.defaultShape.scaled(_tiltGuideScaleFactor);
     _apply((s) => s.copyWith(
           phase: FusionPhase.tilt,
-          statusText: 'Phase 2 of 3 — Edge detail',
+          statusText: 'Phase 2 of 5 — Edge detail',
           detailText: 'Small tilts reveal the sides of your print',
           silhouetteState: PadSilhouetteState.aligning,
-          guideShape: PadSilhouetteShape.defaultShape,
+          guideShape: tiltShape,
           phaseProgress: 0.0,
           stationsDone: 0,
           clearStationIndex: true,
@@ -843,6 +1567,30 @@ class FusionCaptureController extends ChangeNotifier {
     if (cam == null) return;
     _tiltAngularVelocity = 0.0;
     _tiltLastAngleAt = null;
+    // Keep the live sharpness/coverage ROI in sync with the guide actually
+    // shown -- same real bug class already fixed once for sweep zones
+    // (_liveRoiOverride's own docs): a scaled-up guide with an unscaled
+    // ROI silently measures the wrong region.
+    _liveRoiOverride = Rect.fromCenter(
+      center: Offset(tiltShape.cx, tiltShape.cy),
+      width: tiltShape.rx * 2,
+      height: tiltShape.ry * 2,
+    );
+    // One real, bounded reconvergence at the new (closer) working distance
+    // before the first station -- not per-station, since the guide scale
+    // is constant across all three tilt angles. Same shared, already-
+    // validated peak-tracking helper the macro/sweep phases use, not a
+    // blind delay.
+    if (_tiltGuideScaleFactor != 1.0) {
+      final tiltFocusDebug = <String, dynamic>{};
+      await _retargetAndConvergeMacro(
+        cam,
+        Offset(tiltShape.cx, tiltShape.cy),
+        lockAfter: false,
+        debugOut: tiltFocusDebug,
+      );
+      _debug['tiltCloserFocusDebug'] = tiltFocusDebug;
+    }
     try {
       for (var i = 0; i < _tiltStations.length; i++) {
         if (_abortPhase || _disposed) break;
@@ -885,6 +1633,7 @@ class FusionCaptureController extends ChangeNotifier {
               tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
               flashOn: wantFlash,
               exif: parseJpegExposureExif(bytes),
+              gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
             ));
           } catch (e) {
             debugPrint('[fusion] tilt station ${station.key} flash=$wantFlash failed: $e');
@@ -908,6 +1657,7 @@ class FusionCaptureController extends ChangeNotifier {
       _tiltAnglePoll?.cancel();
       _tiltAnglePoll = null;
       _abortPhase = false;
+      _liveRoiOverride = null;
     }
   }
 
@@ -984,7 +1734,7 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _runSweepPhase() async {
     _apply((s) => s.copyWith(
           phase: FusionPhase.sweep,
-          statusText: 'Phase 3 of 3 — Texture',
+          statusText: 'Phase 3 of 5 — Texture',
           // Sweep's own real cue text lives entirely in distanceHint (see
           // _runSweepStations) -- detailText is left at whatever the tilt
           // phase last set, harmlessly, since the screen suppresses the
@@ -1015,6 +1765,9 @@ class FusionCaptureController extends ChangeNotifier {
       _abortPhase = true;
     } finally {
       _abortPhase = false;
+      // Never leave a later phase measuring the last zone's region --
+      // see _liveRoiOverride's own docs.
+      _liveRoiOverride = null;
       await _stopStream();
     }
   }
@@ -1055,19 +1808,29 @@ class FusionCaptureController extends ChangeNotifier {
   /// lift than what was asked (visual/UX parity with the real
   /// architecture). If real device data ever shows this phase needs them,
   /// port from the same source file.
-  Future<void> _runSweepStations() async {
-    final cam = _camera;
+  /// [stations] defaults to the main sweep's own zones on the already-open
+  /// main camera. Added a real second caller 2026-09-02
+  /// (`_runUltrawideSweepPhase`): passing a different station list and
+  /// camera controller reuses this exact zone-loop mechanic (glide,
+  /// content-driven readiness gate, countdown, ambient+flash pair) for
+  /// camera "3" verbatim, rather than a second copy that could drift from
+  /// it -- the real bug class (`sweepShots` corruption) this file's own
+  /// tag-routing already documents guarding against elsewhere.
+  Future<void> _runSweepStations(
+      {List<SweepStation>? stations, CameraController? camOverride}) async {
+    final zones = stations ?? _sweepStations;
+    final cam = camOverride ?? _camera;
     if (cam == null) return;
-    for (var i = 0; i < _sweepStations.length; i++) {
+    for (var i = 0; i < zones.length; i++) {
       if (_abortPhase || _disposed) break;
-      final station = _sweepStations[i];
+      final station = zones[i];
       final zr = _guideRegionFor(_sweepGuideFor(station));
       if (zr != null) _guideRegions[station.key] = zr;
 
       // Animated glide from wherever the guide last was to this zone --
       // the real architecture's own tween (_zoneMoveMs), replacing the old
       // instant snap.
-      final from = i == 0 ? _sweepStations[0] : _sweepStations[i - 1];
+      final from = i == 0 ? zones[0] : zones[i - 1];
       final moveStart = DateTime.now();
       while (true) {
         if (_abortPhase || _disposed) break;
@@ -1103,24 +1866,85 @@ class FusionCaptureController extends ChangeNotifier {
       final zoneLabel = station.key.replaceFirst('sweep_', '');
       _apply((s) => s.copyWith(distanceHint: 'Hold still — capturing $zoneLabel'),
           force: true);
+
+      // Measure the live signal where the guide ACTUALLY is for this zone,
+      // not at the centre default -- see _liveRoiOverride's own docs.
+      final zoneShape = _sweepGuideFor(station);
+      _liveRoiOverride = Rect.fromCenter(
+        center: Offset(zoneShape.cx, zoneShape.cy),
+        width: zoneShape.rx * 2,
+        height: zoneShape.ry * 2,
+      );
+
+      // Point AF at this zone's own guide centre before the shutter.
+      // Previously the sweep NEVER called setFocusPoint at all: it simply
+      // inherited whatever the front phase left behind (deliberately
+      // unlocked, on continuous AF) and let the lens meter the whole
+      // scene. Against a textured wall or floor and a smooth, low-contrast
+      // thumb, continuous AF reliably picks the background -- which is
+      // exactly what the CTO reported and what this capture's own frames
+      // show. Only the main camera has real AF (afAvailableModes on every
+      // other camera is [OFF]), so this is skipped for a camera override.
+      //
+      // lockAfter: false, matching the front phase's own hard-won
+      // conclusion (see _fireFrontBurst) that locking pins the burst to one
+      // mediocre point; the convergence pass alone "can only put the lens
+      // in the right place".
+      if (camOverride == null) {
+        try {
+          await _retargetAndConvergeMacro(
+            cam,
+            Offset(zoneShape.cx, zoneShape.cy),
+            minMs: _frontFocusMinMs,
+            maxMs: _frontFocusMaxMs,
+            lockAfter: false,
+          );
+        } catch (_) {}
+        if (_abortPhase || _disposed) break;
+      }
+
       final readyStart = DateTime.now();
       var readyDetected = false;
+      // Absolute floor, not just the peak-normalised ratio -- see
+      // _sweepFocusFloorRatio. Null reference (front phase never produced
+      // one) falls back to the old relative-only behaviour rather than
+      // blocking on a bar that cannot be evaluated.
+      final absFloor = _frontFocusPeakAbs != null
+          ? _frontFocusPeakAbs! * _sweepFocusFloorRatio
+          : null;
       while (DateTime.now().difference(readyStart).inMilliseconds <
           _sweepZoneReadyMaxWaitMs) {
         if (_abortPhase || _disposed) break;
         final elapsed = DateTime.now().difference(readyStart).inMilliseconds;
-        if (elapsed >= _sweepZoneReadyMinWaitMs && _focusValue >= _focusThreshold) {
+        final abs = _liveAbsSharpness;
+        final absOk = absFloor == null || (abs != null && abs >= absFloor);
+        if (elapsed >= _sweepZoneReadyMinWaitMs &&
+            _focusValue >= _focusThreshold &&
+            absOk) {
           readyDetected = true;
           break;
         }
         await Future<void>.delayed(const Duration(milliseconds: 80));
       }
       _debug['${station.key}_readyDetected'] = readyDetected;
+      _debug['${station.key}_absAtFire'] = _liveAbsSharpness;
+      _debug['${station.key}_absFloor'] = absFloor;
+      if (_abortPhase || _disposed) break;
+
+      // Same 3-2-1 countdown every other phase uses (front, tilt, macro/
+      // cam3), CTO's explicit ask for a consistent capture cue across the
+      // whole session (2026-09-02). Deliberately layered ON TOP of the
+      // real content-driven readiness gate above, not replacing it --
+      // that gate is a genuine, already-validated convergence-quality
+      // check (round 2026-08-22), not just a stand-in for this UX cue.
+      // The gate still decides WHEN it's safe to capture; the countdown
+      // now gives the user the same visual/audible warning beforehand
+      // that every other phase already gives.
+      await _runCountdown();
       if (_abortPhase || _disposed) break;
 
       // Visual "capturing now" cue -- flips the guide to green/locked for
-      // the real duration of the shutter sequence, replacing the removed
-      // verbal countdown.
+      // the real duration of the shutter sequence.
       unawaited(HapticFeedback.mediumImpact());
       _apply((s) => s.copyWith(
             zoneCaptureFlash: true,
@@ -1128,12 +1952,31 @@ class FusionCaptureController extends ChangeNotifier {
           ), force: true);
 
       // Ambient first, then flash -- flash last so the torch is off again
-      // before the next station's cue is shown.
+      // before the next station's cue is shown. Main camera reuses the
+      // already-adaptive `_flash` controller unchanged (camOverride ==
+      // null); a secondary camera (camOverride != null, e.g. camera "3"
+      // via _runUltrawideSweepPhase) has no such controller bound to it
+      // and drives its own torch + a real EV pulldown directly, same
+      // pattern as `_runSecondaryCameraPhase`'s macro/cam3 shutter pair --
+      // `_flash` is only ever wired to the main camera controller.
       for (final wantFlash in [false, true]) {
         if (_abortPhase || _disposed) break;
         try {
           if (wantFlash) {
-            await _flash?.activate();
+            if (camOverride != null) {
+              try {
+                final minEv =
+                    await cam.getMinExposureOffset().timeout(_macroFocusCallTimeout);
+                final maxEv =
+                    await cam.getMaxExposureOffset().timeout(_macroFocusCallTimeout);
+                await cam
+                    .setExposureOffset((-1.0).clamp(minEv, maxEv))
+                    .timeout(_macroFocusCallTimeout);
+              } catch (_) {}
+              await cam.setFlashMode(FlashMode.torch).timeout(_macroFocusCallTimeout);
+            } else {
+              await _flash?.activate();
+            }
             await Future<void>.delayed(
                 const Duration(milliseconds: _burstFlashSettleMs));
           }
@@ -1144,28 +1987,75 @@ class FusionCaptureController extends ChangeNotifier {
             tag: '${station.key}_${wantFlash ? "fl" : "amb"}',
             flashOn: wantFlash,
             exif: parseJpegExposureExif(bytes),
+            gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
           ));
         } catch (e) {
           debugPrint('[fusion] sweep station ${station.key} flash=$wantFlash failed: $e');
         } finally {
-          if (wantFlash) await _flash?.deactivate();
+          if (wantFlash) {
+            if (camOverride != null) {
+              try {
+                await cam.setFlashMode(FlashMode.off).timeout(_macroFocusCallTimeout);
+              } catch (_) {}
+              try {
+                await cam.setExposureOffset(0.0).timeout(_macroFocusCallTimeout);
+              } catch (_) {}
+            } else {
+              await _flash?.deactivate();
+            }
+          }
         }
       }
       unawaited(HapticFeedback.heavyImpact());
       _apply((s) => s.copyWith(
-            phaseProgress: (i + 1) / _sweepStations.length,
-            overallProgress: 0.66 + 0.33 * ((i + 1) / _sweepStations.length),
+            phaseProgress: (i + 1) / zones.length,
+            overallProgress: 0.66 + 0.33 * ((i + 1) / zones.length),
             zoneCaptureFlash: false,
             stationsDone: i + 1,
           ), force: true);
     }
   }
 
+  /// Sweep-station guide placement.
+  ///
+  /// FIXED 2026-08-27. The offsets used to be `cx = 0.2 + 0.6 * progress`
+  /// -- stations at screen x 0.2 / 0.5 / 0.8 -- chosen, per the comment that
+  /// stood here, "so the guide never clips off-edge at the extremes". That
+  /// is a UI framing constant. Nothing ever derived it from what the fusion
+  /// pipeline downstream actually needs from these frames.
+  ///
+  /// Measured on a real capture's own recorded fusionGuideRegions
+  /// (5e68ed01), rasterising the real superellipse masks:
+  ///
+  ///   stations at 0.2/0.5/0.8   adjacent overlap  0.0%   coverage 3.00x
+  ///   stations at 0.35/0.5/0.65 adjacent overlap 35.9%   coverage 2.28x
+  ///
+  /// Zero. All three pairs. The three stations imaged completely disjoint
+  /// regions of the pad -- 3.00x coverage is exactly what perfectly
+  /// disjoint regions give -- so they shared no content and NOTHING could
+  /// register them to one another. Every sweep source could only ever be
+  /// tied in through whatever it happened to share with the front anchor.
+  ///
+  /// `0.35/0.5/0.65` is not a new guess: it reproduces clearbridge_beta's
+  /// own sweep geometry (cx shifted +/-0.15), whose ~48% area overlap with
+  /// centre is already recorded in this project's history. The measurement
+  /// above puts it at 35.9% by mask intersection, inside the 30-50% band
+  /// mosaicking normally wants, and 0.35-0.65 stays comfortably inside the
+  /// screen, so the original no-clipping concern is still satisfied.
+  ///
+  /// Real, deliberate trade: unique pad coverage drops 3.00x -> 2.28x. That
+  /// is the right direction given this project's own findings -- rounds
+  /// 37-41 established that added coverage which cannot be registered is
+  /// not merely useless but actively harmful, because it still pays the
+  /// template-density penalty while contributing nothing a matcher can use.
+  /// Registerable overlap is worth more than disjoint area.
+  ///
+  /// Not device-tested: this changes capture geometry, so it needs a real
+  /// sweep capture to confirm the stations now genuinely share content.
   PadSilhouetteShape _sweepGuideFor(SweepStation z) {
     const base = PadSilhouetteShape.defaultShape;
-    // Translate across the middle 60% of the screen so the guide never
-    // clips off-edge at the extremes.
-    final cx = 0.2 + 0.6 * z.progress;
+    const halfSpan = 0.15;
+    final cx = (0.5 - halfSpan) + (2 * halfSpan) * z.progress;
     return PadSilhouetteShape(
       cx: cx,
       cy: base.cy + z.dyFrac,
@@ -1178,6 +2068,520 @@ class FusionCaptureController extends ChangeNotifier {
   /// Downscale everything captured so far that has not been shrunk yet, and
   /// release the raw bytes.
   ///
+  // ------------------------------------------------------------------
+  // phase 4 -- macro (camera "2") close-up
+  // ------------------------------------------------------------------
+
+  /// Real, measured focus convergence for a camera this app has not
+  /// previously needed to retarget mid-session (every other phase runs on
+  /// one already-locked camera with continuous AF). Ported verbatim from
+  /// clearbridge_beta's `_retargetAndConverge` -- peak-tracking with one
+  /// drift retry, not a blind delay, per this project's own hard-learned
+  /// lesson (front_capture_controller.dart's own history: "secondary-camera
+  /// focus now actually measured, not guessed"). Polls the SAME
+  /// `_liveAbsSharpness` field `_onFrame` writes for the other phases.
+  ///
+  /// Shared by the macro phase and (2026-08-27) the FRONT phase. The two
+  /// differ in whether the shared image stream is running at the time, and
+  /// both are correct: the macro phase runs after `_stopStream()` and
+  /// starts its own separate listener, while the front phase runs while
+  /// `_onFrame` is still live -- which is not a race but a requirement,
+  /// since this poll has nothing to read unless something is writing
+  /// `_liveAbsSharpness` concurrently.
+  Future<double?> _retargetAndConvergeMacro(CameraController cam, Offset pt,
+      {int minMs = _macroFocusMinMs,
+      int maxMs = _macroFocusMaxMs,
+      bool lockAfter = true,
+      Map<String, dynamic>? debugOut}) async {
+    double? lastSample;
+    var maxSample = 0.0;
+    var driftRetried = false;
+    for (var attempt = 1; attempt <= 2; attempt++) {
+      try {
+        await cam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);
+        await cam.setFocusPoint(pt).timeout(_macroFocusCallTimeout);
+        await cam.setExposurePoint(pt).timeout(_macroFocusCallTimeout);
+      } catch (_) {}
+      lastSample = _liveAbsSharpness;
+      var stableStreak = 0;
+      final pollSw = Stopwatch()..start();
+      while (pollSw.elapsedMilliseconds < maxMs) {
+        await Future<void>.delayed(const Duration(milliseconds: _macroPollIntervalMs));
+        if (_disposed) break;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample > 0) {
+          if (sample > maxSample) maxSample = sample;
+          if (lastSample != null && lastSample! > 0) {
+            final change = (sample - lastSample!).abs() / lastSample!;
+            stableStreak = change < _macroStableRatio ? stableStreak + 1 : 0;
+          }
+          lastSample = sample;
+        }
+        if (pollSw.elapsedMilliseconds >= minMs &&
+            stableStreak >= _macroStableStreakRequired) {
+          break;
+        }
+      }
+      final driftedLow = attempt == 1 &&
+          maxSample > 0 &&
+          lastSample != null &&
+          lastSample! < maxSample * _macroDriftAcceptRatio &&
+          !_disposed;
+      if (!driftedLow) break;
+      driftRetried = true;
+    }
+    if (lockAfter) {
+      try {
+        await cam.setFocusMode(FocusMode.locked).timeout(_macroFocusCallTimeout);
+      } catch (_) {}
+    }
+    if (debugOut != null) {
+      debugOut['lockedAfter'] = lockAfter;
+      debugOut['sharpness'] = lastSample;
+      debugOut['maxSample'] = maxSample;
+      debugOut['driftRetried'] = driftRetried;
+    }
+    return lastSample;
+  }
+
+  /// Originally built (2026-09-02) for a camera with NO autofocus
+  /// mechanism -- see `_macroPeakSearchMaxMs`'s own docs. As of the same
+  /// day's later camera-identity fix, the macro phase now routes through
+  /// camera "0" (real AF), so this poll is watching a signal an actual AF
+  /// motor drives, not just hand motion -- but the mechanism itself is
+  /// unchanged and still correct either way: it only watches
+  /// `_liveAbsSharpness` rise then hold near its own running peak,
+  /// agnostic to what causes the rise. Still used verbatim by the
+  /// (currently disabled) cam3 path, where the fixed-focus/hand-motion
+  /// framing below still applies exactly as written.
+  ///
+  /// This polls that signal, live-guides the user via `distanceHint`, and
+  /// only returns once the signal holds near its own observed running
+  /// peak for a real streak -- or the bound is hit, whichever comes first
+  /// (never blocks indefinitely, same discipline as every other real-time
+  /// gate in this file).
+  ///
+  /// Deliberately does NOT require the peak to exceed the starting sample
+  /// by any margin: a user who is already well-positioned when this
+  /// starts should converge quickly (correctly), not be forced to find an
+  /// artificial "improvement" that was never there to find. The real
+  /// safeguard against firing on pure noise is `_macroPeakSearchMinMs`
+  /// (a floor on real sampling time before any exit is allowed) combined
+  /// with `_macroStableStreakRequired` consecutive near-peak samples.
+  Future<void> _waitForMacroFocusPeak({required Map<String, dynamic> debugOut}) async {
+    var lastSample = _liveAbsSharpness;
+    final baseline = lastSample ?? 0.0;
+    var maxSample = baseline;
+    var stableNearPeakStreak = 0;
+    var declinedFromPeak = false;
+    final sw = Stopwatch()..start();
+    var lastHintAt = -1000;
+    while (sw.elapsedMilliseconds < _macroPeakSearchMaxMs) {
+      await Future<void>.delayed(const Duration(milliseconds: _macroPollIntervalMs));
+      if (_disposed) break;
+      final sample = _liveAbsSharpness;
+      if (sample != null && sample > 0) {
+        if (sample > maxSample) {
+          maxSample = sample;
+          stableNearPeakStreak = 0;
+          declinedFromPeak = false;
+        } else if (maxSample > 0 && sample < maxSample * _macroDriftAcceptRatio) {
+          declinedFromPeak = true;
+        }
+        stableNearPeakStreak = (maxSample > 0 && sample >= maxSample * _macroPeakHoldRatio)
+            ? stableNearPeakStreak + 1
+            : 0;
+        lastSample = sample;
+      }
+      final elapsed = sw.elapsedMilliseconds;
+      if (elapsed - lastHintAt >= 400) {
+        lastHintAt = elapsed;
+        final hint = declinedFromPeak
+            ? 'Pull back slightly'
+            : (stableNearPeakStreak > 0 ? 'Hold there' : 'Bring thumb closer');
+        _apply((s) => s.copyWith(distanceHint: hint), force: true);
+      }
+      if (elapsed >= _macroPeakSearchMinMs &&
+          stableNearPeakStreak >= _macroStableStreakRequired) {
+        break;
+      }
+    }
+    _apply((s) => s.copyWith(clearDistanceHint: true), force: true);
+    debugOut['baseline'] = baseline;
+    debugOut['maxSample'] = maxSample;
+    debugOut['finalSample'] = lastSample;
+    debugOut['peakHoldStreak'] = stableNearPeakStreak;
+    debugOut['peakFound'] = stableNearPeakStreak >= _macroStableStreakRequired;
+    debugOut['waitedMs'] = sw.elapsedMilliseconds;
+  }
+
+  /// Dedicated final close-up capture, ORIGINALLY on a separate physical
+  /// lens (camera "2", then "1"), NOW on camera "0" (main -- see the
+  /// 2026-09-02 camera-identity fix on `_macroCameraName`, no rear macro
+  /// id exists in this device's real Camera2 enumeration). Ported from
+  /// clearbridge_beta's own `_captureMacroShot`
+  /// (front_capture_controller.dart) -- real, already-validated capture
+  /// logic, not new design. Guide grown `_macroGuideScaleFactor` (20%)
+  /// larger than the standard shape, same explicit direction as the
+  /// source: pull the thumb physically closer than the front phase's own
+  /// working distance.
+  ///
+  /// Self-skipping at every step (missing camera id, failed open, failed
+  /// capture, failed upload) -- can only ever ADD a fourth candidate
+  /// source, never block or regress the front/tilt/sweep phases that
+  /// already ran. Real, deliberate cost: one more camera open/close cycle
+  /// (of a camera already used earlier this same capture), one focus
+  /// convergence, two shutter presses (ambient + flash) on top of the
+  /// three phases before it.
+  /// Generalised in round 40 so camera "3" can reuse this exact,
+  /// already-device-validated sequence rather than get a second parallel
+  /// implementation that could drift from it. Every parameter below is a
+  /// value that genuinely differs BETWEEN the two lenses; everything else
+  /// (focus convergence, EV pulldown, ambient+flash pairing, self-skip
+  /// behaviour, the forced _apply after the camera swap) is shared by
+  /// construction. Calling it with the macro arguments is behaviourally
+  /// identical to the pre-refactor `_runMacroPhase()`.
+  Future<void> _runSecondaryCameraPhase({
+    required String cameraName,
+    required double guideScale,
+    required double focusTargetCy,
+    required String tagPrefix,
+    required String phaseLabel,
+    required String busyText,
+    required String confirmText,
+    required String debugKey,
+  }) async {
+    _apply((s) => s.copyWith(
+          phase: FusionPhase.macro,
+          statusText: phaseLabel,
+          phaseProgress: 0.0,
+          clearStationIndex: true,
+          zoneCaptureFlash: false,
+        ));
+    try {
+      await (() async {
+        final cams = await _cameraService.getAvailableCameras();
+        CameraDescription? macroDesc;
+        // Matched by NAME only, not lensDirection -- real finding
+        // 2026-09-02: camera "3" self-reports lensDirection=front on the
+        // A55 despite being a rear lens (see _uwSweepEnabled's own docs),
+        // the same "camera-ID-to-role isn't stable" gotcha already
+        // documented elsewhere in this project. Gating on `.back` here
+        // would have silently skipped camera "3" outright on this device.
+        // Camera "2" (macro) already reports back correctly, so this is
+        // strictly more permissive, not a behavior change for it.
+        for (final c in cams) {
+          if (c.name == cameraName) {
+            macroDesc = c;
+            break;
+          }
+        }
+        if (macroDesc == null) {
+          debugPrint('[fusion] secondary camera ($cameraName) not present, skipping');
+          _debug['${debugKey}CameraAbsent'] = true;
+          return;
+        }
+
+        _apply(
+          (s) => s.copyWith(
+            confirmationText: busyText,
+            guideShape: guideScale == 1.0
+                ? PadSilhouetteShape.defaultShape
+                : PadSilhouetteShape.defaultShape.scaled(guideScale),
+          ),
+          force: true,
+        );
+        unawaited(HapticFeedback.lightImpact());
+
+        await _cameraService.initializeCamera(cameraDescription: macroDesc);
+        final macroCam = _camera;
+        if (macroCam == null) return;
+        // Same real bug/fix as clearbridge_beta: the screen's camera layer
+        // only rebuilds on this controller's own notifyListeners(), and the
+        // one _apply call above ran BEFORE initializeCamera() finished
+        // swapping -- force a fresh emit now that the new controller is
+        // actually ready, or the preview can render solid black.
+        _apply((s) => s, force: true);
+
+        _liveAbsSharpness = null;
+        // Real measured pad offset for this lens (_macroFocusTargetCy),
+        // not frame-centre -- see clearbridge_beta's own round-33 finding
+        // this is ported from: camera "2"'s pad sits at cy~0.34, and
+        // autofocus/sharpness-ROI aimed at 0.5 was measurably tracking
+        // background/crease content instead.
+        //
+        // REAL FIX (2026-09-02): that 0.34 is only correct for the ONE
+        // device it was measured on. A Samsung A55's camera "2" has
+        // meaningfully different optics (1.74mm focal length vs the
+        // original test device's 2.37mm) and a real, differently-measured
+        // pad position -- confirmed by visually locating the pad on an
+        // actual A55 raw macro frame (round 2026-09-02), which showed the
+        // OLD constant's crop landing mostly on background. Rather than
+        // overwrite one device's calibration with another's (same mistake
+        // repeated on the next new phone), look up the ACTUAL detected
+        // camera's own reported focal length against a real per-device
+        // table and only override when it matches a calibrated device;
+        // otherwise keep the caller's own default. Falls back to the
+        // existing behaviour whenever cameraLensInfo hasn't resolved or
+        // reports nothing usable -- can only ever correct a known-wrong
+        // default, never regress an already-calibrated device.
+        final lensInfo = await _cameraLensInfoFuture;
+        final camFocalLengthMm =
+            (lensInfo?[cameraName]?['focalLengthMm'] as num?)?.toDouble();
+        final calibratedCy = _cam2FocalLengthCalibratedCy(camFocalLengthMm);
+        final effectiveFocusTargetCy = calibratedCy ?? focusTargetCy;
+        if (calibratedCy != null) {
+          _debug['${debugKey}CalibratedFocusTargetCy'] = calibratedCy;
+        }
+        // Records WHICH physical camera this phase actually opened, and its
+        // own reported optics, so the next real capture confirms the
+        // 2026-09-02 camera-identity correction landed (macro should now be
+        // camera "1", ~3.72mm, NOT camera "2"'s 1.74mm ultra-wide) without
+        // needing another round of inference.
+        _debug['${debugKey}CameraName'] = cameraName;
+        _debug['${debugKey}CameraFocalLengthMm'] = camFocalLengthMm;
+        final macroRoi =
+            Rect.fromLTWH(0.25, effectiveFocusTargetCy - 0.19, 0.5, 0.4);
+        void macroFrameListener(CameraImage image) {
+          try {
+            final raw = _hybrid.offerFrame(image, thumbRoi: macroRoi);
+            _liveAbsSharpness = HybridCaptureService.ema(_liveAbsSharpness ?? raw, raw);
+          } catch (_) {}
+        }
+        await macroCam.startImageStream(macroFrameListener);
+        final focusDebug = <String, dynamic>{};
+        final focusSw = Stopwatch()..start();
+        try {
+          // For the macro phase (camera "0", 2026-09-02 fix): this is
+          // now real AF, not best-effort -- setFocusMode(auto) has an
+          // actual motor to drive, and _waitForMacroFocusPeak's polling
+          // loop still works unchanged (it only watches live sharpness
+          // rise-then-hold, agnostic to whether an AF motor or the user's
+          // own hand motion produces the rise). For the disabled cam3
+          // path, still best-effort -- that camera reports afAvailableModes:
+          // [OFF], so these calls are metering-only there.
+          final pt = Offset(0.5, effectiveFocusTargetCy);
+          try {
+            await macroCam.setFocusMode(FocusMode.auto).timeout(_macroFocusCallTimeout);
+            await macroCam.setFocusPoint(pt).timeout(_macroFocusCallTimeout);
+            await macroCam.setExposurePoint(pt).timeout(_macroFocusCallTimeout);
+          } catch (_) {}
+          await _waitForMacroFocusPeak(debugOut: focusDebug);
+          try {
+            await macroCam.setFocusMode(FocusMode.locked).timeout(_macroFocusCallTimeout);
+          } catch (_) {}
+        } finally {
+          try {
+            await macroCam.stopImageStream();
+          } catch (_) {}
+        }
+        focusDebug['convergedMs'] = focusSw.elapsedMilliseconds;
+        _debug['${debugKey}Debug'] = focusDebug;
+
+        // Same 3-2-1 countdown every other phase uses (front, tilt, sweep),
+        // CTO's explicit ask for a consistent capture cue across the whole
+        // session (2026-09-02). Right after focus convergence, before the
+        // shutter sequence -- shared by both macro and cam3 since they run
+        // through this same function.
+        await _runCountdown();
+        if (_abortPhase || _disposed) return;
+
+        // Ambient+flash pair (not a single shot) so the backend's real
+        // flash-diff segmentation can engage for this candidate -- same
+        // real fix/reasoning as clearbridge_beta round 34: a single macro
+        // frame has never had any content-aware masking available to it.
+        Uint8List? flashJpeg;
+        try {
+          try {
+            final minEv = await macroCam.getMinExposureOffset().timeout(_macroFocusCallTimeout);
+            final maxEv = await macroCam.getMaxExposureOffset().timeout(_macroFocusCallTimeout);
+            await macroCam
+                .setExposureOffset((-1.0).clamp(minEv, maxEv))
+                .timeout(_macroFocusCallTimeout);
+          } catch (_) {}
+          await macroCam.setFlashMode(FlashMode.torch).timeout(_macroFocusCallTimeout);
+          await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
+          final flXfile = await macroCam.takePicture();
+          flashJpeg = await flXfile.readAsBytes();
+        } catch (e) {
+          debugPrint('[fusion] $cameraName flash shot failed (non-fatal, ambient-only): $e');
+        } finally {
+          try {
+            await macroCam.setFlashMode(FlashMode.off).timeout(_macroFocusCallTimeout);
+          } catch (_) {}
+          try {
+            await macroCam.setExposureOffset(0.0).timeout(_macroFocusCallTimeout);
+          } catch (_) {}
+        }
+
+        final xfile = await macroCam.takePicture();
+        final ambJpeg = await xfile.readAsBytes();
+        final ambExif = parseJpegExposureExif(ambJpeg);
+        // Tagged with the MACRO camera's own sensorOrientation, not the
+        // cached main-camera _sensorOrientation -- a different physical
+        // lens module could in principle be mounted at a different
+        // rotation. _shrinkCaptured() (called later, for every OTHER shot)
+        // always uses _sensorOrientation, so these two macro shots are
+        // shrunk here instead, immediately, with the correct orientation,
+        // and marked already-shrunk so the shared pass skips them.
+        // These two are shrunk here rather than in the shared pass, so the
+        // measured sharpness has to be carried across explicitly -- setting
+        // `shrunk = true` is exactly what stops that pass from ever seeing
+        // them again.
+        final ambShrunk =
+            await _shrinkForUpload(ambJpeg, macroDesc.sensorOrientation);
+        final ambShot = _Shot(
+          jpeg: ambShrunk.bytes,
+          tag: '${tagPrefix}_amb_0',
+          flashOn: false,
+          exif: ambExif,
+          gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+        )
+          ..shrunk = true
+          ..sharpness = ambShrunk.sharpness;
+        _shots.add(ambShot);
+
+        if (flashJpeg != null) {
+          final flExif = parseJpegExposureExif(flashJpeg);
+          final flShrunk =
+              await _shrinkForUpload(flashJpeg, macroDesc.sensorOrientation);
+          final flShot = _Shot(
+            jpeg: flShrunk.bytes,
+            tag: '${tagPrefix}_fl_0',
+            flashOn: true,
+            exif: flExif,
+            gyroMagnitudeDegPerSec: _gyroMagnitudeDegPerSec,
+          )
+            ..shrunk = true
+            ..sharpness = flShrunk.sharpness;
+          _shots.add(flShot);
+        }
+
+        _apply((s) => s.copyWith(confirmationText: confirmText), force: true);
+      }())
+          .timeout(const Duration(milliseconds: _macroCaptureTimeoutMs));
+    } catch (e) {
+      debugPrint('[fusion] $cameraName phase failed (non-fatal): $e');
+      _debug['${debugKey}PhaseFailed'] = e.toString();
+    }
+  }
+
+  /// Camera "2" close-up. Arguments reproduce the pre-refactor behaviour
+  /// exactly, so this remains the same already-device-tested capture.
+  Future<void> _runMacroPhase() => _runSecondaryCameraPhase(
+        cameraName: _macroCameraName,
+        guideScale: _macroGuideScaleFactor,
+        focusTargetCy: _macroFocusTargetCy,
+        tagPrefix: 'macro',
+        phaseLabel: 'Phase 4 of 5 — Close-up detail',
+        busyText: 'Capturing close-up detail…',
+        confirmText: '✓ Close-up captured',
+        debugKey: 'macro',
+      );
+
+  /// Camera "3" diversity source. Same sequence, standard guide/distance
+  /// -- see the `_cam3*` constants for why the macro guide growth is
+  /// deliberately NOT applied here.
+  ///
+  /// Real caveat worth knowing when the first capture lands: this device
+  /// reports `hasOwnFlash: false` for camera "3", yet every real camera-3
+  /// frame this project has captured is clearly torch-lit (median
+  /// brightness 117-128/255) -- the torch is a system-level LED not gated
+  /// by the active camera's own reported flash capability. The flash half
+  /// of the pair is already inside its own try/catch and self-skips to
+  /// ambient-only if that turns out not to hold on some other device.
+  Future<void> _runCam3Phase() => _runSecondaryCameraPhase(
+        cameraName: _cam3CameraName,
+        guideScale: _cam3GuideScaleFactor,
+        focusTargetCy: _cam3FocusTargetCy,
+        tagPrefix: 'cam3',
+        phaseLabel: 'Phase 5 of 5 — Wide detail',
+        busyText: 'Capturing wide detail…',
+        confirmText: '✓ Wide detail captured',
+        debugKey: 'cam3',
+      );
+
+  /// Experimental phase 6: runs the real sweep zone-loop mechanic
+  /// (`_runSweepStations`) on camera "3" instead of the main camera --
+  /// see `_uwSweepEnabled`'s own docs for why "3" and the real,
+  /// unconfirmed camera-identity caveat. Purely additive: opens its own
+  /// camera, self-skips on any failure, and never touches `sweepShots`/
+  /// `fusionGuideRegions['sweep_*']` (its own shots tag `cam3_sweep_*`,
+  /// landing in the SAME `cam3Shots` bucket `_runCam3Phase` already
+  /// writes to -- no new Firestore field, no upload-routing changes).
+  Future<void> _runUltrawideSweepPhase() async {
+    if (!_uwSweepEnabled) return;
+    try {
+      await (() async {
+        final cams = await _cameraService.getAvailableCameras();
+        CameraDescription? uwDesc;
+        // Name-only match -- see the identical note on
+        // _runSecondaryCameraPhase's own lookup; camera "3" self-reports
+        // lensDirection=front on the A55 despite being the real target.
+        for (final c in cams) {
+          if (c.name == _uwSweepCameraName) {
+            uwDesc = c;
+            break;
+          }
+        }
+        if (uwDesc == null) {
+          debugPrint('[fusion] ultra-wide sweep camera ($_uwSweepCameraName) not present, skipping');
+          _debug['uwSweepCameraAbsent'] = true;
+          return;
+        }
+
+        _apply((s) => s.copyWith(
+              phase: FusionPhase.sweep,
+              statusText: 'Phase 6 (experimental) — Ultra-wide sweep',
+              phaseProgress: 0.0,
+              stationsDone: 0,
+              clearStationIndex: true,
+              zoneCaptureFlash: false,
+              guideShape: _sweepGuideFor(_uwSweepStations[0]),
+            ), force: true);
+        unawaited(HapticFeedback.lightImpact());
+
+        await _cameraService.initializeCamera(cameraDescription: uwDesc);
+        final uwCam = _camera;
+        if (uwCam == null) return;
+        // Same real black-preview fix as every other camera swap in this
+        // file: the screen only rebuilds on notifyListeners(), and the
+        // _apply above ran before the swap finished.
+        _apply((s) => s, force: true);
+
+        // _guideRegionFor() (used by _runSweepStations via
+        // _sweepGuideFor) reads _previewSize, which was last set for the
+        // MAIN camera back in start() and never refreshed on any later
+        // camera swap (macro/cam3's own single-shot phase never needed
+        // it, since it uses a fixed ROI + the backend's own per-camera
+        // fallback instead of a client-derived guide region). This is
+        // the first phase to need a real per-zone guide region on a
+        // NON-main camera, so it must be refreshed here -- and restored
+        // afterward in case anything downstream still assumes it's the
+        // main camera's own preview size.
+        final savedPreviewSize = _previewSize;
+        final pv = uwCam.value.previewSize;
+        if (pv != null) _previewSize = Size(pv.width, pv.height);
+
+        await _startStream();
+        try {
+          await _runSweepStations(stations: _uwSweepStations, camOverride: uwCam)
+              .timeout(const Duration(milliseconds: _sweepPhaseTimeoutMs));
+        } on TimeoutException {
+          _debug['uwSweepPhaseTimedOut'] = true;
+        } finally {
+          _liveRoiOverride = null;
+          await _stopStream();
+          _previewSize = savedPreviewSize;
+        }
+      }())
+          .timeout(const Duration(milliseconds: _uwSweepPhaseOuterTimeoutMs));
+    } catch (e) {
+      debugPrint('[fusion] ultra-wide sweep phase failed (non-fatal): $e');
+      _debug['uwSweepPhaseFailed'] = e.toString();
+    }
+  }
+
   /// Called ONCE, from `_finishAndUpload`, after all three phases are done
   /// -- not per-phase. It used to run at each phase boundary specifically
   /// to bound peak memory (~8 raw frames instead of ~20), but real device
@@ -1189,7 +2593,9 @@ class FusionCaptureController extends ChangeNotifier {
   Future<void> _shrinkCaptured() async {
     for (final shot in _shots) {
       if (shot.shrunk) continue;
-      shot.jpeg = await _shrinkForUpload(shot.jpeg, _sensorOrientation);
+      final shrunk = await _shrinkForUpload(shot.jpeg, _sensorOrientation);
+      shot.jpeg = shrunk.bytes;
+      shot.sharpness ??= shrunk.sharpness;
       shot.shrunk = true;
     }
   }
@@ -1218,6 +2624,35 @@ class FusionCaptureController extends ChangeNotifier {
   void _onFrame(CameraImage image) {
     if (_disposed) return;
     try {
+      // Throttled CV orientation confirmation -- see the field declarations'
+      // own docs for scope/rationale. Scoped to frontHold: this camera
+      // stream also feeds the tilt/sweep phases, whose poses the model was
+      // never trained to classify.
+      if (_state.phase == FusionPhase.frontHold) {
+        final cvNow = DateTime.now();
+        if (_lastCvClassifyAt == null ||
+            cvNow.difference(_lastCvClassifyAt!).inMilliseconds >=
+                _cvClassifyThrottleMs) {
+          _lastCvClassifyAt = cvNow;
+          final cvPred =
+              _orientationClassifier.classify(image, _sensorOrientation);
+          if (cvPred != null) {
+            _cvSamples++;
+            _cvConfidenceSum += cvPred.confidence;
+            _cvLastAngleName = cvPred.angleName;
+            _cvLastConfidence = cvPred.confidence;
+            if (cvPred.angleName == 'front' &&
+                cvPred.confidence > _cvMaxFrontConfidence) {
+              _cvMaxFrontConfidence = cvPred.confidence;
+            }
+            if (cvPred.angleName == 'front' &&
+                cvPred.confidence >= _cvConfidenceThreshold) {
+              _cvFrontSamples++;
+            }
+          }
+        }
+      }
+
       final roi = _scoreRoi;
       final raw = _hybrid.offerFrame(image, thumbRoi: roi);
       _liveAbsSharpness =
@@ -1228,6 +2663,12 @@ class FusionCaptureController extends ChangeNotifier {
       // varies far too much across devices/lighting for a fixed threshold.
       _focusValue = _focusPeak > 0 ? (abs / _focusPeak).clamp(0.0, 1.0) : 0.0;
       _coverage = HybridCaptureService.meanLuma(image, roi: roi) / 255.0;
+      // Same pad ROI as the coverage read above, so the two describe
+      // exactly the same region.
+      _lastPadClipFrac = HybridCaptureService.clippedFraction(image, roi: roi);
+      if (_lastPadClipFrac > _maxPadClipFracSeen) {
+        _maxPadClipFracSeen = _lastPadClipFrac;
+      }
       // Live-push to FusionState (throttled, see _apply) so the front-phase
       // BRIGHT/FOCUS meters read live -- front_only_v1's own meters read
       // straight off the controller's live value every rebuild; this app's
@@ -1247,7 +2688,22 @@ class FusionCaptureController extends ChangeNotifier {
   /// front_only_v1 was burned twice by hand-copied geometry constants
   /// drifting from PadSilhouetteShape -- deriving it keeps one source of
   /// truth.
+  /// Set while a sweep zone is active so the live signal is measured where
+  /// the guide ACTUALLY is, not where it starts.
+  ///
+  /// REAL BUG, found 2026-09-02 (CTO: "Sweep was blurry no focus on
+  /// foreground at all but background was crisp", visually confirmed on
+  /// this capture's own sweep frames -- wall planks and floor razor-sharp,
+  /// thumb blurred). The sweep phase translates the guide to cx 0.35 /
+  /// 0.50 / 0.65, but `_scoreRoi` was hardcoded to
+  /// PadSilhouetteShape.defaultShape -- the CENTRE position -- so for the
+  /// left and right zones every live reading (sharpness, coverage, the
+  /// readiness gate) was sampled from a region the thumb was no longer in.
+  Rect? _liveRoiOverride;
+
   Rect get _scoreRoi {
+    final override = _liveRoiOverride;
+    if (override != null) return override;
     const g = PadSilhouetteShape.defaultShape;
     return Rect.fromCenter(
       center: Offset(g.cx, g.cy),
@@ -1322,6 +2778,20 @@ class FusionCaptureController extends ChangeNotifier {
       await _cameraService.disposeCamera();
     } catch (_) {}
 
+    // Started back in start(), run in the background the whole session --
+    // by now (all phases already ran) these have almost certainly long
+    // since resolved, so this await is effectively free. See the comment
+    // at the start() call site for why these aren't awaited any earlier.
+    try {
+      _cameraLensInfo = await _cameraLensInfoFuture;
+    } catch (_) {}
+    try {
+      _rawSensorSupport = await _rawSensorSupportFuture;
+    } catch (_) {}
+    try {
+      _physicalCameraIds = await _physicalCameraIdsFuture;
+    } catch (_) {}
+
     // REAL DEVICE FEEDBACK (2026-08-22): decode/encode used to run at the
     // end of EACH phase (see the phase methods' own "Decode/encode is
     // deferred" comments) so peak memory stayed bounded to one phase's raw
@@ -1364,6 +2834,8 @@ class FusionCaptureController extends ChangeNotifier {
     final frames = <Map<String, dynamic>>[];
     final tiltShots = <Map<String, dynamic>>[];
     final sweepShots = <Map<String, dynamic>>[];
+    final macroShots = <Map<String, dynamic>>[];
+    final cam3Shots = <Map<String, dynamic>>[];
 
     final sensorOrientation = _sensorOrientation;
 
@@ -1388,25 +2860,108 @@ class FusionCaptureController extends ChangeNotifier {
     const firstPassTimeout = Duration(seconds: 20);
     const retryBackoff = Duration(seconds: 3);
 
+    // REAL DATA-LOSS BUG (found 2026-08-26 by auditing capture ffb1682f's
+    // own bytes in Storage, not from the client's own logs -- which were
+    // the thing that turned out to be wrong).
+    //
+    // That capture recorded `frames: []` with an `uploadFailed_front_*`
+    // TimeoutException for all 8 front frames. Storage told a different
+    // story:
+    //
+    //   front_amb_0.jpg  2,097,152 bytes (exactly 2 MiB), NO JPEG EOI
+    //                    marker -> genuinely truncated at a buffer boundary
+    //   the other 7      valid EOI marker -> complete, perfectly usable
+    //
+    // So SEVEN uploads actually completed and were thrown away, because
+    // `putData(...).timeout(...)` only abandons the DART future -- it does
+    // not cancel the native upload, which carries on and finishes. The
+    // client sees a TimeoutException, records the frame as failed, and
+    // omits it from `frames`. Result: a capture 7/8 intact in Storage but
+    // entirely invisible to everything that reads the document, the
+    // production backend included. The two-pass restructure above reduces
+    // how OFTEN a timeout fires; it cannot help once one has, because the
+    // verdict itself is wrong.
+    //
+    // The eighth frame is the mirror-image failure: a partial object left
+    // behind by an abandoned upload, sitting in Storage looking like a real
+    // file. Nothing downstream checks -- cv2 decodes a truncated JPEG
+    // happily (it only warns), and the garbage in the missing region
+    // actually INFLATES sharpness metrics, so a corrupt frame can score as
+    // the SHARPEST and be picked as the fusion anchor. That is not
+    // hypothetical: it happened while analysing this exact capture.
+    //
+    // Both halves need the same missing mechanism -- ask Storage what
+    // actually landed instead of trusting (or distrusting) the timeout.
+    // Byte length is the check, since it catches both the abandoned-but-
+    // complete case and the truncated case, and needs no image decode.
+    Future<bool> storedObjectIsComplete(String path, int expectedBytes) async {
+      try {
+        final md = await _storage
+            .ref(path)
+            .getMetadata()
+            .timeout(const Duration(seconds: 10));
+        return md.size == expectedBytes;
+      } catch (_) {
+        // Object absent, or metadata unreachable -- either way we cannot
+        // claim it landed. Deliberately conservative: a false "incomplete"
+        // costs one retry, a false "complete" silently ships a corrupt
+        // frame into the pipeline.
+        return false;
+      }
+    }
+
+    Future<void> deletePartialObject(String path, String tag) async {
+      try {
+        await _storage.ref(path).delete().timeout(const Duration(seconds: 10));
+        _debug['deletedPartial_$tag'] = true;
+      } catch (_) {
+        // Nothing there to delete, or the delete failed -- not worth
+        // failing the capture over. Recorded rather than silently dropped
+        // so a partial object that survives is at least traceable.
+        _debug['deletePartialFailed_$tag'] = true;
+      }
+    }
+
     Future<bool> attemptUpload(_Shot shot, Duration timeout) async {
       // Normally already shrunk at its phase boundary; this only does real
       // work if a phase timed out before its shrink pass ran.
       if (!shot.shrunk) {
-        shot.jpeg = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+        final shrunk = await _shrinkForUpload(shot.jpeg, sensorOrientation);
+        shot.jpeg = shrunk.bytes;
+        shot.sharpness ??= shrunk.sharpness;
         shot.shrunk = true;
       }
       final path = '$basePath/${shot.tag}.jpg';
+      final expected = shot.jpeg.length;
       try {
         await _storage
             .ref(path)
             .putData(shot.jpeg, SettableMetadata(contentType: 'image/jpeg'))
             .timeout(timeout);
-        return true;
       } catch (e) {
-        debugPrint('[fusion] upload failed ${shot.tag}: $e');
+        debugPrint('[fusion] upload threw ${shot.tag}: $e');
+        // The upload may well have finished anyway (see above). Ask.
+        if (await storedObjectIsComplete(path, expected)) {
+          debugPrint('[fusion] ${shot.tag} landed complete despite $e');
+          _debug['uploadRecovered_${shot.tag}'] = e.toString();
+          return true;
+        }
         _debug['uploadFailed_${shot.tag}'] = e.toString();
+        // Whatever partial bytes are up there must not masquerade as a
+        // real frame on a later pass, or to the backend.
+        await deletePartialObject(path, shot.tag);
         return false;
       }
+      // putData returning normally is not proof the stored object is whole
+      // -- verify the same way, so a truncated upload can never be reported
+      // as success.
+      if (await storedObjectIsComplete(path, expected)) {
+        return true;
+      }
+      debugPrint('[fusion] upload incomplete ${shot.tag} (expected $expected)');
+      _debug['uploadIncomplete_${shot.tag}'] = expected;
+      await deletePartialObject(path, shot.tag);
+      return false;
     }
 
     final uploadedTags = <String>{};
@@ -1450,18 +3005,46 @@ class FusionCaptureController extends ChangeNotifier {
     for (final shot in _shots) {
       if (!uploadedTags.contains(shot.tag)) continue;
       final path = '$basePath/${shot.tag}.jpg';
+      // Key names deliberately match clearbridge_beta's own frame schema
+      // (shutterSpeedUs / isoValue / laplacianScore /
+      // gyroMagnitudeDegPerSec) rather than this app's earlier ad-hoc ones.
+      // The offline harnesses read the production population by those names;
+      // matching them is what lets a fusion capture be measured by the same
+      // scripts instead of needing a special case. Nothing reads the old
+      // `exposureTimeUs`/`iso` names -- checked before renaming -- so this
+      // costs nothing beyond captures already taken.
       final meta = <String, dynamic>{
         'path': path,
         'tag': shot.tag,
         'flashOn': shot.flashOn,
         if (shot.exif?.exposureTimeUs != null)
-          'exposureTimeUs': shot.exif!.exposureTimeUs,
-        if (shot.exif?.isoValue != null) 'iso': shot.exif!.isoValue,
+          'shutterSpeedUs': shot.exif!.exposureTimeUs,
+        if (shot.exif?.exposureTimeReadable != null)
+          'shutterSpeedReadable': shot.exif!.exposureTimeReadable,
+        if (shot.exif?.isoValue != null) 'isoValue': shot.exif!.isoValue,
+        if (shot.sharpness != null) 'laplacianScore': shot.sharpness,
+        if (shot.gyroMagnitudeDegPerSec != null)
+          'gyroMagnitudeDegPerSec': shot.gyroMagnitudeDegPerSec,
       };
       if (shot.tag.startsWith('front_')) {
         frames.add(meta);
       } else if (shot.tag.startsWith('tilt_')) {
         tiltShots.add(meta);
+      } else if (shot.tag.startsWith('macro_')) {
+        // Real bug caught before it shipped: this bucketing used to be a
+        // bare `else -> sweepShots`, which would have silently swallowed
+        // every macro_* tag into sweepShots the moment this phase's shots
+        // started landing in `_shots` -- corrupting sweepShots with frames
+        // from a completely different camera/geometry, invisibly, since
+        // nothing about the shape of a Map<String,dynamic> would reveal
+        // the mistake. Macro gets its own explicit branch and its own
+        // Firestore field for the same reason tilt/sweep each already do.
+        macroShots.add(meta);
+      } else if (shot.tag.startsWith('cam3_')) {
+        // Own explicit branch for exactly the reason documented above --
+        // the catch-all below is sweepShots, so a missing branch here
+        // would silently file camera-3 frames as sweep zones.
+        cam3Shots.add(meta);
       } else {
         sweepShots.add(meta);
       }
@@ -1494,6 +3077,9 @@ class FusionCaptureController extends ChangeNotifier {
           'front': _frontEnabled,
           'tilt': _tiltEnabled,
           'sweep': _sweepEnabled,
+          'macro': _macroEnabled,
+          'cam3': _cam3Enabled,
+          'uwSweep': _uwSweepEnabled,
         },
         'status': 'pending',
         'nfiqScore': 0,
@@ -1503,7 +3089,34 @@ class FusionCaptureController extends ChangeNotifier {
         'frames': frames,
         if (tiltShots.isNotEmpty) 'tiltShots': tiltShots,
         if (sweepShots.isNotEmpty) 'sweepShots': sweepShots,
+        if (macroShots.isNotEmpty) 'macroShots': macroShots,
+        if (cam3Shots.isNotEmpty) 'cam3Shots': cam3Shots,
         'fusionGuideRegions': _guideRegions,
+        if (_cameraLensInfo != null) 'cameraLensInfo': _cameraLensInfo,
+        if (_rawSensorSupport != null) 'rawSensorSupport': _rawSensorSupport,
+        if (_physicalCameraIds != null) 'physicalCameraIds': _physicalCameraIds,
+        'padClipDebug': {
+          'lastPadClipFrac': _lastPadClipFrac,
+          'maxPadClipFracSeen': _maxPadClipFracSeen,
+        },
+        'orientationDebug': {
+          'samples': _cvSamples,
+          'frontConfidentSamples': _cvFrontSamples,
+          'meanConfidence': _cvSamples > 0 ? _cvConfidenceSum / _cvSamples : null,
+          'maxFrontConfidence': _cvMaxFrontConfidence,
+          'lastAngleName': _cvLastAngleName,
+          'lastConfidence': _cvLastConfidence,
+          'confidenceThreshold': _cvConfidenceThreshold,
+          // Without these, `samples: 0` is ambiguous between "the model
+          // never loaded" and "it loaded and every inference threw" -- the
+          // exact ambiguity the first real fusion capture landed in.
+          'modelReady': _orientationClassifier.isReady,
+          'modelAsset': _orientationClassifier.loadedAssetKey,
+          'initError': _orientationClassifier.lastInitError,
+          'classifyError': _orientationClassifier.lastClassifyError,
+          'inputShape': _orientationClassifier.inputShape,
+          'outputShape': _orientationClassifier.outputShape,
+        },
         'fusionDebug': _debug,
       }, SetOptions(merge: true)).timeout(_networkTimeout);
 
@@ -1543,6 +3156,7 @@ class FusionCaptureController extends ChangeNotifier {
     _tiltAnglePoll = null;
     _orientation.dispose();
     _audio.dispose();
+    _orientationClassifier.dispose();
     unawaited(_cameraService.disposeCamera());
     super.dispose();
   }

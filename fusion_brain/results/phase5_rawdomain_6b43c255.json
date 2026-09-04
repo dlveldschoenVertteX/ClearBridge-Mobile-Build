@@ -1,0 +1,34 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "mosaic": true,
+  "sides_used": 3,
+  "sides_offered": 6,
+  "anchor_minutiae": 135,
+  "composite_minutiae": 91,
+  "scores": {
+    "anchor_alone": {
+      "ink_scan": 5,
+      "macro_round32": 34,
+      "macro_round35": 29
+    },
+    "raw_domain": {
+      "ink_scan": 5,
+      "macro_round32": 25,
+      "macro_round35": 20
+    }
+  },
+  "raw_mosaic_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_rawmosaic.png",
+  "composite_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_composite_rawdomain.png",
+  "afis_params": {
+    "afisSource": "{'frameIndex': 0, 'angleDeg': 0.0}",
+    "afisWavelengthPx": 14.0,
+    "afisMask": "guide",
+    "afisWavelengthPxRaw": 15.0,
+    "afisWavelengthPxRawBlocks": 1149.0,
+    "afisFreqScale": 0.7,
+    "afisEnhance": "gabor",
+    "afisRotated": 1.0,
+    "afisCreaseTrimPx": 105141.0,
+    "afisVignette": "elliptical"
+  }
+}

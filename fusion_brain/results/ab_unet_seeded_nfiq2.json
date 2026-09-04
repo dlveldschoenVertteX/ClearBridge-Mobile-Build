@@ -1,0 +1,110 @@
+{
+ "old": {
+  "01662ffb": [
+   60.0,
+   "guide+unet"
+  ],
+  "181e8cd8": [
+   71.0,
+   "guide+unet"
+  ],
+  "1c019820": [
+   37.0,
+   "guide+unet"
+  ],
+  "1d186afc": [
+   50.0,
+   "guide"
+  ],
+  "474b4d6a": [
+   39.0,
+   "guide"
+  ],
+  "4ae6d13c": [
+   44.0,
+   "guide"
+  ],
+  "5363a49b": [
+   57.0,
+   "guide+unet"
+  ],
+  "774f2252": [
+   37.0,
+   "guide+unet"
+  ],
+  "80a994ca": [
+   34.0,
+   "guide"
+  ],
+  "b615f37b": [
+   63.0,
+   "guide+unet"
+  ],
+  "d0ec5195": [
+   52.0,
+   "guide+unet"
+  ],
+  "e50047c7": [
+   57.0,
+   "guide"
+  ],
+  "eacb0b2c": [
+   62.0,
+   "guide+unet"
+  ]
+ },
+ "new": {
+  "01662ffb": [
+   59.0,
+   "guide+unet"
+  ],
+  "181e8cd8": [
+   77.0,
+   "guide+unet"
+  ],
+  "1c019820": [
+   23.0,
+   "guide+unet"
+  ],
+  "1d186afc": [
+   50.0,
+   "guide"
+  ],
+  "474b4d6a": [
+   39.0,
+   "guide"
+  ],
+  "4ae6d13c": [
+   38.0,
+   "guide+unet"
+  ],
+  "5363a49b": [
+   66.0,
+   "guide+unet"
+  ],
+  "774f2252": [
+   44.0,
+   "guide+unet"
+  ],
+  "80a994ca": [
+   32.0,
+   "guide+unet"
+  ],
+  "b615f37b": [
+   57.0,
+   "guide+unet"
+  ],
+  "d0ec5195": [
+   45.0,
+   "guide+unet"
+  ],
+  "e50047c7": [
+   57.0,
+   "guide"
+  ],
+  "eacb0b2c": [
+   44.0,
+   "guide+unet"
+  ]
+ }
+}

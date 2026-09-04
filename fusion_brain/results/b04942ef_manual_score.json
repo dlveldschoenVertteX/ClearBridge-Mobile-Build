@@ -1,0 +1,68 @@
+{
+ "native": [
+  46.0,
+  "guide",
+  null,
+  null
+ ],
+ "freqNorm": [
+  67.0,
+  "guide",
+  null,
+  null
+ ],
+ "fuseAvg": [
+  50.0,
+  "guide",
+  "avg",
+  null
+ ],
+ "deepFuse": [
+  72.0,
+  "guide",
+  null,
+  null
+ ],
+ "macro_native": [
+  60.0,
+  "guide+unet",
+  null,
+  null
+ ],
+ "sweep_left": [
+  68.0,
+  "guide",
+  null,
+  null
+ ],
+ "sweep_center": [
+  61.0,
+  "guide",
+  null,
+  null
+ ],
+ "sweep_right": [
+  59.0,
+  "guide",
+  null,
+  null
+ ],
+ "tilt_left": [
+  57.0,
+  "guide",
+  null,
+  null
+ ],
+ "tilt_tip": [
+  36.0,
+  "guide",
+  null,
+  null
+ ],
+ "tilt_right": [
+  62.0,
+  "guide",
+  null,
+  null
+ ]
+}

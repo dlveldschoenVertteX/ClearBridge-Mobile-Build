@@ -37,6 +37,7 @@ firebase-debug.log
 # project deploys via Cloud Storage, never git, same as every existing
 # *.onnx model already in the pipeline.
 ml/**/dataset/
+ml/**/dataset_*/
 ml/**/runs/
 ml/**/*.onnx
 ml/**/*.pt
@@ -62,3 +63,10 @@ ml/ridge_restore_curriculum/*.png
 # from prior sessions) -- ignore it explicitly so untracked-file hooks
 # don't flag every drop.
 scratchpad/
+
+# Frame-selection experiment output: records per-frame Storage paths while a
+# run is in flight (sanitised to basenames on completion). Belt-and-braces so
+# a mid-run commit can never publish a capturing user's uid to this PUBLIC repo.
+# Harness run logs are transient console capture, superseded by the findings
+# docs alongside them. No run log has ever been tracked here.
+fusion_brain/results/*.log

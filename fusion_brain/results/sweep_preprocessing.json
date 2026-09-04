@@ -1,0 +1,255 @@
+{
+  "BASELINE (production)": {
+    "6b43c255": {
+      "minutiae": 135,
+      "scores": {
+        "main_round32": 44,
+        "main_round35": 31
+      }
+    },
+    "43378ea7": {
+      "minutiae": 158,
+      "scores": {
+        "main_round32": 29,
+        "main_round35": 13
+      }
+    },
+    "5181d451": {
+      "minutiae": 144,
+      "scores": {
+        "main_round32": 33,
+        "main_round35": 36
+      }
+    }
+  },
+  "CLAHE OFF": {
+    "6b43c255": {
+      "minutiae": 115,
+      "scores": {
+        "main_round32": 25,
+        "main_round35": 23
+      }
+    },
+    "43378ea7": {
+      "minutiae": 187,
+      "scores": {
+        "main_round32": 28,
+        "main_round35": 15
+      }
+    },
+    "5181d451": {
+      "minutiae": 271,
+      "scores": {
+        "main_round32": 18,
+        "main_round35": 31
+      }
+    }
+  },
+  "CLAHE clip=1.0": {
+    "6b43c255": {
+      "minutiae": 119,
+      "scores": {
+        "main_round32": 25,
+        "main_round35": 25
+      }
+    },
+    "43378ea7": {
+      "minutiae": 161,
+      "scores": {
+        "main_round32": 29,
+        "main_round35": 14
+      }
+    },
+    "5181d451": {
+      "minutiae": 148,
+      "scores": {
+        "main_round32": 34,
+        "main_round35": 43
+      }
+    }
+  },
+  "CLAHE clip=2.0": {
+    "6b43c255": {
+      "minutiae": 110,
+      "scores": {
+        "main_round32": 33,
+        "main_round35": 28
+      }
+    },
+    "43378ea7": {
+      "minutiae": 160,
+      "scores": {
+        "main_round32": 33,
+        "main_round35": 12
+      }
+    },
+    "5181d451": {
+      "minutiae": 148,
+      "scores": {
+        "main_round32": 39,
+        "main_round35": 40
+      }
+    }
+  },
+  "CLAHE clip=5.0": {
+    "6b43c255": {
+      "minutiae": 127,
+      "scores": {
+        "main_round32": 34,
+        "main_round35": 37
+      }
+    },
+    "43378ea7": {
+      "minutiae": 167,
+      "scores": {
+        "main_round32": 31,
+        "main_round35": 19
+      }
+    },
+    "5181d451": {
+      "minutiae": 153,
+      "scores": {
+        "main_round32": 35,
+        "main_round35": 40
+      }
+    }
+  },
+  "CLAHE tiles=4x4": {
+    "6b43c255": {
+      "minutiae": 120,
+      "scores": {
+        "main_round32": 29,
+        "main_round35": 28
+      }
+    },
+    "43378ea7": {
+      "minutiae": 170,
+      "scores": {
+        "main_round32": 27,
+        "main_round35": 15
+      }
+    },
+    "5181d451": {
+      "minutiae": 147,
+      "scores": {
+        "main_round32": 28,
+        "main_round35": 29
+      }
+    }
+  },
+  "CLAHE tiles=16x16": {
+    "6b43c255": {
+      "minutiae": 132,
+      "scores": {
+        "main_round32": 37,
+        "main_round35": 36
+      }
+    },
+    "43378ea7": {
+      "minutiae": 163,
+      "scores": {
+        "main_round32": 31,
+        "main_round35": 13
+      }
+    },
+    "5181d451": {
+      "minutiae": 147,
+      "scores": {
+        "main_round32": 33,
+        "main_round35": 34
+      }
+    }
+  },
+  "CLAHE tiles=32x32": {
+    "6b43c255": {
+      "minutiae": 138,
+      "scores": {
+        "main_round32": 25,
+        "main_round35": 26
+      }
+    },
+    "43378ea7": {
+      "minutiae": 158,
+      "scores": {
+        "main_round32": 30,
+        "main_round35": 20
+      }
+    },
+    "5181d451": {
+      "minutiae": 150,
+      "scores": {
+        "main_round32": 22,
+        "main_round35": 36
+      }
+    }
+  },
+  "mask_dilate=1.0 (shrink only)": {
+    "6b43c255": {
+      "minutiae": 135,
+      "scores": {
+        "main_round32": 44,
+        "main_round35": 31
+      }
+    },
+    "43378ea7": {
+      "minutiae": 120,
+      "scores": {
+        "main_round32": 22,
+        "main_round35": 11
+      }
+    },
+    "5181d451": {
+      "minutiae": 106,
+      "scores": {
+        "main_round32": 30,
+        "main_round35": 27
+      }
+    }
+  },
+  "mask_dilate=1.15": {
+    "6b43c255": {
+      "minutiae": 135,
+      "scores": {
+        "main_round32": 44,
+        "main_round35": 31
+      }
+    },
+    "43378ea7": {
+      "minutiae": 150,
+      "scores": {
+        "main_round32": 28,
+        "main_round35": 13
+      }
+    },
+    "5181d451": {
+      "minutiae": 144,
+      "scores": {
+        "main_round32": 33,
+        "main_round35": 36
+      }
+    }
+  },
+  "ambient burst STACKED anchor": {
+    "6b43c255": {
+      "minutiae": 119,
+      "scores": {
+        "main_round32": 30,
+        "main_round35": 31
+      }
+    },
+    "43378ea7": {
+      "minutiae": 158,
+      "scores": {
+        "main_round32": 42,
+        "main_round35": 13
+      }
+    },
+    "5181d451": {
+      "minutiae": 102,
+      "scores": {
+        "main_round32": 22,
+        "main_round35": 13
+      }
+    }
+  }
+}

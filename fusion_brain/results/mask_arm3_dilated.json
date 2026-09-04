@@ -1,0 +1,170 @@
+[
+ {
+  "id": "e33d618e",
+  "prod": 70.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 71.0,
+  "dilated": 61.0
+ },
+ {
+  "id": "a262d2b3",
+  "prod": 73.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 68.0,
+  "dilated": 69.0
+ },
+ {
+  "id": "01662ffb",
+  "prod": 68.0,
+  "prod_mask": "guide+unet",
+  "bare": 74.0,
+  "dilated": 71.0
+ },
+ {
+  "id": "474b4d6a",
+  "prod": 76.0,
+  "prod_mask": "guide+unet",
+  "bare": 73.0,
+  "dilated": 65.0
+ },
+ {
+  "id": "4ae6d13c",
+  "prod": 74.0,
+  "prod_mask": "guide",
+  "bare": 74.0,
+  "dilated": 48.0
+ },
+ {
+  "id": "5363a49b",
+  "prod": 70.0,
+  "prod_mask": "guide+unet",
+  "bare": 79.0,
+  "dilated": 79.0
+ },
+ {
+  "id": "181e8cd8",
+  "prod": 76.0,
+  "prod_mask": "guide+unet",
+  "bare": 75.0,
+  "dilated": 64.0
+ },
+ {
+  "id": "eacb0b2c",
+  "prod": 75.0,
+  "prod_mask": "guide+unet",
+  "bare": 76.0,
+  "dilated": 66.0
+ },
+ {
+  "id": "80a994ca",
+  "prod": 82.0,
+  "prod_mask": "guide",
+  "bare": 82.0,
+  "dilated": 64.0
+ },
+ {
+  "id": "286f1f0a",
+  "prod": 76.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 83.0,
+  "dilated": 62.0
+ },
+ {
+  "id": "1c019820",
+  "prod": 70.0,
+  "prod_mask": "guide+unet",
+  "bare": 71.0,
+  "dilated": 39.0
+ },
+ {
+  "id": "4508786f",
+  "prod": 50.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 66.0,
+  "dilated": 65.0
+ },
+ {
+  "id": "e50047c7",
+  "prod": 56.0,
+  "prod_mask": "guide+unet",
+  "bare": 62.0,
+  "dilated": 41.0
+ },
+ {
+  "id": "774f2252",
+  "prod": 46.0,
+  "prod_mask": "guide+unet",
+  "bare": 70.0,
+  "dilated": 66.0
+ },
+ {
+  "id": "315f79f1",
+  "prod": 79.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 71.0,
+  "dilated": 51.0
+ },
+ {
+  "id": "fc142f97",
+  "prod": 61.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 65.0,
+  "dilated": 63.0
+ },
+ {
+  "id": "1cc301a8",
+  "prod": 76.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 68.0,
+  "dilated": 48.0
+ },
+ {
+  "id": "d0ec5195",
+  "prod": 80.0,
+  "prod_mask": "guide+unet",
+  "bare": 75.0,
+  "dilated": 63.0
+ },
+ {
+  "id": "c27d0004",
+  "prod": 73.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 67.0,
+  "dilated": 66.0
+ },
+ {
+  "id": "8ed1c600",
+  "prod": 52.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 76.0,
+  "dilated": 69.0
+ },
+ {
+  "id": "5d3fb521",
+  "prod": 75.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 80.0,
+  "dilated": 60.0
+ },
+ {
+  "id": "f4cb3ba5",
+  "prod": 61.0,
+  "prod_mask": "guide+flashdiff",
+  "bare": 69.0,
+  "dilated": 53.0
+ },
+ {
+  "id": "b615f37b",
+  "prod": 85.0,
+  "prod_mask": "guide+unet",
+  "bare": 76.0,
+  "dilated": 77.0
+ },
+ {
+  "id": "1d186afc",
+  "prod": 69.0,
+  "prod_mask": "guide",
+  "bare": 69.0,
+  "dilated": 46.0
+ }
+]

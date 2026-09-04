@@ -1,0 +1,57 @@
+[
+ {
+  "id": "01662ffb",
+  "prod": [
+   68.0,
+   "guide+unet"
+  ],
+  "seeded": [
+   68.0,
+   "guide+unet"
+  ]
+ },
+ {
+  "id": "474b4d6a",
+  "prod": [
+   73.0,
+   "guide"
+  ],
+  "seeded": [
+   76.0,
+   "guide+unet"
+  ]
+ },
+ {
+  "id": "4ae6d13c",
+  "prod": [
+   74.0,
+   "guide"
+  ],
+  "seeded": [
+   74.0,
+   "guide"
+  ]
+ },
+ {
+  "id": "80a994ca",
+  "prod": [
+   82.0,
+   "guide"
+  ],
+  "seeded": [
+   82.0,
+   "guide"
+  ]
+ },
+ {
+  "id": "774f2252",
+  "prod": [
+   46.0,
+   "guide+unet"
+  ],
+  "seeded": [
+   46.0,
+   "guide+unet"
+  ]
+ }
+]

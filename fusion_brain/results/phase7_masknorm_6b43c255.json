@@ -1,0 +1,125 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "arms": {
+    "full_frame": {
+      "minutiae": 135,
+      "ink_px": 40905,
+      "scores": {
+        "macro_round32": 34,
+        "main_round32": 44,
+        "macro_round35": 29,
+        "main_round35": 31
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "full_frame+maskNorm": {
+      "minutiae": 135,
+      "ink_px": 40905,
+      "scores": {
+        "macro_round32": 34,
+        "main_round32": 44,
+        "macro_round35": 29,
+        "main_round35": 31
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "crop": {
+      "minutiae": 135,
+      "ink_px": 36675,
+      "scores": {
+        "macro_round32": 24,
+        "main_round32": 27,
+        "macro_round35": 27,
+        "main_round35": 36
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "crop+maskNorm": {
+      "minutiae": 135,
+      "ink_px": 36675,
+      "scores": {
+        "macro_round32": 24,
+        "main_round32": 27,
+        "macro_round35": 27,
+        "main_round35": 36
+      },
+      "wl": 16.0,
+      "freq_scale": 0.7
+    },
+    "full_frame+tile300": {
+      "minutiae": 118,
+      "ink_px": 38170,
+      "scores": {
+        "macro_round32": 17,
+        "main_round32": 27,
+        "macro_round35": 18,
+        "main_round35": 21
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "crop+tile300": {
+      "minutiae": 110,
+      "ink_px": 33213,
+      "scores": {
+        "macro_round32": 14,
+        "main_round32": 24,
+        "macro_round35": 17,
+        "main_round35": 23
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "full_frame+tile400": {
+      "minutiae": 131,
+      "ink_px": 40989,
+      "scores": {
+        "macro_round32": 23,
+        "main_round32": 32,
+        "macro_round35": 24,
+        "main_round35": 37
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "crop+tile400": {
+      "minutiae": 125,
+      "ink_px": 34076,
+      "scores": {
+        "macro_round32": 20,
+        "main_round32": 29,
+        "macro_round35": 26,
+        "main_round35": 31
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "full_frame+tile533": {
+      "minutiae": 121,
+      "ink_px": 38128,
+      "scores": {
+        "macro_round32": 21,
+        "main_round32": 32,
+        "macro_round35": 30,
+        "main_round35": 31
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    },
+    "crop+tile533": {
+      "minutiae": 133,
+      "ink_px": 32589,
+      "scores": {
+        "macro_round32": 25,
+        "main_round32": 35,
+        "macro_round35": 26,
+        "main_round35": 31
+      },
+      "wl": 20.0,
+      "freq_scale": 0.7
+    }
+  }
+}

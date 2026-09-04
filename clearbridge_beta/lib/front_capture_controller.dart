@@ -675,17 +675,57 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _stillDecodeTargetWidth = 3200;
   static const int _burstFlashSettleMs = 70;
   // EV multipliers applied to flashEvStep across the 4 flash shots in the
-  // main burst. flashEvStep is negative (reduces exposure to guard against
-  // torch blowout), so:
+  // main burst. flashEvStep is negative (reduces exposure), so a larger
+  // multiplier means a deeper pulldown.
   //   0.5× = lighter reduction = brighter effective flash (catches dark scenes)
   //   1.0× = standard (the adaptive curve's own recommendation)
-  //   1.5× = heavier reduction = darker flash (hard blowout guard)
-  //   0.75× = intermediate
-  // The backend picks the sharpest frame via Laplacian ranking; the bracket
-  // gives it 4 real exposure candidates instead of 4 identical ones.
-  // Works via setExposureOffset() -- no hardware variable-intensity flash
-  // needed, same safe API already proven for the adaptive EV step itself.
-  static const List<double> _flashEvBracketMultipliers = [0.5, 1.0, 1.5, 0.75];
+  //   2.5× / 4.0× = deep pulldown -- see below, this is the point
+  //
+  // RETUNED SHALLOWER 2026-08-27, after the deepened bracket was tested on a
+  // real capture (996a22c8) and its central hypothesis was REFUTED.
+  //
+  // The hypothesis: across 63 real captures the AE looked like it would
+  // trade light for a shorter exposure once ISO bottomed out (46 captures
+  // pinned at the 30ms ceiling spent torch light purely on gain reduction;
+  // 16 captures with ISO already at its ~50 floor showed exposure halving
+  // instead). So a bracket deep enough to reach the ISO floor should have
+  // converted torch light into shutter speed and cut motion blur.
+  //
+  // Half of that is confirmed and half is wrong. The deep rungs DID walk
+  // the AE down its ladder exactly as predicted -- ISO fell 161 -> 55, the
+  // floor the old bracket never reached. But the shutter never moved: all
+  // eight frames stayed at 29999us. Once ISO bottoms out this AE simply
+  // UNDEREXPOSES rather than shortening exposure.
+  //
+  // My reading of those 16 "shutter halved" captures was a brightness
+  // confound: every one of them was a scene whose AMBIENT was already off
+  // the 30ms ceiling, i.e. bright enough that the AE had left the ceiling
+  // on its own. That is not the same thing as the ISO floor causing it.
+  //
+  // Worse, the deep rungs actively cost frames. Measured inside the guide
+  // on that capture (ridge-band energy, not the whole-frame client proxy):
+  //   fl_1  EV -0.35  ISO 161  ridge 0.993  coherence 0.423   <- best
+  //   fl_3  EV -0.70  ISO 161  ridge 0.128  coherence 0.221
+  //   fl_5  EV -1.75  ISO  55  ridge 0.106  coherence 0.269
+  //   fl_7  EV -2.00  ISO  58  ridge 0.108  coherence 0.277
+  // Quality falls monotonically as the pulldown deepens, and the SHALLOWEST
+  // rung is dramatically the best -- 8x the ridge-band energy of any other
+  // frame. Two of four flash shots were being spent on frames that cannot
+  // win, which is a real reduction in effective burst depth.
+  //
+  // So the bracket should explore SHALLOWER, not deeper. 0.5x is retained
+  // as the rung that actually won, 1.0x as the adaptive curve's own
+  // recommendation, and 0.25x is added below both to test whether even less
+  // pulldown is better still -- the direction the data points and the one
+  // this bracket has never sampled. 1.5x is kept as the single blowout
+  // guard, since a bright scene genuinely can need it and this capture was
+  // taken under artificial light, not sun.
+  //
+  // Also learned from the same capture, and worth keeping: this device
+  // clamps exposure offset at -2.0 EV (flashEvRangeMin), so any multiplier
+  // past ~2.9x saturates and cannot be distinguished from 2.9x. That is a
+  // hard ceiling on how far this lever can ever be pushed on this hardware.
+  static const List<double> _flashEvBracketMultipliers = [0.25, 0.5, 1.0, 1.5];
 
   // Guided thumb-sweep capture (2026-07-30, diagnostic-first): replaces the
   // static "hold still -> fire immediately" trigger with two phases inserted
@@ -865,7 +905,25 @@ class FrontCaptureController extends ChangeNotifier {
   static const int _focusZoneMinMs = 250;
   static const int _focusZoneMaxMs = 700;
 
-  static const int _holdDurationMs = 1500;
+  // Shortened 1500ms -> 900ms, 2026-09-02, direct CTO product call on the
+  // real focus-lock-to-shutter softness finding (CLAUDE.md: capture
+  // 474b4d6a -- live signal read healthy and stable through the whole
+  // hold, yet the delivered still frames scored a real 5-9x softer than
+  // that signal implied). This dwell is the window during which AF sits
+  // FocusMode.locked (set by _refocus() before this timer even starts)
+  // while the thumb can still drift against that now-fixed focal plane --
+  // shortening it directly shrinks that drift window. Not further swept
+  // against real data beyond this one deliberate reduction; paired with
+  // _waitForShutterSharpness() below (the CTO's own explicit ask: keep AF
+  // active/verified, don't just shorten blind) so the real verification
+  // work no longer rests on dwell time alone.
+  static const int _holdDurationMs = 900;
+  // Real, bounded re-check of live sharpness immediately before the burst
+  // fires -- see _waitForShutterSharpness()'s own docs. Reuses
+  // _refocusDriftAcceptRatio (the SAME already-validated peak-relative
+  // threshold _refocus() itself trusts) rather than inventing a new one.
+  static const int _shutterSharpnessMaxWaitMs = 900;
+  static const int _shutterSharpnessPollIntervalMs = 60;
   static const int _calibDurationMs = 500;
   static const int _confirmationDisplayMs = 700;
   static const int _emitThrottleMs = 80;
@@ -1353,6 +1411,19 @@ class FrontCaptureController extends ChangeNotifier {
   bool _starting = false;
   bool _streamRunning = false;
   bool _burstInFlight = false;
+  // Guards the gap between hold-complete and _fireBurst actually starting
+  // (_burstInFlight only becomes true once _fireBurst's own synchronous
+  // prefix runs) -- see _waitForShutterSharpness()'s own docs. Without
+  // this, the hold-complete branch in _onFrame could fire a SECOND
+  // _fireAfterShutterSharpnessGate() while the first is still polling for
+  // sharpness, since _holdStart resets and the shortened _holdDurationMs
+  // can elapse again before the first gate resolves.
+  bool _shutterPending = false;
+  // Peak liveAbsSharpness observed during this hold's own _refocus() poll
+  // (its own local `maxSample`) -- the reference _waitForShutterSharpness()
+  // checks the live signal against right before the shutter fires. Reset
+  // per hold alongside _refocusedThisHold.
+  double? _lockPeakSharpness;
   // True if the capture-side sequence in _fireBurst ever exceeded
   // _burstCaptureTimeoutMs -- see that constant's own docs. Written to the
   // capture doc as `burstCaptureDebug.timedOut` so a real capture shows
@@ -1447,6 +1518,32 @@ class FrontCaptureController extends ChangeNotifier {
   double _appliedEvOffset = 0.0;
   bool _evChangeInFlight = false;
   double _lastStableBrightness = 128.0;
+
+  // ---- pad highlight-clipping guard (2026-08-27) --------------------
+  // REAL, MEASURED GAP this closes. The glare pulldown above triggers on
+  // MEAN luma over the pad ROI (_glareHighLuma = 205). Mean is structurally
+  // blind to clipping. Measured across all 8 burst frames of a real capture
+  // (6b43c255): pad mean luma 167-201 -- under 205 on every frame, so the
+  // pulldown NEVER fired -- while 11-15% of the pad sat at/above 250 and
+  // 8.4% was pegged at exactly 255.
+  //
+  // That matters more than an ordinary exposure error because saturated
+  // pixels carry no gradient at all: the ridges under them are gone at
+  // capture time and no backend setting recovers them. Verified directly --
+  // the clipped fraction is byte-identical before and after every CLAHE
+  // limit the backend uses (1.0/2.0/3.0/4.0), and a full sweep of the
+  // enhancement filters found no processing setting that helps.
+  //
+  // Threshold: 4% of the pad ROI. Real usable captures in this project sit
+  // near 0%; the capture that motivated this ran 11-15%. 4% is deliberately
+  // well below the observed bad case rather than tuned to it, and it can
+  // only ever ADD a pulldown the mean-based rule already missed -- the
+  // existing hysteresis, settle delay and min/max clamping are untouched,
+  // so this cannot introduce oscillation the current rule doesn't already
+  // have.
+  static const double _padClipHighFrac = 0.04;
+  double _lastPadClipFrac = 0.0;
+  double _maxPadClipFracSeen = 0.0;
   DateTime? _lastGlareEvAdjustAt;
 
   // Zoom-to-fill (2026-07-22): compensates for the pad under-filling the
@@ -1496,6 +1593,42 @@ class FrontCaptureController extends ChangeNotifier {
   double? _liveWavelengthPx;
   double? _liveWavelengthStillPx;
   int _wavelengthSampleCount = 0;
+
+  // ---- thumb-orientation CV classifier (round 41 port) --------------
+  // Ported from the discontinued multi-angle architecture
+  // (MultiAngleCaptureController), where it exists specifically because
+  // ThumbLandmarkerService's landmark model needs a wrist/knuckles in
+  // frame to compute rotation -- unreliable at the close range this app
+  // captures at (see thumb_orientation_classifier_io.dart's own
+  // docstring). front_only_v1 has the identical close-range problem and
+  // never had any CV confirmation that the thumb is genuinely presented
+  // pad-first, only the geometric guide + coverage/focus/wavelength
+  // signals. The model's 4 trained classes ('front'/'right'/'top'/'left')
+  // were built for the multi-angle orbit's specific poses -- only 'front'
+  // is meaningful here, so this is scoped to a presentation-confidence
+  // signal, not an angle selector.
+  //
+  // DIAGNOSTIC-ONLY for this pass, matching this project's own standing
+  // rollout discipline (ship telemetry first, gate later once real data
+  // justifies it -- see the live-wavelength estimator's own hint-then-gate
+  // history). Runs only during `holding` (throttled, see _onFrame), never
+  // blocks the hold from completing. Whether/how to make this load-bearing
+  // is exactly the kind of decision to revisit once real scanner-backed
+  // matchability data exists.
+  final _orientationClassifier = ThumbOrientationClassifier();
+  static const int _cvClassifyThrottleMs = 90; // = multi-angle's own
+      // _detectThrottleMs -- the already-validated real-device cadence for
+      // this exact model, not a new guess.
+  static const double _cvConfidenceThreshold = 0.45; // = multi-angle's own
+      // _cvConfidenceThreshold.
+  DateTime? _lastCvClassifyAt;
+  int _cvSamples = 0;
+  int _cvFrontSamples = 0;
+  double _cvConfidenceSum = 0.0;
+  double _cvMaxFrontConfidence = 0.0;
+  String? _cvLastAngleName;
+  double? _cvLastConfidence;
+
   // Diagnostic-only counters added 2026-08-14 to answer a real, open
   // question: real Firestore data shows _wavelengthSampleCount stays 0 on
   // 71% of real front_only_v1 captures (24/34 checked), yet the backend's
@@ -1840,6 +1973,8 @@ class FrontCaptureController extends ChangeNotifier {
     _focusPeak = 1.0;
     _appliedEvOffset = 0.0;
     _refocusedThisHold = false;
+    _shutterPending = false;
+    _lockPeakSharpness = null;
     // Same reset as the per-hold "thumb genuinely left" trigger a few lines
     // below in _onFrame (2026-08-15 fix) -- belt-and-suspenders for a
     // session-level equivalent. Currently inert (front_capture_screen.dart
@@ -1882,6 +2017,15 @@ class FrontCaptureController extends ChangeNotifier {
     _sweepLeftDwellStart = null;
     _lastCentroidX = null;
     _sweepDebug = {};
+    _lastPadClipFrac = 0.0;
+    _maxPadClipFracSeen = 0.0;
+    _lastCvClassifyAt = null;
+    _cvSamples = 0;
+    _cvFrontSamples = 0;
+    _cvConfidenceSum = 0.0;
+    _cvMaxFrontConfidence = 0.0;
+    _cvLastAngleName = null;
+    _cvLastConfidence = null;
     try {
       _maxZoomLevel = (await camera.getMaxZoomLevel()).clamp(1.0, _maxZoomFill);
     } catch (_) {}
@@ -1897,6 +2041,7 @@ class FrontCaptureController extends ChangeNotifier {
     // in its own setup; this call was never copied over when the chime call
     // sites were retrofitted into this controller).
     unawaited(_audio.init());
+    _orientationClassifier.initialize();
 
     _apply((s) => s.copyWith(phase: FrontCapturePhase.calibrating), force: true);
 
@@ -2329,6 +2474,14 @@ class FrontCaptureController extends ChangeNotifier {
     if (!(_flash?.isFlashOn ?? false)) {
       try {
         _lastStableBrightness = HybridCaptureService.meanLuma(image, roi: roi);
+        // Clipped fraction of the SAME pad ROI. See _padClipHighFrac for the
+        // real measurement this exists to catch -- mean luma cannot see
+        // blown highlights, and blown highlights are what actually destroy
+        // ridges.
+        _lastPadClipFrac = HybridCaptureService.clippedFraction(image, roi: roi);
+        if (_lastPadClipFrac > _maxPadClipFracSeen) {
+          _maxPadClipFracSeen = _lastPadClipFrac;
+        }
         _apply((s) => s.copyWith(
               lightingValue: (_lastStableBrightness / 255.0).clamp(0.0, 1.0),
             ));
@@ -2365,6 +2518,33 @@ class FrontCaptureController extends ChangeNotifier {
     }
 
     if (_state.phase != FrontCapturePhase.holding) return;
+
+    // Throttled CV orientation confirmation -- see the field declarations'
+    // own docs for scope/rationale. Runs at the same real-device-validated
+    // cadence as the model's original (discontinued) call site so this
+    // isn't a fresh guess at how expensive synchronous TFLite inference is
+    // per frame.
+    final _cvNow = DateTime.now();
+    if (_lastCvClassifyAt == null ||
+        _cvNow.difference(_lastCvClassifyAt!).inMilliseconds >=
+            _cvClassifyThrottleMs) {
+      _lastCvClassifyAt = _cvNow;
+      final cvPred = _orientationClassifier.classify(image, _sensorOrientation);
+      if (cvPred != null) {
+        _cvSamples++;
+        _cvConfidenceSum += cvPred.confidence;
+        _cvLastAngleName = cvPred.angleName;
+        _cvLastConfidence = cvPred.confidence;
+        if (cvPred.angleName == 'front' &&
+            cvPred.confidence > _cvMaxFrontConfidence) {
+          _cvMaxFrontConfidence = cvPred.confidence;
+        }
+        if (cvPred.angleName == 'front' &&
+            cvPred.confidence >= _cvConfidenceThreshold) {
+          _cvFrontSamples++;
+        }
+      }
+    }
 
     // On-target: focus score crosses threshold, distance is right, AND the
     // device is objectively still (gyroscope-derived). Real captures showed
@@ -2425,8 +2605,9 @@ class FrontCaptureController extends ChangeNotifier {
       final heldMs = DateTime.now().difference(_holdStart!).inMilliseconds;
       final progress = (heldMs / _holdDurationMs).clamp(0.0, 1.0);
       _apply((s) => s.copyWith(onTarget: true, holdProgress: progress, isSteady: steady));
-      if (heldMs >= _holdDurationMs) {
+      if (heldMs >= _holdDurationMs && !_shutterPending) {
         _holdStart = null;
+        _shutterPending = true;
         // Real checkpoint: sharpness/coverage right as the hold completes,
         // directly comparable against 'refocusLocked' above (same
         // liveAbsSharpness signal, same units) to see whether anything
@@ -2437,8 +2618,9 @@ class FrontCaptureController extends ChangeNotifier {
         // Sweep behind a disabled flag (see _sweepEnabled's own docs) --
         // routes back to the proven static burst path _fireBurst() by
         // default, which is _fireBurst's original pre-sweep behaviour when
-        // called with no preCollectedShots argument.
-        unawaited(_sweepEnabled ? _beginSweepPositioning() : _fireBurst());
+        // called with no preCollectedShots argument. Both now go through
+        // _waitForShutterSharpness() first -- see that method's own docs.
+        unawaited(_fireAfterShutterSharpnessGate());
       }
     } else {
       _holdStart = null;
@@ -3351,6 +3533,10 @@ class FrontCaptureController extends ChangeNotifier {
         break;
       }
       await _lockFocusOnly();
+      // See _lockPeakSharpness's own declaration -- the reference
+      // _waitForShutterSharpness() re-checks the live signal against right
+      // before the shutter fires, later in this same hold.
+      _lockPeakSharpness = maxSample > 0 ? maxSample : null;
       _logTelemetry('refocusLocked', extra: {
         'converged': converged,
         'finalSharpnessAtLock': lastSample,
@@ -3381,6 +3567,76 @@ class FrontCaptureController extends ChangeNotifier {
       debugPrint('[front] refocus failed (non-fatal): $e');
     } finally {
       _refocusing = false;
+    }
+  }
+
+  /// Real, bounded re-check of live sharpness immediately before the main
+  /// burst fires -- direct CTO product call, 2026-09-02, on the real
+  /// focus-lock-to-shutter softness finding (CLAUDE.md: capture
+  /// `474b4d6a` -- `liveAbsSharpness` read a healthy, STABLE value through
+  /// the whole hold, 106.58 at lock -> 103.69 at hold-complete 1.5s later,
+  /// yet the delivered still frames scored a real 5-9x softer than that
+  /// signal implied). AF was already `FocusMode.locked` by `_refocus()`
+  /// well before this point -- this method never re-issues autofocus, it
+  /// only gates WHEN the shutter fires, so it cannot reintroduce the
+  /// AF-hunting risk early-locking exists to avoid. Paired with
+  /// `_holdDurationMs` being shortened 1500ms -> 900ms the same round: the
+  /// dwell no longer has to carry the whole burden of "hope nothing
+  /// drifted" by itself, since this is a real, live check instead.
+  ///
+  /// Polls the same `_liveAbsSharpness` signal `_refocus()` itself
+  /// trusts, against the SAME peak observed at lock time
+  /// (`_lockPeakSharpness`) and the SAME `_refocusDriftAcceptRatio`
+  /// `_refocus()`'s own drift-retry check uses -- reusing an
+  /// already-validated threshold rather than guessing a new one, per this
+  /// project's own standing discipline. Bounded by
+  /// `_shutterSharpnessMaxWaitMs`: fires anyway once the bound is hit,
+  /// same "never block indefinitely" pattern as every other real-time
+  /// gate in this file (e.g. `_wavelengthOnlyBlockMaxMs`). No peak to
+  /// compare against (e.g. `_refocus()` never got a usable sample) is
+  /// treated as already-cleared -- this gate can only ever ADD a bounded
+  /// wait on top of an already-working hold, never block a capture that
+  /// would otherwise have succeeded.
+  Future<void> _waitForShutterSharpness() async {
+    final peak = _lockPeakSharpness;
+    final sw = Stopwatch()..start();
+    var cleared = peak == null || peak <= 0;
+    var clearedAtMs = 0;
+    final sampleAtStart = _liveAbsSharpness;
+    if (!cleared) {
+      while (sw.elapsedMilliseconds < _shutterSharpnessMaxWaitMs) {
+        if (_disposed) return;
+        final sample = _liveAbsSharpness;
+        if (sample != null && sample >= peak * _refocusDriftAcceptRatio) {
+          cleared = true;
+          clearedAtMs = sw.elapsedMilliseconds;
+          break;
+        }
+        await Future<void>.delayed(
+            const Duration(milliseconds: _shutterSharpnessPollIntervalMs));
+      }
+    }
+    _logTelemetry('shutterSharpnessGate', extra: {
+      'peakAtLock': peak,
+      'sampleAtGateStart': sampleAtStart,
+      'sampleAtFire': _liveAbsSharpness,
+      'cleared': cleared,
+      'waitedMs': sw.elapsedMilliseconds,
+      'clearedAtMs': cleared && clearedAtMs > 0 ? clearedAtMs : null,
+    });
+  }
+
+  /// Thin wrapper around the hold-complete -> burst hand-off: waits for
+  /// `_waitForShutterSharpness()` (bounded, see its own docs) before
+  /// actually firing, then clears `_shutterPending` so a later hold in the
+  /// same session isn't permanently blocked from ever firing again.
+  Future<void> _fireAfterShutterSharpnessGate() async {
+    try {
+      await _waitForShutterSharpness();
+      if (_disposed) return;
+      await (_sweepEnabled ? _beginSweepPositioning() : _fireBurst());
+    } finally {
+      _shutterPending = false;
     }
   }
 
@@ -3419,9 +3675,17 @@ class FrontCaptureController extends ChangeNotifier {
         now.difference(_lastGlareEvAdjustAt!).inMilliseconds < _glareEvSettleMs) {
       return;
     }
-    final wantsDarker = _lastStableBrightness > _glareHighLuma;
-    final wantsBrighter =
-        _lastStableBrightness < _glareLowLuma && _appliedEvOffset < 0.0;
+    // Darker if the pad is too bright ON AVERAGE (the original rule) OR if
+    // its highlights are clipping even though the average looks fine -- see
+    // _padClipHighFrac. Either condition alone is sufficient.
+    final wantsDarker = _lastStableBrightness > _glareHighLuma ||
+        _lastPadClipFrac > _padClipHighFrac;
+    final wantsBrighter = _lastStableBrightness < _glareLowLuma &&
+        _appliedEvOffset < 0.0 &&
+        // Never brighten back into clipping: a dim MEAN with blown
+        // highlights is exactly the state this guard exists for, and the
+        // old rule would have fought the pulldown that produced it.
+        _lastPadClipFrac <= _padClipHighFrac;
     if (!wantsDarker && !wantsBrighter) return;
     final step = wantsDarker ? _glareEvStep : -_glareEvStep;
     _evChangeInFlight = true;
@@ -3523,6 +3787,14 @@ class FrontCaptureController extends ChangeNotifier {
           .toList(),
       'flashIntensity': _flash?.intensity,
       'flashMode': _flash?.modeName,
+      // The REQUESTED bracket above is not necessarily what the sensor got:
+      // every rung is clamped to the device's own exposure-offset range at
+      // the call site. Without these two, a deep rung that silently
+      // saturated is indistinguishable from one that applied in full --
+      // which is exactly the question the deepened bracket needs answered on
+      // its first real capture. 'evApplied' below records the real
+      // post-clamp value per flash shot.
+      'evApplied': <double>[],
     };
     // Snapshot the running live-wavelength estimate at the moment the burst
     // actually fires (same convention as _flashEvDebug above), not at
@@ -3609,6 +3881,14 @@ class FrontCaptureController extends ChangeNotifier {
         maxEv = await cam?.getMaxExposureOffset();
       } catch (_) {}
     }
+    // The deepened EV bracket's rungs reach -2.5 to -2.9 EV on this
+    // project's own measured flashEvStep range; a device whose exposure
+    // offset bottoms out shallower than that will silently saturate them.
+    // Recording the real range is what tells the difference on the next
+    // capture, rather than leaving a flat evApplied list ambiguous between
+    // "hardware clamped" and "the step was small".
+    _flashEvDebug?['evRangeMin'] = minEv;
+    _flashEvDebug?['evRangeMax'] = maxEv;
 
     final rawShots = <_RawShot>[];
 
@@ -3656,7 +3936,10 @@ class FrontCaptureController extends ChangeNotifier {
                   final multiplier = _flashEvBracketMultipliers[
                       flashShotIndex % _flashEvBracketMultipliers.length];
                   final target = _appliedEvOffset + flashEvStep * multiplier;
-                  await cam.setExposureOffset(target.clamp(minEv, maxEv));
+                  final applied = target.clamp(minEv, maxEv);
+                  await cam.setExposureOffset(applied);
+                  (_flashEvDebug?['evApplied'] as List<double>?)
+                      ?.add(double.parse(applied.toStringAsFixed(3)));
                 }
                 await Future<void>.delayed(const Duration(milliseconds: _burstFlashSettleMs));
               } else {
@@ -4836,6 +5119,32 @@ class FrontCaptureController extends ChangeNotifier {
         'flashEvDebug': _flashEvDebug,
         'liveWavelengthDebug': _wavelengthDebug,
         'refocusDebug': _refocusDebug,
+        'padClipDebug': {
+          'lastPadClipFrac': _lastPadClipFrac,
+          'maxPadClipFracSeen': _maxPadClipFracSeen,
+          'threshold': _padClipHighFrac,
+          'appliedEvOffset': _appliedEvOffset,
+        },
+        'orientationDebug': {
+          'samples': _cvSamples,
+          'frontConfidentSamples': _cvFrontSamples,
+          'meanConfidence': _cvSamples > 0 ? _cvConfidenceSum / _cvSamples : null,
+          'maxFrontConfidence': _cvMaxFrontConfidence,
+          'lastAngleName': _cvLastAngleName,
+          'lastConfidence': _cvLastConfidence,
+          'confidenceThreshold': _cvConfidenceThreshold,
+          // Without these, `samples: 0` is ambiguous between "the model
+          // never loaded" and "it loaded and every inference threw" -- the
+          // exact ambiguity the first real fusion capture landed in
+          // (orientationDebug.samples = 0 while padClipDebug, measured in
+          // the SAME frame callback, had real values).
+          'modelReady': _orientationClassifier.isReady,
+          'modelAsset': _orientationClassifier.loadedAssetKey,
+          'initError': _orientationClassifier.lastInitError,
+          'classifyError': _orientationClassifier.lastClassifyError,
+          'inputShape': _orientationClassifier.inputShape,
+          'outputShape': _orientationClassifier.outputShape,
+        },
         if (sweepDebugData != null) 'sweepDebug': sweepDebugData,
         'zoomDebug': {
           'zoomApplied': _zoomEverApplied,
@@ -5323,6 +5632,7 @@ class FrontCaptureController extends ChangeNotifier {
     unawaited(_gyroSub?.cancel());
     _gyroSub = null;
     _audio.dispose();
+    _orientationClassifier.dispose();
     super.dispose();
   }
 }

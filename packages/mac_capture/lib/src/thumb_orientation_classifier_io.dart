@@ -31,39 +31,106 @@ class OrientationPrediction {
 class ThumbOrientationClassifier {
   Interpreter? _interpreter;
   bool _ready = false;
+  String? _lastInitError;
+  String? _loadedAssetKey;
 
   static const double _cropFraction = 0.85;
   static const int _inputSize = 224;
   static const List<String> _classes = ['front', 'right', 'top', 'left'];
 
+  /// Asset keys tried in order. A host app that declares the model in its
+  /// OWN pubspec (every app in this monorepo does) publishes it under the
+  /// bare path; one that ever relies on mac_capture shipping the model
+  /// itself would publish it package-scoped instead. Trying both removes a
+  /// whole failure class for the cost of one extra rootBundle miss, and
+  /// costs nothing at all in the common case -- the first key wins.
+  static const List<String> _assetKeys = [
+    'assets/models/thumb_orientation.tflite',
+    'packages/mac_capture/assets/models/thumb_orientation.tflite',
+  ];
+
   bool get isReady => _ready;
+
+  /// Why the model is not ready, when it is not. Exposed because this
+  /// classifier fails SILENTLY by design -- `classify()` returns null and
+  /// every caller falls back to IMU -- which means a permanently-failing
+  /// model load is invisible from the outside.
+  ///
+  /// REAL CASE this exists for (2026-08-27): the first fusion_capture run
+  /// to record classifier telemetry came back `orientationDebug.samples =
+  /// 0` while `padClipDebug` from the SAME `_onFrame` callback showed real
+  /// measurements -- so the frame callback was firing and every single
+  /// `classify()` call was returning null. "samples: 0" alone cannot
+  /// distinguish "the model never loaded" from "the model loaded and every
+  /// inference threw", and no capture in this project's Firestore history
+  /// has ever recorded a successful classification, so it is entirely
+  /// possible this model has never loaded on any real device. These two
+  /// fields are what make the next real capture answer that directly.
+  String? get lastInitError => _lastInitError;
+
+  /// Which of [_assetKeys] actually loaded, or null if none did.
+  String? get loadedAssetKey => _loadedAssetKey;
+
+  /// The model's real tensor shapes, read off the interpreter at load.
+  /// Exposed because a shape mismatch is the failure mode that already cost
+  /// this classifier a full device round.
+  String? get inputShape => _inputShape;
+  String? get outputShape => _outputShape;
+  String? _inputShape;
+  String? _outputShape;
 
   void initialize() {
     _initAsync();
   }
 
   Future<void> _initAsync() async {
-    if (defaultTargetPlatform != TargetPlatform.android) return;
-    for (final useGpu in [true, false]) {
-      try {
-        final opts = InterpreterOptions()..threads = 2;
-        if (useGpu) opts.addDelegate(GpuDelegate());
-        _interpreter = await Interpreter.fromAsset(
-          'assets/models/thumb_orientation.tflite',
-          options: opts,
-        );
-        _ready = true;
-        debugPrint('[ThumbOrientation] init OK (${useGpu ? "gpu" : "cpu"})');
-        return;
-      } catch (e) {
-        debugPrint(
-            '[ThumbOrientation] init failed (${useGpu ? "gpu" : "cpu"}): $e');
-        _interpreter?.close();
-        _interpreter = null;
+    if (defaultTargetPlatform != TargetPlatform.android) {
+      _lastInitError = 'not android';
+      return;
+    }
+    final failures = <String>[];
+    for (final assetKey in _assetKeys) {
+      for (final useGpu in [true, false]) {
+        try {
+          final opts = InterpreterOptions()..threads = 2;
+          if (useGpu) opts.addDelegate(GpuDelegate());
+          _interpreter = await Interpreter.fromAsset(assetKey, options: opts);
+          // Explicit rather than relying on the first inference to do it:
+          // the tensor-level path in classify() does NOT allocate on our
+          // behalf the way runForMultipleInputs did.
+          _interpreter!.allocateTensors();
+          // Recorded so a REMAINING shape mismatch is immediately readable
+          // from a real capture instead of needing another round of
+          // guessing -- the whole reason the previous bug survived this
+          // long is that it surfaced only as a generic message.
+          _inputShape = _interpreter!.getInputTensor(0).shape.toString();
+          _outputShape = _interpreter!.getOutputTensor(0).shape.toString();
+          _ready = true;
+          _loadedAssetKey = assetKey;
+          _lastInitError = null;
+          debugPrint('[ThumbOrientation] init OK '
+              '(${useGpu ? "gpu" : "cpu"}, $assetKey)');
+          return;
+        } catch (e) {
+          failures.add('${useGpu ? "gpu" : "cpu"}/$assetKey: $e');
+          debugPrint('[ThumbOrientation] init failed '
+              '(${useGpu ? "gpu" : "cpu"}, $assetKey): $e');
+          _interpreter?.close();
+          _interpreter = null;
+        }
       }
     }
-    debugPrint('[ThumbOrientation] all delegates failed');
+    // Truncated: this is written to a Firestore diagnostic field, and a
+    // raw tflite stack trace can run to kilobytes.
+    final joined = failures.join(' | ');
+    _lastInitError =
+        joined.length > 400 ? '${joined.substring(0, 400)}...' : joined;
+    debugPrint('[ThumbOrientation] all delegates/assets failed');
   }
+
+  /// Set by [classify] when inference itself throws (as opposed to load).
+  String? get lastClassifyError => _lastClassifyError;
+  String? _lastClassifyError;
 
   /// Classifies the current camera frame's thumb orientation. Returns null
   /// when the model isn't ready or inference fails -- callers should treat
@@ -72,15 +139,54 @@ class ThumbOrientationClassifier {
     if (!_ready || _interpreter == null) return null;
     try {
       final inputData = _preprocess(image, sensorOrientation);
-      final outputBuffer = Float32List(_classes.length);
-      _interpreter!.runForMultipleInputs([inputData], {0: outputBuffer});
+
+      // REAL BUG, found from a real capture (2026-08-27, 996a22c8): the
+      // previous call was
+      //     _interpreter.runForMultipleInputs([inputData], {0: outputBuffer})
+      // with `inputData` a FLAT Float32List. That threw "Bad state: failed
+      // precondition" on every single inference -- confirmed live, with
+      // modelReady:true and initError:null in the same record, so the model
+      // loaded fine and only inference failed.
+      //
+      // Mechanism: runForMultipleInputs infers a shape from each input via
+      // Tensor.getInputShapeIfDifferent() and RESIZES the input tensor when
+      // it differs. A flat Float32List of 224*224*3 infers as shape
+      // [150528], which differs from the model's real [1, 224, 224, 3], so
+      // the interpreter dutifully resized its input tensor to a rank-1
+      // 150528 vector -- after which the first convolution has no valid
+      // spatial dimensions and the graph fails its own preconditions.
+      //
+      // The flat buffer itself was the right call (the nested form boxes
+      // 150K+ doubles per throttled inference, real jank on a budget phone).
+      // What was wrong was the entry point. The tensor-level API takes the
+      // same flat buffer and copies it into the already-correctly-shaped
+      // tensor WITHOUT any shape inference or resize, so it keeps the
+      // allocation win and drops the bug.
+      final inTensor = _interpreter!.getInputTensor(0);
+      final outTensor = _interpreter!.getOutputTensor(0);
+      inTensor.setTo(inputData);
+      _interpreter!.invoke();
+
+      // Output is rank-2 [1, nClasses], not a flat [nClasses] -- confirmed
+      // from the real model on a real capture (5e68ed01 reported
+      // outputShape "[1, 4]"), after a first attempt passing
+      // Float32List(_classes.length) failed with "Output object shape
+      // mismatch, interpreter returned output of shape: [1, 4] while shape
+      // of output provided as argument in run is: [4]". copyTo matches
+      // shapes strictly, so the destination has to carry the leading batch
+      // dimension. That error message is exactly what the outputShape
+      // diagnostic was added to make available.
+      final output = [List<double>.filled(_classes.length, 0.0)];
+      outTensor.copyTo(output);
+      final scores = output[0];
 
       var bestIdx = 0;
-      for (var i = 1; i < outputBuffer.length; i++) {
-        if (outputBuffer[i] > outputBuffer[bestIdx]) bestIdx = i;
+      for (var i = 1; i < scores.length; i++) {
+        if (scores[i] > scores[bestIdx]) bestIdx = i;
       }
-      return OrientationPrediction(_classes[bestIdx], outputBuffer[bestIdx]);
+      return OrientationPrediction(_classes[bestIdx], scores[bestIdx]);
     } catch (e) {
+      _lastClassifyError = e.toString();
       debugPrint('[ThumbOrientation] classify error: $e');
       return null;
     }

@@ -1,0 +1,24 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "max_added": 15,
+  "close_radius": 30.0,
+  "exclude_radius": 0.0,
+  "suppress": true,
+  "region_minutiae": 119,
+  "suppressed": 6,
+  "composite_minutiae": 171,
+  "anchor_minutiae": 135,
+  "scores": {
+    "anchor_alone": {
+      "ink_scan": 5,
+      "macro_round32": 34,
+      "macro_round35": 29
+    },
+    "composite": {
+      "ink_scan": 4,
+      "macro_round32": 40,
+      "macro_round35": 30
+    }
+  },
+  "composite_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_composite_validmerge_f0.png"
+}

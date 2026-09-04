@@ -1,0 +1,218 @@
+[
+ {
+  "id": "e33d618e",
+  "prod_nfiq2": 70.0,
+  "prod_wl": 15.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 70.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "a262d2b3",
+  "prod_nfiq2": 73.0,
+  "prod_wl": 16.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 73.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "01662ffb",
+  "prod_nfiq2": 68.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 68.0,
+  "masked_wl": 14.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "474b4d6a",
+  "prod_nfiq2": 73.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 73.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "4ae6d13c",
+  "prod_nfiq2": 74.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 74.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "5363a49b",
+  "prod_nfiq2": 70.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 70.0,
+  "masked_wl": 16.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "181e8cd8",
+  "prod_nfiq2": 76.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 76.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "eacb0b2c",
+  "prod_nfiq2": 75.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 75.0,
+  "masked_wl": 15.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "80a994ca",
+  "prod_nfiq2": 82.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 82.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "286f1f0a",
+  "prod_nfiq2": 76.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 76.0,
+  "masked_wl": 19.5,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "1c019820",
+  "prod_nfiq2": 70.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 70.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "4508786f",
+  "prod_nfiq2": 50.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 50.0,
+  "masked_wl": 13.5,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "e50047c7",
+  "prod_nfiq2": 56.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 56.0,
+  "masked_wl": 13.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "774f2252",
+  "prod_nfiq2": 46.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 46.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "315f79f1",
+  "prod_nfiq2": 79.0,
+  "prod_wl": 15.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 79.0,
+  "masked_wl": 15.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "fc142f97",
+  "prod_nfiq2": 61.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 61.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "1cc301a8",
+  "prod_nfiq2": 76.0,
+  "prod_wl": 14.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 76.0,
+  "masked_wl": 17.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "d0ec5195",
+  "prod_nfiq2": 80.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 66.0,
+  "masked_wl": 11.0,
+  "masked_scale": 0.818
+ },
+ {
+  "id": "c27d0004",
+  "prod_nfiq2": 73.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 73.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "8ed1c600",
+  "prod_nfiq2": 52.0,
+  "prod_wl": 18.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 52.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "5d3fb521",
+  "prod_nfiq2": 75.0,
+  "prod_wl": 17.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 69.0,
+  "masked_wl": 12.5,
+  "masked_scale": 0.72
+ },
+ {
+  "id": "f4cb3ba5",
+  "prod_nfiq2": 61.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 61.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ },
+ {
+  "id": "b615f37b",
+  "prod_nfiq2": 85.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 68.0,
+  "masked_wl": 11.5,
+  "masked_scale": 0.783
+ },
+ {
+  "id": "1d186afc",
+  "prod_nfiq2": 69.0,
+  "prod_wl": 20.0,
+  "prod_scale": 0.7,
+  "masked_nfiq2": 69.0,
+  "masked_wl": 20.0,
+  "masked_scale": 0.7
+ }
+]

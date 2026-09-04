@@ -1,0 +1,98 @@
+[
+ {
+  "id": "e33d618e",
+  "ratio": 3.6778842330646615,
+  "prod": 71.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ },
+ {
+  "id": "a262d2b3",
+  "ratio": 5.338949544879709,
+  "prod": 64.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ },
+ {
+  "id": "01662ffb",
+  "ratio": 0.4669242029211651,
+  "prod": 72.0,
+  "prod_fused": "avg",
+  "guarded": 72.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "474b4d6a",
+  "ratio": 1.7447107742033316,
+  "prod": 75.0,
+  "prod_fused": "avg",
+  "guarded": 75.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "4ae6d13c",
+  "ratio": 0.7123332324280074,
+  "prod": 67.0,
+  "prod_fused": "avg",
+  "guarded": 67.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "80a994ca",
+  "ratio": 2.937545480719781,
+  "prod": 62.0,
+  "prod_fused": "avg",
+  "guarded": 75.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "286f1f0a",
+  "ratio": 3.1729872589384875,
+  "prod": 77.0,
+  "prod_fused": "avg",
+  "guarded": 76.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "fc142f97",
+  "ratio": 2.80637332156162,
+  "prod": 64.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ },
+ {
+  "id": "1cc301a8",
+  "ratio": 5.373101953324159,
+  "prod": 49.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ },
+ {
+  "id": "c27d0004",
+  "ratio": 5.427021290736537,
+  "prod": 82.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ },
+ {
+  "id": "8ed1c600",
+  "ratio": 2.5810933405401904,
+  "prod": 52.0,
+  "prod_fused": "avg",
+  "guarded": 49.0,
+  "guarded_fused": "avg"
+ },
+ {
+  "id": "f4cb3ba5",
+  "ratio": 2.4875866390468993,
+  "prod": 54.0,
+  "prod_fused": "avg",
+  "guarded": null,
+  "guarded_fused": null
+ }
+]

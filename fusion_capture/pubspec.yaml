@@ -52,3 +52,12 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  # thumb_orientation.tflite: the CV close-range presentation classifier
+  # ported from the discontinued multi-angle architecture (round 41). Only
+  # this one model, not hand_landmark_full.tflite -- that one is MediaPipe's
+  # general landmark model, which the classifier was built specifically to
+  # replace at close range (see thumb_orientation_classifier_io.dart's own
+  # docstring). No new pub dependency needed: mac_capture already pins
+  # tflite_flutter and already exports ThumbOrientationClassifier.
+  assets:
+    - assets/models/

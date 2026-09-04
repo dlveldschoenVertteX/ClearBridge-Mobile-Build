@@ -1,0 +1,86 @@
+[
+  {
+    "captureId": "01662ffb-ef9d-4340-bd78-2d13ebc22e82",
+    "nfiq2_prod": 26.0,
+    "bgCoherence_prod": 0.6430751085281372,
+    "nfiq2_fixed": 22.0,
+    "bgCoherence_fixed": 0.592278242111206
+  },
+  {
+    "captureId": "03b91b6f-92d0-45ff-a0ef-648d3c8fb1d2",
+    "nfiq2_prod": 22.0,
+    "bgCoherence_prod": 0.8269559144973755,
+    "nfiq2_fixed": 29.0,
+    "bgCoherence_fixed": 0.66008460521698
+  },
+  {
+    "captureId": "076a1775-1654-47c1-a769-7dc8b32bda3d",
+    "nfiq2_prod": 23.0,
+    "bgCoherence_prod": 0.5512675046920776,
+    "nfiq2_fixed": 22.0,
+    "bgCoherence_fixed": 0.4790542423725128
+  },
+  {
+    "captureId": "0bd23cc2-9bf4-4eb5-9ab0-76cd6c6022af",
+    "nfiq2_prod": 13.0,
+    "bgCoherence_prod": 0.5425639152526855,
+    "nfiq2_fixed": 19.0,
+    "bgCoherence_fixed": 0.547541618347168
+  },
+  {
+    "captureId": "14674391-c65c-4c84-8e36-04b1c0690137",
+    "nfiq2_prod": 24.0,
+    "bgCoherence_prod": 0.6879720687866211,
+    "nfiq2_fixed": 27.0,
+    "bgCoherence_fixed": 0.7423574328422546
+  },
+  {
+    "captureId": "17dbee53-fa31-470f-859d-7a79013fdeb4",
+    "nfiq2_prod": 26.0,
+    "bgCoherence_prod": 0.5683575868606567,
+    "nfiq2_fixed": 28.0,
+    "bgCoherence_fixed": 0.5741363763809204
+  },
+  {
+    "captureId": "181e8cd8-85b6-44ac-a970-74fdc0ff7d99",
+    "nfiq2_prod": 23.0,
+    "bgCoherence_prod": 0.6633720397949219,
+    "nfiq2_fixed": 29.0,
+    "bgCoherence_fixed": 0.6819327473640442
+  },
+  {
+    "captureId": "1863e50f-b47c-4a59-9401-2b1b7b420554",
+    "nfiq2_prod": 26.0,
+    "bgCoherence_prod": 0.5192688703536987,
+    "nfiq2_fixed": 32.0,
+    "bgCoherence_fixed": 0.536820650100708
+  },
+  {
+    "captureId": "19184018-be77-4320-9648-42f44ba5a35b",
+    "nfiq2_prod": 12.0,
+    "bgCoherence_prod": 0.6160165667533875,
+    "nfiq2_fixed": 16.0,
+    "bgCoherence_fixed": 0.622156023979187
+  },
+  {
+    "captureId": "1c019820-5052-444c-be89-ef86b0345fdf",
+    "nfiq2_prod": 19.0,
+    "bgCoherence_prod": 0.695784866809845,
+    "nfiq2_fixed": 19.0,
+    "bgCoherence_fixed": 0.6968204975128174
+  },
+  {
+    "captureId": "1cc301a8-bd8a-4750-91dd-b8d5b3cd6614",
+    "nfiq2_prod": 24.0,
+    "bgCoherence_prod": 0.4221644997596741,
+    "nfiq2_fixed": 30.0,
+    "bgCoherence_fixed": 0.421318918466568
+  },
+  {
+    "captureId": "1d186afc-221b-449b-928a-e01491da5f3b",
+    "nfiq2_prod": 16.0,
+    "bgCoherence_prod": 0.5692867040634155,
+    "nfiq2_fixed": 11.0,
+    "bgCoherence_fixed": 0.5637074708938599
+  }
+]

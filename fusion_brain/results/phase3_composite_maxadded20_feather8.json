@@ -1,0 +1,37 @@
+{
+  "capture": "6b43c255-0d46-4aac-bdfa-f117bd0781a1",
+  "max_added": 20,
+  "feather_px": 8.0,
+  "counts": {
+    "anchor_alone": 135,
+    "composite_minutiae": 155
+  },
+  "contributed": {
+    "tilt_left": 5,
+    "tilt_tip": 0,
+    "tilt_right": 4,
+    "sweep_left": 3,
+    "sweep_center": 0,
+    "sweep_right": 8
+  },
+  "composited_sources_px": {
+    "tilt_left": 7145,
+    "tilt_right": 10663,
+    "sweep_left": 8904,
+    "sweep_right": 11726
+  },
+  "scores": {
+    "anchor_alone": {
+      "ink_scan": 5,
+      "macro_round32": 34,
+      "macro_round35": 29
+    },
+    "composite_image": {
+      "ink_scan": 9,
+      "macro_round32": 27,
+      "macro_round35": 27
+    }
+  },
+  "composite_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_composite_maxadded20_feather8.png",
+  "anchor_image_path": "/home/user/ClearBridge-Mobile-Build/fusion_brain/results/cache_fusion_v1/6b43c255-0d4_anchor_alone.png"
+}

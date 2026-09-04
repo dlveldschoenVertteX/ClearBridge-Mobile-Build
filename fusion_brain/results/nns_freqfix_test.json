@@ -1,0 +1,122 @@
+[
+  {
+    "captureId": "01662ffb-ef9d-4340-bd78-2d13ebc22e82",
+    "padPeriodPx": 17.0,
+    "nfiq2_scene": 26.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 6.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 24.0,
+    "periodUsed_sceneFix": 2.7,
+    "nfiq2_guideFix": 4.0,
+    "periodUsed_guideFix": 10.6
+  },
+  {
+    "captureId": "03b91b6f-92d0-45ff-a0ef-648d3c8fb1d2",
+    "padPeriodPx": 18.0,
+    "nfiq2_scene": 22.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 26.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 33.0,
+    "periodUsed_sceneFix": 2.9,
+    "nfiq2_guideFix": 29.0,
+    "periodUsed_guideFix": 9.1
+  },
+  {
+    "captureId": "076a1775-1654-47c1-a769-7dc8b32bda3d",
+    "padPeriodPx": 9.0,
+    "nfiq2_scene": 23.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 28.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 19.0,
+    "periodUsed_sceneFix": 1.4,
+    "nfiq2_guideFix": 31.0,
+    "periodUsed_guideFix": 5.6
+  },
+  {
+    "captureId": "0bd23cc2-9bf4-4eb5-9ab0-76cd6c6022af",
+    "padPeriodPx": 20.0,
+    "nfiq2_scene": 13.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 17.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 17.0,
+    "periodUsed_sceneFix": 3.2,
+    "nfiq2_guideFix": 15.0,
+    "periodUsed_guideFix": 12.5
+  },
+  {
+    "captureId": "14674391-c65c-4c84-8e36-04b1c0690137",
+    "padPeriodPx": 19.0,
+    "nfiq2_scene": 24.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 9.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 25.0,
+    "periodUsed_sceneFix": 3.0,
+    "nfiq2_guideFix": 13.0,
+    "periodUsed_guideFix": 11.9
+  },
+  {
+    "captureId": "17dbee53-fa31-470f-859d-7a79013fdeb4",
+    "padPeriodPx": 20.0,
+    "nfiq2_scene": 26.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 12.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 25.0,
+    "periodUsed_sceneFix": 3.2,
+    "nfiq2_guideFix": 5.0,
+    "periodUsed_guideFix": 12.5
+  },
+  {
+    "captureId": "181e8cd8-85b6-44ac-a970-74fdc0ff7d99",
+    "padPeriodPx": 15.0,
+    "nfiq2_scene": 23.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 15.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 16.0,
+    "periodUsed_sceneFix": 2.4,
+    "nfiq2_guideFix": 7.0,
+    "periodUsed_guideFix": 9.4
+  },
+  {
+    "captureId": "1863e50f-b47c-4a59-9401-2b1b7b420554",
+    "padPeriodPx": 9.0,
+    "nfiq2_scene": 26.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 35.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 31.0,
+    "periodUsed_sceneFix": 1.4,
+    "nfiq2_guideFix": 43.0,
+    "periodUsed_guideFix": 5.1
+  },
+  {
+    "captureId": "19184018-be77-4320-9648-42f44ba5a35b",
+    "padPeriodPx": 15.5,
+    "nfiq2_scene": 12.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": 11.0,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 15.0,
+    "periodUsed_sceneFix": 2.5,
+    "nfiq2_guideFix": 10.0,
+    "periodUsed_guideFix": 9.7
+  },
+  {
+    "captureId": "1c019820-5052-444c-be89-ef86b0345fdf",
+    "padPeriodPx": 20.0,
+    "nfiq2_scene": 19.0,
+    "periodUsed_scene": 50.0,
+    "nfiq2_guide": null,
+    "periodUsed_guide": 50.0,
+    "nfiq2_sceneFix": 14.0,
+    "periodUsed_sceneFix": 3.2,
+    "nfiq2_guideFix": 31.0,
+    "periodUsed_guideFix": 12.5
+  }
+]

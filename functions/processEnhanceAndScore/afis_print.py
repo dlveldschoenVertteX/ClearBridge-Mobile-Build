@@ -84,6 +84,36 @@ _FADE_INSET_PX = 25.0       # 2026-08-03: real visual-QA finding -- a hard mask
 # toward white over the same distance as they approach the edge, so the
 # print visually thins out and terminates before the crop boundary rather
 # than being sliced by it -- see the distance-transform blend below.
+# Mask-restricted ridge-wavelength estimation ( _ridge_wavelength's new
+# `mask` param, round 46), deliberately OFF pending its own real NFIQ2/
+# matchability check -- same discipline as _UNET_GUIDE_SEED_ENABLED above.
+# See that function's docstring and fusion_brain/results/ for the real
+# measurement this is gated on.
+_WAVELENGTH_MASK_RESTRICT = False
+
+# Grey-fill background before the default Gabor pass (round 47), gated
+# pending its own real NFIQ2 check -- see that section's own comment below
+# for the mechanism and fusion_brain/results/ for the measurement.
+_GABOR_BOUNDARY_FEATHER = False
+_GABOR_BOUNDARY_FEATHER_SIGMA = 8.0
+
+# Apply the already-validated sweep flash-softness guard
+# (flash_pair_sharpness_ratio / _FLASH_PAIR_MAX_SHARPNESS_RATIO, calibrated
+# 2026-08-12 on real sweep captures: 5/5 zones and 2/2 mosaics scored LOWER
+# after fusing a pair where flash ran 2.8-17.8x softer than ambient, up to
+# -13 NFIQ2, zero counter-examples) to front_only_v1's OWN fuse variants
+# (fuseAvg/fuseMaxc/fuseSoft/deepFuse/deepMaxc/...), which have never had
+# this guard at all despite this project's own repeated documentation that
+# the main burst's flash frames hit the identical torch-blowout pattern
+# (round 42: ambient Laplacian 3.4x flash's on real front bursts). Verified
+# on THIS population (round 48, real generate() end-to-end, real NFIQ2,
+# n=12): 3 controls exact no-op, 3 real deltas +13/-1/-3 (mean +3.0), 6
+# forfeit to None (whole burst uniformly blown out -- safe, another variant
+# competes) -- net positive, no control regressed. See
+# fusion_brain/results/FUSE_SOFTNESS_GUARD_FINDINGS.md.
+_FUSE_FLASH_SOFTNESS_GUARD = True
+
+
 _FREQ_SCALE_MIN = 0.7       # was 0.35 -- the real Firestore correlation (24 scored captures)
 # shows every capture whose winning variant applied a rescale below ~0.7 (i.e. shrinking
 # native ridge period by more than ~30%) scored catastrophically on REAL nfiq2Score
@@ -107,6 +137,26 @@ _MASK_COVER_DILATE = 1.3    # grow the guide oval by this factor to form the OUT
 # noise-limited) cannot finely arbitrate a fidelity gain from coverage, so this is a
 # conservative choice honouring the explicit "cover the pad" ask with limited downside --
 # confirm on-device before trusting further expansion. See CLAUDE.md "whole-pad coverage".
+
+# Guide-seeded component selection inside `_unet_mask` -- built and measured
+# 2026-08-27 (round 45), deliberately OFF.
+#
+# It works: 10/13 real captures locate the pad vs argmax(area)'s 9/13, verified
+# in this exact code path, +3 NFIQ2 on the one capture it changes and
+# byte-identical on the rest. The reason it is not enabled is the control run
+# in the same round: content-aware refinement OFF beats refinement ON by 2.92
+# NFIQ2 across 24 real captures (72.50 vs 69.58, worse on 13 of 24), equally
+# for both detectors. If refinement is net-negative, making the U-Net succeed
+# more often makes a losing mechanism fire more often -- the +3 would be a coin
+# flip that happened to land well.
+#
+# What would justify turning this on: refinement shown to help on real
+# MATCHABILITY, not NFIQ2. That needs the >=500-DPI scanner reference this
+# project has been blocked on throughout; NFIQ2 cannot tell "removed useful
+# ridge area" from "removed non-pad content NFIQ2 was happy to count", and
+# round 43's crease-trim result is the standing proof that it gets that
+# distinction wrong here. See fusion_brain/results/MASKING_FINDINGS.md.
+_UNET_GUIDE_SEED_ENABLED = False
 
 _FLASH_DIFF_MIN_FLASH_LAPLACIAN = 50.0  # below this, treat the flash frame as
 # blown-out and don't trust it for flash-diff segmentation (2026-07-23: real capture
@@ -370,9 +420,38 @@ def _fomfe_orientation_field(img: np.ndarray, mask: np.ndarray,
     return 0.5 * np.arctan2(sn_blend, cs_blend) + np.pi / 2
 
 
-def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> float:
+def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32,
+                      mask: Optional[np.ndarray] = None) -> float:
+    """`mask`, added 2026-08-27 (round 46): restrict which blocks contribute
+    to the pad, when one is available.
+
+    Real defect measured on 24 real recent front_only_v1 captures
+    (`fusion_brain/diag_wavelength_mask_leak.py`): this function scans the
+    FULL, un-cropped frame -- no mask parameter existed before this -- and
+    the guide occupies only ~3% of that frame's area. Across the population,
+    **96% of every block that ever contributes a frequency sample sits
+    OUTSIDE the guide**. Round 33 already measured, on a real capture, that
+    background can carry HIGHER local contrast than the pad itself
+    (Laplacian 2282 background vs 1619 pad, same frame) -- so the bare
+    `std() >= 8` gate below has no reason to prefer pad content, and at this
+    area ratio it structurally can't: even a pad with every block passing
+    would be outnumbered roughly 30:1 by background candidates. On 11/23
+    captures the reported wavelength moves by >=1px once restricted to the
+    pad (mean |delta| 2.2px, max 9px) -- this is the estimate that decides
+    `freq_normalize`'s resample scale for the whole Gabor bank, so a few px
+    here is not a rounding error.
+
+    Backward compatible by construction: every existing call site that
+    doesn't pass `mask` is byte-for-byte unaffected (this parameter is
+    additive, not a signature change to anything already in use). When a
+    mask IS passed, falls back to the full unmasked population if zero
+    in-mask blocks qualify -- can only ever narrow toward better-targeted
+    real content, never regress a capture that had no real pad signal to
+    find in the first place.
+    """
     h, w = img.shape
     freqs = []
+    in_freqs = []
     for y in range(0, h - bsize, bsize):
         for x in range(0, w - bsize, bsize):
             blk = img[y:y + bsize, x:x + bsize]
@@ -404,6 +483,10 @@ def _ridge_wavelength(img: np.ndarray, orient: np.ndarray, bsize: int = 32) -> f
             peaks = peaks[peaks > 3]
             if len(peaks):
                 freqs.append(peaks[0])
+                if mask is not None and mask[y + bsize // 2, x + bsize // 2] > 0:
+                    in_freqs.append(peaks[0])
+    if mask is not None and in_freqs:
+        return float(np.clip(np.median(in_freqs), 5, 20))
     if not freqs:
         return 9.0
     return float(np.clip(np.median(freqs), 5, 20))
@@ -1286,8 +1369,40 @@ def _front_anchored_mosaic_zones(
     return mos, adj_guide, used
 
 
-def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
-    """Thumb mask via the shared U-Net ONNX session (None if unavailable)."""
+def _unet_mask(gray: np.ndarray,
+               guide_region: Optional[dict] = None) -> Optional[np.ndarray]:
+    """Thumb mask via the shared U-Net ONNX session (None if unavailable).
+
+    `guide_region` picks WHICH connected component to keep. Without it this
+    falls back to the largest by area, which is what this function did
+    exclusively until 2026-08-27.
+
+    Why that mattered, measured on 24 real recent front_only_v1 captures
+    (`fusion_brain/test_unet_guide_seed.py`): the U-Net is the detector on 13
+    of them and fails to locate the pad on 4 -- a 31% miss rate, against
+    flash-diff's 0/11 on the same population. Every miss is MIS-LOCATION: a
+    real blob exists, it just does not overlap the guide (survivors of the
+    bound intersection: 0%, 3%, 13%, 10%), never over- or under-segmentation.
+
+    That failure shape has a specific cause. `ml/thumb_seg/build_dataset.py`
+    generates this model's pseudo-labels by calling
+    `_segment_via_flash_diff(amb, fl, _KSIZE)` with NO seed -- i.e. with the
+    pre-round-16 frame-centre seed, the exact 555px error round 16 found and
+    fixed in production but never regenerated labels for. So the model was
+    distilled from a detector aimed at the wrong point and learned "the
+    near-camera blob near the frame centre" rather than "the guided pad".
+    Retraining against correctly-seeded labels is the root-cause fix; this is
+    the cheap inference-side mitigation.
+
+    ADDITIVE, deliberately. A straight swap to guide-seeded selection was
+    measured first and came out a WASH -- 9/13 either way: it recovered
+    474b4d6a but lost 774f2252, where the guide-centre pixel landed in a small
+    neighbouring component that failed the >=3% area floor. Falling back to
+    argmax whenever the seeded pick is unusable keeps the recovery without the
+    loss (10/13), and structurally can only ever turn a reject into an accept.
+    Confirmed end-to-end with the real NFIQ2 binary: 1 better (474b4d6a
+    73 -> 76), 0 worse, the other four byte-identical.
+    """
     try:
         import sfm_pipeline
         session = sfm_pipeline._get_thumb_seg_session()
@@ -1301,10 +1416,24 @@ def _unet_mask(gray: np.ndarray) -> Optional[np.ndarray]:
         m = cv2.resize(m, (gray.shape[1], gray.shape[0]), interpolation=cv2.INTER_NEAREST)
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((31, 31), np.uint8))
         m = cv2.morphologyEx(m, cv2.MORPH_OPEN, np.ones((21, 21), np.uint8))
-        n, lab, stats, _ = cv2.connectedComponentsWithStats(m)
+        n, lab, stats, cents = cv2.connectedComponentsWithStats(m)
         if n > 1:
-            big = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-            m = (lab == big).astype(np.uint8) * 255
+            big = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+            keep = big
+            if guide_region is not None:
+                h_img, w_img = m.shape[:2]
+                gx = int(min(w_img - 1, max(0, float(guide_region.get('cx', 0.5)) * w_img)))
+                gy = int(min(h_img - 1, max(0, float(guide_region.get('cy', 0.5)) * h_img)))
+                seeded = int(lab[gy, gx])
+                if seeded == 0:     # guide centre sits on background
+                    d = [np.hypot(cents[i][0] - gx, cents[i][1] - gy) for i in range(1, n)]
+                    seeded = 1 + int(np.argmin(d))
+                # Only take the seeded component if it is itself plausible --
+                # otherwise keep production's argmax pick. This is what makes
+                # the change additive rather than a swap; see the docstring.
+                if (lab == seeded).mean() >= 0.03:
+                    keep = seeded
+            m = (lab == keep).astype(np.uint8) * 255
         if (m > 0).mean() < 0.03:   # implausibly small — treat as failed
             return None
         return m
@@ -1387,7 +1516,8 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
                        min_circvar: float = _CREASE_MIN_CIRCVAR,
                        min_run_frac: float = _CREASE_MIN_RUN_FRAC,
                        max_trim_frac: float = _CREASE_MAX_TRIM_FRAC,
-                       smooth_px: int = _CREASE_SMOOTH_PX
+                       smooth_px: int = _CREASE_SMOOTH_PX,
+                       orient_src: Optional[np.ndarray] = None
                        ) -> Tuple[np.ndarray, np.ndarray]:
     """Trims print area toward the BASE half only (never the tip -- matches
     the CTO's own annotated photo, which flagged only the bottom boundary as
@@ -1418,10 +1548,34 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     trust the one point in the pipeline with a guaranteed, deterministic
     orientation contract, not an intermediate space's own field names.
 
-    Runs `_orientation_field` directly on the binarized ridge image --
-    already clean, high-contrast black/white content, which gives a
-    stronger edge signal for this purpose than the noisier pre-binarization
-    grayscale would.
+    `orient_src`, when given, is the image the orientation field is measured
+    on INSTEAD of `binimg`. `generate()` passes the pre-Gabor normalized
+    grayscale, in this same post-rotation geometry.
+
+    REAL CIRCULARITY this fixes, found 2026-08-27 from a direct CTO report
+    that a print was "enhancing everything past the crease at the bottom".
+    This function used to measure the binarized image, on the reasoning that
+    clean high-contrast black/white gives a stronger edge signal than the
+    noisier grayscale. That reasoning is sound about edge STRENGTH and wrong
+    about what is being asked: by then the Gabor bank has already run, and
+    this project has already documented that the bank "will impose ridge-like
+    structure on any input with enough local contrast". So the crease is
+    handed to the detector already wearing plausible, varied ridge flow --
+    the detector is reading data the enhancer has made fingerprint-shaped.
+
+    Measured on real capture b615f37b, where the trim did not fire and the
+    below-crease region survived into the delivered print:
+
+        base-half circular variance   post-Gabor   pre-Gabor
+        median                            0.506       0.181
+        longest run below threshold        27px       162px
+        fires (needs >= 29px)                no         yes
+
+    On two captures where the trim already fired (01662ffb, 8ed1c600) the
+    pre-Gabor measure fires as well, with longer runs -- so this changes the
+    captures that were failing without flipping the ones that were working.
+    Falls back to `binimg` when no source is supplied, so every other caller
+    keeps the previous behaviour exactly.
 
     Real, deliberate choice: scans from the CENTRE outward (not from the
     base edge inward) and requires a sustained run (on a SMOOTHED profile,
@@ -1445,7 +1599,11 @@ def _trim_base_crease(binimg: np.ndarray, mask: np.ndarray,
     span = y1 - y0
     if span < 40:
         return binimg, mask
-    orient = _orientation_field(binimg.astype(np.float32))
+    src = binimg if orient_src is None else orient_src
+    if src.shape[:2] != binimg.shape[:2]:
+        src = cv2.resize(src, (binimg.shape[1], binimg.shape[0]),
+                         interpolation=cv2.INTER_AREA)
+    orient = _orientation_field(src.astype(np.float32))
     mid_y = y0 + span // 2
 
     raw = np.full(y1 - y0 + 1, np.nan, dtype=np.float32)
@@ -1582,12 +1740,42 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
         ab = [g for g in (ambient_burst or []) if g is not None]
         fb = [g for g in (flash_burst or []) if g is not None]
         seed_cx = seed_cy = None
+        # Same pad-crop bbox `flash_pair_sharpness_ratio` already uses, and
+        # for the identical reason its own docstring states: "a whole-frame
+        # Laplacian is dominated by background texture and says almost
+        # nothing about the ridge content" -- this guard used to measure
+        # `f_lap` on the WHOLE frame, which for a close-up/macro shot with
+        # a large dark, low-texture background can drag a genuinely fine
+        # in-focus flash frame's variance below the threshold on background
+        # alone. Real case found 2026-09-03: a macro flash frame measured
+        # 49.5 whole-frame (just under the 50.0 guard, wrongly skipped) vs
+        # 60.2 restricted to the guide's own pad crop -- same frame, same
+        # pixels that actually matter, different verdict.
+        gx0 = gx1 = gy0 = gy1 = None
         if guide_region:
             try:
                 seed_cx = float(guide_region['cx']) * shape[1]
                 seed_cy = float(guide_region['cy']) * shape[0]
+                # Dilated by _MASK_COVER_DILATE, the SAME factor the final
+                # mask itself is later allowed to expand past the raw guide
+                # by (below) -- measuring the guard over a narrower,
+                # un-dilated bbox understated real contrast here on a real
+                # macro capture (48.6, still under the guard) vs the
+                # dilated crop (56.9, clears it): macro's guide is the
+                # FRONT phase's own tight box reused at a closer working
+                # distance, so the pad now fills more of frame than that
+                # box alone assumes, and a plain un-dilated crop samples
+                # only the smoothest, most torch-saturated centre of the
+                # pad rather than the ridge-bearing area around it.
+                rx = float(guide_region['rx']) * shape[1] * _MASK_COVER_DILATE
+                ry = float(guide_region['ry']) * shape[0] * _MASK_COVER_DILATE
+                gx0 = max(0, int(seed_cx - rx)); gx1 = min(shape[1], int(seed_cx + rx))
+                gy0 = max(0, int(seed_cy - ry)); gy1 = min(shape[0], int(seed_cy + ry))
+                if gx1 - gx0 < 16 or gy1 - gy0 < 16:
+                    gx0 = gx1 = gy0 = gy1 = None
             except (KeyError, TypeError, ValueError):
                 seed_cx = seed_cy = None
+                gx0 = gx1 = gy0 = gy1 = None
         for a, f in zip(ab, fb):
             a_gray = a if a.ndim == 2 else cv2.cvtColor(a, cv2.COLOR_BGR2GRAY)
             f_gray = f if f.ndim == 2 else cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
@@ -1597,8 +1785,13 @@ def _flash_diff_mask(ambient_burst: Optional[List[np.ndarray]],
             # own comment. A saturated/clipped flash frame has too little local
             # gradient left for the torch-falloff cue to work, and produces a
             # noisy mask rather than failing cleanly -- skip this pair (try the
-            # next burst pair, if any) rather than trust it.
-            f_lap = float(cv2.Laplacian(f_gray, cv2.CV_64F).var())
+            # next burst pair, if any) rather than trust it. Measured on the
+            # guide's own pad crop when available (see above), whole-frame
+            # only as the fallback with no guide_region -- matches every
+            # other caller of _segment_via_flash_diff (arc_sweep/oscillating),
+            # unaffected by this change.
+            f_region = f_gray[gy0:gy1, gx0:gx1] if gx0 is not None else f_gray
+            f_lap = float(cv2.Laplacian(f_region, cv2.CV_64F).var())
             if f_lap < _FLASH_DIFF_MIN_FLASH_LAPLACIAN:
                 logger.info('flash-diff: skipping blown-out flash frame (lap=%.1f < %.0f)',
                             f_lap, _FLASH_DIFF_MIN_FLASH_LAPLACIAN)
@@ -2862,7 +3055,13 @@ def generate(
         if df is not None and df.ndim != 2:
             df = cv2.cvtColor(df, cv2.COLOR_BGR2GRAY)
         if da is not None and df is not None:
-            fused = _fuse_flash_ambient(da, df, mode=_deep_mode)
+            _da_df_ratio = (flash_pair_sharpness_ratio(da, df, guide_region)
+                            if _FUSE_FLASH_SOFTNESS_GUARD else None)
+            _da_df_ok = (_da_df_ratio is None
+                        or _da_df_ratio <= _FLASH_PAIR_MAX_SHARPNESS_RATIO)
+            fused = _fuse_flash_ambient(da, df, mode=_deep_mode) if _da_df_ok else None
+            if _FUSE_FLASH_SOFTNESS_GUARD and not _da_df_ok:
+                params['afisFuseSoftnessSkipped'] = round(_da_df_ratio, 2)
             gray = fused if fused is not None else da
         elif da is not None or df is not None:
             gray = da if da is not None else df
@@ -2892,6 +3091,11 @@ def generate(
                             key=_pair_key)
         fused = None
         for i in pair_cands:
+            if _FUSE_FLASH_SOFTNESS_GUARD:
+                _pratio = flash_pair_sharpness_ratio(
+                    ambient_frames[i], flash_frames[i], guide_region)
+                if _pratio is not None and _pratio > _FLASH_PAIR_MAX_SHARPNESS_RATIO:
+                    continue
             fused = _fuse_flash_ambient(ambient_frames[i], flash_frames[i], mode=fuse)
             if fused is not None:
                 gray = fused
@@ -2919,6 +3123,11 @@ def generate(
                 range(_n),
                 key=lambda i: -min(_ridge_energy(_burst_amb[i]), _ridge_energy(_burst_fla[i])))
             for i in _burst_pairs:
+                if _FUSE_FLASH_SOFTNESS_GUARD:
+                    _pratio = flash_pair_sharpness_ratio(
+                        _burst_amb[i], _burst_fla[i], guide_region)
+                    if _pratio is not None and _pratio > _FLASH_PAIR_MAX_SHARPNESS_RATIO:
+                        continue
                 fused = _fuse_flash_ambient(_burst_amb[i], _burst_fla[i], mode=fuse)
                 if fused is not None:
                     gray = fused
@@ -3075,7 +3284,8 @@ def generate(
             pad_mask = _flash_diff_mask(ambient_burst, flash_burst, gray.shape[:2], guide_region)
             refine_tag = 'flashdiff'
             if pad_mask is None:
-                pad_mask = _unet_mask(gray)
+                pad_mask = _unet_mask(
+                    gray, guide_region if _UNET_GUIDE_SEED_ENABLED else None)
                 refine_tag = 'unet'
         if pad_mask is not None:
             # Real bug found 2026-07-23 (capture dadd4ef9): a noisy detector
@@ -3158,9 +3368,21 @@ def generate(
     # enhancement (mask stays at native res for the U-Net; only the Gabor stage
     # sees the resampled version). Grid search over real captures: consistent
     # NFIQ gain when the estimate is reliable.
+    #
+    # "on the MASKED pad" above was aspirational, not actual, until
+    # `_WAVELENGTH_MASK_RESTRICT` (round 46) -- `_ridge_wavelength` had no
+    # mask parameter at all before this, and scanned the full un-cropped
+    # frame. Measured on 24 real recent captures
+    # (fusion_brain/diag_wavelength_mask_leak.py): the guide occupies ~3% of
+    # frame area, and 96% of every contributing block sat OUTSIDE it -- on
+    # 11/23 captures restricting to the pad moves the reported wavelength by
+    # >=1px (mean 2.2, max 9). Gated behind this flag pending the real
+    # NFIQ2/matchability check every other change in this pipeline gets
+    # before shipping -- see fusion_brain/results/ once that lands.
     norm0 = _normalize(g8)
     orient0 = _orientation_field(norm0)
-    native_wl = _ridge_wavelength(norm0, orient0)
+    native_wl = _ridge_wavelength(
+        norm0, orient0, mask=mask if _WAVELENGTH_MASK_RESTRICT else None)
     params['afisWavelengthPx'] = float(round(native_wl, 1))
     # Diagnostic-only, unclipped, multi-peak-averaged companion measurement
     # -- see _ridge_wavelength_robust's docstring. Does NOT feed the
@@ -3336,12 +3558,46 @@ def generate(
             params['afisEnhance'] = 'fomfe'
         else:
             params['afisEnhance'] = 'fomfe_unavailable'
+    pre_gabor_gray: Optional[np.ndarray] = None
     if binimg is None:
         # Either enhance == 'gabor', or a pyfing path was requested but the
         # sidecar wasn't configured/reachable -- same non-blocking contract
         # as every other optional signal in this module (fall back, don't
         # fail).
-        norm = _normalize(g8)
+        #
+        # Boundary-feather (round 47), gated OFF pending its own NFIQ2 check.
+        # `_orientation_field` (boxFilter _BLOCK=16 + Gaussian _ORIENT_SMOOTH
+        # =15) and `_gabor_enhance` (kernel radius ~18-39px at wl 9-20) both
+        # run on the WHOLE frame here -- background is still sitting in `g8`
+        # at this point, and neither function is mask-aware. `binimg[mask==0]
+        # =255` only discards the OUTPUT afterwards; it cannot undo a
+        # boundary-adjacent PAD pixel's orientation/Gabor response having
+        # been computed partly from background content within the kernel's
+        # reach. `_FADE_INSET_PX=25` (the band that keeps some Gabor output
+        # near the edge, applied further down) overlaps this same reach, so
+        # real delivered ridge content near the pad edge can be measurably
+        # background-influenced, not just wasted computation on discarded
+        # output. A different mechanism from the already-refuted Phase 7-8
+        # "mask-aware `_normalize`" experiment (byte-identical there, because
+        # `_normalize` reduces to a pure global affine map that gradient/
+        # contrast-sensitive orientation and Gabor filtering don't share).
+        #
+        # Replaces background with the in-mask mean, feathered at the
+        # boundary (small Gaussian on the fill alpha, not a hard step) so
+        # this can't manufacture the exact "ridge terminating on one curve"
+        # artifact `_FADE_INSET_PX` exists to avoid downstream -- deliberately
+        # a much narrower feather than that constant (`_GABOR_BOUNDARY_FEATHER
+        # _SIGMA=8` vs `_FADE_INSET_PX=25`), since the goal here is to
+        # suppress background content close to the boundary, not soften a
+        # wide band of it.
+        g8_in = g8
+        if _GABOR_BOUNDARY_FEATHER and mask is not None and (mask > 0).any():
+            fill_val = float(g8[mask > 0].mean())
+            alpha = cv2.GaussianBlur((mask == 0).astype(np.float32), (0, 0),
+                                     sigmaX=_GABOR_BOUNDARY_FEATHER_SIGMA)
+            g8_in = (g8.astype(np.float32) * (1.0 - alpha)
+                     + fill_val * alpha).astype(np.uint8)
+        norm = _normalize(g8_in)
         orient = _orientation_field(norm)
         enh = _gabor_enhance(
             norm, orient, wl,
@@ -3350,6 +3606,14 @@ def generate(
             gamma=(gabor_gamma if gabor_gamma is not None else _GABOR_GAMMA),
         )
         binimg = 255 - (enh < 0).astype(np.uint8) * 255   # ridges black on white
+        # Kept for the crease trim, which must NOT measure ridge orientation
+        # on the Gabor output -- see _trim_base_crease's own docstring for
+        # the circularity that causes and the real capture that found it.
+        # Only this branch is wired: it is the path every production
+        # front_only_v1 variant that has ever won selection goes through
+        # (native / freqNorm). The denoise-pre-pass branches fall back to
+        # the previous behaviour rather than being changed untested.
+        pre_gabor_gray = norm
         params.setdefault('afisEnhance', 'gabor')
 
     # Sub-pixel anti-alias pass (2026-08-03, visual-QA finding, MEASURED
@@ -3404,13 +3668,34 @@ def generate(
     alpha = cv2.GaussianBlur(alpha, (0, 0), sigmaX=_FEATHER_SIGMA)
     binimg = (binimg.astype(np.float32) * alpha +
               255.0 * (1.0 - alpha)).astype(np.uint8)
+    # The crease trim runs post-rotation (see its docstring), so its
+    # orientation source has to make the same trip. Rotated with the SAME
+    # pre-rotation mask -- captured before the reassignment below, since
+    # `mask` is about to become the rotated one.
+    _mask_pre_rot = mask
+    _pre_rot_src = None
+    if pre_gabor_gray is not None:
+        _pre_rot_src = cv2.normalize(pre_gabor_gray.astype(np.float32), None,
+                                     0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if _pre_rot_src.shape[:2] != binimg.shape[:2]:
+            # freq_normalize resamples, so this can be at a different scale.
+            # Resize rather than drop it: the question asked of this image is
+            # about orientation structure, which a resample preserves.
+            _pre_rot_src = cv2.resize(_pre_rot_src,
+                                      (binimg.shape[1], binimg.shape[0]),
+                                      interpolation=cv2.INTER_AREA)
     if guide_region is not None and guide_mask is not None and 'tipAngleDeg' in guide_region:
         # Deterministic upright from the guide's known tip direction -- the pad
         # silhouette is near-symmetric, so PCA (_upright_rotate) can pick the
         # wrong axis; the app tells us exactly which way the tip points.
-        binimg, mask = _upright_from_tip(binimg, mask, float(guide_region['tipAngleDeg']))
+        _tip = float(guide_region['tipAngleDeg'])
+        binimg, mask = _upright_from_tip(binimg, mask, _tip)
+        if _pre_rot_src is not None:
+            _pre_rot_src = _upright_from_tip(_pre_rot_src, _mask_pre_rot, _tip)[0]
     else:
         binimg, mask = _upright_rotate(binimg, mask)
+        if _pre_rot_src is not None:
+            _pre_rot_src = _upright_rotate(_pre_rot_src, _mask_pre_rot)[0]
     params['afisRotated'] = True
 
     # Base-crease trim (2026-08-17, CTO-directed: "pad isolation needs to be
@@ -3423,10 +3708,13 @@ def generate(
     # own cy/ry) trimmed the wrong axis entirely.
     if crease_trim:
         pre_cov = int((mask > 0).sum())
-        binimg, mask = _trim_base_crease(binimg, mask)
+        binimg, mask = _trim_base_crease(binimg, mask,
+                                         orient_src=_pre_rot_src)
         trimmed_px = pre_cov - int((mask > 0).sum())
         if trimmed_px > 0:
             params['afisCreaseTrimPx'] = trimmed_px
+            params['afisCreaseTrimSrc'] = (
+                'preGabor' if _pre_rot_src is not None else 'binarized')
 
     # Circular/elliptical vignette (2026-08-17, CTO request: "have the
     # feathing be circular so it mimics real fingerprint scanner prints").

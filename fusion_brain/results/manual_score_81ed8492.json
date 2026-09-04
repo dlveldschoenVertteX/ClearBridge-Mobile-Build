@@ -1,0 +1,54 @@
+{
+ "front_native": [
+  50.0,
+  "guide+flashdiff"
+ ],
+ "front_freqNorm": [
+  60.0,
+  "guide+flashdiff"
+ ],
+ "front_fuseAvg": [
+  null,
+  null
+ ],
+ "front_fuseMaxc": [
+  null,
+  null
+ ],
+ "front_deepFuse": [
+  59.0,
+  "guide+flashdiff"
+ ],
+ "front_deepMaxc": [
+  59.0,
+  "guide+flashdiff"
+ ],
+ "macro_native": [
+  34.0,
+  "guide"
+ ],
+ "sweep_left": [
+  41.0,
+  "guide+flashdiff"
+ ],
+ "sweep_center": [
+  49.0,
+  "guide+flashdiff"
+ ],
+ "sweep_right": [
+  42.0,
+  "guide+flashdiff"
+ ],
+ "tilt_left": [
+  57.0,
+  "guide+flashdiff"
+ ],
+ "tilt_tip": [
+  39.0,
+  "guide+flashdiff"
+ ],
+ "tilt_right": [
+  52.0,
+  "guide+flashdiff"
+ ]
+}

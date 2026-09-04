@@ -34,7 +34,8 @@ _GRID   = 64   # output grid size from Stage 1 NNS
 
 # ── Public entry point ────────────────────────────────────────────────────────
 
-def enhance(image: np.ndarray, sfm_coverage: float = 1.0, config: dict | None = None) -> tuple:
+def enhance(image: np.ndarray, sfm_coverage: float = 1.0, config: dict | None = None,
+           roi_box: tuple[int, int, int, int] | None = None) -> tuple:
     """
     Accepts any square uint8 grayscale image (output of sfm_pipeline).
     Resizes to 512×512 (NNS fixed input shape), then runs CLAHE and adaptive
@@ -42,6 +43,33 @@ def enhance(image: np.ndarray, sfm_coverage: float = 1.0, config: dict | None = 
     Returns (512×512 uint8 enhanced fingerprint, params_dict) for NFIQ scoring.
 
     sfm_coverage: fraction [0,1] of the cylindrical texture covered by real data.
+    roi_box: optional (x0, y0, x1, y1) in 512-space -- e.g. the guide region --
+             restricting where the ridge FREQUENCY and ORIENTATION are measured.
+             Everything else about `image` is untouched: CLAHE, the UNet, and
+             the final filter are still applied to the WHOLE frame. Only the
+             measurement region narrows.
+
+             REAL BUG this exists to fix, found 2026-08-27 from a direct CTO
+             report of diagonal streaking through a real enhanced print.
+             `_ridge_pass` (the Stage-3 filter, active on every real
+             production capture -- confirmed via enhancementParams on real
+             captures, nnsStage: 3) derives BOTH its frequency (via
+             `_estimate_ridge_frequency`) and its single dominant ORIENTATION
+             (via `_sharpest_roi`) from the highest-Laplacian-variance
+             quadrant of the WHOLE 512x512 scene, then stamps ONE Gabor
+             kernel at that one frequency/orientation across the entire
+             image, pad and background alike. On a capture shot over
+             something with strong coherent texture -- decking, a blind --
+             that quadrant is background, and the resulting streaks run
+             straight through the thumb. Isolating the filter (unet_weight=0)
+             on a real streaked capture reproduces the artifact almost
+             exactly; isolating the UNet (unet_weight=1) does not -- this is
+             the mechanism, not a guess. `roi_box` lets the two estimates
+             be told where the pad actually is (the guide region, same as
+             AFIS already uses) without changing what the rest of the
+             pipeline sees, since feeding the CROP itself as the whole input
+             was tested separately and measured negative (loses CLAHE/UNet
+             context) -- a different variable from this one.
     config: optional dict of parameter overrides for offline optimization. When
             None, production defaults are used. Keys and defaults:
               clahe_clip_normal  (1.5)   — CLAHE clip for well-exposed frames
@@ -83,16 +111,31 @@ def enhance(image: np.ndarray, sfm_coverage: float = 1.0, config: dict | None = 
     # before the first inference always chose the slow 32-filter bank incorrectly.
     _ensure_nns_loaded()
 
+    # ROI-restricted measurement region: the guide box when given, clamped
+    # to the 512x512 frame; None (whole frame) otherwise -- see enhance()'s
+    # own docstring for why this exists.
+    roi_img = normalised
+    if roi_box is not None:
+        rx0, ry0, rx1, ry1 = roi_box
+        rx0, ry0 = max(0, int(rx0)), max(0, int(ry0))
+        rx1, ry1 = min(512, int(rx1)), min(512, int(ry1))
+        if rx1 - rx0 >= 32 and ry1 - ry0 >= 32:
+            roi_img = normalised[ry0:ry1, rx0:rx1]
+
     # 3.2 — Gabor ridge enhancement (scale tuned to measured ridge period)
     # When Stage 3 UNet is active, replace the 32-filter bank with a single
     # oriented ridge pass (~32× faster).  UNet dominates at unet_w; the
     # Gabor contribution needs only one filter at the dominant orientation.
     # Full 32-filter bank is kept for Stage 1 where Gabor carries 60% weight.
-    freq             = _estimate_ridge_frequency(normalised)
+    freq             = _estimate_ridge_frequency(roi_img)
     period           = min(1.0 / freq, 30.0)
     gabor_wavelengths = sorted(set(max(4, int(round(period * m))) for m in (0.75, 0.875, 1.0, 1.125)))
     if _nns_stage == 3:
-        gabor_fixed = _ridge_pass(normalised, freq=freq)   # 1 filter, dominant orientation
+        # Orientation estimated on roi_img too (ridge_pass's own default,
+        # `_sharpest_roi(image)`, is exactly the whole-frame call this
+        # narrows) -- the FILTER still applies to the whole frame; only
+        # where its frequency/orientation are measured changes.
+        gabor_fixed = _ridge_pass(normalised, freq=freq, orient_src=roi_img)
     else:
         gabor_fixed = _multiscale_gabor(normalised, freq=freq)
 
@@ -448,7 +491,8 @@ def ink_scanner_style(image: np.ndarray, strength: float = 7.0) -> np.ndarray:
 
 # ── Step 3.6: Ridge-orientation final pass ────────────────────────────────────
 
-def _ridge_pass(image: np.ndarray, freq: float | None = None) -> np.ndarray:
+def _ridge_pass(image: np.ndarray, freq: float | None = None,
+                orient_src: np.ndarray | None = None) -> np.ndarray:
     """
     Single-orientation Gabor pass tuned to the detected ridge frequency and dominant
     ridge direction. Adds 20% ridge-frequency contrast on top of the post-processed
@@ -457,13 +501,21 @@ def _ridge_pass(image: np.ndarray, freq: float | None = None) -> np.ndarray:
     Uses circular mean of doubled Sobel angles to avoid the 0°/180° ambiguity in
     ridge orientation estimation (ridges are symmetric; doubling maps both halves
     to the same semicircle, mean gives the dominant orientation).
+
+    `orient_src`, when given, is measured INSTEAD of `image` for the dominant-
+    orientation estimate (e.g. enhance()'s guide-restricted roi_img). The
+    single resulting kernel is still applied to the full `image` -- this
+    changes only WHERE the one orientation is measured, not where the filter
+    runs. Falls back to `_sharpest_roi(image)` -- the whole-frame default --
+    when absent, so every other caller is unchanged. See enhance()'s
+    docstring for the real streaking artifact this was built to fix.
     """
     freq   = freq if freq is not None else _estimate_ridge_frequency(image)
     period = min(1.0 / freq, 30.0)
     wl     = max(4, int(round(period)))
 
     # Dominant ridge orientation from the sharpest quadrant (avoids centre seam artefacts)
-    roi    = _sharpest_roi(image)
+    roi    = _sharpest_roi(orient_src) if orient_src is not None else _sharpest_roi(image)
     gx     = cv2.Sobel(roi, cv2.CV_32F, 1, 0, ksize=3)
     gy     = cv2.Sobel(roi, cv2.CV_32F, 0, 1, ksize=3)
     # Double the gradient angle → circular mean → halve back: resolves 0°/180° ambiguity

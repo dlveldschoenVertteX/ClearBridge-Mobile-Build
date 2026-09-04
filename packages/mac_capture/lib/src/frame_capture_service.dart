@@ -832,6 +832,61 @@ class HybridCaptureService {
     return n > 0 ? sum / n : 0.0;
   }
 
+  /// Fraction (0-1) of sampled Y-plane pixels at or above [threshold],
+  /// optionally restricted to [roi] -- i.e. how much of the region is
+  /// CLIPPED, not how bright it is on average.
+  ///
+  /// Exists because mean luminance is structurally blind to clipping, and
+  /// clipping is what actually destroys ridge detail. Measured on a real
+  /// capture (6b43c255, 2026-08-27): the pad's mean luma read 167-201
+  /// across all 8 burst frames -- comfortably under the 205 glare
+  /// threshold, so the EV pulldown never fired once -- while 11-15% of the
+  /// pad sat at/above 250 and 8.4% was pegged at exactly 255. Saturated
+  /// pixels carry no gradient, so those ridges are unrecoverable by any
+  /// amount of downstream enhancement (verified: the clipped fraction is
+  /// identical before and after every CLAHE setting the backend uses).
+  ///
+  /// Deliberately mirrors [meanLuma]'s exact scan pattern -- same stride 8,
+  /// same ROI clamping, same bytesPerRow handling -- so the two report on
+  /// precisely the same sample set and can be compared without a sampling
+  /// confound.
+  static double clippedFraction(CameraImage image,
+      {Rect? roi, int threshold = 250}) {
+    if (image.planes.isEmpty) return 0.0;
+    final plane = image.planes[0];
+    final bytes = plane.bytes;
+    final w = image.width;
+    final h = image.height;
+    if (w < 8 || h < 8) return 0.0;
+    final stride = h > 0 ? math.min(plane.bytesPerRow, bytes.length ~/ h) : plane.bytesPerRow;
+    var hot = 0;
+    var n = 0;
+    if (roi != null) {
+      final x0 = (roi.left * w).clamp(0, w - 1).toInt();
+      final y0 = (roi.top * h).clamp(0, h - 1).toInt();
+      final x1 = (roi.right * w).clamp(0, w - 1).toInt();
+      final y1 = (roi.bottom * h).clamp(0, h - 1).toInt();
+      if (x1 > x0 + 1 && y1 > y0 + 1) {
+        for (var y = y0; y < y1; y += 8) {
+          final row = y * stride;
+          for (var x = x0; x < x1; x += 8) {
+            if (bytes[row + x] >= threshold) hot++;
+            n++;
+          }
+        }
+        return n > 0 ? hot / n : 0.0;
+      }
+    }
+    for (var y = 0; y < h; y += 8) {
+      final row = y * stride;
+      for (var x = 0; x < w; x += 8) {
+        if (bytes[row + x] >= threshold) hot++;
+        n++;
+      }
+    }
+    return n > 0 ? hot / n : 0.0;
+  }
+
   Uint8List? _extractBytes(CameraImage image) {
     if (image.planes.isEmpty) return null;
     try {
